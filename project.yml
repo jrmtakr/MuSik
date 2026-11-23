@@ -3,12 +3,30 @@ options:
   bundleIdPrefix: com.personal.musicplayer
   deploymentTarget:
     iOS: "17.0"
+packages:
+  KSPlayer:
+    url: https://github.com/kingslay/KSPlayer.git
+    revision: 0947b3e4d755addcea04980fe7cb4a4d92810bf2
+  FFmpegKit:
+    url: https://github.com/kingslay/FFmpegKit.git
+    exactVersion: 6.1.4
 targets:
   MusicPlayer:
     type: application
     platform: iOS
     sources:
       - path: MusicPlayer
+    dependencies:
+      - package: KSPlayer
+        product: KSPlayer
+      - package: FFmpegKit
+        product: Libavformat
+      - package: FFmpegKit
+        product: Libavcodec
+      - package: FFmpegKit
+        product: Libavutil
+      - package: FFmpegKit
+        product: Libswscale
     settings:
       base:
         INFOPLIST_FILE: MusicPlayer/Info.plist

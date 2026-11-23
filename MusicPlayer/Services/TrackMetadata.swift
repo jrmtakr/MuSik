@@ -31,13 +31,35 @@ func extractMetadata(from url: URL) async -> TrackMetadata {
         }
     }
 
-    let videoExtensions: Set<String> = ["mp4", "mov", "m4v"]
-    if artwork == nil && videoExtensions.contains(url.pathExtension.lowercased()) {
-        let generator = AVAssetImageGenerator(asset: asset)
-        generator.appliesPreferredTrackTransform = true
-        generator.maximumSize = CGSize(width: 480, height: 480)
-        if let (cgImage, _) = try? await generator.image(at: .zero) {
-            artwork = UIImage(cgImage: cgImage)
+    let ext = url.pathExtension.lowercased()
+    let videoExtensions = MediaItem.allVideoExtensions
+    if artwork == nil && (videoExtensions.contains(ext) || MediaItem.ffmpegAudioExtensions.contains(ext)) {
+        if MediaItem.appleNativeVideoExtensions.contains(ext) && ext != "movpkg" {
+            let generator = AVAssetImageGenerator(asset: asset)
+            generator.appliesPreferredTrackTransform = true
+            generator.maximumSize = CGSize(width: 480, height: 480)
+            if let (cgImage, _) = try? await generator.image(at: .zero) {
+                artwork = UIImage(cgImage: cgImage)
+            }
+        }
+    }
+
+    if artwork == nil || title == url.deletingPathExtension().lastPathComponent || artist == "Unknown Artist" {
+        let info = await Task.detached(priority: .utility) {
+            let meta = FFmpegMediaService.probeMetadata(for: url)
+            let img = artwork == nil ? FFmpegMediaService.extractArtworkOrFrame(from: url, at: 1.0, maxDimension: 480) : nil
+            return (meta, img)
+        }.value
+        if let meta = info.0 {
+            if let metaTitle = meta.title, !metaTitle.isEmpty, title == url.deletingPathExtension().lastPathComponent {
+                title = metaTitle
+            }
+            if let metaArtist = meta.artist, !metaArtist.isEmpty, artist == "Unknown Artist" {
+                artist = metaArtist
+            }
+        }
+        if artwork == nil {
+            artwork = info.1
         }
     }
 

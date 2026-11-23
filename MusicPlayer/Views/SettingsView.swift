@@ -107,6 +107,13 @@ struct SettingsView: View {
                     Toggle("Inline video player", isOn: $settings.inlineVideoPlayback)
                     Toggle("Web page dark mode", isOn: $settings.webDarkModeEnabled)
                     Toggle("Ad-Block", isOn: $settings.adBlockEnabled)
+
+                    if !settings.suppressedCacheHosts.isEmpty {
+                        Button("Reset \"Don't Remind\" Sites (\(settings.suppressedCacheHosts.count))") {
+                            settings.clearSuppressedCacheHosts()
+                            mediaManager.statusMessage = "Cleared muted prompt sites"
+                        }
+                    }
                 }
 
                 Section("Browser & Reader") {

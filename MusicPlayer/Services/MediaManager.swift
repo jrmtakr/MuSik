@@ -1,4 +1,5 @@
 import AVFoundation
+import KSPlayer
 import MediaPlayer
 import Observation
 import SwiftUI
@@ -8,9 +9,7 @@ import UIKit
 final class MediaManager {
     static let shared = MediaManager()
 
-    static let supportedExtensions: Set<String> = [
-        "mp3", "m4a", "wav", "aac", "flac", "aiff", "caf", "mp4", "mov", "m4v", "movpkg"
-    ]
+    static let supportedExtensions: Set<String> = MediaItem.allSupportedExtensions
 
     struct CustomTrackMetadata: Codable, Hashable {
         var title: String?
@@ -56,14 +55,20 @@ final class MediaManager {
 
     let equalizerPlayer = EqualizerAudioPlayer()
     private(set) var player: AVPlayer?
+    private(set) var ffmpegPlayer: KSMEPlayer?
+    private(set) var isUsingFFmpegBackend = false
     private var isUsingEqualizerBackend = false
 
     private let docsURL = MediaItem.documentsDirectory
     private var timeObserverToken: Any?
+    private var playerItemStatusObservation: NSKeyValueObservation?
     private var endObserver: NSObjectProtocol?
     private var interruptionObserver: NSObjectProtocol?
     private var routeChangeObserver: NSObjectProtocol?
+    private var ffmpegTimeTimer: Timer?
+    private var ksBridge: KSMEPlayerBridge?
     private var isScrubbing = false
+    private(set) var remoteStreamSourceURL: URL?
 
     private var existingIDsByPath: [String: UUID] = [:]
     private var existingOtherIDsByPath: [String: UUID] = [:]
@@ -75,6 +80,8 @@ final class MediaManager {
     private var metadataLoadTask: Task<Void, Never>?
 
     init() {
+        KSOptions.canBackgroundPlay = true
+        KSOptions.secondPlayerType = KSMEPlayer.self
         setupAudioSession()
         setupAudioNotifications()
         setupRemoteCommands()
@@ -177,7 +184,7 @@ final class MediaManager {
         otherFiles = loadedOthers
         folders = loadedFolders
 
-        if let currentItem {
+        if let currentItem, !currentItem.relativePath.hasPrefix("__remote__/") {
             if let refreshed = loadedItems.first(where: { $0.relativePath == currentItem.relativePath }) {
                 self.currentItem = refreshed
             } else {
@@ -437,17 +444,19 @@ final class MediaManager {
             return
         }
 
-        cleanupObservers()
-        player?.pause()
-        player = nil
-        equalizerPlayer.stop()
-        isUsingEqualizerBackend = false
+        stopCurrentEngines()
+        remoteStreamSourceURL = nil
         activePlaylistID = playlistID
         if let playlistID {
             lastPlaylistID = playlistID
         }
         recordRecent(item.relativePath)
         try? AVAudioSession.sharedInstance().setActive(true)
+
+        if item.prefersFFmpegEngine {
+            playWithFFmpegEngine(url: item.fileURL, item: item, headers: nil)
+            return
+        }
 
         if !item.isVideo {
             do {
@@ -477,11 +486,194 @@ final class MediaManager {
 
         attachTimeObserver(to: newPlayer, playerItem: playerItem)
         attachEndObserver(to: playerItem)
+        attachFailureFallbackObserver(to: playerItem, item: item)
 
         newPlayer.play()
         newPlayer.rate = playbackRate
         isPlaying = true
         updateNowPlayingInfo(for: item)
+    }
+
+    func playRemoteStream(url: URL, title: String, headers: [String: String]? = nil, isVideo: Bool) {
+        stopCurrentEngines()
+        activePlaylistID = nil
+        remoteStreamSourceURL = url
+        try? AVAudioSession.sharedInstance().setActive(true)
+
+        let ext = url.pathExtension.lowercased()
+        let syntheticExt = MediaItem.allSupportedExtensions.contains(ext) ? ext : (isVideo ? "mp4" : "m4a")
+        let virtualItem = MediaItem(
+            id: UUID(),
+            name: title,
+            fileName: "\(title).\(syntheticExt)",
+            relativePath: "__remote__/\(url.absoluteString)",
+            fileSize: 0,
+            dateAdded: .now,
+            durationSeconds: nil,
+            metadataTitle: title,
+            artist: url.host
+        )
+
+        let isHLS = ext == "m3u8" || url.absoluteString.lowercased().contains(".m3u8")
+        if isHLS || !MediaItem.ffmpegVideoExtensions.contains(ext) {
+            let playURL = isHLS ? url : LocalMediaCacheProxy.shared.proxiedURL(for: url, headers: headers)
+            let asset = AVURLAsset(
+                url: playURL,
+                options: headers.map { ["AVURLAssetHTTPHeaderFieldsKey": $0] }
+            )
+            let playerItem = AVPlayerItem(asset: asset)
+            let newPlayer = AVPlayer(playerItem: playerItem)
+            newPlayer.actionAtItemEnd = .pause
+
+            player = newPlayer
+            currentItem = virtualItem
+            currentTime = 0
+            duration = 0
+
+            attachTimeObserver(to: newPlayer, playerItem: playerItem)
+            attachEndObserver(to: playerItem)
+            playerItemStatusObservation = playerItem.observe(\.status, options: [.new]) { [weak self] itemObj, _ in
+                if itemObj.status == .failed {
+                    DispatchQueue.main.async {
+                        self?.playWithFFmpegEngine(url: url, item: virtualItem, headers: headers)
+                    }
+                }
+            }
+
+            newPlayer.play()
+            newPlayer.rate = playbackRate
+            isPlaying = true
+            updateNowPlayingInfo(for: virtualItem)
+        } else {
+            playWithFFmpegEngine(url: url, item: virtualItem, headers: headers)
+        }
+    }
+
+    private func playWithFFmpegEngine(url: URL, item: MediaItem, headers: [String: String]?) {
+        cleanupObservers()
+        player?.pause()
+        player = nil
+        equalizerPlayer.stop()
+        isUsingEqualizerBackend = false
+
+        let options = KSOptions()
+        options.registerRemoteControll = false
+        options.isLoopPlay = false
+        options.userAgent = WebMediaDownloader.browserUserAgent
+        if let headers, !headers.isEmpty {
+            options.appendHeader(headers)
+        }
+        options.videoDisable = !item.isVideo
+
+        let bridge = KSMEPlayerBridge(manager: self)
+        let ksPlayer = KSMEPlayer(url: url, options: options)
+        ksPlayer.delegate = bridge
+        ksPlayer.playbackRate = playbackRate
+
+        self.ksBridge = bridge
+        self.ffmpegPlayer = ksPlayer
+        self.isUsingFFmpegBackend = true
+        self.currentItem = item
+        self.currentTime = 0
+        self.duration = item.durationSeconds ?? 0
+        self.isPlaying = true
+
+        ksPlayer.prepareToPlay()
+        startFFmpegTimer()
+        updateNowPlayingInfo(for: item)
+    }
+
+    private func stopCurrentEngines() {
+        cleanupObservers()
+        ffmpegTimeTimer?.invalidate()
+        ffmpegTimeTimer = nil
+        ffmpegPlayer?.shutdown()
+        ffmpegPlayer = nil
+        ksBridge = nil
+        isUsingFFmpegBackend = false
+
+        player?.pause()
+        player = nil
+        equalizerPlayer.stop()
+        isUsingEqualizerBackend = false
+    }
+
+    private func attachFailureFallbackObserver(to playerItem: AVPlayerItem, item: MediaItem) {
+        playerItemStatusObservation = playerItem.observe(\.status, options: [.new]) { [weak self] itemObj, _ in
+            if itemObj.status == .failed {
+                DispatchQueue.main.async {
+                    guard let self, self.currentItem?.relativePath == item.relativePath else { return }
+                    self.playWithFFmpegEngine(url: item.fileURL, item: item, headers: nil)
+                }
+            }
+        }
+    }
+
+    private func startFFmpegTimer() {
+        ffmpegTimeTimer?.invalidate()
+        ffmpegTimeTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
+            guard let self, self.isUsingFFmpegBackend, let ks = self.ffmpegPlayer else { return }
+            if !self.isScrubbing {
+                let elapsed = ks.currentPlaybackTime
+                if elapsed.isFinite && elapsed >= 0 {
+                    self.currentTime = elapsed
+                }
+            }
+            let dur = ks.duration
+            if dur.isFinite, dur > 0, abs(self.duration - dur) > 0.2 {
+                self.duration = dur
+                if let path = self.currentItem?.relativePath, !path.hasPrefix("__remote__/") {
+                    self.durationsByPath[path] = dur
+                }
+                if let currentItem = self.currentItem {
+                    self.updateNowPlayingInfo(for: currentItem)
+                }
+            }
+        }
+    }
+
+    fileprivate func handleFFmpegReady(player: any MediaPlayerProtocol) {
+        guard isUsingFFmpegBackend else { return }
+        if player.duration.isFinite, player.duration > 0 {
+            duration = player.duration
+            if let path = currentItem?.relativePath, !path.hasPrefix("__remote__/") {
+                durationsByPath[path] = player.duration
+            }
+        }
+        if #available(iOS 14.2, *) {
+            player.pipController?.canStartPictureInPictureAutomaticallyFromInline = true
+        }
+        player.playbackRate = playbackRate
+        player.play()
+        isPlaying = true
+        if let currentItem {
+            updateNowPlayingInfo(for: currentItem)
+        }
+    }
+
+    @MainActor
+    func saveCurrentRemoteStreamOffline(using downloader: WebMediaDownloader) {
+        guard let sourceURL = remoteStreamSourceURL else { return }
+        let title = currentItem?.displayTitle ?? "Stream Media"
+        if let cachedBin = LocalMediaCacheProxy.cachedDataURL(for: sourceURL) {
+            let tempCopy = FileManager.default.temporaryDirectory
+                .appendingPathComponent("\(UUID().uuidString)_\(currentItem?.fileName ?? "stream.mp4")")
+            if (try? FileManager.default.copyItem(at: cachedBin, to: tempCopy)) != nil {
+                _ = importTemporaryFile(from: tempCopy, preferredFileName: currentItem?.fileName)
+                return
+            }
+        }
+        downloader.downloadDirectMedia(from: sourceURL, title: title)
+    }
+
+    fileprivate func handleFFmpegFinish(error: Error?) {
+        guard isUsingFFmpegBackend else { return }
+        if let error {
+            isPlaying = false
+            errorMessage = "Playback error: \(error.localizedDescription)"
+            return
+        }
+        handlePlaybackEnded()
     }
 
     func togglePlayPause() {
@@ -491,6 +683,14 @@ final class MediaManager {
     func resume() {
         guard let currentItem else { return }
         try? AVAudioSession.sharedInstance().setActive(true)
+
+        if isUsingFFmpegBackend, let ks = ffmpegPlayer {
+            ks.playbackRate = playbackRate
+            ks.play()
+            isPlaying = true
+            updateNowPlayingInfo(for: currentItem)
+            return
+        }
 
         if isUsingEqualizerBackend {
             equalizerPlayer.resume()
@@ -507,6 +707,16 @@ final class MediaManager {
     }
 
     func pause() {
+        if isUsingFFmpegBackend, let ks = ffmpegPlayer {
+            ks.pause()
+            currentTime = ks.currentPlaybackTime
+            isPlaying = false
+            if let currentItem {
+                updateNowPlayingInfo(for: currentItem)
+            }
+            return
+        }
+
         if isUsingEqualizerBackend {
             equalizerPlayer.pause()
             currentTime = equalizerPlayer.currentTime
@@ -526,11 +736,8 @@ final class MediaManager {
     }
 
     func stop() {
-        cleanupObservers()
-        player?.pause()
-        player = nil
-        equalizerPlayer.stop()
-        isUsingEqualizerBackend = false
+        stopCurrentEngines()
+        remoteStreamSourceURL = nil
         activePlaylistID = nil
         currentItem = nil
         isPlaying = false
@@ -551,6 +758,23 @@ final class MediaManager {
     func seek(to seconds: Double) {
         let upperBound = max(duration, 0)
         let clamped = min(max(seconds, 0), upperBound > 0 ? upperBound : max(seconds, 0))
+
+        if isUsingFFmpegBackend, let ks = ffmpegPlayer {
+            let wasPlaying = isPlaying
+            currentTime = clamped
+            ks.seek(time: clamped) { [weak self] _ in
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    if wasPlaying {
+                        ks.play()
+                    }
+                    if let currentItem = self.currentItem {
+                        self.updateNowPlayingInfo(for: currentItem)
+                    }
+                }
+            }
+            return
+        }
 
         if isUsingEqualizerBackend {
             equalizerPlayer.seek(to: clamped)
@@ -578,7 +802,9 @@ final class MediaManager {
 
     func setPlaybackRate(_ rate: Float) {
         playbackRate = rate
-        if isUsingEqualizerBackend {
+        if isUsingFFmpegBackend {
+            ffmpegPlayer?.playbackRate = rate
+        } else if isUsingEqualizerBackend {
             equalizerPlayer.setPlaybackRate(rate)
         } else if isPlaying {
             player?.rate = rate
@@ -1152,7 +1378,20 @@ final class MediaManager {
         }
 
         guard let session = selectedSession else {
-            errorMessage = "This file format cannot be exported directly to MP4 on this device."
+            let baseOutputName = item.name.hasSuffix("_converted") ? "\(item.name)_new.mp4" : "\(item.name)_converted.mp4"
+            let outputURL = uniqueDestinationURL(for: baseOutputName, inFolder: item.folderRelativePath)
+            try? FileManager.default.removeItem(at: outputURL)
+            conversionProgress = 0.5
+            let remuxed = await Task.detached(priority: .userInitiated) {
+                FFmpegMediaService.remuxToMP4(inputURL: item.fileURL, outputURL: outputURL)
+            }.value
+            if remuxed {
+                loadLocalFiles()
+                statusMessage = "Exported \(outputURL.lastPathComponent)"
+            } else {
+                try? FileManager.default.removeItem(at: outputURL)
+                errorMessage = "This container's codecs cannot be losslessly remuxed to MP4, but it plays directly with the built-in FFmpeg player."
+            }
             return
         }
 
@@ -1211,13 +1450,23 @@ final class MediaManager {
         }
 
         let asset = AVURLAsset(url: item.fileURL)
-        guard let session = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetAppleM4A) else {
-            errorMessage = "Audio extraction is not supported for this file."
-            return
-        }
-
         let outputURL = uniqueDestinationURL(for: "\(item.name).m4a", inFolder: item.folderRelativePath)
         try? FileManager.default.removeItem(at: outputURL)
+
+        guard let session = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetAppleM4A) else {
+            conversionProgress = 0.5
+            let remuxed = await Task.detached(priority: .userInitiated) {
+                FFmpegMediaService.remuxAudioTrackToM4A(inputURL: item.fileURL, outputURL: outputURL)
+            }.value
+            if remuxed {
+                loadLocalFiles()
+                statusMessage = "Extracted \(outputURL.lastPathComponent)"
+            } else {
+                try? FileManager.default.removeItem(at: outputURL)
+                errorMessage = "Audio extraction is only available for AAC/ALAC tracks in this container."
+            }
+            return
+        }
 
         session.outputURL = outputURL
         session.outputFileType = .m4a
@@ -1252,7 +1501,34 @@ final class MediaManager {
 
     @MainActor
     func saveVideoScreenshot(from item: MediaItem, at seconds: Double) async {
-        let asset = AVURLAsset(url: item.fileURL)
+        let saveFolder = item.relativePath.hasPrefix("__remote__/") ? "" : item.folderRelativePath
+
+        if isUsingFFmpegBackend,
+           currentItem?.relativePath == item.relativePath,
+           let cgImage = await ffmpegPlayer?.thumbnailImageAtCurrentTime(),
+           let pngData = UIImage(cgImage: cgImage).pngData() {
+            let destURL = uniqueDestinationURL(for: "\(item.name)_frame.png", inFolder: saveFolder)
+            try? pngData.write(to: destURL, options: [.atomic])
+            loadLocalFiles()
+            statusMessage = "Saved screenshot: \(destURL.lastPathComponent)"
+            return
+        }
+
+        if item.prefersFFmpegEngine {
+            let captured = await Task.detached(priority: .userInitiated) {
+                FFmpegMediaService.extractArtworkOrFrame(from: item.fileURL, at: max(seconds, 0), maxDimension: 1920)
+            }.value
+            if let captured, let pngData = captured.pngData() {
+                let destURL = uniqueDestinationURL(for: "\(item.name)_frame.png", inFolder: saveFolder)
+                try? pngData.write(to: destURL, options: [.atomic])
+                loadLocalFiles()
+                statusMessage = "Saved screenshot: \(destURL.lastPathComponent)"
+                return
+            }
+        }
+
+        let assetURL = item.relativePath.hasPrefix("__remote__/") ? (remoteStreamSourceURL ?? item.fileURL) : item.fileURL
+        let asset = AVURLAsset(url: assetURL)
         let generator = AVAssetImageGenerator(asset: asset)
         generator.appliesPreferredTrackTransform = true
         generator.requestedTimeToleranceBefore = .zero
@@ -1263,7 +1539,7 @@ final class MediaManager {
             let (cgImage, _) = try await generator.image(at: cmTime)
             let uiImage = UIImage(cgImage: cgImage)
             guard let pngData = uiImage.pngData() else { return }
-            let destURL = uniqueDestinationURL(for: "\(item.name)_frame.png", inFolder: item.folderRelativePath)
+            let destURL = uniqueDestinationURL(for: "\(item.name)_frame.png", inFolder: saveFolder)
             try pngData.write(to: destURL, options: [.atomic])
             loadLocalFiles()
             statusMessage = "Saved screenshot: \(destURL.lastPathComponent)"
@@ -1567,6 +1843,8 @@ final class MediaManager {
     }
 
     private func cleanupObservers() {
+        playerItemStatusObservation?.invalidate()
+        playerItemStatusObservation = nil
         if let token = timeObserverToken, let player {
             player.removeTimeObserver(token)
             timeObserverToken = nil
@@ -1713,10 +1991,18 @@ final class MediaManager {
 
             let asset = AVURLAsset(url: item.fileURL)
 
-            if durationsByPath[path] == nil,
-               let loadedDuration = try? await asset.load(.duration) {
-                let seconds = CMTimeGetSeconds(loadedDuration)
-                if seconds.isFinite, seconds > 0 {
+            if durationsByPath[path] == nil {
+                var resolvedSec: Double?
+                if !item.prefersFFmpegEngine, let loadedDuration = try? await asset.load(.duration) {
+                    let sec = CMTimeGetSeconds(loadedDuration)
+                    if sec.isFinite, sec > 0 { resolvedSec = sec }
+                }
+                if resolvedSec == nil {
+                    resolvedSec = await Task.detached(priority: .utility) {
+                        FFmpegMediaService.probeMetadata(for: item.fileURL)?.durationSeconds
+                    }.value
+                }
+                if let seconds = resolvedSec, seconds > 0 {
                     durationsByPath[path] = seconds
                     if let idx = items.firstIndex(where: { $0.relativePath == path }) {
                         items[idx].durationSeconds = seconds
@@ -1787,5 +2073,35 @@ final class MediaManager {
             }
         }
         return total
+    }
+}
+
+@MainActor
+private final class KSMEPlayerBridge: MediaPlayerDelegate {
+    weak var manager: MediaManager?
+
+    init(manager: MediaManager) {
+        self.manager = manager
+    }
+
+    func readyToPlay(player: some MediaPlayerProtocol) {
+        manager?.handleFFmpegReady(player: player)
+    }
+
+    func changeLoadState(player: some MediaPlayerProtocol) {
+        _ = player
+    }
+
+    func changeBuffering(player _: some MediaPlayerProtocol, progress: Int) {
+        _ = progress
+    }
+
+    func playBack(player _: some MediaPlayerProtocol, loopCount: Int) {
+        _ = loopCount
+    }
+
+    func finish(player: some MediaPlayerProtocol, error: Error?) {
+        _ = player
+        manager?.handleFFmpegFinish(error: error)
     }
 }

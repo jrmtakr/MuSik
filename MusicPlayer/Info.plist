@@ -65,7 +65,11 @@
 			<array>
 				<string>public.audio</string>
 				<string>public.mp3</string>
+				<string>org.xiph.ogg-vorbis</string>
+				<string>org.xiph.opus</string>
+				<string>org.xiph.flac</string>
 				<string>com.microsoft.waveform-audio</string>
+				<string>com.microsoft.windows-media-wma</string>
 			</array>
 		</dict>
 		<dict>
@@ -78,6 +82,12 @@
 				<string>public.movie</string>
 				<string>public.mpeg-4</string>
 				<string>com.apple.quicktime-movie</string>
+				<string>org.matroska.mkv</string>
+				<string>public.avi</string>
+				<string>org.webmproject.webm</string>
+				<string>com.adobe.flash.video</string>
+				<string>com.microsoft.windows-media-wmv</string>
+				<string>public.mpeg-2-transport-stream</string>
 			</array>
 		</dict>
 		<dict>

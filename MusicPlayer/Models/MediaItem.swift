@@ -18,6 +18,27 @@ struct MediaItem: Identifiable, Hashable, Codable {
         return name
     }
 
+    static let appleNativeAudioExtensions: Set<String> = [
+        "mp3", "m4a", "wav", "aac", "flac", "aiff", "caf", "alac", "m4b", "m4r"
+    ]
+
+    static let appleNativeVideoExtensions: Set<String> = [
+        "mp4", "mov", "m4v", "movpkg"
+    ]
+
+    static let ffmpegVideoExtensions: Set<String> = [
+        "mkv", "avi", "webm", "flv", "wmv", "rmvb", "ts", "m2ts",
+        "vob", "ogv", "divx", "3gp", "mpg", "mpeg", "f4v", "asf"
+    ]
+
+    static let ffmpegAudioExtensions: Set<String> = [
+        "ogg", "opus", "wma", "ape", "ac3", "dts", "amr"
+    ]
+
+    static let allVideoExtensions: Set<String> = appleNativeVideoExtensions.union(ffmpegVideoExtensions)
+    static let allAudioExtensions: Set<String> = appleNativeAudioExtensions.union(ffmpegAudioExtensions)
+    static let allSupportedExtensions: Set<String> = allVideoExtensions.union(allAudioExtensions)
+
     var fileExtension: String {
         (fileName as NSString).pathExtension.lowercased()
     }
@@ -27,7 +48,11 @@ struct MediaItem: Identifiable, Hashable, Codable {
     }
 
     var isVideo: Bool {
-        ["mp4", "mov", "m4v", "movpkg"].contains(fileExtension)
+        Self.allVideoExtensions.contains(fileExtension)
+    }
+
+    var prefersFFmpegEngine: Bool {
+        Self.ffmpegVideoExtensions.contains(fileExtension) || Self.ffmpegAudioExtensions.contains(fileExtension)
     }
 
     var folderRelativePath: String {

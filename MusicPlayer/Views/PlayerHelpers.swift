@@ -45,6 +45,41 @@ struct PiPVideoPlayer: UIViewControllerRepresentable {
     }
 }
 
+struct FFmpegVideoPlayerView: UIViewRepresentable {
+    let renderView: UIView?
+
+    func makeUIView(context: Context) -> UIView {
+        let container = UIView()
+        container.backgroundColor = .black
+        container.clipsToBounds = true
+        attachRenderView(renderView, to: container)
+        return container
+    }
+
+    func updateUIView(_ uiView: UIView, context: Context) {
+        attachRenderView(renderView, to: uiView)
+    }
+
+    private func attachRenderView(_ target: UIView?, to container: UIView) {
+        guard let target else {
+            container.subviews.forEach { $0.removeFromSuperview() }
+            return
+        }
+        if target.superview !== container {
+            container.subviews.forEach { $0.removeFromSuperview() }
+            target.translatesAutoresizingMaskIntoConstraints = false
+            target.contentMode = .scaleAspectFit
+            container.addSubview(target)
+            NSLayoutConstraint.activate([
+                target.topAnchor.constraint(equalTo: container.topAnchor),
+                target.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+                target.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+                target.trailingAnchor.constraint(equalTo: container.trailingAnchor)
+            ])
+        }
+    }
+}
+
 struct AirPlayRoutePickerView: UIViewRepresentable {
     var prioritizesVideoDevices: Bool = false
 

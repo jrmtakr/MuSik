@@ -99,6 +99,9 @@ final class AppSettings {
     var selectedAppIconName: String {
         didSet { UserDefaults.standard.set(selectedAppIconName, forKey: Keys.selectedAppIconName) }
     }
+    var suppressedCacheHosts: [String] {
+        didSet { UserDefaults.standard.set(suppressedCacheHosts, forKey: Keys.suppressedCacheHosts) }
+    }
 
     private enum Keys {
         static let appearance = "musicplayer.appearance"
@@ -114,6 +117,7 @@ final class AppSettings {
         static let readerFontSize = "musicplayer.readerFontSize"
         static let readerDarkTheme = "musicplayer.readerDarkTheme"
         static let selectedAppIconName = "musicplayer.selectedAppIconName"
+        static let suppressedCacheHosts = "musicplayer.suppressedCacheHosts"
     }
 
     init() {
@@ -147,6 +151,7 @@ final class AppSettings {
         self.readerFontSize = defaults.double(forKey: Keys.readerFontSize)
         self.readerDarkTheme = defaults.bool(forKey: Keys.readerDarkTheme)
         self.selectedAppIconName = defaults.string(forKey: Keys.selectedAppIconName) ?? ""
+        self.suppressedCacheHosts = defaults.stringArray(forKey: Keys.suppressedCacheHosts) ?? []
     }
 
     func setAskBeforeCaching(_ enabled: Bool) {
@@ -161,5 +166,20 @@ final class AppSettings {
         if enabled {
             askBeforeCaching = false
         }
+    }
+
+    func suppressCachingPrompts(forHost host: String) {
+        let normalized = host.lowercased()
+        guard !normalized.isEmpty, !suppressedCacheHosts.contains(normalized) else { return }
+        suppressedCacheHosts.append(normalized)
+    }
+
+    func isPromptSuppressed(forHost host: String?) -> Bool {
+        guard let host = host?.lowercased(), !host.isEmpty else { return false }
+        return suppressedCacheHosts.contains(host)
+    }
+
+    func clearSuppressedCacheHosts() {
+        suppressedCacheHosts.removeAll()
     }
 }

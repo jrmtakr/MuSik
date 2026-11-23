@@ -4,6 +4,7 @@ import SwiftUI
 struct NowPlayingView: View {
     @Environment(MediaManager.self) private var mediaManager
     @Environment(SleepTimerManager.self) private var sleepTimer
+    @Environment(WebMediaDownloader.self) private var downloader
     @Environment(\.dismiss) private var dismiss
 
     @State private var scrubPosition: Double = 0
@@ -12,6 +13,7 @@ struct NowPlayingView: View {
     @State private var customSleepMinutes = ""
     @State private var showEqualizerSheet = false
     @State private var showQueueSheet = false
+    @State private var showFullscreenFFmpegVideo = false
     @State private var editingInfoItem: MediaItem?
 
     private let speedOptions: [Float] = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
@@ -39,7 +41,7 @@ struct NowPlayingView: View {
                                 conversionBanner
                             }
 
-                            if !item.isVideo {
+                            if !item.isVideo || mediaManager.isUsingFFmpegBackend {
                                 scrubberSection
                             }
 
@@ -107,6 +109,21 @@ struct NowPlayingView: View {
             }
             .sheet(item: $editingInfoItem) { item in
                 EditTrackInfoSheet(item: item)
+            }
+            .fullScreenCover(isPresented: $showFullscreenFFmpegVideo) {
+                ZStack(alignment: .topTrailing) {
+                    Color.black.ignoresSafeArea()
+                    FFmpegVideoPlayerView(renderView: mediaManager.ffmpegPlayer?.view)
+                        .ignoresSafeArea()
+                    Button {
+                        showFullscreenFFmpegVideo = false
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.title)
+                            .foregroundStyle(.white.opacity(0.85))
+                            .padding()
+                    }
+                }
             }
             .alert("Custom Sleep Timer", isPresented: $showCustomSleepAlert) {
                 TextField("Minutes (e.g. 20)", text: $customSleepMinutes)
@@ -188,7 +205,44 @@ struct NowPlayingView: View {
 
     @ViewBuilder
     private var videoPlayerSection: some View {
-        if let player = mediaManager.player {
+        if mediaManager.isUsingFFmpegBackend {
+            ZStack(alignment: .bottomTrailing) {
+                FFmpegVideoPlayerView(renderView: mediaManager.ffmpegPlayer?.view)
+                    .frame(height: 240)
+                    .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                    .shadow(color: .black.opacity(0.2), radius: 14, y: 6)
+
+                HStack(spacing: 8) {
+                    if let pip = mediaManager.ffmpegPlayer?.pipController,
+                       AVPictureInPictureController.isPictureInPictureSupported() {
+                        Button {
+                            if pip.isPictureInPictureActive {
+                                pip.stopPictureInPicture()
+                            } else {
+                                pip.startPictureInPicture()
+                            }
+                        } label: {
+                            Image(systemName: "pip.enter")
+                                .font(.caption.weight(.bold))
+                                .foregroundStyle(.white)
+                                .padding(8)
+                                .background(.black.opacity(0.55), in: Circle())
+                        }
+                    }
+
+                    Button {
+                        showFullscreenFFmpegVideo = true
+                    } label: {
+                        Image(systemName: "arrow.up.left.and.arrow.down.right")
+                            .font(.caption.weight(.bold))
+                            .foregroundStyle(.white)
+                            .padding(8)
+                            .background(.black.opacity(0.55), in: Circle())
+                    }
+                }
+                .padding(10)
+            }
+        } else if let player = mediaManager.player {
             PiPVideoPlayer(player: player)
                 .frame(height: 240)
                 .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
@@ -409,7 +463,21 @@ struct NowPlayingView: View {
     }
 
     private func secondaryActions(item: MediaItem) -> some View {
-        VStack(spacing: 10) {
+        let isRemote = item.relativePath.hasPrefix("__remote__/")
+        return VStack(spacing: 10) {
+            if isRemote {
+                Button {
+                    mediaManager.saveCurrentRemoteStreamOffline(using: downloader)
+                } label: {
+                    Label("Cache Stream Offline to Files", systemImage: "arrow.down.circle.fill")
+                        .font(.subheadline.weight(.semibold))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 12)
+                        .background(Color.accentColor.opacity(0.18), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                        .foregroundStyle(Color.accentColor)
+                }
+            }
+
             if item.isVideo {
                 HStack(spacing: 10) {
                     Button {
@@ -424,7 +492,7 @@ struct NowPlayingView: View {
                             .background(Color.secondary.opacity(0.14), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
                     }
 
-                    if !item.isHLS {
+                    if !item.isHLS && !isRemote {
                         Button {
                             Task {
                                 await mediaManager.extractAudioToM4A(item: item)
@@ -441,38 +509,40 @@ struct NowPlayingView: View {
                 }
             }
 
-            HStack(spacing: 10) {
-                Button {
-                    editingInfoItem = item
-                } label: {
-                    Label("Edit Info", systemImage: "pencil.and.outline")
-                        .font(.subheadline.weight(.semibold))
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 12)
-                        .background(Color.secondary.opacity(0.14), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-                }
-
-                if !item.isHLS {
+            if !isRemote {
+                HStack(spacing: 10) {
                     Button {
-                        Task {
-                            await mediaManager.convertToMP4(item: item)
-                        }
+                        editingInfoItem = item
                     } label: {
-                        Label("To MP4", systemImage: "film.stack")
+                        Label("Edit Info", systemImage: "pencil.and.outline")
                             .font(.subheadline.weight(.semibold))
                             .frame(maxWidth: .infinity)
                             .padding(.vertical, 12)
                             .background(Color.secondary.opacity(0.14), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
                     }
-                    .disabled(mediaManager.convertingItemID != nil)
-                }
 
-                ShareLink(item: item.fileURL) {
-                    Label("Share", systemImage: "square.and.arrow.up")
-                        .font(.subheadline.weight(.semibold))
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 12)
-                        .background(Color.secondary.opacity(0.14), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    if !item.isHLS {
+                        Button {
+                            Task {
+                                await mediaManager.convertToMP4(item: item)
+                            }
+                        } label: {
+                            Label("To MP4", systemImage: "film.stack")
+                                .font(.subheadline.weight(.semibold))
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 12)
+                                .background(Color.secondary.opacity(0.14), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                        }
+                        .disabled(mediaManager.convertingItemID != nil)
+                    }
+
+                    ShareLink(item: item.fileURL) {
+                        Label("Share", systemImage: "square.and.arrow.up")
+                            .font(.subheadline.weight(.semibold))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 12)
+                            .background(Color.secondary.opacity(0.14), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    }
                 }
             }
         }

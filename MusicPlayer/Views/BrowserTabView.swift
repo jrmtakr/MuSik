@@ -15,13 +15,27 @@ final class BrowserController {
     var detectedStreams: [DetectedBrowserMedia] = []
 
     var detectedMedia: DetectedBrowserMedia? {
-        detectedStreams.last
+        detectedStreams.last(where: { $0.isActivelyPlaying }) ?? detectedStreams.last
     }
 
     func addDetectedStream(_ media: DetectedBrowserMedia) {
-        if !detectedStreams.contains(where: { $0.url == media.url }) {
-            detectedStreams.append(media)
+        if let idx = detectedStreams.firstIndex(where: { $0.url == media.url }) {
+            let existing = detectedStreams[idx]
+            let mergedActive = existing.isActivelyPlaying || media.isActivelyPlaying
+            let mergedDur = media.durationSeconds ?? existing.durationSeconds
+            let mergedTitle = (media.title?.isEmpty == false ? media.title : existing.title)
+            detectedStreams[idx] = DetectedBrowserMedia(
+                url: media.url,
+                isHLS: media.isHLS || existing.isHLS,
+                isAudio: media.isAudio || existing.isAudio,
+                title: mergedTitle,
+                referer: media.referer ?? existing.referer,
+                durationSeconds: mergedDur,
+                isActivelyPlaying: mergedActive
+            )
+            return
         }
+        detectedStreams.append(media)
     }
 
     func clearDetectedStreams() {
@@ -52,6 +66,7 @@ final class BrowserController {
 
 struct WebViewWrapper: UIViewRepresentable {
     let url: URL
+    let tabID: UUID
     let isPrivate: Bool
     let darkModeEnabled: Bool
     let adBlockEnabled: Bool
@@ -60,41 +75,84 @@ struct WebViewWrapper: UIViewRepresentable {
     var contentBlocker: ContentBlockerManager? = nil
     var onURLChange: (URL, String?) -> Void = { _, _ in }
     var onMediaDetected: (DetectedBrowserMedia) -> Void = { _ in }
+    var onBlobCaptured: (Data, String, String) -> Void = { _, _, _ in }
     var onWKDownloadImported: (URL, String) -> Void = { _, _ in }
     var onWKDownloadFailed: (Error) -> Void = { _ in }
     var onDownloadTriggered: (URL) -> Void = { _ in }
-
-    private static let mobileSafariUA =
-        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1"
 
     private static let documentStartMediaJS = """
     (function() {
         if (window.__musicPlayerHookInstalled) return;
         window.__musicPlayerHookInstalled = true;
-        var seen = new Set();
+        var seen = new Map();
+        var blobMap = new Map();
+        window.__mpBlobMap = blobMap;
+
+        var adHostPattern = /(doubleclick\\.net|googlesyndication|googleadservices|adnxs|exoclick|popads|popcash|propellerads|juicyads|trafficjunky|adsterra|taboola|outbrain)/i;
+
+        function isSegmentChunk(lower) {
+            if (/\\.m3u8(\\?|#|$|&)/i.test(lower)) return false;
+            if (/\\/(seg|chunk|frag|part)[-_]?\\d+\\.(ts|m4s|mp4)(\\?|$)/i.test(lower)) return true;
+            if (/\\.ts(\\?|$)/i.test(lower) && (seenHasHLS())) return true;
+            if (/\\.m4s(\\?|$)/i.test(lower)) return true;
+            return false;
+        }
+
+        function seenHasHLS() {
+            var found = false;
+            seen.forEach(function(kind) { if (kind === 'hls') found = true; });
+            return found;
+        }
 
         function classify(src, forcedKind) {
-            if (!src || !/^https?:\\/\\//i.test(src)) return null;
+            if (!src) return null;
+            if (/^blob:/i.test(src)) {
+                return blobMap.has(src) ? (forcedKind || 'video') : null;
+            }
+            if (!/^https?:\\/\\//i.test(src)) return null;
             var lower = src.toLowerCase();
+            if (adHostPattern.test(lower)) return null;
+            if (isSegmentChunk(lower)) return null;
             if (forcedKind) return forcedKind;
             if (/\\.m3u8(\\?|#|$|&)/i.test(lower) || /\\/(hls|manifest)\\/.*m3u8/i.test(lower) || /type=m3u8/i.test(lower)) return 'hls';
-            if (/\\.(mp3|m4a|wav|aac|flac|ogg)(\\?|#|$)/i.test(lower) || /mime=audio(%2f|\\/)?/i.test(lower)) return 'audio';
-            if (/\\.(mp4|mov|m4v)(\\?|#|$)/i.test(lower) || /mime=video(%2f|\\/)?(mp4|quicktime|x-m4v)/i.test(lower)) return 'video';
+            if (/\\.(mp3|m4a|wav|aac|flac|ogg|opus|wma|ape|ac3|dts|amr|alac)(\\?|#|$)/i.test(lower) || /mime=audio(%2f|\\/)?/i.test(lower)) return 'audio';
+            if (/\\.(mp4|mov|m4v|mkv|avi|webm|flv|wmv|ts|m2ts|3gp|ogv|mpg|mpeg)(\\?|#|$)/i.test(lower) || /mime=video(%2f|\\/)?/i.test(lower)) return 'video';
             return null;
         }
 
-        function report(src, forcedKind) {
+        function report(src, forcedKind, dur, active) {
             var kind = classify(src, forcedKind);
-            if (!kind || seen.has(src)) return;
-            seen.add(src);
+            if (!kind) return;
+            var prev = seen.get(src);
+            if (prev === kind && !active && !(dur > 0)) return;
+            if (seen.has(src) && prev === kind + '|1' && !active) return;
+            seen.set(src, kind + (active ? '|1' : ''));
             try {
                 window.webkit.messageHandlers.mediaDetected.postMessage({
                     url: src,
                     kind: kind,
-                    title: document.title || ''
+                    title: (window.top && window.top !== window ? '' : document.title) || document.title || '',
+                    duration: (typeof dur === 'number' && isFinite(dur) && dur > 0) ? dur : 0,
+                    active: !!active
                 });
             } catch (e) {}
         }
+
+        try {
+            var origCreateObjectURL = URL.createObjectURL;
+            URL.createObjectURL = function(obj) {
+                var u = origCreateObjectURL.apply(URL, arguments);
+                try {
+                    if (obj && typeof Blob !== 'undefined' && obj instanceof Blob) {
+                        var t = (obj.type || '').toLowerCase();
+                        if (t.indexOf('video/') === 0 || t.indexOf('audio/') === 0 || obj.size > 262144) {
+                            blobMap.set(u, obj);
+                        }
+                    }
+                } catch (e) {}
+                return u;
+            };
+        } catch (e) {}
 
         if (window.fetch) {
             var origFetch = window.fetch;
@@ -102,7 +160,7 @@ struct WebViewWrapper: UIViewRepresentable {
                 var reqUrl = '';
                 try {
                     reqUrl = typeof input === 'string' ? input : (input && input.url) || '';
-                    if (reqUrl) report(new URL(reqUrl, window.location.href).toString(), null);
+                    if (reqUrl) report(new URL(reqUrl, window.location.href).toString(), null, 0, false);
                 } catch (e) {}
                 var p = origFetch.apply(this, arguments);
                 if (p && typeof p.then === 'function') {
@@ -112,9 +170,19 @@ struct WebViewWrapper: UIViewRepresentable {
                             var finalUrl = resp.url || reqUrl;
                             if (!finalUrl) return;
                             var abs = new URL(finalUrl, window.location.href).toString();
-                            if (ct.indexOf('mpegurl') !== -1) report(abs, 'hls');
-                            else if (ct.indexOf('audio/') === 0) report(abs, 'audio');
-                            else if (ct.indexOf('video/') === 0) report(abs, 'video');
+                            if (ct.indexOf('mpegurl') !== -1) report(abs, 'hls', 0, false);
+                            else if (ct.indexOf('audio/') === 0) report(abs, 'audio', 0, false);
+                            else if (ct.indexOf('video/') === 0 || ct.indexOf('matroska') !== -1) report(abs, 'video', 0, false);
+                            else if ((ct.indexOf('text/plain') === 0 || ct.indexOf('octet-stream') !== -1) && resp.clone) {
+                                var cl = parseInt((resp.headers && resp.headers.get('content-length')) || '0', 10);
+                                if (!cl || cl < 2097152) {
+                                    resp.clone().text().then(function(txt) {
+                                        if (txt && txt.slice(0, 32).indexOf('#EXTM3U') !== -1) {
+                                            report(abs, 'hls', 0, false);
+                                        }
+                                    }).catch(function() {});
+                                }
+                            }
                         } catch (e) {}
                     }).catch(function() {});
                 }
@@ -126,7 +194,7 @@ struct WebViewWrapper: UIViewRepresentable {
         XMLHttpRequest.prototype.open = function(method, url) {
             try {
                 this.__mpReqUrl = url ? new URL(url, window.location.href).toString() : '';
-                if (this.__mpReqUrl) report(this.__mpReqUrl, null);
+                if (this.__mpReqUrl) report(this.__mpReqUrl, null, 0, false);
                 if (!this.__mpLoadHooked) {
                     this.__mpLoadHooked = true;
                     this.addEventListener('loadend', function() {
@@ -135,9 +203,15 @@ struct WebViewWrapper: UIViewRepresentable {
                             var finalUrl = this.responseURL || this.__mpReqUrl;
                             if (!finalUrl) return;
                             var abs = new URL(finalUrl, window.location.href).toString();
-                            if (ct.indexOf('mpegurl') !== -1) report(abs, 'hls');
-                            else if (ct.indexOf('audio/') === 0) report(abs, 'audio');
-                            else if (ct.indexOf('video/') === 0) report(abs, 'video');
+                            if (ct.indexOf('mpegurl') !== -1) report(abs, 'hls', 0, false);
+                            else if (ct.indexOf('audio/') === 0) report(abs, 'audio', 0, false);
+                            else if (ct.indexOf('video/') === 0 || ct.indexOf('matroska') !== -1) report(abs, 'video', 0, false);
+                            else if ((ct.indexOf('text/plain') === 0 || ct.indexOf('octet-stream') !== -1) &&
+                                     (!this.responseType || this.responseType === 'text') &&
+                                     typeof this.responseText === 'string' &&
+                                     this.responseText.slice(0, 32).indexOf('#EXTM3U') !== -1) {
+                                report(abs, 'hls', 0, false);
+                            }
                         } catch (e) {}
                     });
                 }
@@ -145,47 +219,118 @@ struct WebViewWrapper: UIViewRepresentable {
             return origOpen.apply(this, arguments);
         };
 
-        function inspectMediaElement(el) {
+        try {
+            var origAudio = window.Audio;
+            window.Audio = function(src) {
+                var a = new origAudio(src);
+                if (src) {
+                    try { report(new URL(src, window.location.href).toString(), 'audio', 0, true); } catch (e) {}
+                }
+                return a;
+            };
+            window.Audio.prototype = origAudio.prototype;
+        } catch (e) {}
+
+        function inspectMediaElement(el, isActivePlay) {
             if (!el) return;
             try {
-                var src = el.currentSrc || el.src;
+                var src = el.currentSrc || el.src || (el.getAttribute && (el.getAttribute('src') || el.getAttribute('data-src')));
                 if (!src) return;
-                var abs = new URL(src, window.location.href).toString();
+                if (el.muted && el.loop && el.duration > 0 && el.duration < 3 && !isActivePlay) return;
+                var abs = /^blob:/i.test(src) ? src : new URL(src, window.location.href).toString();
                 var isAudioTag = (el.tagName && el.tagName.toLowerCase() === 'audio') ||
                     (el.parentElement && el.parentElement.tagName && el.parentElement.tagName.toLowerCase() === 'audio');
                 var kind = /\\.m3u8/i.test(abs) ? 'hls' : (isAudioTag ? 'audio' : 'video');
-                report(abs, kind);
+                report(abs, kind, el.duration, !!isActivePlay);
             } catch (e) {}
         }
 
+        try {
+            var desc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'src');
+            if (desc && desc.set) {
+                Object.defineProperty(HTMLMediaElement.prototype, 'src', {
+                    configurable: true,
+                    enumerable: desc.enumerable,
+                    get: desc.get,
+                    set: function(val) {
+                        desc.set.call(this, val);
+                        inspectMediaElement(this, !this.paused);
+                    }
+                });
+            }
+        } catch (e) {}
+
         var origPlay = HTMLMediaElement.prototype.play;
         HTMLMediaElement.prototype.play = function() {
-            inspectMediaElement(this);
+            inspectMediaElement(this, true);
             return origPlay.apply(this, arguments);
         };
 
         var origLoad = HTMLMediaElement.prototype.load;
         HTMLMediaElement.prototype.load = function() {
-            inspectMediaElement(this);
+            inspectMediaElement(this, !this.paused);
             return origLoad.apply(this, arguments);
         };
 
-        document.addEventListener('loadedmetadata', function(e) { inspectMediaElement(e.target); }, true);
-        document.addEventListener('canplay', function(e) { inspectMediaElement(e.target); }, true);
-        document.addEventListener('play', function(e) { inspectMediaElement(e.target); }, true);
+        document.addEventListener('loadedmetadata', function(e) { inspectMediaElement(e.target, false); }, true);
+        document.addEventListener('durationchange', function(e) { inspectMediaElement(e.target, false); }, true);
+        document.addEventListener('canplay', function(e) { inspectMediaElement(e.target, !e.target.paused); }, true);
+        document.addEventListener('play', function(e) { inspectMediaElement(e.target, true); }, true);
+        document.addEventListener('playing', function(e) { inspectMediaElement(e.target, true); }, true);
+
+        function scanNodeTree(root) {
+            if (!root || !root.querySelectorAll) return;
+            root.querySelectorAll('video, video source, audio, audio source').forEach(function(el) {
+                inspectMediaElement(el, !el.paused);
+            });
+            root.querySelectorAll('*').forEach(function(el) {
+                if (el.shadowRoot) scanNodeTree(el.shadowRoot);
+            });
+        }
+
+        function scanPerformance() {
+            try {
+                if (!window.performance || !performance.getEntriesByType) return;
+                performance.getEntriesByType('resource').forEach(function(entry) {
+                    if (!entry || !entry.name) return;
+                    if (entry.initiatorType === 'video' || entry.initiatorType === 'audio') {
+                        report(entry.name, entry.initiatorType, 0, false);
+                    } else {
+                        report(entry.name, null, 0, false);
+                    }
+                });
+            } catch (e) {}
+        }
+
+        try {
+            if (window.PerformanceObserver) {
+                var po = new PerformanceObserver(function(list) {
+                    list.getEntries().forEach(function(entry) {
+                        if (!entry || !entry.name) return;
+                        if (entry.initiatorType === 'video' || entry.initiatorType === 'audio') {
+                            report(entry.name, entry.initiatorType, 0, false);
+                        } else {
+                            report(entry.name, null, 0, false);
+                        }
+                    });
+                });
+                po.observe({ entryTypes: ['resource'] });
+            }
+        } catch (e) {}
 
         function scan() {
-            document.querySelectorAll('video, video source, audio, audio source').forEach(inspectMediaElement);
+            scanNodeTree(document);
+            scanPerformance();
         }
 
         window.addEventListener('DOMContentLoaded', function() {
             scan();
             if (document.documentElement) {
-                new MutationObserver(scan).observe(document.documentElement, {
+                new MutationObserver(function() { scanNodeTree(document); }).observe(document.documentElement, {
                     childList: true,
                     subtree: true,
                     attributes: true,
-                    attributeFilter: ['src']
+                    attributeFilter: ['src', 'data-src']
                 });
             }
             setInterval(scan, 1500);
@@ -211,6 +356,7 @@ struct WebViewWrapper: UIViewRepresentable {
             contentBlocker: contentBlocker,
             onURLChange: onURLChange,
             onMediaDetected: onMediaDetected,
+            onBlobCaptured: onBlobCaptured,
             onWKDownloadImported: onWKDownloadImported,
             onWKDownloadFailed: onWKDownloadFailed,
             onDownloadTriggered: onDownloadTriggered
@@ -220,6 +366,7 @@ struct WebViewWrapper: UIViewRepresentable {
     func makeUIView(context: Context) -> WKWebView {
         let userController = WKUserContentController()
         userController.add(context.coordinator, name: "mediaDetected")
+        userController.add(context.coordinator, name: "blobCaptured")
         userController.addUserScript(
             WKUserScript(
                 source: Self.documentStartMediaJS,
@@ -245,7 +392,7 @@ struct WebViewWrapper: UIViewRepresentable {
         config.mediaTypesRequiringUserActionForPlayback = []
 
         let webView = WKWebView(frame: .zero, configuration: config)
-        webView.customUserAgent = Self.mobileSafariUA
+        webView.customUserAgent = WebMediaDownloader.browserUserAgent
         webView.navigationDelegate = context.coordinator
         webView.uiDelegate = context.coordinator
         webView.allowsBackForwardNavigationGestures = true
@@ -254,8 +401,9 @@ struct WebViewWrapper: UIViewRepresentable {
         context.coordinator.contentBlocker = contentBlocker
         context.coordinator.darkModeEnabled = darkModeEnabled
         context.coordinator.lastBlockingState = adBlockEnabled
-        context.coordinator.observe(webView)
         context.coordinator.lastRequestedURL = url
+        context.coordinator.lastTabID = tabID
+        context.coordinator.observe(webView)
         controller?.webView = webView
 
         if let contentBlocker {
@@ -278,6 +426,7 @@ struct WebViewWrapper: UIViewRepresentable {
         context.coordinator.contentBlocker = contentBlocker
         context.coordinator.onURLChange = onURLChange
         context.coordinator.onMediaDetected = onMediaDetected
+        context.coordinator.onBlobCaptured = onBlobCaptured
         context.coordinator.onWKDownloadImported = onWKDownloadImported
         context.coordinator.onWKDownloadFailed = onWKDownloadFailed
         context.coordinator.onDownloadTriggered = onDownloadTriggered
@@ -304,7 +453,8 @@ struct WebViewWrapper: UIViewRepresentable {
             }
         }
 
-        if context.coordinator.lastRequestedURL != url {
+        if context.coordinator.lastTabID != tabID || context.coordinator.lastRequestedURL != url {
+            context.coordinator.lastTabID = tabID
             context.coordinator.lastRequestedURL = url
             controller?.clearDetectedStreams()
             webView.load(URLRequest(url: url))
@@ -312,20 +462,20 @@ struct WebViewWrapper: UIViewRepresentable {
     }
 
     final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDelegate, WKScriptMessageHandler {
-        static let downloadableExtensions: Set<String> = [
-            "mp3", "m4a", "wav", "aac", "flac", "aiff", "caf",
-            "mp4", "mov", "m4v",
-            "pdf", "zip", "cbz", "png", "jpg", "jpeg", "webp", "gif", "txt"
+        static let directDocumentExtensions: Set<String> = [
+            "pdf", "zip", "cbz", "png", "jpg", "jpeg", "webp", "gif", "txt", "md", "rtf"
         ]
 
         var controller: BrowserController?
         var contentBlocker: ContentBlockerManager?
         var onURLChange: (URL, String?) -> Void
         var onMediaDetected: (DetectedBrowserMedia) -> Void
+        var onBlobCaptured: (Data, String, String) -> Void
         var onWKDownloadImported: (URL, String) -> Void
         var onWKDownloadFailed: (Error) -> Void
         var onDownloadTriggered: (URL) -> Void
         var lastRequestedURL: URL?
+        var lastTabID: UUID?
         var lastBlockingState: Bool?
         var darkModeEnabled = false
 
@@ -337,6 +487,7 @@ struct WebViewWrapper: UIViewRepresentable {
             contentBlocker: ContentBlockerManager?,
             onURLChange: @escaping (URL, String?) -> Void,
             onMediaDetected: @escaping (DetectedBrowserMedia) -> Void,
+            onBlobCaptured: @escaping (Data, String, String) -> Void,
             onWKDownloadImported: @escaping (URL, String) -> Void,
             onWKDownloadFailed: @escaping (Error) -> Void,
             onDownloadTriggered: @escaping (URL) -> Void
@@ -345,6 +496,7 @@ struct WebViewWrapper: UIViewRepresentable {
             self.contentBlocker = contentBlocker
             self.onURLChange = onURLChange
             self.onMediaDetected = onMediaDetected
+            self.onBlobCaptured = onBlobCaptured
             self.onWKDownloadImported = onWKDownloadImported
             self.onWKDownloadFailed = onWKDownloadFailed
             self.onDownloadTriggered = onDownloadTriggered
@@ -357,6 +509,7 @@ struct WebViewWrapper: UIViewRepresentable {
                     let currentTitle = view.title
                     DispatchQueue.main.async {
                         self?.controller?.currentURL = current
+                        self?.lastRequestedURL = current
                         self?.onURLChange(current, currentTitle)
                     }
                 },
@@ -399,6 +552,9 @@ struct WebViewWrapper: UIViewRepresentable {
 
         func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
             DispatchQueue.main.async {
+                if let navURL = webView.url {
+                    self.lastRequestedURL = navURL
+                }
                 self.controller?.clearDetectedStreams()
             }
         }
@@ -410,6 +566,18 @@ struct WebViewWrapper: UIViewRepresentable {
         }
 
         func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+            if message.name == "blobCaptured",
+               let dict = message.body as? [String: Any],
+               let base64 = dict["data"] as? String,
+               let data = Data(base64Encoded: base64) {
+                let fileName = (dict["name"] as? String) ?? "WebMedia"
+                let mime = (dict["mime"] as? String) ?? "video/mp4"
+                DispatchQueue.main.async {
+                    self.onBlobCaptured(data, fileName, mime)
+                }
+                return
+            }
+
             guard message.name == "mediaDetected",
                   let dict = message.body as? [String: Any],
                   let urlString = dict["url"] as? String,
@@ -419,6 +587,9 @@ struct WebViewWrapper: UIViewRepresentable {
 
             let kind = dict["kind"] as? String ?? "video"
             let title = dict["title"] as? String
+            let rawDur = dict["duration"] as? Double
+            let durationSeconds = (rawDur != nil && rawDur!.isFinite && rawDur! > 0) ? rawDur : nil
+            let isActivelyPlaying = (dict["active"] as? Bool) ?? false
             let referer = controller?.currentURL?.absoluteString
 
             DispatchQueue.main.async {
@@ -427,11 +598,13 @@ struct WebViewWrapper: UIViewRepresentable {
                     isHLS: kind == "hls",
                     isAudio: kind == "audio",
                     title: title,
-                    referer: referer
+                    referer: referer,
+                    durationSeconds: durationSeconds,
+                    isActivelyPlaying: isActivelyPlaying
                 )
-                let wasNew = !(self.controller?.detectedStreams.contains(where: { $0.url == media.url }) ?? false)
+                let wasKnown = self.controller?.detectedStreams.contains(where: { $0.url == media.url }) ?? false
                 self.controller?.addDetectedStream(media)
-                if wasNew {
+                if !wasKnown || isActivelyPlaying {
                     self.onMediaDetected(media)
                 }
             }
@@ -458,14 +631,36 @@ struct WebViewWrapper: UIViewRepresentable {
             decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
         ) {
             let isMainOrBlank = navigationAction.targetFrame?.isMainFrame ?? true
-            if isMainOrBlank,
-               let targetURL = navigationAction.request.url,
-               Self.downloadableExtensions.contains(targetURL.pathExtension.lowercased()) {
-                DispatchQueue.main.async {
-                    self.onDownloadTriggered(targetURL)
+            if isMainOrBlank, let targetURL = navigationAction.request.url {
+                let ext = targetURL.pathExtension.lowercased()
+                if Self.directDocumentExtensions.contains(ext) {
+                    DispatchQueue.main.async {
+                        self.onDownloadTriggered(targetURL)
+                    }
+                    decisionHandler(.cancel)
+                    return
                 }
-                decisionHandler(.cancel)
-                return
+                if MediaItem.allSupportedExtensions.contains(ext) || ext == "m3u8" {
+                    let isHLS = ext == "m3u8"
+                    let isAudio = MediaItem.allAudioExtensions.contains(ext)
+                    let media = DetectedBrowserMedia(
+                        url: targetURL,
+                        isHLS: isHLS,
+                        isAudio: isAudio,
+                        title: controller?.pageTitle,
+                        referer: controller?.currentURL?.absoluteString,
+                        isActivelyPlaying: true
+                    )
+                    DispatchQueue.main.async {
+                        self.controller?.addDetectedStream(media)
+                        self.onMediaDetected(media)
+                    }
+                    // Allow apple-native media to play inside WebView too if link-tapped; FFmpeg containers prompt/download
+                    if MediaItem.ffmpegVideoExtensions.contains(ext) || MediaItem.ffmpegAudioExtensions.contains(ext) {
+                        decisionHandler(.cancel)
+                        return
+                    }
+                }
             }
             decisionHandler(.allow)
         }
@@ -475,6 +670,25 @@ struct WebViewWrapper: UIViewRepresentable {
             decidePolicyFor navigationResponse: WKNavigationResponse,
             decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void
         ) {
+            let mime = navigationResponse.response.mimeType?.lowercased() ?? ""
+            if let respURL = navigationResponse.response.url {
+                if mime.contains("mpegurl") || mime.hasPrefix("video/") || mime.hasPrefix("audio/") {
+                    let isHLS = mime.contains("mpegurl")
+                    let isAudio = mime.hasPrefix("audio/")
+                    let media = DetectedBrowserMedia(
+                        url: respURL,
+                        isHLS: isHLS,
+                        isAudio: isAudio,
+                        title: controller?.pageTitle,
+                        referer: controller?.currentURL?.absoluteString,
+                        isActivelyPlaying: true
+                    )
+                    DispatchQueue.main.async {
+                        self.controller?.addDetectedStream(media)
+                        self.onMediaDetected(media)
+                    }
+                }
+            }
             if !navigationResponse.canShowMIMEType {
                 decisionHandler(.download)
                 return
@@ -543,10 +757,14 @@ struct BrowserTabView: View {
 
     @State private var urlString = ""
     @State private var activeURL = URL(string: "https://www.google.com")!
+    @State private var loadedTabID: UUID?
     @State private var browser = BrowserController()
     @State private var contentBlocker = ContentBlockerManager()
     @State private var isDownloading = false
     @State private var downloadStatus: String?
+    @State private var autoCachedURLs: Set<String> = []
+    @State private var promptedURLsThisPage: Set<String> = []
+    @State private var offlineReadyItem: MediaItem?
     @FocusState private var isAddressFieldFocused: Bool
 
     @State private var pendingMediaPrompt: DetectedBrowserMedia?
@@ -569,6 +787,10 @@ struct BrowserTabView: View {
                         .tint(.accentColor)
                 }
 
+                if let offlineReadyItem {
+                    offlineReadyBanner(offlineReadyItem)
+                }
+
                 if let status = downloadStatus {
                     statusBanner(status)
                 }
@@ -583,6 +805,7 @@ struct BrowserTabView: View {
 
                 WebViewWrapper(
                     url: activeURL,
+                    tabID: browserStore.activeTab.id,
                     isPrivate: browserStore.activeTab.isPrivate,
                     darkModeEnabled: settings.webDarkModeEnabled,
                     adBlockEnabled: settings.adBlockEnabled,
@@ -590,20 +813,27 @@ struct BrowserTabView: View {
                     controller: browser,
                     contentBlocker: contentBlocker,
                     onURLChange: { newURL, newTitle in
+                        activeURL = newURL
                         if !isAddressFieldFocused {
                             urlString = newURL.absoluteString
                         }
                         browserStore.updateActiveTab(urlString: newURL.absoluteString, title: newTitle)
                     },
                     onMediaDetected: { media in
-                        if settings.autoCacheDetectedMedia {
-                            handleDetectedMedia(media, autoMode: true)
-                        } else if settings.askBeforeCaching && pendingMediaPrompt == nil {
-                            pendingMediaPrompt = media
-                        }
+                        handleIncomingDetectedMedia(media)
+                    },
+                    onBlobCaptured: { data, fileName, mimeType in
+                        downloader.saveBlobData(
+                            data,
+                            fileName: fileName,
+                            mimeType: mimeType,
+                            maxDurationMinutes: settings.maxCacheDurationMinutes
+                        )
                     },
                     onWKDownloadImported: { tempURL, fileName in
-                        mediaManager.importTemporaryFile(from: tempURL, preferredFileName: fileName)
+                        if let imported = mediaManager.importTemporaryFile(from: tempURL, preferredFileName: fileName) {
+                            offlineReadyItem = imported
+                        }
                         downloadStatus = "Saved: \(fileName)"
                     },
                     onWKDownloadFailed: { error in
@@ -617,17 +847,31 @@ struct BrowserTabView: View {
                 .id("\(browserStore.activeTab.id.uuidString)-\(settings.inlineVideoPlayback)")
             }
             .onAppear {
-                syncTabState()
+                if loadedTabID != browserStore.activeTabID {
+                    syncTabState()
+                }
             }
             .onChange(of: browserStore.activeTabID) { _, _ in
                 syncTabState()
             }
             .onChange(of: browserStore.navigationRequestNonce) { _, _ in
-                syncTabState()
+                syncTabState(forceReload: true)
+            }
+            .onChange(of: downloader.lastCompletedMediaItem) { _, newItem in
+                if let newItem {
+                    offlineReadyItem = newItem
+                }
+            }
+            .task(id: offlineReadyItem?.id) {
+                guard offlineReadyItem != nil else { return }
+                try? await Task.sleep(for: .seconds(8.0))
+                if !Task.isCancelled {
+                    offlineReadyItem = nil
+                }
             }
             .task(id: downloadStatus) {
                 guard downloadStatus != nil, !isDownloading else { return }
-                try? await Task.sleep(for: .seconds(3.0))
+                try? await Task.sleep(for: .seconds(3.5))
                 if !Task.isCancelled && !isDownloading {
                     downloadStatus = nil
                 }
@@ -637,9 +881,7 @@ struct BrowserTabView: View {
             .toolbar {
                 ToolbarItemGroup(placement: .topBarLeading) {
                     if isModal {
-                        Button("Done") {
-                            dismiss()
-                        }
+                        Button("Done") { dismiss() }
                     }
 
                     Button {
@@ -801,34 +1043,79 @@ struct BrowserTabView: View {
                         pendingMediaPrompt = nil
                         handleDetectedMedia(media, autoMode: false)
                     }
+                    Button("Stream Online (Cached)") {
+                        pendingMediaPrompt = nil
+                        streamDetectedMedia(media)
+                    }
+                    Button("Always Auto-Cache") {
+                        settings.setAutoCacheDetectedMedia(true)
+                        pendingMediaPrompt = nil
+                        handleDetectedMedia(media, autoMode: true)
+                    }
+                    if let host = browser.currentURL?.host ?? media.url.host {
+                        Button("Don't Remind for \(host)") {
+                            settings.suppressCachingPrompts(forHost: host)
+                            pendingMediaPrompt = nil
+                        }
+                    }
                 }
                 Button("Ignore", role: .cancel) {
                     pendingMediaPrompt = nil
                 }
             } message: {
-                Text(pendingMediaPrompt?.url.absoluteString ?? "")
+                let durText = pendingMediaPrompt?.formattedDuration.map { " (\($0))" } ?? ""
+                Text("\(pendingMediaPrompt?.title ?? pendingMediaPrompt?.url.lastPathComponent ?? "")\(durText)\n\(pendingMediaPrompt?.url.absoluteString ?? "")")
             }
             .sheet(isPresented: $showingStreamsSheet) {
                 NavigationStack {
                     List(browser.detectedStreams) { stream in
-                        Button {
-                            showingStreamsSheet = false
-                            handleDetectedMedia(stream, autoMode: false)
-                        } label: {
-                            HStack(spacing: 12) {
-                                Image(systemName: stream.isAudio ? "music.note" : "film")
-                                    .foregroundStyle(Color.accentColor)
-                                VStack(alignment: .leading, spacing: 3) {
+                        HStack(spacing: 12) {
+                            Image(systemName: stream.isAudio ? "music.note" : "film")
+                                .foregroundStyle(Color.accentColor)
+                            VStack(alignment: .leading, spacing: 3) {
+                                HStack(spacing: 6) {
                                     Text(stream.kindLabel)
                                         .font(.subheadline.weight(.semibold))
-                                    Text(stream.url.absoluteString)
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                        .lineLimit(2)
+                                    Text(stream.fileExtensionHint)
+                                        .font(.caption2.weight(.bold))
+                                        .padding(.horizontal, 5)
+                                        .padding(.vertical, 1)
+                                        .background(Color.accentColor.opacity(0.14), in: Capsule())
+                                    if let dur = stream.formattedDuration {
+                                        Text(dur)
+                                            .font(.caption2.monospacedDigit())
+                                            .foregroundStyle(.secondary)
+                                    }
                                 }
-                                Spacer()
-                                Image(systemName: "arrow.down.circle")
+                                if let title = stream.title, !title.isEmpty {
+                                    Text(title)
+                                        .font(.caption)
+                                        .lineLimit(1)
+                                }
+                                Text(stream.url.absoluteString)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(2)
                             }
+                            Spacer()
+                            if stream.url.scheme?.lowercased() != "blob" {
+                                Button {
+                                    showingStreamsSheet = false
+                                    streamDetectedMedia(stream)
+                                } label: {
+                                    Image(systemName: "play.circle")
+                                        .font(.title3)
+                                }
+                                .buttonStyle(.borderless)
+                            }
+                            Button {
+                                showingStreamsSheet = false
+                                handleDetectedMedia(stream, autoMode: false)
+                            } label: {
+                                Image(systemName: "arrow.down.circle.fill")
+                                    .font(.title3)
+                            }
+                            .buttonStyle(.borderless)
                         }
                     }
                     .navigationTitle("Detected Streams")
@@ -857,9 +1144,11 @@ struct BrowserTabView: View {
                                         let headers = await buildRequestHeaders(for: media.url, referer: media.referer)
                                         downloader.startHLSDownload(
                                             from: media.url,
+                                            selectedVariantURL: variant.variantURL,
                                             title: media.title ?? browser.pageTitle,
                                             minimumBitrate: variant.peakBitrate > 0 ? variant.peakBitrate : nil,
-                                            headers: headers
+                                            headers: headers,
+                                            maxDurationMinutes: settings.maxCacheDurationMinutes
                                         )
                                     }
                                 } label: {
@@ -907,17 +1196,53 @@ struct BrowserTabView: View {
         }
     }
 
-    private func syncTabState() {
+    private func syncTabState(forceReload: Bool = false) {
         let tab = browserStore.activeTab
+        loadedTabID = tab.id
+        promptedURLsThisPage.removeAll()
         urlString = tab.urlString
         if let parsed = resolvedURL(from: tab.urlString) {
             if activeURL == parsed {
-                browser.load(parsed)
+                if forceReload {
+                    browser.load(parsed)
+                }
             } else {
                 activeURL = parsed
             }
         }
-        browser.clearDetectedStreams()
+    }
+
+    private func offlineReadyBanner(_ item: MediaItem) -> some View {
+        Button {
+            offlineReadyItem = nil
+            mediaManager.play(item)
+            showPlayerSheet = true
+        } label: {
+            HStack(spacing: 10) {
+                Image(systemName: "checkmark.circle.fill")
+                    .foregroundStyle(.green)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("👉 Tap to playback offline!")
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(.primary)
+                    Text(item.displayTitle)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                Spacer()
+                Text("Play")
+                    .font(.caption.weight(.semibold))
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 4)
+                    .background(Color.green, in: Capsule())
+                    .foregroundStyle(.white)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(Color.green.opacity(0.14))
+        }
+        .buttonStyle(.plain)
     }
 
     private func statusBanner(_ status: String) -> some View {
@@ -973,8 +1298,15 @@ struct BrowserTabView: View {
             Image(systemName: media.isAudio ? "music.note" : "film")
                 .foregroundStyle(Color.accentColor)
             VStack(alignment: .leading, spacing: 1) {
-                Text("\(media.kindLabel) Detected")
-                    .font(.caption.weight(.semibold))
+                HStack(spacing: 5) {
+                    Text("\(media.kindLabel) Detected")
+                        .font(.caption.weight(.semibold))
+                    if let dur = media.formattedDuration {
+                        Text("• \(dur)")
+                            .font(.caption2.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                }
                 Text(media.title?.isEmpty == false ? (media.title ?? "") : media.url.lastPathComponent)
                     .font(.caption2)
                     .foregroundStyle(.secondary)
@@ -989,7 +1321,7 @@ struct BrowserTabView: View {
                 .buttonStyle(.bordered)
                 .controlSize(.small)
             }
-            Button(media.isHLS ? "Select Quality" : "Save Offline") {
+            Button(media.isHLS ? "Quality" : "Cache") {
                 handleDetectedMedia(media, autoMode: false)
             }
             .font(.caption.weight(.semibold))
@@ -1051,6 +1383,7 @@ struct BrowserTabView: View {
             return
         }
         urlString = validURL.absoluteString
+        promptedURLsThisPage.removeAll()
         if activeURL == validURL {
             browser.load(validURL)
         } else {
@@ -1074,9 +1407,14 @@ struct BrowserTabView: View {
     }
 
     private func buildRequestHeaders(for url: URL, referer: String?) async -> [String: String] {
-        var headers: [String: String] = [:]
+        var headers: [String: String] = [
+            "User-Agent": WebMediaDownloader.browserUserAgent
+        ]
         if let referer, !referer.isEmpty {
             headers["Referer"] = referer
+            if let refURL = URL(string: referer), let scheme = refURL.scheme, let host = refURL.host {
+                headers["Origin"] = "\(scheme)://\(host)"
+            }
         }
         if let store = browser.webView?.configuration.websiteDataStore.httpCookieStore {
             let cookies = await store.allCookies()
@@ -1090,6 +1428,32 @@ struct BrowserTabView: View {
             }
         }
         return headers
+    }
+
+    private func handleIncomingDetectedMedia(_ media: DetectedBrowserMedia) {
+        let key = media.url.absoluteString
+        let currentHost = browser.currentURL?.host ?? media.url.host
+
+        if settings.autoCacheDetectedMedia {
+            guard !autoCachedURLs.contains(key) else { return }
+            if let dur = media.durationSeconds, dur > 0, dur < 3, !media.isActivelyPlaying {
+                return
+            }
+            autoCachedURLs.insert(key)
+            handleDetectedMedia(media, autoMode: true)
+            return
+        }
+
+        if settings.askBeforeCaching,
+           !settings.isPromptSuppressed(forHost: currentHost),
+           pendingMediaPrompt == nil,
+           !promptedURLsThisPage.contains(key) {
+            if let dur = media.durationSeconds, dur > 0, dur < 3, !media.isActivelyPlaying {
+                return
+            }
+            promptedURLsThisPage.insert(key)
+            pendingMediaPrompt = media
+        }
     }
 
     private func extractAndSavePageImages() {
@@ -1116,7 +1480,53 @@ struct BrowserTabView: View {
         }
     }
 
+    private func captureBlobFromWebView(blobURLString: String, title: String?) {
+        guard let webView = browser.webView else { return }
+        let escaped = blobURLString.replacingOccurrences(of: "'", with: "\\'")
+        let js = """
+        (function() {
+            var b = window.__mpBlobMap && window.__mpBlobMap.get('\(escaped)');
+            if (!b || b.size > 33554432) return;
+            var r = new FileReader();
+            r.onloadend = function() {
+                try {
+                    var res = r.result || '';
+                    var comma = res.indexOf(',');
+                    if (comma !== -1) {
+                        window.webkit.messageHandlers.blobCaptured.postMessage({
+                            data: res.slice(comma + 1),
+                            name: document.title || 'WebMedia',
+                            mime: b.type || 'video/mp4'
+                        });
+                    }
+                } catch (e) {}
+            };
+            r.readAsDataURL(b);
+        })();
+        """
+        _ = title
+        webView.evaluateJavaScript(js)
+    }
+
+    private func streamDetectedMedia(_ media: DetectedBrowserMedia) {
+        Task {
+            let headers = await buildRequestHeaders(for: media.url, referer: media.referer)
+            mediaManager.playRemoteStream(
+                url: media.url,
+                title: media.title ?? (browser.pageTitle.isEmpty ? media.url.lastPathComponent : browser.pageTitle),
+                headers: headers,
+                isVideo: !media.isAudio
+            )
+            showPlayerSheet = true
+        }
+    }
+
     private func handleDetectedMedia(_ media: DetectedBrowserMedia, autoMode: Bool) {
+        if media.url.scheme?.lowercased() == "blob" {
+            captureBlobFromWebView(blobURLString: media.url.absoluteString, title: media.title ?? browser.pageTitle)
+            return
+        }
+
         if media.isHLS {
             if autoMode {
                 Task {
@@ -1124,7 +1534,8 @@ struct BrowserTabView: View {
                     downloader.startHLSDownload(
                         from: media.url,
                         title: media.title ?? browser.pageTitle,
-                        headers: headers
+                        headers: headers,
+                        maxDurationMinutes: settings.maxCacheDurationMinutes
                     )
                 }
             } else {
@@ -1147,6 +1558,7 @@ struct BrowserTabView: View {
                     from: media.url,
                     title: media.title ?? browser.pageTitle,
                     headers: headers,
+                    knownDurationSeconds: media.durationSeconds,
                     maxDurationMinutes: settings.maxCacheDurationMinutes
                 )
             }
@@ -1170,8 +1582,17 @@ struct BrowserTabView: View {
         }
 
         let ext = url.pathExtension.lowercased()
-        let isKnownDocumentOrMedia = Self.isDirectDownloadExtension(ext)
-        if !isKnownDocumentOrMedia {
+        if MediaItem.allSupportedExtensions.contains(ext) {
+            downloader.downloadDirectMedia(
+                from: url,
+                title: browser.pageTitle,
+                headers: headers,
+                maxDurationMinutes: settings.maxCacheDurationMinutes
+            )
+            return
+        }
+
+        if !Self.isDirectDownloadExtension(ext) {
             downloadStatus = "Checking page for media..."
             isDownloading = true
             await downloader.resolveAndDownload(
@@ -1188,14 +1609,12 @@ struct BrowserTabView: View {
         let displayName = url.lastPathComponent.isEmpty ? "file" : url.lastPathComponent
         downloadStatus = "Downloading \(displayName)..."
         isDownloading = true
-        defer {
-            isDownloading = false
-        }
+        defer { isDownloading = false }
 
         do {
             var request = URLRequest(url: url)
             headers.forEach { request.setValue($0.value, forHTTPHeaderField: $0.key) }
-            let (tempURL, response) = try await URLSession.shared.download(for: request)
+            let (tempURL, response) = try await downloader.browserSession.download(for: request)
 
             if let httpResponse = response as? HTTPURLResponse,
                !(200...299).contains(httpResponse.statusCode) {
@@ -1238,7 +1657,9 @@ struct BrowserTabView: View {
                 mimeType: mimeType
             )
 
-            mediaManager.importTemporaryFile(from: tempURL, preferredFileName: resolvedFileName)
+            if let saved = mediaManager.importTemporaryFile(from: tempURL, preferredFileName: resolvedFileName) {
+                offlineReadyItem = saved
+            }
             downloadStatus = "Saved: \(resolvedFileName)"
         } catch {
             downloadStatus = "Download failed."
@@ -1247,8 +1668,8 @@ struct BrowserTabView: View {
     }
 
     private static func isDirectDownloadExtension(_ ext: String) -> Bool {
-        MediaManager.supportedExtensions.contains(ext)
-            || WebViewWrapper.Coordinator.downloadableExtensions.contains(ext)
+        MediaItem.allSupportedExtensions.contains(ext)
+            || WebViewWrapper.Coordinator.directDocumentExtensions.contains(ext)
     }
 
     fileprivate static func resolvedMediaFileName(
@@ -1267,8 +1688,8 @@ struct BrowserTabView: View {
 
         let nsCandidate = rawCandidate as NSString
         let currentExt = nsCandidate.pathExtension.lowercased()
-        if MediaManager.supportedExtensions.contains(currentExt) ||
-            WebViewWrapper.Coordinator.downloadableExtensions.contains(currentExt) {
+        if MediaItem.allSupportedExtensions.contains(currentExt) ||
+            WebViewWrapper.Coordinator.directDocumentExtensions.contains(currentExt) {
             return rawCandidate
         }
 
@@ -1290,9 +1711,16 @@ struct BrowserTabView: View {
         case "audio/flac", "audio/x-flac": return "flac"
         case "audio/aiff", "audio/x-aiff": return "aiff"
         case "audio/x-caf": return "caf"
+        case "audio/ogg": return "ogg"
+        case "audio/opus": return "opus"
         case "video/mp4": return "mp4"
         case "video/quicktime": return "mov"
         case "video/x-m4v": return "m4v"
+        case "video/x-matroska": return "mkv"
+        case "video/webm", "audio/webm": return "webm"
+        case "video/x-msvideo": return "avi"
+        case "video/x-flv": return "flv"
+        case "video/mp2t": return "ts"
         case "application/pdf": return "pdf"
         case "image/png": return "png"
         case "image/jpeg": return "jpg"

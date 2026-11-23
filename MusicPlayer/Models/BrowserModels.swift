@@ -81,10 +81,43 @@ struct DetectedBrowserMedia: Identifiable, Equatable {
     let isAudio: Bool
     let title: String?
     let referer: String?
+    let durationSeconds: Double?
+    let isActivelyPlaying: Bool
+
+    init(
+        url: URL,
+        isHLS: Bool,
+        isAudio: Bool,
+        title: String? = nil,
+        referer: String? = nil,
+        durationSeconds: Double? = nil,
+        isActivelyPlaying: Bool = false
+    ) {
+        self.url = url
+        self.isHLS = isHLS
+        self.isAudio = isAudio
+        self.title = title
+        self.referer = referer
+        self.durationSeconds = durationSeconds
+        self.isActivelyPlaying = isActivelyPlaying
+    }
 
     var kindLabel: String {
         if isHLS { return "HLS Stream" }
         return isAudio ? "Audio" : "Video"
+    }
+
+    var formattedDuration: String? {
+        guard let durationSeconds, durationSeconds.isFinite, durationSeconds > 0 else { return nil }
+        return MediaTimeFormatter.format(durationSeconds)
+    }
+
+    var fileExtensionHint: String {
+        let ext = url.pathExtension.lowercased()
+        if !ext.isEmpty && ext.count <= 6 {
+            return ext.uppercased()
+        }
+        return isHLS ? "M3U8" : (isAudio ? "AUDIO" : "VIDEO")
     }
 }
 
@@ -94,6 +127,23 @@ struct HLSQualityVariant: Identifiable, Hashable {
     let width: Int
     let height: Int
     let peakBitrate: Double
+    let variantURL: URL?
+
+    init(
+        id: String,
+        label: String,
+        width: Int,
+        height: Int,
+        peakBitrate: Double,
+        variantURL: URL? = nil
+    ) {
+        self.id = id
+        self.label = label
+        self.width = width
+        self.height = height
+        self.peakBitrate = peakBitrate
+        self.variantURL = variantURL
+    }
 }
 
 struct BrowserDownloadItem: Identifiable {
