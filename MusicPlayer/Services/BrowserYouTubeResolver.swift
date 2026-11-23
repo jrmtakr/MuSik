@@ -10,6 +10,7 @@ import WebKit
 final class BrowserYouTubeResolver: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
     static let shared = BrowserYouTubeResolver()
 
+    @MainActor
     private final class WeakScriptProxy: NSObject, WKScriptMessageHandler {
         weak var target: WKScriptMessageHandler?
         init(_ target: WKScriptMessageHandler) { self.target = target }
@@ -399,40 +400,38 @@ final class BrowserYouTubeResolver: NSObject, WKNavigationDelegate, WKScriptMess
         }
     }
 
-    nonisolated func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
         guard let body = message.body as? [String: Any] else { return }
-        Task { @MainActor in
-            if message.name == "ytResolverPlayerJSON" {
-                let raw = body["json"] as? String ?? ""
-                let vd = body["visitorData"] as? String
-                if !raw.isEmpty {
-                    self.handleCapturedPlayerJSON(raw, visitorData: vd)
-                }
-            } else if message.name == "ytResolverMediaURL" {
-                guard let urlStr = body["url"] as? String,
-                      let streamURL = URL(string: urlStr),
-                      let watchURL = self.activeWatchURL else { return }
-                let lower = urlStr.lowercased()
-                let isHLS = lower.contains(".m3u8") || lower.contains("/manifest/hls")
-                let isAudio = lower.contains("mime=audio") || lower.contains("mime%3daudio")
-                let media = DetectedBrowserMedia(
-                    url: streamURL,
-                    isHLS: isHLS,
-                    isAudio: isAudio,
-                    title: nil,
-                    author: nil,
-                    qualityLabel: isHLS ? "HLS Stream" : (isAudio ? "Audio" : "Video"),
-                    referer: watchURL.absoluteString,
-                    customHeaders: [
-                        "User-Agent": WebMediaDownloader.browserUserAgent,
-                        "Referer": watchURL.absoluteString
-                    ],
-                    durationSeconds: nil,
-                    isActivelyPlaying: false
-                )
-                if !self.fallbackStreamURLs.contains(where: { $0.url == streamURL }) {
-                    self.fallbackStreamURLs.append(media)
-                }
+        if message.name == "ytResolverPlayerJSON" {
+            let raw = body["json"] as? String ?? ""
+            let vd = body["visitorData"] as? String
+            if !raw.isEmpty {
+                self.handleCapturedPlayerJSON(raw, visitorData: vd)
+            }
+        } else if message.name == "ytResolverMediaURL" {
+            guard let urlStr = body["url"] as? String,
+                  let streamURL = URL(string: urlStr),
+                  let watchURL = self.activeWatchURL else { return }
+            let lower = urlStr.lowercased()
+            let isHLS = lower.contains(".m3u8") || lower.contains("/manifest/hls")
+            let isAudio = lower.contains("mime=audio") || lower.contains("mime%3daudio")
+            let media = DetectedBrowserMedia(
+                url: streamURL,
+                isHLS: isHLS,
+                isAudio: isAudio,
+                title: nil,
+                author: nil,
+                qualityLabel: isHLS ? "HLS Stream" : (isAudio ? "Audio" : "Video"),
+                referer: watchURL.absoluteString,
+                customHeaders: [
+                    "User-Agent": WebMediaDownloader.browserUserAgent,
+                    "Referer": watchURL.absoluteString
+                ],
+                durationSeconds: nil,
+                isActivelyPlaying: false
+            )
+            if !self.fallbackStreamURLs.contains(where: { $0.url == streamURL }) {
+                self.fallbackStreamURLs.append(media)
             }
         }
     }

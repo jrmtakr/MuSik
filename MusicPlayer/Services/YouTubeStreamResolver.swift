@@ -133,6 +133,8 @@ enum YouTubeStreamResolver {
             await visitorCache.store(visitorData)
         }
 
+        let visitorDataForRequests = resolvedVisitorData
+
         // 1. Query iOS (HD/audio adaptive + HLS when un-gated) and Android in parallel with visitorData.
         async let iosTask = fetchInnerTube(
             videoID: videoID,
@@ -147,7 +149,7 @@ enum YouTubeStreamResolver {
                 "osName": "iPhone",
                 "osVersion": "18.3.2"
             ],
-            visitorData: resolvedVisitorData,
+            visitorData: visitorDataForRequests,
             cookiesHeader: cookiesHeader
         )
         async let androidTask = fetchInnerTube(
@@ -162,7 +164,7 @@ enum YouTubeStreamResolver {
                 "osVersion": "14",
                 "androidSdkVersion": 34
             ],
-            visitorData: resolvedVisitorData,
+            visitorData: visitorDataForRequests,
             cookiesHeader: cookiesHeader
         )
 

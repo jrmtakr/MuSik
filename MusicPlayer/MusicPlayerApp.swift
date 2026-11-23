@@ -92,7 +92,7 @@ struct MusicPlayerApp: App {
     @State private var settings = AppSettings()
     @State private var browserStore = BrowserStore()
     @State private var playlistImportManager = PlaylistImportManager.shared
-    @State private var downloader = WebMediaDownloader()
+    @State private var downloader = WebMediaDownloader.shared
     @State private var groupService = GroupPlaylistService.shared
     @State private var partyService = PartyQueueService.shared
     @State private var timeMachine = PlaylistTimeMachineService.shared

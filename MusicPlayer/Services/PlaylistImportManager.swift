@@ -157,7 +157,6 @@ final class PlaylistImportManager {
         let config = URLSessionConfiguration.background(withIdentifier: Self.backgroundSessionIdentifier)
         config.sessionSendsLaunchEvents = true
         config.isDiscretionary = false
-        config.shouldUseExtendedBackgroundAccess = true
         config.allowsCellularAccess = true
         config.httpMaximumConnectionsPerHost = 4
 

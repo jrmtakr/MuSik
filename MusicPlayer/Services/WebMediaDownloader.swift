@@ -179,6 +179,8 @@ final class WebMediaDownloader {
         let isLiveWithoutEndList: Bool
     }
 
+    static let shared = WebMediaDownloader()
+
     init() {}
 
     // MARK: - Public API

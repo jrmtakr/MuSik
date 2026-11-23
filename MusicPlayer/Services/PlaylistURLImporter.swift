@@ -376,7 +376,7 @@ enum PlaylistURLImporter {
         cookiesHeader: String?,
         onPage: @escaping @Sendable (PlaylistStreamPage) async -> Void
     ) async throws -> LoadedExternalPlaylist {
-        var playlistTitle = extractYouTubePlaylistTitle(from: initialJSON) ?? "YouTube Playlist"
+        let playlistTitle = extractYouTubePlaylistTitle(from: initialJSON) ?? "YouTube Playlist"
         var seenVideoIDs = Set<String>()
         var tracks: [ExternalPlaylistTrack] = []
         let firstPage = extractYouTubePlaylistPage(from: initialJSON, seenIDs: &seenVideoIDs)

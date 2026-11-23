@@ -39,6 +39,7 @@ struct ImportPlaylistSheetView: View {
         self.onPlaylistImported = onPlaylistImported
     }
 
+    @MainActor
     private final class DiscoveryHandoffBox {
         var adoptedJobID: UUID?
         var includeFuturePages = true
