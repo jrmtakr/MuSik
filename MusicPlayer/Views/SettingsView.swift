@@ -97,6 +97,17 @@ struct SettingsView: View {
                         )
                     )
 
+                    Toggle("Save Cached Media to Playlist", isOn: $settings.autoAddDownloadsToPlaylist)
+
+                    if settings.autoAddDownloadsToPlaylist {
+                        Picker("Download Playlist", selection: $settings.targetDownloadPlaylistIDString) {
+                            Text("Auto (\"Downloads\")").tag("")
+                            ForEach(mediaManager.playlists) { playlist in
+                                Text(playlist.name).tag(playlist.id.uuidString)
+                            }
+                        }
+                    }
+
                     Picker("Only cache videos with duration less than", selection: $settings.maxCacheDurationMinutes) {
                         Text("No Limit").tag(0)
                         ForEach(durationOptions.filter { $0 > 0 }, id: \.self) { mins in

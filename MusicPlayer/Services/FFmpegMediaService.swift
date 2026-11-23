@@ -572,4 +572,142 @@ enum FFmpegMediaService {
         closedCleanly = true
         return trailerRet >= 0
     }
+
+    /// Losslessly muxes a separate video stream and audio stream (e.g. adaptive HD MP4 + M4A) into one synced MP4.
+    static func muxVideoAndAudioToMP4(videoURL: URL, audioURL: URL, outputURL: URL) -> Bool {
+        _ = networkInitOnce
+        var videoCtx: UnsafeMutablePointer<AVFormatContext>?
+        var audioCtx: UnsafeMutablePointer<AVFormatContext>?
+
+        guard avformat_open_input(&videoCtx, videoURL.path, nil, nil) == 0, let vFmtCtx = videoCtx else { return false }
+        defer {
+            var ctx: UnsafeMutablePointer<AVFormatContext>? = vFmtCtx
+            avformat_close_input(&ctx)
+        }
+
+        guard avformat_open_input(&audioCtx, audioURL.path, nil, nil) == 0, let aFmtCtx = audioCtx else { return false }
+        defer {
+            var ctx: UnsafeMutablePointer<AVFormatContext>? = aFmtCtx
+            avformat_close_input(&ctx)
+        }
+
+        guard avformat_find_stream_info(vFmtCtx, nil) >= 0,
+              avformat_find_stream_info(aFmtCtx, nil) >= 0 else {
+            return false
+        }
+
+        var inVideoIdx: Int32 = -1
+        for i in 0 ..< Int(vFmtCtx.pointee.nb_streams) {
+            if let st = vFmtCtx.pointee.streams[i],
+               let par = st.pointee.codecpar,
+               par.pointee.codec_type == AVMEDIA_TYPE_VIDEO,
+               [AV_CODEC_ID_H264, AV_CODEC_ID_HEVC, AV_CODEC_ID_MPEG4].contains(par.pointee.codec_id) {
+                inVideoIdx = Int32(i)
+                break
+            }
+        }
+
+        var inAudioIdx: Int32 = -1
+        for i in 0 ..< Int(aFmtCtx.pointee.nb_streams) {
+            if let st = aFmtCtx.pointee.streams[i],
+               let par = st.pointee.codecpar,
+               par.pointee.codec_type == AVMEDIA_TYPE_AUDIO,
+               [AV_CODEC_ID_AAC, AV_CODEC_ID_MP3, AV_CODEC_ID_ALAC, AV_CODEC_ID_FLAC, AV_CODEC_ID_AC3, AV_CODEC_ID_EAC3].contains(par.pointee.codec_id) {
+                inAudioIdx = Int32(i)
+                break
+            }
+        }
+
+        guard inVideoIdx >= 0, inAudioIdx >= 0,
+              let vInStream = vFmtCtx.pointee.streams[Int(inVideoIdx)],
+              let aInStream = aFmtCtx.pointee.streams[Int(inAudioIdx)],
+              let vPar = vInStream.pointee.codecpar,
+              let aPar = aInStream.pointee.codecpar else {
+            return false
+        }
+
+        var outCtx: UnsafeMutablePointer<AVFormatContext>?
+        guard avformat_alloc_output_context2(&outCtx, nil, "mp4", outputURL.path) >= 0,
+              let outputFmtCtx = outCtx else {
+            return false
+        }
+
+        var closedCleanly = false
+        defer {
+            if !closedCleanly {
+                if let pb = outputFmtCtx.pointee.pb {
+                    var pbCopy: UnsafeMutablePointer<AVIOContext>? = pb
+                    avio_closep(&pbCopy)
+                    outputFmtCtx.pointee.pb = nil
+                }
+                avformat_free_context(outputFmtCtx)
+            }
+        }
+
+        guard let outVStream = avformat_new_stream(outputFmtCtx, nil),
+              let outAStream = avformat_new_stream(outputFmtCtx, nil),
+              avcodec_parameters_copy(outVStream.pointee.codecpar, vPar) >= 0,
+              avcodec_parameters_copy(outAStream.pointee.codecpar, aPar) >= 0 else {
+            return false
+        }
+        outVStream.pointee.codecpar.pointee.codec_tag = vPar.pointee.codec_id == AV_CODEC_ID_HEVC
+            ? CMFormatDescription.MediaSubType.hevc.rawValue.bigEndian
+            : 0
+        outAStream.pointee.codecpar.pointee.codec_tag = 0
+
+        if let flags = outputFmtCtx.pointee.oformat?.pointee.flags, (flags & AVFMT_NOFILE) == 0 {
+            var pb: UnsafeMutablePointer<AVIOContext>?
+            guard avio_open(&pb, outputURL.path, AVIO_FLAG_WRITE) >= 0 else { return false }
+            outputFmtCtx.pointee.pb = pb
+        }
+
+        var muxOpts: OpaquePointer?
+        av_dict_set(&muxOpts, "movflags", "+faststart", 0)
+        let hdrRet = avformat_write_header(outputFmtCtx, &muxOpts)
+        av_dict_free(&muxOpts)
+        guard hdrRet >= 0 else { return false }
+
+        var pkt = av_packet_alloc()
+        defer { av_packet_free(&pkt) }
+        guard let pkt else { return false }
+        var lastDts = [Int32: Int64]()
+
+        while av_read_frame(vFmtCtx, pkt) >= 0 {
+            if pkt.pointee.stream_index == inVideoIdx {
+                writeRescaledPacket(
+                    pkt,
+                    inTimeBase: vInStream.pointee.time_base,
+                    outTimeBase: outVStream.pointee.time_base,
+                    outIndex: 0,
+                    outCtx: outputFmtCtx,
+                    lastDtsByOutStream: &lastDts
+                )
+            }
+            av_packet_unref(pkt)
+        }
+
+        while av_read_frame(aFmtCtx, pkt) >= 0 {
+            if pkt.pointee.stream_index == inAudioIdx {
+                writeRescaledPacket(
+                    pkt,
+                    inTimeBase: aInStream.pointee.time_base,
+                    outTimeBase: outAStream.pointee.time_base,
+                    outIndex: 1,
+                    outCtx: outputFmtCtx,
+                    lastDtsByOutStream: &lastDts
+                )
+            }
+            av_packet_unref(pkt)
+        }
+
+        let trailerRet = av_write_trailer(outputFmtCtx)
+        if let pb = outputFmtCtx.pointee.pb {
+            var pbCopy: UnsafeMutablePointer<AVIOContext>? = pb
+            avio_closep(&pbCopy)
+            outputFmtCtx.pointee.pb = nil
+        }
+        avformat_free_context(outputFmtCtx)
+        closedCleanly = true
+        return trailerRet >= 0
+    }
 }

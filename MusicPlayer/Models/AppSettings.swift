@@ -102,6 +102,27 @@ final class AppSettings {
     var suppressedCacheHosts: [String] {
         didSet { UserDefaults.standard.set(suppressedCacheHosts, forKey: Keys.suppressedCacheHosts) }
     }
+    var autoAddDownloadsToPlaylist: Bool {
+        didSet { UserDefaults.standard.set(autoAddDownloadsToPlaylist, forKey: Keys.autoAddDownloadsToPlaylist) }
+    }
+    var targetDownloadPlaylistIDString: String {
+        didSet { UserDefaults.standard.set(targetDownloadPlaylistIDString, forKey: Keys.targetDownloadPlaylistID) }
+    }
+
+    var targetDownloadPlaylistID: UUID? {
+        UUID(uuidString: targetDownloadPlaylistIDString)
+    }
+
+    static var isAutoAddDownloadsToPlaylistEnabled: Bool {
+        let d = UserDefaults.standard
+        if d.object(forKey: Keys.autoAddDownloadsToPlaylist) == nil { return true }
+        return d.bool(forKey: Keys.autoAddDownloadsToPlaylist)
+    }
+
+    static var storedTargetDownloadPlaylistID: UUID? {
+        guard let str = UserDefaults.standard.string(forKey: Keys.targetDownloadPlaylistID) else { return nil }
+        return UUID(uuidString: str)
+    }
 
     private enum Keys {
         static let appearance = "musicplayer.appearance"
@@ -118,6 +139,8 @@ final class AppSettings {
         static let readerDarkTheme = "musicplayer.readerDarkTheme"
         static let selectedAppIconName = "musicplayer.selectedAppIconName"
         static let suppressedCacheHosts = "musicplayer.suppressedCacheHosts"
+        static let autoAddDownloadsToPlaylist = "musicplayer.autoAddDownloadsToPlaylist"
+        static let targetDownloadPlaylistID = "musicplayer.targetDownloadPlaylistID"
     }
 
     init() {
@@ -137,6 +160,9 @@ final class AppSettings {
         if defaults.object(forKey: Keys.readerFontSize) == nil {
             defaults.set(17.0, forKey: Keys.readerFontSize)
         }
+        if defaults.object(forKey: Keys.autoAddDownloadsToPlaylist) == nil {
+            defaults.set(true, forKey: Keys.autoAddDownloadsToPlaylist)
+        }
 
         self.appearanceMode = AppearanceMode(rawValue: defaults.string(forKey: Keys.appearance) ?? "") ?? .system
         self.searchEngine = SearchEngineOption(rawValue: defaults.string(forKey: Keys.searchEngine) ?? "") ?? .google
@@ -152,6 +178,8 @@ final class AppSettings {
         self.readerDarkTheme = defaults.bool(forKey: Keys.readerDarkTheme)
         self.selectedAppIconName = defaults.string(forKey: Keys.selectedAppIconName) ?? ""
         self.suppressedCacheHosts = defaults.stringArray(forKey: Keys.suppressedCacheHosts) ?? []
+        self.autoAddDownloadsToPlaylist = defaults.bool(forKey: Keys.autoAddDownloadsToPlaylist)
+        self.targetDownloadPlaylistIDString = defaults.string(forKey: Keys.targetDownloadPlaylistID) ?? ""
     }
 
     func setAskBeforeCaching(_ enabled: Bool) {

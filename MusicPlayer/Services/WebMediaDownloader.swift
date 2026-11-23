@@ -129,6 +129,7 @@ final class WebMediaDownloader {
 
     private struct DownloadMeta {
         let title: String
+        let artist: String?
         let sourceURL: URL
         let maxDurationSeconds: Double?
         let isHLS: Bool
@@ -207,6 +208,7 @@ final class WebMediaDownloader {
         from url: URL,
         selectedVariantURL: URL? = nil,
         title: String? = nil,
+        artist: String? = nil,
         minimumBitrate: Double? = nil,
         headers: [String: String]? = nil,
         maxDurationMinutes: Int = 0,
@@ -231,6 +233,7 @@ final class WebMediaDownloader {
                 downloadID: downloadID,
                 playlistURL: targetURL,
                 cleanTitle: cleanTitle,
+                artist: artist,
                 minimumBitrate: minimumBitrate,
                 headers: mergedHeaders,
                 maxDurationSeconds: maxSec,
@@ -244,6 +247,7 @@ final class WebMediaDownloader {
                 startAppleAVAssetHLSDownload(
                     from: targetURL,
                     cleanTitle: cleanTitle,
+                    artist: artist,
                     minimumBitrate: minimumBitrate,
                     headers: mergedHeaders,
                     maxDurationSeconds: maxSec,
@@ -254,9 +258,120 @@ final class WebMediaDownloader {
         activeAsyncTasks[downloadID] = asyncTask
     }
 
+    func downloadMuxedVideoAndAudio(
+        videoURL: URL,
+        audioURL: URL,
+        title: String? = nil,
+        artist: String? = nil,
+        headers: [String: String]? = nil,
+        knownDurationSeconds: Double? = nil,
+        maxDurationMinutes: Int = 0,
+        destinationFolder: String = ""
+    ) {
+        let cleanVideo = cleanedStreamURLIfRangeFragment(videoURL)
+        let cleanAudio = cleanedStreamURLIfRangeFragment(audioURL)
+        let cleanTitle = sanitizedTitle(title, fallbackURL: cleanVideo, defaultTitle: "Video")
+
+        if let maxMin = maxDurationMinutes > 0 ? maxDurationMinutes : nil,
+           let known = knownDurationSeconds, known.isFinite, known > 0,
+           known > Double(maxMin * 60) {
+            MediaManager.shared.errorMessage = "Skipped \"\(cleanTitle)\" (exceeds \(maxMin) min limit)."
+            return
+        }
+
+        guard !activeDownloads.contains(where: { $0.sourceURL == cleanVideo }) else {
+            MediaManager.shared.statusMessage = "Download already in progress"
+            return
+        }
+
+        let downloadID = UUID()
+        let mergedHeaders = enrichedHeaders(headers, for: cleanVideo)
+        activeDownloads.append(BrowserDownloadItem(id: downloadID, title: cleanTitle, sourceURL: cleanVideo, progress: 0, isHLS: false))
+        MediaManager.shared.statusMessage = "Downloading HD \(cleanTitle)..."
+
+        let session = ephemeralDataSession
+        let asyncTask = Task {
+            defer {
+                activeAsyncTasks.removeValue(forKey: downloadID)
+                activeDownloads.removeAll { $0.id == downloadID }
+            }
+
+            async let videoData = fetchTempFile(from: cleanVideo, ext: "mp4", headers: mergedHeaders, using: session)
+            updateProgress(downloadID: downloadID, fraction: 0.25)
+            async let audioData = fetchTempFile(from: cleanAudio, ext: "m4a", headers: mergedHeaders, using: session)
+
+            guard let tempVideo = await videoData else {
+                MediaManager.shared.errorMessage = "Could not download HD video track."
+                return
+            }
+            updateProgress(downloadID: downloadID, fraction: 0.75)
+            guard let tempAudio = await audioData else {
+                try? FileManager.default.removeItem(at: tempVideo)
+                MediaManager.shared.errorMessage = "Could not download audio track."
+                return
+            }
+            defer {
+                try? FileManager.default.removeItem(at: tempVideo)
+                try? FileManager.default.removeItem(at: tempAudio)
+            }
+            if Task.isCancelled { return }
+
+            let muxedTemp = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString).mp4")
+            let ok = await Task.detached(priority: .userInitiated) {
+                FFmpegMediaService.muxVideoAndAudioToMP4(videoURL: tempVideo, audioURL: tempAudio, outputURL: muxedTemp)
+            }.value
+            updateProgress(downloadID: downloadID, fraction: 0.95)
+
+            if ok {
+                if let saved = MediaManager.shared.importTemporaryFile(
+                    from: muxedTemp,
+                    preferredFileName: "\(cleanTitle).mp4",
+                    inFolder: destinationFolder
+                ) {
+                    let updated = MediaManager.shared.applyDownloadedMetadataAndPlaylist(for: saved, title: title ?? cleanTitle, artist: artist)
+                    lastCompletedMediaItem = updated
+                }
+            } else {
+                try? FileManager.default.removeItem(at: muxedTemp)
+                MediaManager.shared.errorMessage = "Could not mux video & audio tracks into MP4."
+            }
+        }
+        activeAsyncTasks[downloadID] = asyncTask
+    }
+
+    nonisolated private func fetchTempFile(
+        from url: URL,
+        ext: String,
+        headers: [String: String],
+        using session: URLSession
+    ) async -> URL? {
+        var req = URLRequest(url: url)
+        headers.forEach { req.setValue($0.value, forHTTPHeaderField: $0.key) }
+        req.timeoutInterval = 120
+        guard let (tempURL, resp) = try? await session.download(for: req),
+              let http = resp as? HTTPURLResponse,
+              (200...299).contains(http.statusCode) else {
+            return nil
+        }
+        let mime = resp.mimeType?.lowercased() ?? ""
+        if mime.contains("html") {
+            try? FileManager.default.removeItem(at: tempURL)
+            return nil
+        }
+        let dest = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString).\(ext)")
+        do {
+            try FileManager.default.moveItem(at: tempURL, to: dest)
+            return dest
+        } catch {
+            try? FileManager.default.removeItem(at: tempURL)
+            return nil
+        }
+    }
+
     func downloadDirectMedia(
         from url: URL,
         title: String? = nil,
+        artist: String? = nil,
         headers: [String: String]? = nil,
         knownDurationSeconds: Double? = nil,
         maxDurationMinutes: Int = 0,
@@ -274,6 +389,7 @@ final class WebMediaDownloader {
             startHLSDownload(
                 from: url,
                 title: title,
+                artist: artist,
                 headers: headers,
                 maxDurationMinutes: maxDurationMinutes,
                 destinationFolder: destinationFolder
@@ -320,6 +436,7 @@ final class WebMediaDownloader {
                     downloadID: downloadID,
                     url: normalizedURL,
                     cleanTitle: cleanTitle,
+                    artist: artist,
                     headers: mergedHeaders,
                     maxDurationSeconds: maxSec,
                     destinationFolder: destinationFolder
@@ -336,6 +453,7 @@ final class WebMediaDownloader {
             downloadID: downloadID,
             url: normalizedURL,
             cleanTitle: cleanTitle,
+            artist: artist,
             headers: mergedHeaders,
             maxDurationSeconds: maxSec,
             destinationFolder: destinationFolder
@@ -371,7 +489,8 @@ final class WebMediaDownloader {
                     preferredFileName: preferredName,
                     inFolder: destinationFolder
                 ) {
-                    lastCompletedMediaItem = saved
+                    let updated = MediaManager.shared.applyDownloadedMetadataAndPlaylist(for: saved, title: baseName, artist: nil)
+                    lastCompletedMediaItem = updated
                 }
             }
         } catch {
@@ -393,6 +512,50 @@ final class WebMediaDownloader {
         guard let url = URL(string: normalized), url.scheme?.hasPrefix("http") == true else {
             MediaManager.shared.errorMessage = "Please enter the correct link"
             return
+        }
+
+        if YouTubeStreamResolver.isYouTubeURL(url),
+           YouTubeStreamResolver.extractVideoID(from: url) != nil {
+            MediaManager.shared.statusMessage = "Resolving YouTube stream..."
+            if let ytResult = await YouTubeStreamResolver.resolveStreams(
+                for: url,
+                cookiesHeader: headers?["Cookie"],
+                referer: headers?["Referer"]
+            ), let best = ytResult.streams.first {
+                let resolvedTitle = (title?.isEmpty == false ? title : nil) ?? ytResult.title
+                if best.isHLS {
+                    startHLSDownload(
+                        from: best.url,
+                        title: resolvedTitle,
+                        artist: ytResult.author,
+                        headers: best.customHeaders,
+                        maxDurationMinutes: maxDurationMinutes,
+                        destinationFolder: destinationFolder
+                    )
+                } else if let pairedAudio = best.pairedAudioURL {
+                    downloadMuxedVideoAndAudio(
+                        videoURL: best.url,
+                        audioURL: pairedAudio,
+                        title: resolvedTitle,
+                        artist: ytResult.author,
+                        headers: best.customHeaders,
+                        knownDurationSeconds: ytResult.durationSeconds,
+                        maxDurationMinutes: maxDurationMinutes,
+                        destinationFolder: destinationFolder
+                    )
+                } else {
+                    downloadDirectMedia(
+                        from: best.url,
+                        title: resolvedTitle,
+                        artist: ytResult.author,
+                        headers: best.customHeaders,
+                        knownDurationSeconds: ytResult.durationSeconds,
+                        maxDurationMinutes: maxDurationMinutes,
+                        destinationFolder: destinationFolder
+                    )
+                }
+                return
+            }
         }
 
         let mergedHeaders = enrichedHeaders(headers, for: url)
@@ -521,6 +684,7 @@ final class WebMediaDownloader {
         downloadID: UUID,
         playlistURL: URL,
         cleanTitle: String,
+        artist: String?,
         minimumBitrate: Double?,
         headers: [String: String],
         maxDurationSeconds: Double?,
@@ -697,8 +861,8 @@ final class WebMediaDownloader {
             preferredFileName: "\(cleanTitle).\(finalExt)",
             inFolder: destinationFolder
         ) {
-            lastCompletedMediaItem = saved
-            MediaManager.shared.statusMessage = "Cached \(saved.displayTitle)"
+            let updated = MediaManager.shared.applyDownloadedMetadataAndPlaylist(for: saved, title: cleanTitle, artist: artist)
+            lastCompletedMediaItem = updated
         }
         LocalMediaCacheProxy.shared.refreshCacheSize()
         return true
@@ -707,6 +871,7 @@ final class WebMediaDownloader {
     private func startAppleAVAssetHLSDownload(
         from url: URL,
         cleanTitle: String,
+        artist: String?,
         minimumBitrate: Double?,
         headers: [String: String],
         maxDurationSeconds: Double?,
@@ -731,6 +896,7 @@ final class WebMediaDownloader {
 
         downloadMeta[downloadID] = DownloadMeta(
             title: cleanTitle,
+            artist: artist,
             sourceURL: url,
             maxDurationSeconds: maxDurationSeconds,
             isHLS: true,
@@ -747,12 +913,14 @@ final class WebMediaDownloader {
         downloadID: UUID,
         url: URL,
         cleanTitle: String,
+        artist: String?,
         headers: [String: String],
         maxDurationSeconds: Double?,
         destinationFolder: String
     ) {
         downloadMeta[downloadID] = DownloadMeta(
             title: cleanTitle,
+            artist: artist,
             sourceURL: url,
             maxDurationSeconds: maxDurationSeconds,
             isHLS: false,
@@ -1007,12 +1175,11 @@ final class WebMediaDownloader {
     }
 
     private func cleanedStreamURLIfRangeFragment(_ url: URL) -> URL {
+        if url.host?.lowercased().contains("googlevideo.com") == true {
+            return YouTubeStreamResolver.cleanGooglevideoURL(url)
+        }
         guard var comps = URLComponents(url: url, resolvingAgainstBaseURL: false),
               let items = comps.queryItems, !items.isEmpty else {
-            return url
-        }
-        // Only strip trivial byte-range chunks on direct CDN URLs where range= wasn't part of signed videoplayback
-        if comps.host?.contains("googlevideo.com") == true {
             return url
         }
         let filtered = items.filter { item in
@@ -1152,8 +1319,8 @@ final class WebMediaDownloader {
                 preferredFileName: preferredName,
                 inFolder: meta.destinationFolder
             ) {
-                lastCompletedMediaItem = saved
-                MediaManager.shared.statusMessage = "Cached \(saved.displayTitle)"
+                let updated = MediaManager.shared.applyDownloadedMetadataAndPlaylist(for: saved, title: meta.title, artist: meta.artist)
+                lastCompletedMediaItem = updated
             }
             LocalMediaCacheProxy.shared.refreshCacheSize()
         }
@@ -1311,6 +1478,10 @@ private final class DownloadDelegateProxy: NSObject, AVAssetDownloadDelegate, UR
         }
         if let urlExt = url?.pathExtension.lowercased(), !urlExt.isEmpty, urlExt.count <= 6, urlExt != "html", urlExt != "php" {
             return urlExt
+        }
+        if let url, let comps = URLComponents(url: url, resolvingAgainstBaseURL: false),
+           let mimeQuery = comps.queryItems?.first(where: { $0.name.lowercased() == "mime" })?.value {
+            return WebMediaDownloader.extensionFor(mimeType: mimeQuery, fallbackName: "")
         }
         return WebMediaDownloader.extensionFor(mimeType: response?.mimeType ?? "", fallbackName: "")
     }

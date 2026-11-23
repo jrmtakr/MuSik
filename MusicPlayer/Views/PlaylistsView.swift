@@ -12,6 +12,8 @@ enum PlaylistSortOrder: String, CaseIterable, Identifiable {
 private enum SmartPlaylistKind: String, Identifiable {
     case liked = "Liked Songs"
     case offline = "Offline Songs"
+    case offlineVideos = "Offline Videos"
+    case allOffline = "All Offline Media"
     case recents = "Recents"
 
     var id: String { rawValue }
@@ -19,7 +21,9 @@ private enum SmartPlaylistKind: String, Identifiable {
     var systemImage: String {
         switch self {
         case .liked: return "heart.fill"
-        case .offline: return "arrow.down.circle.fill"
+        case .offline: return "music.note"
+        case .offlineVideos: return "film.fill"
+        case .allOffline: return "arrow.down.circle.fill"
         case .recents: return "clock.fill"
         }
     }
@@ -28,6 +32,8 @@ private enum SmartPlaylistKind: String, Identifiable {
         switch self {
         case .liked: return .pink
         case .offline: return .accentColor
+        case .offlineVideos: return .purple
+        case .allOffline: return .green
         case .recents: return .orange
         }
     }
@@ -112,7 +118,9 @@ struct PlaylistsView: View {
                 if trimmedSearch.isEmpty {
                     Section("Library Collections") {
                         smartPlaylistRow(.liked, count: mediaManager.favoriteItems.count)
-                        smartPlaylistRow(.offline, count: mediaManager.items.filter { !$0.isVideo }.count)
+                        smartPlaylistRow(.offline, count: mediaManager.audioItems.count)
+                        smartPlaylistRow(.offlineVideos, count: mediaManager.videoItems.count)
+                        smartPlaylistRow(.allOffline, count: mediaManager.items.count)
                         smartPlaylistRow(.recents, count: mediaManager.recentItems.count)
                     }
                 }
@@ -387,7 +395,9 @@ private struct SmartPlaylistDetailView: View {
     private var tracks: [MediaItem] {
         switch kind {
         case .liked: return mediaManager.favoriteItems
-        case .offline: return mediaManager.items.filter { !$0.isVideo }
+        case .offline: return mediaManager.audioItems
+        case .offlineVideos: return mediaManager.videoItems
+        case .allOffline: return mediaManager.items
         case .recents: return mediaManager.recentItems
         }
     }

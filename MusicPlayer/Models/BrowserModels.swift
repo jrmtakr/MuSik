@@ -77,32 +77,45 @@ struct HistoryEntry: Identifiable, Codable, Hashable {
 struct DetectedBrowserMedia: Identifiable, Equatable {
     let id = UUID()
     let url: URL
+    let pairedAudioURL: URL?
     let isHLS: Bool
     let isAudio: Bool
     let title: String?
+    let author: String?
+    let qualityLabel: String?
     let referer: String?
+    let customHeaders: [String: String]?
     let durationSeconds: Double?
     let isActivelyPlaying: Bool
 
     init(
         url: URL,
+        pairedAudioURL: URL? = nil,
         isHLS: Bool,
         isAudio: Bool,
         title: String? = nil,
+        author: String? = nil,
+        qualityLabel: String? = nil,
         referer: String? = nil,
+        customHeaders: [String: String]? = nil,
         durationSeconds: Double? = nil,
         isActivelyPlaying: Bool = false
     ) {
         self.url = url
+        self.pairedAudioURL = pairedAudioURL
         self.isHLS = isHLS
         self.isAudio = isAudio
         self.title = title
+        self.author = author
+        self.qualityLabel = qualityLabel
         self.referer = referer
+        self.customHeaders = customHeaders
         self.durationSeconds = durationSeconds
         self.isActivelyPlaying = isActivelyPlaying
     }
 
     var kindLabel: String {
+        if let qualityLabel, !qualityLabel.isEmpty { return qualityLabel }
         if isHLS { return "HLS Stream" }
         return isAudio ? "Audio" : "Video"
     }
@@ -113,11 +126,12 @@ struct DetectedBrowserMedia: Identifiable, Equatable {
     }
 
     var fileExtensionHint: String {
+        if pairedAudioURL != nil { return "MP4 HD" }
         let ext = url.pathExtension.lowercased()
         if !ext.isEmpty && ext.count <= 6 {
             return ext.uppercased()
         }
-        return isHLS ? "M3U8" : (isAudio ? "AUDIO" : "VIDEO")
+        return isHLS ? "M3U8" : (isAudio ? "M4A" : "MP4")
     }
 }
 

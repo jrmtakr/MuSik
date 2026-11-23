@@ -840,6 +840,14 @@ final class MediaManager {
         items.filter { likedPaths.contains($0.relativePath) }
     }
 
+    var videoItems: [MediaItem] {
+        items.filter { $0.isVideo }
+    }
+
+    var audioItems: [MediaItem] {
+        items.filter { !$0.isVideo }
+    }
+
     var recentItems: [MediaItem] {
         let byPath = Dictionary(uniqueKeysWithValues: items.map { ($0.relativePath, $0) })
         return recentPaths.compactMap { byPath[$0] }
@@ -1007,6 +1015,50 @@ final class MediaManager {
             updateNowPlayingInfo(for: updated)
         }
         statusMessage = "Updated track info"
+    }
+
+    @discardableResult
+    func applyDownloadedMetadataAndPlaylist(
+        for item: MediaItem,
+        title: String? = nil,
+        artist: String? = nil
+    ) -> MediaItem {
+        let cleanTitle = title?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanArtist = artist?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if (cleanTitle?.isEmpty == false) || (cleanArtist?.isEmpty == false) {
+            var entry = customMetadataByPath[item.relativePath] ?? CustomTrackMetadata()
+            if let cleanTitle, !cleanTitle.isEmpty { entry.title = cleanTitle }
+            if let cleanArtist, !cleanArtist.isEmpty { entry.artist = cleanArtist }
+            customMetadataByPath[item.relativePath] = entry
+            saveLibraryState()
+            loadLocalFiles()
+        }
+
+        let refreshedItem = items.first(where: { $0.relativePath == item.relativePath }) ?? item
+
+        if AppSettings.isAutoAddDownloadsToPlaylistEnabled {
+            var targetIndex: Int?
+            if let configuredID = AppSettings.storedTargetDownloadPlaylistID {
+                targetIndex = playlists.firstIndex(where: { $0.id == configuredID })
+            }
+            if targetIndex == nil {
+                if let existingDownloads = playlists.firstIndex(where: { $0.name.compare("Downloads", options: .caseInsensitive) == .orderedSame }) {
+                    targetIndex = existingDownloads
+                } else {
+                    let created = Playlist(id: UUID(), name: "Downloads", itemFileNames: [])
+                    playlists.insert(created, at: 0)
+                    targetIndex = 0
+                }
+            }
+            if let idx = targetIndex {
+                if !playlistContains(refreshedItem, in: playlists[idx]) {
+                    playlists[idx].itemFileNames.insert(refreshedItem.relativePath, at: 0)
+                    savePlaylists()
+                }
+                statusMessage = "Saved to \(playlists[idx].name): \(refreshedItem.displayTitle)"
+            }
+        }
+        return refreshedItem
     }
 
     // MARK: - Folders & Moving
