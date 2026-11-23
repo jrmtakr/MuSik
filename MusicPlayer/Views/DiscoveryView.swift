@@ -51,11 +51,11 @@ struct DiscoveryView: View {
 
                     if !recentItems.isEmpty {
                         shelfSection(
-                            title: "Recents",
+                            title: "Last Played",
                             items: recentItems,
-                            actionTitle: "See Files"
+                            actionTitle: "More"
                         ) {
-                            selectedTab = .files
+                            selectedTab = .playlists
                         }
                     }
 
@@ -276,7 +276,7 @@ struct DiscoveryView: View {
                                     .font(.subheadline.weight(.semibold))
                                     .foregroundStyle(mediaManager.currentItem?.relativePath == item.relativePath ? Color.accentColor : .primary)
                                     .lineLimit(1)
-                                Text(item.artist ?? item.fileExtension.uppercased())
+                                Text(shelfSubtitle(for: item))
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                                     .lineLimit(1)
@@ -344,6 +344,20 @@ struct DiscoveryView: View {
     private func openURLInBrowser(_ urlString: String, title: String? = nil) {
         browserStore.openInActiveTab(urlString: urlString, title: title)
         selectedTab = .browser
+    }
+
+    private func shelfSubtitle(for item: MediaItem) -> String {
+        var parts: [String] = []
+        if let artist = item.artist, !artist.isEmpty {
+            parts.append(artist)
+        } else {
+            parts.append(item.fileExtension.uppercased())
+        }
+        if let duration = item.formattedDuration {
+            parts.append(duration)
+        }
+        parts.append(item.formattedFileSize)
+        return parts.joined(separator: " • ")
     }
 }
 

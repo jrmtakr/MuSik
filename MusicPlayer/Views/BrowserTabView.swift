@@ -1251,7 +1251,7 @@ struct BrowserTabView: View {
                                 settings.targetDownloadPlaylistIDString = ""
                             } label: {
                                 Label(
-                                    "Auto (\"Downloads\")",
+                                    "Auto (\"Last Played\")",
                                     systemImage: (settings.autoAddDownloadsToPlaylist && settings.targetDownloadPlaylistIDString.isEmpty) ? "checkmark" : "arrow.down.circle"
                                 )
                             }

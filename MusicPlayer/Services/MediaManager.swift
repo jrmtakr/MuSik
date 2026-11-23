@@ -438,6 +438,12 @@ final class MediaManager {
 
     // MARK: - Playback, Repeat, Favorites, Recents, & Up Next
 
+    private func activatePlaybackAudioSession() {
+        let session = AVAudioSession.sharedInstance()
+        try? session.setCategory(.playback, mode: .default)
+        try? session.setActive(true)
+    }
+
     func play(_ item: MediaItem, inPlaylist playlistID: UUID? = nil) {
         guard FileManager.default.fileExists(atPath: item.fileURL.path) else {
             errorMessage = "File not found: \(item.fileName)"
@@ -452,7 +458,7 @@ final class MediaManager {
             lastPlaylistID = playlistID
         }
         recordRecent(item.relativePath)
-        try? AVAudioSession.sharedInstance().setActive(true)
+        activatePlaybackAudioSession()
 
         if item.prefersFFmpegEngine {
             playWithFFmpegEngine(url: item.fileURL, item: item, headers: nil)
@@ -499,7 +505,7 @@ final class MediaManager {
         stopCurrentEngines()
         activePlaylistID = nil
         remoteStreamSourceURL = url
-        try? AVAudioSession.sharedInstance().setActive(true)
+        activatePlaybackAudioSession()
 
         let ext = url.pathExtension.lowercased()
         let syntheticExt = MediaItem.allSupportedExtensions.contains(ext) ? ext : (isVideo ? "mp4" : "m4a")
@@ -683,7 +689,7 @@ final class MediaManager {
 
     func resume() {
         guard let currentItem else { return }
-        try? AVAudioSession.sharedInstance().setActive(true)
+        activatePlaybackAudioSession()
 
         if isUsingFFmpegBackend, let ks = ffmpegPlayer {
             ks.playbackRate = playbackRate
@@ -1036,28 +1042,18 @@ final class MediaManager {
         }
 
         let refreshedItem = items.first(where: { $0.relativePath == item.relativePath }) ?? item
+        recordRecent(refreshedItem.relativePath)
 
-        if AppSettings.isAutoAddDownloadsToPlaylistEnabled {
-            var targetIndex: Int?
-            if let configuredID = AppSettings.storedTargetDownloadPlaylistID {
-                targetIndex = playlists.firstIndex(where: { $0.id == configuredID })
+        if AppSettings.isAutoAddDownloadsToPlaylistEnabled,
+           let configuredID = AppSettings.storedTargetDownloadPlaylistID,
+           let idx = playlists.firstIndex(where: { $0.id == configuredID }) {
+            if !playlistContains(refreshedItem, in: playlists[idx]) {
+                playlists[idx].itemFileNames.insert(refreshedItem.relativePath, at: 0)
+                savePlaylists()
             }
-            if targetIndex == nil {
-                if let existingDownloads = playlists.firstIndex(where: { $0.name.compare("Downloads", options: .caseInsensitive) == .orderedSame }) {
-                    targetIndex = existingDownloads
-                } else {
-                    let created = Playlist(id: UUID(), name: "Downloads", itemFileNames: [])
-                    playlists.insert(created, at: 0)
-                    targetIndex = 0
-                }
-            }
-            if let idx = targetIndex {
-                if !playlistContains(refreshedItem, in: playlists[idx]) {
-                    playlists[idx].itemFileNames.insert(refreshedItem.relativePath, at: 0)
-                    savePlaylists()
-                }
-                statusMessage = "Saved to \(playlists[idx].name): \(refreshedItem.displayTitle)"
-            }
+            statusMessage = "Saved to Files & \(playlists[idx].name): \(refreshedItem.displayTitle)"
+        } else {
+            statusMessage = "Saved to Files & Last Played: \(refreshedItem.displayTitle)"
         }
         return refreshedItem
     }
@@ -1802,8 +1798,8 @@ final class MediaManager {
     private func recordRecent(_ relativePath: String) {
         recentPaths.removeAll { $0 == relativePath }
         recentPaths.insert(relativePath, at: 0)
-        if recentPaths.count > 50 {
-            recentPaths = Array(recentPaths.prefix(50))
+        if recentPaths.count > 2000 {
+            recentPaths = Array(recentPaths.prefix(2000))
         }
         saveLibraryState()
     }

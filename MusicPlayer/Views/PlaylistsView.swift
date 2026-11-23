@@ -10,11 +10,11 @@ enum PlaylistSortOrder: String, CaseIterable, Identifiable {
 }
 
 private enum SmartPlaylistKind: String, Identifiable {
-    case liked = "Liked Songs"
     case offline = "Offline Songs"
+    case liked = "Liked Songs"
+    case lastPlayed = "Last Played"
     case offlineVideos = "Offline Videos"
     case allOffline = "All Offline Media"
-    case recents = "Recents"
 
     var id: String { rawValue }
 
@@ -22,9 +22,9 @@ private enum SmartPlaylistKind: String, Identifiable {
         switch self {
         case .liked: return "heart.fill"
         case .offline: return "music.note"
+        case .lastPlayed: return "clock.fill"
         case .offlineVideos: return "film.fill"
         case .allOffline: return "arrow.down.circle.fill"
-        case .recents: return "clock.fill"
         }
     }
 
@@ -32,9 +32,9 @@ private enum SmartPlaylistKind: String, Identifiable {
         switch self {
         case .liked: return .pink
         case .offline: return .accentColor
+        case .lastPlayed: return .blue
         case .offlineVideos: return .purple
         case .allOffline: return .green
-        case .recents: return .orange
         }
     }
 }
@@ -124,11 +124,11 @@ struct PlaylistsView: View {
 
                 if trimmedSearch.isEmpty {
                     Section("Library Collections") {
-                        smartPlaylistRow(.liked, count: mediaManager.favoriteItems.count)
                         smartPlaylistRow(.offline, count: mediaManager.audioItems.count)
+                        smartPlaylistRow(.liked, count: mediaManager.favoriteItems.count)
+                        smartPlaylistRow(.lastPlayed, count: mediaManager.recentItems.count)
                         smartPlaylistRow(.offlineVideos, count: mediaManager.videoItems.count)
                         smartPlaylistRow(.allOffline, count: mediaManager.items.count)
-                        smartPlaylistRow(.recents, count: mediaManager.recentItems.count)
                     }
                 }
 
@@ -452,7 +452,7 @@ private struct SmartPlaylistDetailView: View {
         case .offline: return mediaManager.audioItems
         case .offlineVideos: return mediaManager.videoItems
         case .allOffline: return mediaManager.items
-        case .recents: return mediaManager.recentItems
+        case .lastPlayed: return mediaManager.recentItems
         }
     }
 

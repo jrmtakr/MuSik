@@ -103,7 +103,7 @@ struct SettingsView: View {
 
                     if settings.autoAddDownloadsToPlaylist {
                         Picker("Download Playlist", selection: $settings.targetDownloadPlaylistIDString) {
-                            Text("Auto (\"Downloads\")").tag("")
+                            Text("Auto (\"Last Played\")").tag("")
                             ForEach(mediaManager.playlists) { playlist in
                                 Text(playlist.name).tag(playlist.id.uuidString)
                             }
