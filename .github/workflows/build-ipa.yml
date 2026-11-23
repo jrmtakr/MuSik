@@ -1,0 +1,47 @@
+name: Build MusicPlayer IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build-ipa:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Archive unsigned iOS app
+        run: |
+          xcodebuild \
+            -project MusicPlayer.xcodeproj \
+            -scheme MusicPlayer \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            archive \
+            -archivePath build/MusicPlayer.xcarchive
+
+      - name: Package MusicPlayer.ipa
+        run: |
+          mkdir -p build/Payload
+          cp -R build/MusicPlayer.xcarchive/Products/Applications/MusicPlayer.app build/Payload/
+          codesign --force --deep --sign - --timestamp=none build/Payload/MusicPlayer.app
+          cd build
+          zip -qry MusicPlayer.ipa Payload
+
+      - name: Upload MusicPlayer.ipa artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MusicPlayer-ipa
+          path: build/MusicPlayer.ipa
