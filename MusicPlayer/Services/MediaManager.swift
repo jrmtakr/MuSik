@@ -15,6 +15,7 @@ final class MediaManager {
         var title: String?
         var artist: String?
         var coverFileName: String?
+        var sourceVideoID: String?
     }
 
     private struct LibraryPersistedState: Codable {
@@ -60,7 +61,9 @@ final class MediaManager {
     private(set) var isUsingFFmpegBackend = false
     private var isUsingEqualizerBackend = false
 
-    private let docsURL = MediaItem.documentsDirectory
+    @ObservationIgnored var externalQueueNextHandler: (() -> Bool)?
+    @ObservationIgnored var externalQueuePreviousHandler: (() -> Bool)?
+    @ObservationIgnored private let docsURL = MediaItem.documentsDirectory
     private var timeObserverToken: Any?
     private var playerItemStatusObservation: NSKeyValueObservation?
     private var endObserver: NSObjectProtocol?
@@ -543,11 +546,16 @@ final class MediaManager {
         try? session.setActive(true)
     }
 
-    func play(_ item: MediaItem, inPlaylist playlistID: UUID? = nil) {
+    func play(_ item: MediaItem, inPlaylist playlistID: UUID? = nil, keepExternalQueue: Bool = false) {
         guard FileManager.default.fileExists(atPath: item.fileURL.path) else {
             errorMessage = "File not found: \(item.fileName)"
             loadLocalFiles()
             return
+        }
+
+        if !keepExternalQueue {
+            externalQueueNextHandler = nil
+            externalQueuePreviousHandler = nil
         }
 
         stopCurrentEngines()
@@ -600,7 +608,19 @@ final class MediaManager {
         updateNowPlayingInfo(for: item)
     }
 
-    func playRemoteStream(url: URL, title: String, headers: [String: String]? = nil, isVideo: Bool) {
+    func playRemoteStream(
+        url: URL,
+        title: String,
+        artist: String? = nil,
+        headers: [String: String]? = nil,
+        isVideo: Bool,
+        keepExternalQueue: Bool = false
+    ) {
+        if !keepExternalQueue {
+            externalQueueNextHandler = nil
+            externalQueuePreviousHandler = nil
+        }
+
         stopCurrentEngines()
         activePlaylistID = nil
         remoteStreamSourceURL = url
@@ -617,7 +637,7 @@ final class MediaManager {
             dateAdded: .now,
             durationSeconds: nil,
             metadataTitle: title,
-            artist: url.host
+            artist: artist ?? url.host
         )
 
         let isHLS = ext == "m3u8" || url.absoluteString.lowercased().contains(".m3u8")
@@ -1028,6 +1048,10 @@ final class MediaManager {
             return
         }
 
+        if let nextHandler = externalQueueNextHandler, nextHandler() {
+            return
+        }
+
         let queue = activeQueue
         guard !queue.isEmpty else { return }
 
@@ -1057,12 +1081,16 @@ final class MediaManager {
     }
 
     func playPrevious() {
-        let queue = activeQueue
-        guard !queue.isEmpty else { return }
         if currentTime > 3 {
             seek(to: 0)
             return
         }
+        if let prevHandler = externalQueuePreviousHandler, prevHandler() {
+            return
+        }
+
+        let queue = activeQueue
+        guard !queue.isEmpty else { return }
         guard let currentItem,
               let index = queue.firstIndex(where: { $0.id == currentItem.id }) else {
             if let first = queue.first { play(first, inPlaylist: activePlaylistID) }
@@ -1123,20 +1151,36 @@ final class MediaManager {
         statusMessage = "Updated track info"
     }
 
+    func setSourceVideoID(_ videoID: String?, for item: MediaItem) {
+        guard let videoID, !videoID.isEmpty else { return }
+        var entry = customMetadataByPath[item.relativePath] ?? CustomTrackMetadata()
+        guard entry.sourceVideoID != videoID else { return }
+        entry.sourceVideoID = videoID
+        customMetadataByPath[item.relativePath] = entry
+        saveLibraryState()
+    }
+
+    func sourceVideoID(for item: MediaItem) -> String? {
+        customMetadataByPath[item.relativePath]?.sourceVideoID
+    }
+
     @discardableResult
     func applyDownloadedMetadataAndPlaylist(
         for item: MediaItem,
         title: String? = nil,
         artist: String? = nil,
         explicitPlaylistID: UUID? = nil,
-        appendOrder: Bool = false
+        appendOrder: Bool = false,
+        sourceVideoID: String? = nil
     ) -> MediaItem {
         let cleanTitle = title?.trimmingCharacters(in: .whitespacesAndNewlines)
         let cleanArtist = artist?.trimmingCharacters(in: .whitespacesAndNewlines)
-        if (cleanTitle?.isEmpty == false) || (cleanArtist?.isEmpty == false) {
+        let cleanVID = sourceVideoID?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if (cleanTitle?.isEmpty == false) || (cleanArtist?.isEmpty == false) || (cleanVID?.isEmpty == false) {
             var entry = customMetadataByPath[item.relativePath] ?? CustomTrackMetadata()
             if let cleanTitle, !cleanTitle.isEmpty { entry.title = cleanTitle }
             if let cleanArtist, !cleanArtist.isEmpty { entry.artist = cleanArtist }
+            if let cleanVID, !cleanVID.isEmpty { entry.sourceVideoID = cleanVID }
             customMetadataByPath[item.relativePath] = entry
             saveLibraryState()
             loadLocalFiles()
@@ -2153,6 +2197,10 @@ final class MediaManager {
 
         if let queued = popNextQueuedItem() {
             play(queued, inPlaylist: activePlaylistID)
+            return
+        }
+
+        if let nextHandler = externalQueueNextHandler, nextHandler() {
             return
         }
 

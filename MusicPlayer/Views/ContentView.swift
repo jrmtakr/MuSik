@@ -12,6 +12,7 @@ enum AppTab: Hashable {
 struct ContentView: View {
     @Environment(MediaManager.self) private var mediaManager
     @Environment(AppSettings.self) private var settings
+    @Environment(GroupPlaylistService.self) private var groupService
     @Binding var showPlayerSheet: Bool
     @Binding var quickLookTarget: QuickLookTarget?
 
@@ -55,6 +56,14 @@ struct ContentView: View {
             .applyCustomTextStyle()
             .onAppear {
                 updateNavigationBarAppearance()
+                if groupService.pendingOpenGroupID != nil {
+                    selectedTab = .playlists
+                }
+            }
+            .onChange(of: groupService.pendingOpenGroupID) { _, newID in
+                if newID != nil {
+                    selectedTab = .playlists
+                }
             }
             .onChange(of: settings.useCustomTextColor) { _, _ in
                 updateNavigationBarAppearance()

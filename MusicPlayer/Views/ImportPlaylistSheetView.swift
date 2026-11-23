@@ -414,7 +414,8 @@ struct ImportPlaylistSheetView: View {
                     taggedPrimary,
                     fallbackStreams: Array(preferredStreams.dropFirst()),
                     targetPlaylistID: targetPlaylistID,
-                    maxDurationMinutes: maxDuration
+                    maxDurationMinutes: maxDuration,
+                    sourceVideoID: vid
                 ) != nil {
                     tracks[trackIndex].state = .saved
                     completedCount += 1

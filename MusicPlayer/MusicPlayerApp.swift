@@ -8,6 +8,7 @@ struct MusicPlayerApp: App {
     @State private var settings = AppSettings()
     @State private var browserStore = BrowserStore()
     @State private var downloader = WebMediaDownloader()
+    @State private var groupService = GroupPlaylistService.shared
 
     @State private var showPlayerSheet = false
     @State private var quickLookTarget: QuickLookTarget?
@@ -21,6 +22,7 @@ struct MusicPlayerApp: App {
                 .environment(settings)
                 .environment(browserStore)
                 .environment(downloader)
+                .environment(groupService)
                 .task {
                     LocalMediaCacheProxy.shared.start()
                     wifiServer.onFileReceived = { tempURL, fileName, folderPath in
@@ -31,6 +33,12 @@ struct MusicPlayerApp: App {
                     }
                 }
                 .onOpenURL { url in
+                    if url.scheme?.lowercased() == "musicplayer" && url.host?.lowercased() == "group" {
+                        Task { @MainActor in
+                            await groupService.joinGroupPlaylist(input: url.absoluteString)
+                        }
+                        return
+                    }
                     switch mediaManager.importAnyFile(from: url) {
                     case .media(let item):
                         mediaManager.play(item)

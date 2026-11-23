@@ -160,6 +160,17 @@ struct MediaRowView: View {
                             }
                         }
                     }
+
+                    if !GroupPlaylistService.shared.groups.isEmpty {
+                        Divider()
+                        ForEach(GroupPlaylistService.shared.groups) { group in
+                            Button {
+                                GroupPlaylistService.shared.sendLocalItem(item, to: group.id)
+                            } label: {
+                                Label("Send to Group: \(group.name)", systemImage: "person.2.wave.2")
+                            }
+                        }
+                    }
                 } label: {
                     Label("Add to Playlist", systemImage: "text.badge.plus")
                 }

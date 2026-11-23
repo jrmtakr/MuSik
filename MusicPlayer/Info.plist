@@ -45,6 +45,19 @@
 	<true/>
 	<key>LSSupportsOpeningDocumentsInPlace</key>
 	<true/>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>com.personal.musicplayer.offline.invite</string>
+			<key>CFBundleURLName</key>
+			<string>com.personal.musicplayer.offline</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>musicplayer</string>
+			</array>
+		</dict>
+	</array>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>Import videos from your Photos library and choose custom cover images for tracks and playlists.</string>
 	<key>NSLocalNetworkUsageDescription</key>

@@ -42,6 +42,7 @@ private enum SmartPlaylistKind: String, Identifiable {
 struct PlaylistsView: View {
     @Environment(MediaManager.self) private var mediaManager
     @Environment(AppSettings.self) private var settings
+    @Environment(GroupPlaylistService.self) private var groupService
     @Binding var showPlayerSheet: Bool
     @Binding var quickLookTarget: QuickLookTarget?
 
@@ -49,6 +50,9 @@ struct PlaylistsView: View {
     @State private var sortOrder: PlaylistSortOrder = .date
     @State private var showCreateAlert = false
     @State private var showImportURLSheet = false
+    @State private var showCreateGroupSheet = false
+    @State private var showJoinGroupSheet = false
+    @State private var selectedGroupID: UUID?
     @State private var newPlaylistName = ""
     @State private var createdPlaylistID: UUID?
     @State private var playlistToRename: Playlist?
@@ -130,6 +134,67 @@ struct PlaylistsView: View {
                         smartPlaylistRow(.lastPlayed, count: mediaManager.recentItems.count)
                         smartPlaylistRow(.offlineVideos, count: mediaManager.videoItems.count)
                         smartPlaylistRow(.allOffline, count: mediaManager.items.count)
+                    }
+
+                    Section("Group Playlists (Live)") {
+                        HStack(spacing: 10) {
+                            Button {
+                                showCreateGroupSheet = true
+                            } label: {
+                                Label("New Group", systemImage: "person.2.wave.2.fill")
+                                    .font(.caption.weight(.semibold))
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(.borderedProminent)
+
+                            Button {
+                                showJoinGroupSheet = true
+                            } label: {
+                                Label("Join Code / Link", systemImage: "link.badge.plus")
+                                    .font(.caption.weight(.semibold))
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(.bordered)
+                        }
+                        .padding(.vertical, 2)
+
+                        if groupService.groups.isEmpty {
+                            Text("Create a Group Playlist or enter a friend's code/link to add & listen to songs live together.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        } else {
+                            ForEach(groupService.groups) { group in
+                                NavigationLink {
+                                    GroupPlaylistDetailView(groupID: group.id, showPlayerSheet: $showPlayerSheet)
+                                } label: {
+                                    HStack(spacing: 12) {
+                                        ZStack {
+                                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                                .fill(Color.green.opacity(0.16))
+                                                .frame(width: 48, height: 48)
+                                            Image(systemName: "person.2.wave.2.fill")
+                                                .font(.title3.weight(.semibold))
+                                                .foregroundStyle(.green)
+                                        }
+
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text(group.name)
+                                                .font(.body.weight(.semibold))
+                                                .lineLimit(1)
+                                            HStack(spacing: 6) {
+                                                Text("\(group.tracks.count) \(group.tracks.count == 1 ? "song" : "songs")")
+                                                Text("•")
+                                                Text(group.formattedCode)
+                                                    .font(.caption2.monospaced().weight(.bold))
+                                            }
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                        }
+                                    }
+                                    .padding(.vertical, 2)
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -246,6 +311,20 @@ struct PlaylistsView: View {
                         } label: {
                             Label("Import Playlist URL (Spotify / Apple / YT)", systemImage: "link.badge.plus")
                         }
+
+                        Divider()
+
+                        Button {
+                            showCreateGroupSheet = true
+                        } label: {
+                            Label("New Group Playlist (Live)", systemImage: "person.2.wave.2.fill")
+                        }
+
+                        Button {
+                            showJoinGroupSheet = true
+                        } label: {
+                            Label("Join Group with Code / Link", systemImage: "person.badge.plus")
+                        }
                     } label: {
                         Image(systemName: "plus.circle.fill")
                             .font(.title3)
@@ -259,6 +338,24 @@ struct PlaylistsView: View {
                     showPlayerSheet: $showPlayerSheet,
                     quickLookTarget: $quickLookTarget
                 )
+            }
+            .navigationDestination(item: $selectedGroupID) { gid in
+                GroupPlaylistDetailView(
+                    groupID: gid,
+                    showPlayerSheet: $showPlayerSheet
+                )
+            }
+            .onAppear {
+                if let pending = groupService.pendingOpenGroupID {
+                    groupService.pendingOpenGroupID = nil
+                    selectedGroupID = pending
+                }
+            }
+            .onChange(of: groupService.pendingOpenGroupID) { _, pending in
+                if let pending {
+                    groupService.pendingOpenGroupID = nil
+                    selectedGroupID = pending
+                }
             }
             .photosPicker(isPresented: $showCoverPicker, selection: $selectedCoverPhoto, matching: .images)
             .onChange(of: selectedCoverPhoto) { _, picked in
@@ -284,6 +381,16 @@ struct PlaylistsView: View {
             .sheet(isPresented: $showImportURLSheet) {
                 ImportPlaylistSheetView { importedID in
                     createdPlaylistID = importedID
+                }
+            }
+            .sheet(isPresented: $showCreateGroupSheet) {
+                CreateGroupPlaylistSheet { newGroupID in
+                    selectedGroupID = newGroupID
+                }
+            }
+            .sheet(isPresented: $showJoinGroupSheet) {
+                JoinGroupPlaylistSheet { joinedID in
+                    selectedGroupID = joinedID
                 }
             }
             .alert("New Playlist", isPresented: $showCreateAlert) {

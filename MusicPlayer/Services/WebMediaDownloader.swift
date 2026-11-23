@@ -1679,7 +1679,38 @@ final class WebMediaDownloader {
         _ media: DetectedBrowserMedia,
         fallbackStreams: [DetectedBrowserMedia] = [],
         targetPlaylistID: UUID,
-        maxDurationMinutes: Int = 0
+        maxDurationMinutes: Int = 0,
+        sourceVideoID: String? = nil
+    ) async -> MediaItem? {
+        await downloadResolvedToLibrary(
+            media,
+            fallbackStreams: fallbackStreams,
+            targetPlaylistID: targetPlaylistID,
+            maxDurationMinutes: maxDurationMinutes,
+            sourceVideoID: sourceVideoID
+        )
+    }
+
+    func downloadGroupTrackOffline(
+        _ media: DetectedBrowserMedia,
+        fallbackStreams: [DetectedBrowserMedia] = [],
+        sourceVideoID: String? = nil
+    ) async -> MediaItem? {
+        await downloadResolvedToLibrary(
+            media,
+            fallbackStreams: fallbackStreams,
+            targetPlaylistID: nil,
+            maxDurationMinutes: 0,
+            sourceVideoID: sourceVideoID
+        )
+    }
+
+    private func downloadResolvedToLibrary(
+        _ media: DetectedBrowserMedia,
+        fallbackStreams: [DetectedBrowserMedia],
+        targetPlaylistID: UUID?,
+        maxDurationMinutes: Int,
+        sourceVideoID: String?
     ) async -> MediaItem? {
         let candidates = ([media] + fallbackStreams).filter { !$0.isHLS }
         let maxSec = maxDurationMinutes > 0 ? Double(maxDurationMinutes * 60) : nil
@@ -1747,7 +1778,8 @@ final class WebMediaDownloader {
                         title: candidate.title ?? cleanTitle,
                         artist: candidate.author,
                         explicitPlaylistID: targetPlaylistID,
-                        appendOrder: true
+                        appendOrder: true,
+                        sourceVideoID: sourceVideoID
                     )
                 }
             } else {
@@ -1777,7 +1809,8 @@ final class WebMediaDownloader {
                         title: candidate.title ?? cleanTitle,
                         artist: candidate.author,
                         explicitPlaylistID: targetPlaylistID,
-                        appendOrder: true
+                        appendOrder: true,
+                        sourceVideoID: sourceVideoID
                     )
                 }
             }

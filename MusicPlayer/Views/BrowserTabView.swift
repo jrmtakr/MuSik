@@ -1237,6 +1237,7 @@ struct BrowserTabView: View {
                 cachingOverlayTitle = nil
                 if let vid = activeCacheVideoID ?? currentYouTubeVideoID {
                     cachedMediaByYouTubeID[vid] = cachedItem.id
+                    mediaManager.setSourceVideoID(vid, for: cachedItem)
                 }
                 activeCacheVideoID = nil
                 if awaitingAutoOpenPlayer && settings.autoOpenPlayerAfterCache {

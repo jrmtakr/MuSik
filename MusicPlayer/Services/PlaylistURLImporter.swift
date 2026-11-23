@@ -161,11 +161,15 @@ enum PlaylistURLImporter {
         var tracks: [ExternalPlaylistTrack] = []
         var seenVideoIDs = Set<String>()
 
-        if let initialJSON = await fetchYouTubeBrowse(
+        var initialJSON = await fetchYouTubeBrowse(
             browseID: browseID,
             continuation: nil,
             useMusicRemix: listID.hasPrefix("OLAK") || listID.hasPrefix("RDCLAK")
-        ) ?? (await fetchYouTubePlaylistHTMLInitialData(listID: listID)) {
+        )
+        if initialJSON == nil {
+            initialJSON = await fetchYouTubePlaylistHTMLInitialData(listID: listID)
+        }
+        if let initialJSON {
             if let parsedTitle = extractYouTubePlaylistTitle(from: initialJSON), !parsedTitle.isEmpty {
                 playlistTitle = parsedTitle
             }
@@ -710,6 +714,80 @@ enum PlaylistURLImporter {
 
         walkSearch(root, depth: 0)
         return candidates.max(by: { $0.score < $1.score })?.videoID
+    }
+
+    static func searchYouTubeTracks(
+        query: String,
+        limit: Int = 12
+    ) async -> [(videoID: String, title: String, artist: String, durationSeconds: Double?)] {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              let searchURL = URL(string: "https://www.youtube.com/youtubei/v1/search?prettyPrint=false") else {
+            return []
+        }
+
+        let body: [String: Any] = [
+            "context": [
+                "client": [
+                    "clientName": "WEB",
+                    "clientVersion": webClientVersion,
+                    "hl": "en",
+                    "gl": "US"
+                ]
+            ],
+            "query": trimmed
+        ]
+        guard let bodyData = try? JSONSerialization.data(withJSONObject: body) else { return [] }
+
+        var req = URLRequest(url: searchURL)
+        req.httpMethod = "POST"
+        req.httpBody = bodyData
+        req.timeoutInterval = 15
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue(WebMediaDownloader.browserUserAgent, forHTTPHeaderField: "User-Agent")
+        req.setValue("https://www.youtube.com", forHTTPHeaderField: "Origin")
+        req.setValue("https://www.youtube.com/", forHTTPHeaderField: "Referer")
+        req.setValue("1", forHTTPHeaderField: "X-YouTube-Client-Name")
+        req.setValue(webClientVersion, forHTTPHeaderField: "X-YouTube-Client-Version")
+
+        guard let (data, resp) = try? await URLSession.shared.data(for: req),
+              let http = resp as? HTTPURLResponse,
+              (200...299).contains(http.statusCode),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return []
+        }
+
+        var results: [(videoID: String, title: String, artist: String, durationSeconds: Double?)] = []
+        var seen = Set<String>()
+
+        func walk(_ node: Any, depth: Int) {
+            guard depth < 22, results.count < limit else { return }
+            if let arr = node as? [Any] {
+                for item in arr { walk(item, depth: depth + 1) }
+                return
+            }
+            guard let dict = node as? [String: Any] else { return }
+            if let vr = dict["videoRenderer"] as? [String: Any],
+               let vid = vr["videoId"] as? String,
+               !vid.isEmpty,
+               let rawTitle = ytText(vr["title"]),
+               seen.insert(vid).inserted {
+                let owner = (ytText(vr["ownerText"]) ?? ytText(vr["longBylineText"]) ?? "")
+                    .replacingOccurrences(of: " - Topic", with: "")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                let durSec = parseDurationSeconds(ytText(vr["lengthText"]) ?? "").map { Double($0) }
+                results.append((vid, cleanTitle(rawTitle), owner, durSec))
+                return
+            }
+            for (_, val) in dict {
+                if val is [String: Any] || val is [Any] {
+                    walk(val, depth: depth + 1)
+                }
+            }
+        }
+
+        walk(root, depth: 0)
+        return results
     }
 
     // MARK: - Helpers
