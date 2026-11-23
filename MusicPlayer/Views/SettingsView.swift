@@ -188,6 +188,12 @@ struct SettingsView: View {
                 }
             }
             .navigationTitle("Setting")
+            .onAppear {
+                syncTargetDownloadPlaylist()
+            }
+            .onChange(of: mediaManager.playlists) { _, _ in
+                syncTargetDownloadPlaylist()
+            }
             .miniPlayerInset(showPlayerSheet: $showPlayerSheet)
             .sheet(isPresented: $showWiFiSheet) {
                 WiFiTransferView()
@@ -216,6 +222,13 @@ struct SettingsView: View {
 
     private var currentIconLabel: String {
         AppIconChoice.all.first(where: { $0.iconName == settings.selectedAppIconName })?.title ?? "Default"
+    }
+
+    private func syncTargetDownloadPlaylist() {
+        guard !settings.targetDownloadPlaylistIDString.isEmpty else { return }
+        if !mediaManager.playlists.contains(where: { $0.id.uuidString == settings.targetDownloadPlaylistIDString }) {
+            settings.targetDownloadPlaylistIDString = ""
+        }
     }
 }
 

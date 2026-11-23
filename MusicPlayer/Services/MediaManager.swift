@@ -50,6 +50,7 @@ final class MediaManager {
     var conversionProgress: Double = 0
     var statusMessage: String?
     var errorMessage: String?
+    var newPlaylistTargetItem: MediaItem?
     var thumbnails: [String: UIImage] = [:]
     var playlistCovers: [UUID: UIImage] = [:]
 
@@ -832,7 +833,7 @@ final class MediaManager {
     }
 
     var upNextItems: [MediaItem] {
-        let byPath = Dictionary(uniqueKeysWithValues: items.map { ($0.relativePath, $0) })
+        let byPath = Dictionary(items.map { ($0.relativePath, $0) }, uniquingKeysWith: { first, _ in first })
         return upNextPaths.compactMap { byPath[$0] }
     }
 
@@ -849,7 +850,7 @@ final class MediaManager {
     }
 
     var recentItems: [MediaItem] {
-        let byPath = Dictionary(uniqueKeysWithValues: items.map { ($0.relativePath, $0) })
+        let byPath = Dictionary(items.map { ($0.relativePath, $0) }, uniquingKeysWith: { first, _ in first })
         return recentPaths.compactMap { byPath[$0] }
     }
 
@@ -904,7 +905,7 @@ final class MediaManager {
     }
 
     private func popNextQueuedItem() -> MediaItem? {
-        let byPath = Dictionary(uniqueKeysWithValues: items.map { ($0.relativePath, $0) })
+        let byPath = Dictionary(items.map { ($0.relativePath, $0) }, uniquingKeysWith: { first, _ in first })
         while !upNextPaths.isEmpty {
             let nextPath = upNextPaths.removeFirst()
             if let match = byPath[nextPath] {
@@ -1187,11 +1188,38 @@ final class MediaManager {
         case notFound
     }
 
+    private func duplicateLibraryFileNames() -> Set<String> {
+        var counts: [String: Int] = [:]
+        for item in items {
+            counts[item.fileName, default: 0] += 1
+        }
+        return Set(counts.compactMap { $0.value > 1 ? $0.key : nil })
+    }
+
+    private func playlistKeyMatches(_ storedKey: String, item: MediaItem, duplicateNames: Set<String>) -> Bool {
+        if storedKey == item.relativePath {
+            return true
+        }
+        if !storedKey.contains("/") && !duplicateNames.contains(item.fileName) && storedKey == item.fileName {
+            return true
+        }
+        return false
+    }
+
     func items(in playlist: Playlist) -> [MediaItem] {
-        let byPath = Dictionary(uniqueKeysWithValues: items.map { ($0.relativePath, $0) })
-        let byFileName = Dictionary(items.map { ($0.fileName, $0) }, uniquingKeysWith: { first, _ in first })
+        let byPath = Dictionary(items.map { ($0.relativePath, $0) }, uniquingKeysWith: { first, _ in first })
+        let duplicateNames = duplicateLibraryFileNames()
+        let uniqueByName = Dictionary(
+            items.filter { !duplicateNames.contains($0.fileName) }.map { ($0.fileName, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        var seenPaths = Set<String>()
         return playlist.itemFileNames.compactMap { key in
-            byPath[key] ?? byFileName[key]
+            guard let match = byPath[key] ?? (!key.contains("/") ? uniqueByName[key] : nil) else {
+                return nil
+            }
+            guard seenPaths.insert(match.relativePath).inserted else { return nil }
+            return match
         }
     }
 
@@ -1203,7 +1231,9 @@ final class MediaManager {
             return nil
         }
 
-        let playlist = Playlist(id: UUID(), name: trimmed, itemFileNames: initialPaths)
+        var seen = Set<String>()
+        let uniqueInitial = initialPaths.filter { seen.insert($0).inserted }
+        let playlist = Playlist(id: UUID(), name: trimmed, itemFileNames: uniqueInitial)
         playlists.insert(playlist, at: 0)
         savePlaylists()
         statusMessage = "Created playlist \"\(trimmed)\""
@@ -1218,6 +1248,10 @@ final class MediaManager {
             lastPlaylistID = nil
             saveLibraryState()
         }
+        let targetKey = "musicplayer.targetDownloadPlaylistID"
+        if UserDefaults.standard.string(forKey: targetKey) == playlist.id.uuidString {
+            UserDefaults.standard.removeObject(forKey: targetKey)
+        }
         if let coverFile = playlist.customCoverFileName {
             try? FileManager.default.removeItem(at: coversDirectoryURL.appendingPathComponent(coverFile))
         }
@@ -1225,6 +1259,18 @@ final class MediaManager {
         playlists.removeAll { $0.id == playlist.id }
         savePlaylists()
         statusMessage = "Deleted playlist \"\(playlist.name)\""
+    }
+
+    private static func scaledCoverImage(_ image: UIImage, maxDimension: CGFloat = 800) -> UIImage {
+        let size = image.size
+        let longest = max(size.width, size.height)
+        guard longest > maxDimension, longest > 0 else { return image }
+        let ratio = maxDimension / longest
+        let targetSize = CGSize(width: floor(size.width * ratio), height: floor(size.height * ratio))
+        let renderer = UIGraphicsImageRenderer(size: targetSize)
+        return renderer.image { _ in
+            image.draw(in: CGRect(origin: .zero, size: targetSize))
+        }
     }
 
     func updatePlaylistCover(for playlist: Playlist, image: UIImage?, remove: Bool = false) {
@@ -1237,12 +1283,15 @@ final class MediaManager {
         if remove || image == nil {
             playlists[index].customCoverFileName = nil
             playlistCovers.removeValue(forKey: playlist.id)
-        } else if let image, let jpeg = image.jpegData(compressionQuality: 0.85) {
-            let fileName = "playlist_\(playlist.id.uuidString).jpg"
-            try? FileManager.default.createDirectory(at: coversDirectoryURL, withIntermediateDirectories: true)
-            try? jpeg.write(to: coversDirectoryURL.appendingPathComponent(fileName), options: [.atomic])
-            playlists[index].customCoverFileName = fileName
-            playlistCovers[playlist.id] = image
+        } else if let image {
+            let scaled = Self.scaledCoverImage(image)
+            if let jpeg = scaled.jpegData(compressionQuality: 0.85) {
+                let fileName = "playlist_\(playlist.id.uuidString).jpg"
+                try? FileManager.default.createDirectory(at: coversDirectoryURL, withIntermediateDirectories: true)
+                try? jpeg.write(to: coversDirectoryURL.appendingPathComponent(fileName), options: [.atomic])
+                playlists[index].customCoverFileName = fileName
+                playlistCovers[playlist.id] = scaled
+            }
         }
 
         savePlaylists()
@@ -1256,7 +1305,7 @@ final class MediaManager {
                   let image = UIImage(data: data) else {
                 continue
             }
-            playlistCovers[playlist.id] = image
+            playlistCovers[playlist.id] = Self.scaledCoverImage(image)
         }
     }
 
@@ -1273,7 +1322,8 @@ final class MediaManager {
     }
 
     func playlistContains(_ item: MediaItem, in playlist: Playlist) -> Bool {
-        playlist.itemFileNames.contains(item.relativePath) || playlist.itemFileNames.contains(item.fileName)
+        let duplicateNames = duplicateLibraryFileNames()
+        return playlist.itemFileNames.contains { playlistKeyMatches($0, item: item, duplicateNames: duplicateNames) }
     }
 
     func add(_ item: MediaItem, to playlist: Playlist) {
@@ -1287,16 +1337,25 @@ final class MediaManager {
         }
     }
 
+    func remove(_ item: MediaItem, from playlist: Playlist) {
+        guard let index = playlists.firstIndex(where: { $0.id == playlist.id }) else { return }
+        let duplicateNames = duplicateLibraryFileNames()
+        let before = playlists[index].itemFileNames.count
+        playlists[index].itemFileNames.removeAll { playlistKeyMatches($0, item: item, duplicateNames: duplicateNames) }
+        if playlists[index].itemFileNames.count != before {
+            savePlaylists()
+            statusMessage = "Removed from \"\(playlist.name)\""
+        }
+    }
+
     func removeItems(at offsets: IndexSet, from playlist: Playlist) {
         guard let index = playlists.firstIndex(where: { $0.id == playlist.id }) else { return }
         let resolved = items(in: playlists[index])
-        let pathsToRemove = Set(offsets.compactMap { offset in
-            resolved.indices.contains(offset) ? resolved[offset].relativePath : nil
-        })
-        let namesToRemove = Set(offsets.compactMap { offset in
-            resolved.indices.contains(offset) ? resolved[offset].fileName : nil
-        })
-        playlists[index].itemFileNames.removeAll { pathsToRemove.contains($0) || namesToRemove.contains($0) }
+        let duplicateNames = duplicateLibraryFileNames()
+        let victims = offsets.compactMap { resolved.indices.contains($0) ? resolved[$0] : nil }
+        playlists[index].itemFileNames.removeAll { key in
+            victims.contains { playlistKeyMatches(key, item: $0, duplicateNames: duplicateNames) }
+        }
         savePlaylists()
     }
 
@@ -1750,8 +1809,6 @@ final class MediaManager {
     }
 
     private func rekeyTrackedPath(from oldPath: String, to newPath: String) {
-        let oldName = (oldPath as NSString).lastPathComponent
-
         if let id = existingIDsByPath.removeValue(forKey: oldPath) {
             existingIDsByPath[newPath] = id
         }
@@ -1782,8 +1839,7 @@ final class MediaManager {
         var playlistsChanged = false
         for idx in playlists.indices {
             for itemIdx in playlists[idx].itemFileNames.indices {
-                let stored = playlists[idx].itemFileNames[itemIdx]
-                if stored == oldPath || stored == oldName {
+                if playlists[idx].itemFileNames[itemIdx] == oldPath {
                     playlists[idx].itemFileNames[itemIdx] = newPath
                     playlistsChanged = true
                 }
@@ -1951,7 +2007,7 @@ final class MediaManager {
             return
         }
 
-        if let currentItem, !currentItem.isVideo, activeQueue.count > 1 {
+        if let currentItem, (!currentItem.isVideo || activePlaylistID != nil), activeQueue.count > 1 {
             playNext(fromQueueOnly: repeatMode == .off)
             return
         }
@@ -1962,6 +2018,9 @@ final class MediaManager {
         } else {
             isPlaying = false
             seek(to: 0)
+            if let currentItem {
+                updateNowPlayingInfo(for: currentItem)
+            }
         }
     }
 

@@ -15,65 +15,95 @@ struct ContentView: View {
     @Binding var quickLookTarget: QuickLookTarget?
 
     @State private var selectedTab: AppTab = .discovery
+    @State private var quickPlaylistName = ""
 
     var body: some View {
-        TabView(selection: $selectedTab) {
-            DiscoveryView(showPlayerSheet: $showPlayerSheet, selectedTab: $selectedTab)
-                .tabItem {
-                    Label("Discovery", systemImage: "safari")
-                }
-                .tag(AppTab.discovery)
+        Group {
+            TabView(selection: $selectedTab) {
+                DiscoveryView(showPlayerSheet: $showPlayerSheet, selectedTab: $selectedTab)
+                    .tabItem {
+                        Label("Discovery", systemImage: "safari")
+                    }
+                    .tag(AppTab.discovery)
 
-            PlaylistsView(showPlayerSheet: $showPlayerSheet, quickLookTarget: $quickLookTarget)
-                .tabItem {
-                    Label("Playlists", systemImage: "music.note.list")
-                }
-                .tag(AppTab.playlists)
+                PlaylistsView(showPlayerSheet: $showPlayerSheet, quickLookTarget: $quickLookTarget)
+                    .tabItem {
+                        Label("Playlists", systemImage: "music.note.list")
+                    }
+                    .tag(AppTab.playlists)
 
-            BrowserTabView(showPlayerSheet: $showPlayerSheet)
-                .tabItem {
-                    Label("Browser", systemImage: "globe")
-                }
-                .tag(AppTab.browser)
+                BrowserTabView(showPlayerSheet: $showPlayerSheet)
+                    .tabItem {
+                        Label("Browser", systemImage: "globe")
+                    }
+                    .tag(AppTab.browser)
 
-            LibraryView(showPlayerSheet: $showPlayerSheet, quickLookTarget: $quickLookTarget)
-                .tabItem {
-                    Label("Files", systemImage: "folder")
-                }
-                .tag(AppTab.files)
+                LibraryView(showPlayerSheet: $showPlayerSheet, quickLookTarget: $quickLookTarget)
+                    .tabItem {
+                        Label("Files", systemImage: "folder")
+                    }
+                    .tag(AppTab.files)
 
-            SettingsView(showPlayerSheet: $showPlayerSheet)
-                .tabItem {
-                    Label("Setting", systemImage: "gearshape")
+                SettingsView(showPlayerSheet: $showPlayerSheet)
+                    .tabItem {
+                        Label("Setting", systemImage: "gearshape")
+                    }
+                    .tag(AppTab.setting)
+            }
+            .preferredColorScheme(settings.appearanceMode.colorScheme)
+            .sheet(isPresented: $showPlayerSheet) {
+                NowPlayingView()
+            }
+            .sheet(item: $quickLookTarget) { target in
+                QuickLookSheetView(target: target)
+            }
+            .alert(
+                "Notice",
+                isPresented: Binding(
+                    get: { mediaManager.errorMessage != nil },
+                    set: { if !$0 { mediaManager.errorMessage = nil } }
+                )
+            ) {
+                Button("OK", role: .cancel) {
+                    mediaManager.errorMessage = nil
                 }
-                .tag(AppTab.setting)
-        }
-        .preferredColorScheme(settings.appearanceMode.colorScheme)
-        .sheet(isPresented: $showPlayerSheet) {
-            NowPlayingView()
-        }
-        .sheet(item: $quickLookTarget) { target in
-            QuickLookSheetView(target: target)
+            } message: {
+                Text(mediaManager.errorMessage ?? "")
+            }
+            .task(id: mediaManager.statusMessage) {
+                guard mediaManager.statusMessage != nil else { return }
+                try? await Task.sleep(for: .seconds(2.5))
+                if !Task.isCancelled {
+                    mediaManager.statusMessage = nil
+                }
+            }
         }
         .alert(
-            "Notice",
+            "New Playlist",
             isPresented: Binding(
-                get: { mediaManager.errorMessage != nil },
-                set: { if !$0 { mediaManager.errorMessage = nil } }
+                get: { mediaManager.newPlaylistTargetItem != nil },
+                set: {
+                    if !$0 {
+                        mediaManager.newPlaylistTargetItem = nil
+                        quickPlaylistName = ""
+                    }
+                }
             )
         ) {
-            Button("OK", role: .cancel) {
-                mediaManager.errorMessage = nil
+            TextField("Playlist name", text: $quickPlaylistName)
+            Button("Cancel", role: .cancel) {
+                mediaManager.newPlaylistTargetItem = nil
+                quickPlaylistName = ""
+            }
+            Button("Create & Add") {
+                if let target = mediaManager.newPlaylistTargetItem {
+                    mediaManager.createPlaylist(name: quickPlaylistName, initialPaths: [target.relativePath])
+                }
+                mediaManager.newPlaylistTargetItem = nil
+                quickPlaylistName = ""
             }
         } message: {
-            Text(mediaManager.errorMessage ?? "")
-        }
-        .task(id: mediaManager.statusMessage) {
-            guard mediaManager.statusMessage != nil else { return }
-            try? await Task.sleep(for: .seconds(2.5))
-            if !Task.isCancelled {
-                mediaManager.statusMessage = nil
-            }
+            Text("Enter a name for your new offline playlist.")
         }
     }
 }

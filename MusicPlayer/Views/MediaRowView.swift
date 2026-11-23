@@ -135,12 +135,23 @@ struct MediaRowView: View {
                           systemImage: isFavorite ? "heart.slash" : "heart")
                 }
 
-                if !mediaManager.playlists.isEmpty {
-                    Menu {
+                Menu {
+                    Button {
+                        mediaManager.newPlaylistTargetItem = item
+                    } label: {
+                        Label("New Playlist...", systemImage: "plus")
+                    }
+
+                    if !mediaManager.playlists.isEmpty {
+                        Divider()
                         ForEach(mediaManager.playlists) { playlist in
                             let isInPlaylist = mediaManager.playlistContains(item, in: playlist)
                             Button {
-                                mediaManager.add(item, to: playlist)
+                                if isInPlaylist {
+                                    mediaManager.remove(item, from: playlist)
+                                } else {
+                                    mediaManager.add(item, to: playlist)
+                                }
                             } label: {
                                 Label(
                                     playlist.name,
@@ -148,9 +159,9 @@ struct MediaRowView: View {
                                 )
                             }
                         }
-                    } label: {
-                        Label("Add to Playlist", systemImage: "text.badge.plus")
                     }
+                } label: {
+                    Label("Add to Playlist", systemImage: "text.badge.plus")
                 }
 
                 Divider()

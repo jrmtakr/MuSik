@@ -49,8 +49,12 @@ struct PlaylistsView: View {
     @State private var sortOrder: PlaylistSortOrder = .date
     @State private var showCreateAlert = false
     @State private var newPlaylistName = ""
+    @State private var createdPlaylistID: UUID?
     @State private var playlistToRename: Playlist?
     @State private var renameText = ""
+    @State private var searchItemToRename: MediaItem?
+    @State private var searchRenameText = ""
+    @State private var searchEditingInfoItem: MediaItem?
 
     @State private var coverTargetPlaylist: Playlist?
     @State private var showCoverPicker = false
@@ -104,6 +108,9 @@ struct PlaylistsView: View {
 
                             Button {
                                 mediaManager.playPlaylist(last)
+                                if mediaManager.currentItem?.isVideo == true {
+                                    showPlayerSheet = true
+                                }
                             } label: {
                                 Label("Play", systemImage: "play.fill")
                                     .font(.caption.weight(.semibold))
@@ -154,8 +161,9 @@ struct PlaylistsView: View {
                             customPlaylistRow(playlist)
                         }
                         .onDelete { offsets in
-                            for index in offsets where sortedPlaylists.indices.contains(index) {
-                                mediaManager.deletePlaylist(sortedPlaylists[index])
+                            let victims = offsets.compactMap { sortedPlaylists.indices.contains($0) ? sortedPlaylists[$0] : nil }
+                            for playlist in victims {
+                                mediaManager.deletePlaylist(playlist)
                             }
                         }
                     }
@@ -173,7 +181,13 @@ struct PlaylistsView: View {
                                 onQuickLook: {
                                     quickLookTarget = QuickLookTarget(title: item.displayTitle, fileURL: item.fileURL)
                                 },
-                                onRename: {}
+                                onRename: {
+                                    searchRenameText = item.name
+                                    searchItemToRename = item
+                                },
+                                onEditInfo: {
+                                    searchEditingInfoItem = item
+                                }
                             )
                         }
                     }
@@ -206,19 +220,33 @@ struct PlaylistsView: View {
                 }
             }
             .miniPlayerInset(showPlayerSheet: $showPlayerSheet)
+            .navigationDestination(item: $createdPlaylistID) { pid in
+                PlaylistDetailView(
+                    playlistID: pid,
+                    showPlayerSheet: $showPlayerSheet,
+                    quickLookTarget: $quickLookTarget
+                )
+            }
             .photosPicker(isPresented: $showCoverPicker, selection: $selectedCoverPhoto, matching: .images)
             .onChange(of: selectedCoverPhoto) { _, picked in
-                guard let picked, let target = coverTargetPlaylist else { return }
+                guard let picked, let target = coverTargetPlaylist else {
+                    coverTargetPlaylist = nil
+                    return
+                }
                 selectedCoverPhoto = nil
                 Task {
-                    if let data = try? await picked.loadTransferable(type: Data.self),
-                       let image = UIImage(data: data) {
-                        await MainActor.run {
+                    let data = try? await picked.loadTransferable(type: Data.self)
+                    let image = data.flatMap { UIImage(data: $0) }
+                    await MainActor.run {
+                        if let image {
                             mediaManager.updatePlaylistCover(for: target, image: image)
-                            coverTargetPlaylist = nil
                         }
+                        coverTargetPlaylist = nil
                     }
                 }
+            }
+            .sheet(item: $searchEditingInfoItem) { item in
+                EditTrackInfoSheet(item: item)
             }
             .alert("New Playlist", isPresented: $showCreateAlert) {
                 TextField("Playlist name", text: $newPlaylistName)
@@ -226,7 +254,9 @@ struct PlaylistsView: View {
                     newPlaylistName = ""
                 }
                 Button("Create") {
-                    mediaManager.createPlaylist(name: newPlaylistName)
+                    if let created = mediaManager.createPlaylist(name: newPlaylistName) {
+                        createdPlaylistID = created.id
+                    }
                     newPlaylistName = ""
                 }
             } message: {
@@ -249,6 +279,24 @@ struct PlaylistsView: View {
                     }
                     playlistToRename = nil
                 }
+            }
+        }
+        .alert(
+            "Rename Media",
+            isPresented: Binding(
+                get: { searchItemToRename != nil },
+                set: { if !$0 { searchItemToRename = nil } }
+            )
+        ) {
+            TextField("New name", text: $searchRenameText)
+            Button("Cancel", role: .cancel) {
+                searchItemToRename = nil
+            }
+            Button("Save") {
+                if let item = searchItemToRename {
+                    mediaManager.rename(item, to: searchRenameText)
+                }
+                searchItemToRename = nil
             }
         }
     }
@@ -312,6 +360,9 @@ struct PlaylistsView: View {
 
                 Button {
                     mediaManager.playPlaylist(playlist)
+                    if mediaManager.currentItem?.isVideo == true {
+                        showPlayerSheet = true
+                    }
                 } label: {
                     Image(systemName: "play.circle.fill")
                         .font(.title2)
@@ -325,6 +376,9 @@ struct PlaylistsView: View {
         .contextMenu {
             Button {
                 mediaManager.playPlaylist(playlist)
+                if mediaManager.currentItem?.isVideo == true {
+                    showPlayerSheet = true
+                }
             } label: {
                 Label("Play All", systemImage: "play.fill")
             }
@@ -418,6 +472,7 @@ private struct SmartPlaylistDetailView: View {
                                 mediaManager.isShuffleEnabled = false
                                 if let first = tracks.first {
                                     mediaManager.play(first)
+                                    if first.isVideo { showPlayerSheet = true }
                                 }
                             } label: {
                                 Label("Play All", systemImage: "play.fill")
@@ -431,6 +486,7 @@ private struct SmartPlaylistDetailView: View {
                                 mediaManager.isShuffleEnabled = true
                                 if let picked = tracks.randomElement() {
                                     mediaManager.play(picked)
+                                    if picked.isVideo { showPlayerSheet = true }
                                 }
                             } label: {
                                 Label("Shuffle Play", systemImage: "shuffle")
@@ -543,6 +599,9 @@ struct PlaylistDetailView: View {
                                     Button {
                                         mediaManager.isShuffleEnabled = false
                                         mediaManager.playPlaylist(playlist)
+                                        if mediaManager.currentItem?.isVideo == true {
+                                            showPlayerSheet = true
+                                        }
                                     } label: {
                                         Label("Play All", systemImage: "play.fill")
                                             .font(.subheadline.weight(.semibold))
@@ -554,6 +613,9 @@ struct PlaylistDetailView: View {
                                     Button {
                                         mediaManager.isShuffleEnabled = true
                                         mediaManager.playPlaylist(playlist)
+                                        if mediaManager.currentItem?.isVideo == true {
+                                            showPlayerSheet = true
+                                        }
                                     } label: {
                                         Label("Shuffle Play", systemImage: "shuffle")
                                             .font(.subheadline.weight(.semibold))
@@ -678,8 +740,27 @@ private struct AddToPlaylistSheet: View {
 
     let playlist: Playlist
 
+    @State private var searchText = ""
+
     private var currentPlaylist: Playlist {
         mediaManager.playlists.first(where: { $0.id == playlist.id }) ?? playlist
+    }
+
+    private var trimmedSearch: String {
+        searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var filteredItems: [MediaItem] {
+        guard !trimmedSearch.isEmpty else { return mediaManager.items }
+        return mediaManager.items.filter {
+            $0.displayTitle.localizedCaseInsensitiveContains(trimmedSearch) ||
+                ($0.artist?.localizedCaseInsensitiveContains(trimmedSearch) ?? false) ||
+                $0.fileExtension.localizedCaseInsensitiveContains(trimmedSearch)
+        }
+    }
+
+    private var unaddedFilteredItems: [MediaItem] {
+        filteredItems.filter { !mediaManager.playlistContains($0, in: currentPlaylist) }
     }
 
     var body: some View {
@@ -691,11 +772,15 @@ private struct AddToPlaylistSheet: View {
                         systemImage: "music.note",
                         description: Text("Import or download audio and video files first.")
                     )
+                } else if filteredItems.isEmpty {
+                    ContentUnavailableView.search(text: searchText)
                 } else {
-                    List(mediaManager.items) { item in
+                    List(filteredItems) { item in
                         let isIncluded = mediaManager.playlistContains(item, in: currentPlaylist)
                         Button {
-                            if !isIncluded {
+                            if isIncluded {
+                                mediaManager.remove(item, from: currentPlaylist)
+                            } else {
                                 mediaManager.add(item, to: currentPlaylist)
                             }
                         } label: {
@@ -724,14 +809,25 @@ private struct AddToPlaylistSheet: View {
                                     .font(.title3)
                                     .foregroundStyle(isIncluded ? Color.green : Color.accentColor)
                             }
+                            .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
                     }
                 }
             }
+            .searchable(text: $searchText, prompt: "Search library")
             .navigationTitle("Add to \(currentPlaylist.name)")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    if !unaddedFilteredItems.isEmpty {
+                        Button("Add All (\(unaddedFilteredItems.count))") {
+                            for item in unaddedFilteredItems {
+                                mediaManager.add(item, to: currentPlaylist)
+                            }
+                        }
+                    }
+                }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("Done") {
                         dismiss()

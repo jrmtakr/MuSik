@@ -15,6 +15,8 @@ struct NowPlayingView: View {
     @State private var showQueueSheet = false
     @State private var showFullscreenFFmpegVideo = false
     @State private var editingInfoItem: MediaItem?
+    @State private var showNewPlaylistAlert = false
+    @State private var newPlaylistName = ""
 
     private let speedOptions: [Float] = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
     private let sleepPresets = [5, 10, 15, 30, 45, 60]
@@ -69,6 +71,20 @@ struct NowPlayingView: View {
                 }
             }
             .navigationBarTitleDisplayMode(.inline)
+            .alert("New Playlist", isPresented: $showNewPlaylistAlert) {
+                TextField("Playlist name", text: $newPlaylistName)
+                Button("Cancel", role: .cancel) {
+                    newPlaylistName = ""
+                }
+                Button("Create & Add") {
+                    if let current = mediaManager.currentItem, !current.relativePath.hasPrefix("__remote__/") {
+                        mediaManager.createPlaylist(name: newPlaylistName, initialPaths: [current.relativePath])
+                    }
+                    newPlaylistName = ""
+                }
+            } message: {
+                Text("Enter a name for your new offline playlist.")
+            }
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
                     Button {
@@ -543,6 +559,40 @@ struct NowPlayingView: View {
                             .padding(.vertical, 12)
                             .background(Color.secondary.opacity(0.14), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
                     }
+                }
+
+                Menu {
+                    Button {
+                        newPlaylistName = ""
+                        showNewPlaylistAlert = true
+                    } label: {
+                        Label("New Playlist...", systemImage: "plus")
+                    }
+
+                    if !mediaManager.playlists.isEmpty {
+                        Divider()
+                        ForEach(mediaManager.playlists) { playlist in
+                            let isInPlaylist = mediaManager.playlistContains(item, in: playlist)
+                            Button {
+                                if isInPlaylist {
+                                    mediaManager.remove(item, from: playlist)
+                                } else {
+                                    mediaManager.add(item, to: playlist)
+                                }
+                            } label: {
+                                Label(
+                                    playlist.name,
+                                    systemImage: isInPlaylist ? "checkmark" : "plus"
+                                )
+                            }
+                        }
+                    }
+                } label: {
+                    Label("Add to Playlist", systemImage: "text.badge.plus")
+                        .font(.subheadline.weight(.semibold))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 12)
+                        .background(Color.secondary.opacity(0.14), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
                 }
             }
         }
