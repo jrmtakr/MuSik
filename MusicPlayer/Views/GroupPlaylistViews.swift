@@ -554,11 +554,37 @@ private enum GroupAddSourceTab: String, CaseIterable, Identifiable {
 }
 
 private struct GroupAddSongsSheet: View {
-    @Environment(MediaManager.self) private var mediaManager
     @Environment(GroupPlaylistService.self) private var groupService
+    let groupID: UUID
+
+    var body: some View {
+        CollaborativeAddSongsSheet(
+            navigationTitle: "Add Songs to Group",
+            actionTitle: "Send",
+            onSendLocal: { item in
+                groupService.sendLocalItem(item, to: groupID)
+            },
+            onSendSearched: { title, artist, videoID, durationSeconds in
+                groupService.sendSearchedSong(
+                    title: title,
+                    artist: artist,
+                    youtubeVideoID: videoID,
+                    durationSeconds: durationSeconds,
+                    to: groupID
+                )
+            }
+        )
+    }
+}
+
+struct CollaborativeAddSongsSheet: View {
+    @Environment(MediaManager.self) private var mediaManager
     @Environment(\.dismiss) private var dismiss
 
-    let groupID: UUID
+    let navigationTitle: String
+    let actionTitle: String
+    let onSendLocal: (MediaItem) -> Void
+    let onSendSearched: (String, String, String?, Double?) -> Void
 
     @State private var sourceTab: GroupAddSourceTab = .library
     @State private var libraryFilter = ""
@@ -594,7 +620,7 @@ private struct GroupAddSongsSheet: View {
                             ContentUnavailableView(
                                 "No Offline Media",
                                 systemImage: "music.note",
-                                description: Text("Switch to \"Search Songs\" above to send any song directly.")
+                                description: Text("Switch to \"Search Songs\" above to find and send any song directly.")
                             )
                         } else {
                             ForEach(filteredLibraryItems) { item in
@@ -622,9 +648,9 @@ private struct GroupAddSongsSheet: View {
 
                                     Button {
                                         sentKeys.insert(item.relativePath)
-                                        groupService.sendLocalItem(item, to: groupID)
+                                        onSendLocal(item)
                                     } label: {
-                                        Text(alreadySent ? "Sent" : "Send")
+                                        Text(alreadySent ? "Sent" : actionTitle)
                                             .font(.caption.weight(.bold))
                                             .padding(.horizontal, 10)
                                             .padding(.vertical, 5)
@@ -666,7 +692,7 @@ private struct GroupAddSongsSheet: View {
                             ContentUnavailableView(
                                 "Search Any Song",
                                 systemImage: "magnifyingglass",
-                                description: Text("Find a song by name or artist and send it live to your group playlist.")
+                                description: Text("Find a song by name or artist and send it live.")
                             )
                         } else {
                             List(searchResults, id: \.videoID) { hit in
@@ -693,15 +719,9 @@ private struct GroupAddSongsSheet: View {
 
                                     Button {
                                         sentKeys.insert(hit.videoID)
-                                        groupService.sendSearchedSong(
-                                            title: hit.title,
-                                            artist: hit.artist,
-                                            youtubeVideoID: hit.videoID,
-                                            durationSeconds: hit.durationSeconds,
-                                            to: groupID
-                                        )
+                                        onSendSearched(hit.title, hit.artist, hit.videoID, hit.durationSeconds)
                                     } label: {
-                                        Text(alreadySent ? "Sent" : "Send")
+                                        Text(alreadySent ? "Sent" : actionTitle)
                                             .font(.caption.weight(.bold))
                                             .padding(.horizontal, 10)
                                             .padding(.vertical, 5)
@@ -720,7 +740,7 @@ private struct GroupAddSongsSheet: View {
                 }
             }
             .applyAppTheme()
-            .navigationTitle("Add Songs to Group")
+            .navigationTitle(navigationTitle)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {

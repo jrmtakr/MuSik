@@ -43,6 +43,7 @@ struct PlaylistsView: View {
     @Environment(MediaManager.self) private var mediaManager
     @Environment(AppSettings.self) private var settings
     @Environment(GroupPlaylistService.self) private var groupService
+    @Environment(PartyQueueService.self) private var partyService
     @Binding var showPlayerSheet: Bool
     @Binding var quickLookTarget: QuickLookTarget?
 
@@ -53,6 +54,9 @@ struct PlaylistsView: View {
     @State private var showCreateGroupSheet = false
     @State private var showJoinGroupSheet = false
     @State private var selectedGroupID: UUID?
+    @State private var showCreatePartySheet = false
+    @State private var showJoinPartySheet = false
+    @State private var selectedPartyID: UUID?
     @State private var newPlaylistName = ""
     @State private var createdPlaylistID: UUID?
     @State private var playlistToRename: Playlist?
@@ -196,6 +200,67 @@ struct PlaylistsView: View {
                             }
                         }
                     }
+
+                    Section("Party Queue & Blend (Live FIFO)") {
+                        HStack(spacing: 10) {
+                            Button {
+                                showCreatePartySheet = true
+                            } label: {
+                                Label("Start Party", systemImage: "radio.fill")
+                                    .font(.caption.weight(.semibold))
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(.borderedProminent)
+
+                            Button {
+                                showJoinPartySheet = true
+                            } label: {
+                                Label("Join Party Link", systemImage: "person.badge.plus")
+                                    .font(.caption.weight(.semibold))
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(.bordered)
+                        }
+                        .padding(.vertical, 2)
+
+                        if partyService.parties.isEmpty {
+                            Text("Queue songs together with friends in real time. First come, first served: whoever queues first plays first!")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        } else {
+                            ForEach(partyService.parties) { party in
+                                NavigationLink {
+                                    PartyQueueDetailView(partyID: party.id, showPlayerSheet: $showPlayerSheet)
+                                } label: {
+                                    HStack(spacing: 12) {
+                                        ZStack {
+                                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                                .fill(Color.orange.opacity(0.16))
+                                                .frame(width: 48, height: 48)
+                                            Image(systemName: "radio.fill")
+                                                .font(.title3.weight(.semibold))
+                                                .foregroundStyle(.orange)
+                                        }
+
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text(party.name)
+                                                .font(.body.weight(.semibold))
+                                                .lineLimit(1)
+                                            HStack(spacing: 6) {
+                                                Text("\(party.upNext.count) in queue")
+                                                Text("•")
+                                                Text(party.formattedCode)
+                                                    .font(.caption2.monospaced().weight(.bold))
+                                            }
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                        }
+                                    }
+                                    .padding(.vertical, 2)
+                                }
+                            }
+                        }
+                    }
                 }
 
                 Section("My Playlists") {
@@ -325,6 +390,20 @@ struct PlaylistsView: View {
                         } label: {
                             Label("Join Group with Code / Link", systemImage: "person.badge.plus")
                         }
+
+                        Divider()
+
+                        Button {
+                            showCreatePartySheet = true
+                        } label: {
+                            Label("Start Party Queue / Blend (FIFO)", systemImage: "radio.fill")
+                        }
+
+                        Button {
+                            showJoinPartySheet = true
+                        } label: {
+                            Label("Join Party with Code / Link", systemImage: "link.badge.plus")
+                        }
                     } label: {
                         Image(systemName: "plus.circle.fill")
                             .font(.title3)
@@ -345,16 +424,32 @@ struct PlaylistsView: View {
                     showPlayerSheet: $showPlayerSheet
                 )
             }
+            .navigationDestination(item: $selectedPartyID) { pid in
+                PartyQueueDetailView(
+                    partyID: pid,
+                    showPlayerSheet: $showPlayerSheet
+                )
+            }
             .onAppear {
                 if let pending = groupService.pendingOpenGroupID {
                     groupService.pendingOpenGroupID = nil
                     selectedGroupID = pending
+                }
+                if let pendingParty = partyService.pendingOpenPartyID {
+                    partyService.pendingOpenPartyID = nil
+                    selectedPartyID = pendingParty
                 }
             }
             .onChange(of: groupService.pendingOpenGroupID) { _, pending in
                 if let pending {
                     groupService.pendingOpenGroupID = nil
                     selectedGroupID = pending
+                }
+            }
+            .onChange(of: partyService.pendingOpenPartyID) { _, pendingParty in
+                if let pendingParty {
+                    partyService.pendingOpenPartyID = nil
+                    selectedPartyID = pendingParty
                 }
             }
             .photosPicker(isPresented: $showCoverPicker, selection: $selectedCoverPhoto, matching: .images)
@@ -391,6 +486,16 @@ struct PlaylistsView: View {
             .sheet(isPresented: $showJoinGroupSheet) {
                 JoinGroupPlaylistSheet { joinedID in
                     selectedGroupID = joinedID
+                }
+            }
+            .sheet(isPresented: $showCreatePartySheet) {
+                CreatePartyQueueSheet { newPartyID in
+                    selectedPartyID = newPartyID
+                }
+            }
+            .sheet(isPresented: $showJoinPartySheet) {
+                JoinPartyQueueSheet { joinedPartyID in
+                    selectedPartyID = joinedPartyID
                 }
             }
             .alert("New Playlist", isPresented: $showCreateAlert) {

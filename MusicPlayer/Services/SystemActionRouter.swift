@@ -126,6 +126,12 @@ final class SystemActionRouter {
             }
             return true
 
+        case "party":
+            Task { @MainActor in
+                await PartyQueueService.shared.joinParty(input: url.absoluteString)
+            }
+            return true
+
         case "shuffle":
             MediaManager.shared.shuffleAllOfflineMusic()
             shouldPresentPlayerSheet = MediaManager.shared.currentItem != nil

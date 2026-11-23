@@ -15,6 +15,7 @@ struct ContentView: View {
     @Environment(BrowserStore.self) private var browserStore
     @Environment(WebMediaDownloader.self) private var downloader
     @Environment(GroupPlaylistService.self) private var groupService
+    @Environment(PartyQueueService.self) private var partyService
     @Environment(SystemActionRouter.self) private var actionRouter
     @Binding var showPlayerSheet: Bool
     @Binding var quickLookTarget: QuickLookTarget?
@@ -60,12 +61,17 @@ struct ContentView: View {
             .applyCustomTextStyle()
             .onAppear {
                 updateNavigationBarAppearance()
-                if groupService.pendingOpenGroupID != nil {
+                if groupService.pendingOpenGroupID != nil || partyService.pendingOpenPartyID != nil {
                     selectedTab = .playlists
                 }
                 consumePendingSystemActions()
             }
             .onChange(of: groupService.pendingOpenGroupID) { _, newID in
+                if newID != nil {
+                    selectedTab = .playlists
+                }
+            }
+            .onChange(of: partyService.pendingOpenPartyID) { _, newID in
                 if newID != nil {
                     selectedTab = .playlists
                 }

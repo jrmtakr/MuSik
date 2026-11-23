@@ -629,6 +629,17 @@ struct NowPlayingView: View {
                             }
                         }
                     }
+
+                    if !PartyQueueService.shared.parties.isEmpty {
+                        Divider()
+                        ForEach(PartyQueueService.shared.parties) { party in
+                            Button {
+                                PartyQueueService.shared.queueLocalItem(item, to: party.id)
+                            } label: {
+                                Label("Queue in Party: \(party.name)", systemImage: "radio")
+                            }
+                        }
+                    }
                 } label: {
                     Label("Add to Playlist", systemImage: "text.badge.plus")
                         .font(.subheadline.weight(.semibold))
