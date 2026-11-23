@@ -1,0 +1,1005 @@
+import Foundation
+import Observation
+import SwiftUI
+
+enum TrendSourceTag: String, Codable, CaseIterable, Hashable {
+    case tiktok = "TikTok Viral"
+    case instagram = "Instagram Reels"
+    case appleCharts = "Apple Charts"
+    case deezerCharts = "Top Charts"
+
+    var badgeColor: Color {
+        switch self {
+        case .tiktok: return .pink
+        case .instagram: return .purple
+        case .appleCharts: return .red
+        case .deezerCharts: return .blue
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .tiktok: return "music.quarternote.3"
+        case .instagram: return "sparkles.tv.fill"
+        case .appleCharts: return "chart.line.uptrend.xyaxis"
+        case .deezerCharts: return "flame.fill"
+        }
+    }
+}
+
+struct DiscoveredArtistRecord: Identifiable, Hashable, Codable {
+    var id: String { normalizedKey }
+    let normalizedKey: String
+    var canonicalName: String
+    var genre: String
+    var trendSources: [TrendSourceTag]
+    var viralTrackTitle: String?
+    var imageURLString: String?
+    var iTunesArtistID: Int?
+    var deezerArtistID: Int?
+    var discoveredAt: Date
+    var lastSeenTrendingAt: Date
+    var isNewSinceStaticCatalog: Bool
+
+    var imageURL: URL? {
+        imageURLString.flatMap { URL(string: $0) }
+    }
+}
+
+private struct TrendingArtistsPersistedState: Codable {
+    var artists: [DiscoveredArtistRecord] = []
+    var lastRefreshedAt: Date?
+    var autoMonthlyRefresh: Bool = true
+}
+
+struct ArtistReleaseItem: Identifiable, Hashable {
+    var id: Int { collectionId }
+    let collectionId: Int
+    let title: String
+    let artistName: String
+    let releaseDate: Date?
+    let releaseYearText: String
+    let artworkURL: URL?
+    let trackCount: Int
+    let genre: String?
+    let isSingleOrEP: Bool
+}
+
+struct ArtistTopSongItem: Identifiable, Hashable {
+    var id: String { "\(ArtistDatabase.normalizeLookupKey(title))|\(ArtistDatabase.normalizeLookupKey(artistName))" }
+    let title: String
+    let artistName: String
+    let albumTitle: String?
+    let durationSeconds: Double?
+    let artworkURL: URL?
+    let previewURL: URL?
+}
+
+struct ArtistMusicVideoItem: Identifiable, Hashable {
+    var id: Int { trackId }
+    let trackId: Int
+    let title: String
+    let artistName: String
+    let durationSeconds: Double?
+    let artworkURL: URL?
+    let releaseDate: Date?
+}
+
+struct ArtistReleaseTrackItem: Identifiable, Hashable {
+    var id: String { "\(trackNumber)-\(title)" }
+    let trackNumber: Int
+    let title: String
+    let artistName: String
+    let durationSeconds: Double?
+}
+
+struct SimilarArtistItem: Identifiable, Hashable {
+    var id: String { name }
+    let name: String
+    let imageURL: URL?
+    let deezerArtistID: Int?
+}
+
+struct ArtistProfileBundle {
+    let canonicalName: String
+    let genre: String?
+    let heroImageURL: URL?
+    let fanCount: Int?
+    let appleMusicURL: URL?
+    let iTunesArtistID: Int?
+    let deezerArtistID: Int?
+    let trendSources: [TrendSourceTag]
+    let discoveredAt: Date?
+    let latestRelease: ArtistReleaseItem?
+    let topSongs: [ArtistTopSongItem]
+    let albums: [ArtistReleaseItem]
+    let singlesAndEPs: [ArtistReleaseItem]
+    let musicVideos: [ArtistMusicVideoItem]
+    let similarArtists: [SimilarArtistItem]
+}
+
+@Observable
+final class TrendingArtistsService {
+    static let shared = TrendingArtistsService()
+
+    private static let safariUA =
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 Safari/605.1.15"
+
+    private var state = TrendingArtistsPersistedState()
+    var isRefreshing = false
+    var lastStatusMessage: String?
+
+    private var storageFileURL: URL {
+        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent("trending_artists.json")
+    }
+
+    var artists: [DiscoveredArtistRecord] {
+        state.artists
+    }
+
+    var newlyAddedArtists: [DiscoveredArtistRecord] {
+        state.artists.filter(\.isNewSinceStaticCatalog)
+    }
+
+    var lastRefreshedAt: Date? {
+        state.lastRefreshedAt
+    }
+
+    var autoMonthlyRefresh: Bool {
+        get { state.autoMonthlyRefresh }
+        set {
+            state.autoMonthlyRefresh = newValue
+            saveToDisk()
+        }
+    }
+
+    var needsMonthlyRefresh: Bool {
+        guard state.autoMonthlyRefresh else { return false }
+        guard let last = state.lastRefreshedAt else { return true }
+        let cal = Calendar.current
+        let lastYear = cal.component(.year, from: last)
+        let lastMonth = cal.component(.month, from: last)
+        let nowYear = cal.component(.year, from: .now)
+        let nowMonth = cal.component(.month, from: .now)
+        if lastYear != nowYear || lastMonth != nowMonth {
+            return true
+        }
+        return Date().timeIntervalSince(last) >= 28 * 86_400
+    }
+
+    var nextScheduledRefreshDate: Date? {
+        guard let last = state.lastRefreshedAt else { return nil }
+        let cal = Calendar.current
+        guard let nextMonth = cal.date(byAdding: .month, value: 1, to: last) else { return nil }
+        return cal.date(from: cal.dateComponents([.year, .month], from: nextMonth))
+    }
+
+    private init() {
+        loadFromDisk()
+        registerDiscoveredIntoDatabase()
+    }
+
+    func record(forArtistName name: String) -> DiscoveredArtistRecord? {
+        let key = ArtistDatabase.normalizeLookupKey(name)
+        guard !key.isEmpty else { return nil }
+        return state.artists.first(where: { $0.normalizedKey == key })
+    }
+
+    // MARK: - Monthly Social & Chart Refresh
+
+    func refreshIfDue() async {
+        guard needsMonthlyRefresh else { return }
+        await refreshTrendingArtists(force: false)
+    }
+
+    @discardableResult
+    func refreshTrendingArtists(force: Bool = false) async -> Int {
+        guard !isRefreshing else { return 0 }
+        if !force && !needsMonthlyRefresh {
+            return 0
+        }
+
+        await MainActor.run {
+            self.isRefreshing = true
+            self.lastStatusMessage = "Scanning TikTok, Instagram Reels & Charts..."
+        }
+
+        let year = Calendar.current.component(.year, from: .now)
+
+        async let tiktokTask1 = fetchDeezerViralPlaylistArtists(query: "TikTok Trending \(year)", tag: .tiktok)
+        async let tiktokTask2 = fetchDeezerViralPlaylistArtists(query: "Viral TikTok Hits \(year)", tag: .tiktok)
+        async let reelsTask1 = fetchDeezerViralPlaylistArtists(query: "Instagram Reels \(year)", tag: .instagram)
+        async let reelsTask2 = fetchDeezerViralPlaylistArtists(query: "Instagram Reels Hits", tag: .instagram)
+        async let appleTask = fetchAppleTopSongsArtists()
+        async let deezerChartTask = fetchDeezerTopChartArtists()
+
+        var rawDiscoveries: [RawDiscoveredCandidate] = []
+        rawDiscoveries.append(contentsOf: await tiktokTask1)
+        rawDiscoveries.append(contentsOf: await tiktokTask2)
+        rawDiscoveries.append(contentsOf: await reelsTask1)
+        rawDiscoveries.append(contentsOf: await reelsTask2)
+        rawDiscoveries.append(contentsOf: await appleTask)
+        rawDiscoveries.append(contentsOf: await deezerChartTask)
+
+        var existingByKey: [String: DiscoveredArtistRecord] = Dictionary(
+            state.artists.map { ($0.normalizedKey, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        let previouslyKnownKeys = Set(existingByKey.keys)
+
+        var mergedByKey: [String: DiscoveredArtistRecord] = existingByKey
+        var orderedKeys: [String] = []
+        var newDiscoveryCount = 0
+
+        for cand in rawDiscoveries {
+            let splitNames = ArtistDatabase.splitAndCanonicalize(cand.artistName)
+            for singleRaw in splitNames {
+                let canonical = ArtistDatabase.canonicalizeSingle(singleRaw)
+                let key = ArtistDatabase.normalizeLookupKey(canonical)
+                guard !key.isEmpty,
+                      key.count >= 2,
+                      !ArtistDatabase.looksLikeUploaderChannel(canonical) else {
+                    continue
+                }
+
+                if var existing = mergedByKey[key] {
+                    if !existing.trendSources.contains(cand.source) {
+                        existing.trendSources.append(cand.source)
+                    }
+                    if (existing.viralTrackTitle?.isEmpty ?? true), let vt = cand.trackTitle {
+                        existing.viralTrackTitle = vt
+                    }
+                    if existing.imageURLString == nil, let img = cand.imageURLString {
+                        existing.imageURLString = img
+                    }
+                    if existing.iTunesArtistID == nil, let aid = cand.iTunesArtistID {
+                        existing.iTunesArtistID = aid
+                    }
+                    if existing.deezerArtistID == nil, let did = cand.deezerArtistID {
+                        existing.deezerArtistID = did
+                    }
+                    existing.lastSeenTrendingAt = .now
+                    mergedByKey[key] = existing
+                } else {
+                    let isNewArtist = !ArtistDatabase.isInStaticCatalog(canonical)
+                    let record = DiscoveredArtistRecord(
+                        normalizedKey: key,
+                        canonicalName: canonical,
+                        genre: ArtistDatabase.genre(forArtist: canonical) ?? "Pop & Viral",
+                        trendSources: [cand.source],
+                        viralTrackTitle: cand.trackTitle,
+                        imageURLString: cand.imageURLString,
+                        iTunesArtistID: cand.iTunesArtistID,
+                        deezerArtistID: cand.deezerArtistID,
+                        discoveredAt: .now,
+                        lastSeenTrendingAt: .now,
+                        isNewSinceStaticCatalog: isNewArtist
+                    )
+                    mergedByKey[key] = record
+                    if !previouslyKnownKeys.contains(key) {
+                        newDiscoveryCount += 1
+                    }
+                }
+                if !orderedKeys.contains(key) {
+                    orderedKeys.append(key)
+                }
+            }
+        }
+
+        // Prioritize new emerging artists and entries missing artwork/IDs for quick metadata hydration
+        let hydrationTargets = orderedKeys
+            .compactMap { mergedByKey[$0] }
+            .filter { $0.imageURLString == nil || $0.iTunesArtistID == nil }
+            .sorted { lhs, rhs in
+                if lhs.isNewSinceStaticCatalog != rhs.isNewSinceStaticCatalog {
+                    return lhs.isNewSinceStaticCatalog
+                }
+                return lhs.trendSources.count > rhs.trendSources.count
+            }
+            .prefix(36)
+
+        await withTaskGroup(of: (key: String, genre: String?, imageURL: String?, iTunesID: Int?, deezerID: Int?).self) { group in
+            for item in hydrationTargets {
+                group.addTask {
+                    let enriched = await Self.fetchQuickArtistMetadata(
+                        name: item.canonicalName,
+                        needsImage: item.imageURLString == nil,
+                        needsITunes: item.iTunesArtistID == nil
+                    )
+                    return (item.normalizedKey, enriched.genre, enriched.imageURL, enriched.iTunesID, enriched.deezerID)
+                }
+            }
+            for await patch in group {
+                guard var rec = mergedByKey[patch.key] else { continue }
+                if let g = patch.genre, !g.isEmpty { rec.genre = g }
+                if let img = patch.imageURL, rec.imageURLString == nil { rec.imageURLString = img }
+                if let iid = patch.iTunesID, rec.iTunesArtistID == nil { rec.iTunesArtistID = iid }
+                if let did = patch.deezerID, rec.deezerArtistID == nil { rec.deezerArtistID = did }
+                mergedByKey[patch.key] = rec
+            }
+        }
+
+        let sortedFinal = mergedByKey.values.sorted { lhs, rhs in
+            if lhs.isNewSinceStaticCatalog != rhs.isNewSinceStaticCatalog {
+                return lhs.isNewSinceStaticCatalog
+            }
+            if lhs.lastSeenTrendingAt != rhs.lastSeenTrendingAt {
+                return lhs.lastSeenTrendingAt > rhs.lastSeenTrendingAt
+            }
+            if lhs.trendSources.count != rhs.trendSources.count {
+                return lhs.trendSources.count > rhs.trendSources.count
+            }
+            return lhs.canonicalName.localizedCaseInsensitiveCompare(rhs.canonicalName) == .orderedAscending
+        }
+
+        await MainActor.run {
+            self.state.artists = Array(sortedFinal.prefix(400))
+            self.state.lastRefreshedAt = .now
+            self.isRefreshing = false
+            self.lastStatusMessage = newDiscoveryCount > 0
+                ? "Added \(newDiscoveryCount) trending new \(newDiscoveryCount == 1 ? "artist" : "artists") from TikTok, Reels & Charts"
+                : "Trending artists catalog refreshed (\(self.state.artists.count) profiles)"
+            self.saveToDisk()
+            self.registerDiscoveredIntoDatabase()
+        }
+
+        return newDiscoveryCount
+    }
+
+    private func registerDiscoveredIntoDatabase() {
+        let entries = state.artists.map { rec in
+            ArtistCatalogEntry(
+                canonicalName: rec.canonicalName,
+                genre: rec.genre,
+                aliases: [],
+                requiresSeparatedContext: rec.canonicalName.count <= 4
+            )
+        }
+        ArtistDatabase.registerDynamicArtists(entries)
+    }
+
+    // MARK: - Apple Music-Style Artist Profile & Releases
+
+    func loadArtistProfile(
+        artistName: String,
+        seedITunesID: Int? = nil,
+        seedDeezerID: Int? = nil,
+        seedImageURL: URL? = nil
+    ) async -> ArtistProfileBundle {
+        let cachedRec = record(forArtistName: artistName)
+        let queryName = cachedRec?.canonicalName ?? ArtistDatabase.canonicalizeSingle(artistName)
+
+        async let iTunesArtTask = Self.fetchITunesArtistInfo(name: queryName, knownID: seedITunesID ?? cachedRec?.iTunesArtistID)
+        async let deezerArtTask = Self.fetchDeezerArtistInfo(name: queryName, knownID: seedDeezerID ?? cachedRec?.deezerArtistID)
+
+        let itArtist = await iTunesArtTask
+        let dzArtist = await deezerArtTask
+
+        let resolvedITunesID = itArtist.artistId ?? seedITunesID ?? cachedRec?.iTunesArtistID
+        let resolvedDeezerID = dzArtist.id ?? seedDeezerID ?? cachedRec?.deezerArtistID
+
+        async let albumsTask = Self.fetchITunesArtistReleases(artistId: resolvedITunesID, fallbackName: queryName)
+        async let iTunesSongsTask = Self.fetchITunesArtistTopSongs(artistId: resolvedITunesID, fallbackName: queryName)
+        async let musicVideosTask = Self.fetchITunesArtistMusicVideos(artistId: resolvedITunesID)
+        async let dzTopTask = Self.fetchDeezerArtistTopTracks(deezerId: resolvedDeezerID)
+        async let dzRelatedTask = Self.fetchDeezerSimilarArtists(deezerId: resolvedDeezerID)
+
+        let allReleases = await albumsTask
+        let iTunesSongs = await iTunesSongsTask
+        let musicVideos = await musicVideosTask
+        let dzTopSongs = await dzTopTask
+        let similarArtists = await dzRelatedTask
+
+        let canonical = itArtist.name ?? dzArtist.name ?? queryName
+        let genre = itArtist.genre ?? cachedRec?.genre ?? ArtistDatabase.genre(forArtist: canonical)
+        let heroURL = dzArtist.imageURL ?? seedImageURL ?? cachedRec?.imageURL ?? allReleases.first?.artworkURL
+
+        let topSongs = Self.mergeTopSongs(deezerSongs: dzTopSongs, iTunesSongs: iTunesSongs, defaultArtist: canonical)
+        let albums = allReleases.filter { !$0.isSingleOrEP }
+        let singlesAndEPs = allReleases.filter { $0.isSingleOrEP }
+        let latestRelease = allReleases.first
+
+        // Cache enriched IDs & artwork locally if this artist is in our trending catalog
+        if var rec = cachedRec {
+            if rec.iTunesArtistID == nil { rec.iTunesArtistID = resolvedITunesID }
+            if rec.deezerArtistID == nil { rec.deezerArtistID = resolvedDeezerID }
+            if rec.imageURLString == nil, let heroURL { rec.imageURLString = heroURL.absoluteString }
+            if let g = genre, !g.isEmpty { rec.genre = g }
+            if let idx = state.artists.firstIndex(where: { $0.normalizedKey == rec.normalizedKey }) {
+                state.artists[idx] = rec
+                saveToDisk()
+            }
+        }
+
+        return ArtistProfileBundle(
+            canonicalName: canonical,
+            genre: genre,
+            heroImageURL: heroURL,
+            fanCount: dzArtist.fanCount,
+            appleMusicURL: itArtist.linkURL,
+            iTunesArtistID: resolvedITunesID,
+            deezerArtistID: resolvedDeezerID,
+            trendSources: cachedRec?.trendSources ?? [],
+            discoveredAt: cachedRec?.discoveredAt,
+            latestRelease: latestRelease,
+            topSongs: topSongs,
+            albums: albums,
+            singlesAndEPs: singlesAndEPs,
+            musicVideos: musicVideos,
+            similarArtists: similarArtists
+        )
+    }
+
+    func fetchReleaseTracks(collectionId: Int) async -> [ArtistReleaseTrackItem] {
+        guard let url = URL(string: "https://itunes.apple.com/lookup?id=\(collectionId)&entity=song&limit=100"),
+              let dict = await Self.getJSON(url: url) as? [String: Any],
+              let results = dict["results"] as? [[String: Any]] else {
+            return []
+        }
+
+        return results.compactMap { row in
+            guard (row["wrapperType"] as? String) == "track",
+                  let title = row["trackName"] as? String else {
+                return nil
+            }
+            let artist = (row["artistName"] as? String) ?? ""
+            let trackNum = (row["trackNumber"] as? Int) ?? 0
+            let ms = row["trackTimeMillis"] as? Double
+            return ArtistReleaseTrackItem(
+                trackNumber: trackNum,
+                title: title,
+                artistName: artist,
+                durationSeconds: ms.map { $0 / 1000.0 }
+            )
+        }
+        .sorted { $0.trackNumber < $1.trackNumber }
+    }
+
+    // MARK: - Play & Save Offline Helpers
+
+    @MainActor
+    func playArtistTrackAdFree(title: String, artist: String, isVideo: Bool = false) async -> Bool {
+        let query = isVideo ? "\(artist) \(title) official music video" : "\(artist) \(title)"
+        let hits = await PlaylistURLImporter.searchYouTubeTracks(query: query, limit: 5)
+        guard let best = hits.first,
+              let watchURL = URL(string: "https://www.youtube.com/watch?v=\(best.videoID)"),
+              let resolved = await YouTubeStreamResolver.resolveStreams(for: watchURL),
+              !resolved.streams.isEmpty else {
+            MediaManager.shared.errorMessage = "Could not find an ad-free stream for \"\(title)\"."
+            return false
+        }
+
+        let audioOnly = resolved.streams.filter { $0.isAudio }
+        let videoDirect = resolved.streams.filter { !$0.isHLS && !$0.isAudio }
+        let preferred: [DetectedBrowserMedia] = isVideo
+            ? (videoDirect.isEmpty ? resolved.streams : (videoDirect + resolved.streams.filter(\.isHLS)))
+            : (audioOnly.isEmpty ? videoDirect : (audioOnly + videoDirect))
+
+        guard let stream = preferred.first else { return false }
+        MediaManager.shared.playRemoteStream(
+            url: stream.url,
+            title: title,
+            artist: artist,
+            headers: stream.customHeaders,
+            isVideo: isVideo || !stream.isAudio
+        )
+        return true
+    }
+
+    @MainActor
+    func downloadArtistTrackOffline(
+        title: String,
+        artist: String,
+        downloader: WebMediaDownloader,
+        targetPlaylistID: UUID? = nil
+    ) async -> MediaItem? {
+        let hits = await PlaylistURLImporter.searchYouTubeTracks(query: "\(artist) \(title)", limit: 5)
+        guard let best = hits.first,
+              let watchURL = URL(string: "https://www.youtube.com/watch?v=\(best.videoID)"),
+              let resolved = await YouTubeStreamResolver.resolveStreams(for: watchURL),
+              !resolved.streams.isEmpty else {
+            MediaManager.shared.errorMessage = "Could not download \"\(title)\"."
+            return nil
+        }
+
+        let audioOnly = resolved.streams.filter { $0.isAudio }
+        let videoDirect = resolved.streams.filter { !$0.isHLS && !$0.isAudio }
+        let ordered = audioOnly.isEmpty ? videoDirect : (audioOnly + videoDirect)
+        guard let primary = ordered.first else { return nil }
+
+        let media = DetectedBrowserMedia(
+            url: primary.url,
+            pairedAudioURL: primary.pairedAudioURL,
+            isHLS: primary.isHLS,
+            isAudio: primary.isAudio,
+            title: title,
+            author: artist,
+            qualityLabel: primary.qualityLabel,
+            referer: primary.referer,
+            customHeaders: primary.customHeaders,
+            durationSeconds: resolved.durationSeconds ?? primary.durationSeconds,
+            isActivelyPlaying: false
+        )
+
+        if let targetPlaylistID {
+            return await downloader.downloadTrackIntoPlaylist(
+                media,
+                fallbackStreams: Array(ordered.dropFirst()),
+                targetPlaylistID: targetPlaylistID,
+                sourceVideoID: best.videoID
+            )
+        } else {
+            return await downloader.downloadGroupTrackOffline(
+                media,
+                fallbackStreams: Array(ordered.dropFirst()),
+                sourceVideoID: best.videoID
+            )
+        }
+    }
+
+    // MARK: - Feed Parsers
+
+    private struct RawDiscoveredCandidate {
+        let artistName: String
+        let trackTitle: String?
+        let source: TrendSourceTag
+        let imageURLString: String?
+        let iTunesArtistID: Int?
+        let deezerArtistID: Int?
+    }
+
+    private func fetchDeezerViralPlaylistArtists(query: String, tag: TrendSourceTag) async -> [RawDiscoveredCandidate] {
+        guard let encoded = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+              let searchURL = URL(string: "https://api.deezer.com/search/playlist?q=\(encoded)&limit=8"),
+              let json = await Self.getJSON(url: searchURL) as? [String: Any],
+              let playlists = json["data"] as? [[String: Any]] else {
+            return []
+        }
+
+        let yearStr = String(Calendar.current.component(.year, from: .now))
+        let sorted = playlists
+            .filter { ($0["nb_tracks"] as? Int ?? 0) >= 15 }
+            .sorted { lhs, rhs in
+                let lt = (lhs["title"] as? String ?? "").lowercased()
+                let rt = (rhs["title"] as? String ?? "").lowercased()
+                let lHasCurYear = lt.contains(yearStr)
+                let rHasCurYear = rt.contains(yearStr)
+                if lHasCurYear != rHasCurYear { return lHasCurYear }
+                return (lhs["nb_tracks"] as? Int ?? 0) > (rhs["nb_tracks"] as? Int ?? 0)
+            }
+
+        var collected: [RawDiscoveredCandidate] = []
+        for pl in sorted.prefix(2) {
+            guard let pid = pl["id"] as? Int,
+                  let tracksURL = URL(string: "https://api.deezer.com/playlist/\(pid)/tracks?limit=50"),
+                  let tJSON = await Self.getJSON(url: tracksURL) as? [String: Any],
+                  let rows = tJSON["data"] as? [[String: Any]] else {
+                continue
+            }
+            for row in rows {
+                guard let art = row["artist"] as? [String: Any],
+                      let artistName = art["name"] as? String else {
+                    continue
+                }
+                let dzID = art["id"] as? Int
+                let title = row["title"] as? String
+                let img = (art["picture_big"] as? String) ?? (art["picture_medium"] as? String)
+                collected.append(
+                    RawDiscoveredCandidate(
+                        artistName: artistName,
+                        trackTitle: title,
+                        source: tag,
+                        imageURLString: img,
+                        iTunesArtistID: nil,
+                        deezerArtistID: dzID
+                    )
+                )
+            }
+        }
+        return collected
+    }
+
+    private func fetchAppleTopSongsArtists() async -> [RawDiscoveredCandidate] {
+        guard let url = URL(string: "https://rss.marketingtools.apple.com/api/v2/us/music/most-played/50/songs.json"),
+              let json = await Self.getJSON(url: url) as? [String: Any],
+              let feed = json["feed"] as? [String: Any],
+              let results = feed["results"] as? [[String: Any]] else {
+            return []
+        }
+
+        return results.compactMap { row in
+            guard let name = row["artistName"] as? String else { return nil }
+            let aid = (row["artistId"] as? String).flatMap { Int($0) }
+            let songTitle = row["name"] as? String
+            let art = (row["artworkUrl100"] as? String)?
+                .replacingOccurrences(of: "100x100bb", with: "600x600bb")
+            return RawDiscoveredCandidate(
+                artistName: name,
+                trackTitle: songTitle,
+                source: .appleCharts,
+                imageURLString: art,
+                iTunesArtistID: aid,
+                deezerArtistID: nil
+            )
+        }
+    }
+
+    private func fetchDeezerTopChartArtists() async -> [RawDiscoveredCandidate] {
+        guard let url = URL(string: "https://api.deezer.com/chart/0"),
+              let json = await Self.getJSON(url: url) as? [String: Any] else {
+            return []
+        }
+
+        var items: [RawDiscoveredCandidate] = []
+        if let artistsDict = json["artists"] as? [String: Any],
+           let rows = artistsDict["data"] as? [[String: Any]] {
+            for row in rows {
+                guard let name = row["name"] as? String else { continue }
+                let did = row["id"] as? Int
+                let img = (row["picture_xl"] as? String) ?? (row["picture_big"] as? String)
+                items.append(
+                    RawDiscoveredCandidate(
+                        artistName: name,
+                        trackTitle: nil,
+                        source: .deezerCharts,
+                        imageURLString: img,
+                        iTunesArtistID: nil,
+                        deezerArtistID: did
+                    )
+                )
+            }
+        }
+        if let tracksDict = json["tracks"] as? [String: Any],
+           let tRows = tracksDict["data"] as? [[String: Any]] {
+            for row in tRows {
+                guard let art = row["artist"] as? [String: Any],
+                      let name = art["name"] as? String else { continue }
+                let did = art["id"] as? Int
+                let img = (art["picture_big"] as? String)
+                items.append(
+                    RawDiscoveredCandidate(
+                        artistName: name,
+                        trackTitle: row["title"] as? String,
+                        source: .deezerCharts,
+                        imageURLString: img,
+                        iTunesArtistID: nil,
+                        deezerArtistID: did
+                    )
+                )
+            }
+        }
+        return items
+    }
+
+    private static func fetchQuickArtistMetadata(
+        name: String,
+        needsImage: Bool,
+        needsITunes: Bool
+    ) async -> (genre: String?, imageURL: String?, iTunesID: Int?, deezerID: Int?) {
+        async let itTask: (name: String?, artistId: Int?, genre: String?, linkURL: URL?) =
+            needsITunes ? fetchITunesArtistInfo(name: name, knownID: nil) : (nil, nil, nil, nil)
+        async let dzTask: (id: Int?, name: String?, imageURL: URL?, fanCount: Int?) =
+            needsImage ? fetchDeezerArtistInfo(name: name, knownID: nil) : (nil, nil, nil, nil)
+
+        let it = await itTask
+        let dz = await dzTask
+        return (it.genre, dz.imageURL?.absoluteString, it.artistId, dz.id)
+    }
+
+    // MARK: - Artist Profile Network Helpers
+
+    private static func fetchITunesArtistInfo(
+        name: String,
+        knownID: Int?
+    ) async -> (name: String?, artistId: Int?, genre: String?, linkURL: URL?) {
+        if let knownID,
+           let url = URL(string: "https://itunes.apple.com/lookup?id=\(knownID)"),
+           let dict = await getJSON(url: url) as? [String: Any],
+           let first = (dict["results"] as? [[String: Any]])?.first,
+           let artName = first["artistName"] as? String {
+            return (
+                artName,
+                knownID,
+                first["primaryGenreName"] as? String,
+                (first["artistLinkUrl"] as? String).flatMap { URL(string: $0) }
+            )
+        }
+
+        guard let encoded = name.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+              let url = URL(string: "https://itunes.apple.com/search?media=music&entity=musicArtist&limit=5&term=\(encoded)"),
+              let dict = await getJSON(url: url) as? [String: Any],
+              let rows = dict["results"] as? [[String: Any]],
+              !rows.isEmpty else {
+            return (nil, knownID, nil, nil)
+        }
+
+        let targetNorm = ArtistDatabase.normalizeLookupKey(name)
+        let match = rows.first {
+            ArtistDatabase.normalizeLookupKey(($0["artistName"] as? String) ?? "") == targetNorm
+        } ?? rows[0]
+
+        return (
+            match["artistName"] as? String,
+            match["artistId"] as? Int,
+            match["primaryGenreName"] as? String,
+            (match["artistLinkUrl"] as? String).flatMap { URL(string: $0) }
+        )
+    }
+
+    private static func fetchDeezerArtistInfo(
+        name: String,
+        knownID: Int?
+    ) async -> (id: Int?, name: String?, imageURL: URL?, fanCount: Int?) {
+        if let knownID,
+           let url = URL(string: "https://api.deezer.com/artist/\(knownID)"),
+           let dict = await getJSON(url: url) as? [String: Any],
+           let artName = dict["name"] as? String {
+            let imgStr = (dict["picture_xl"] as? String) ?? (dict["picture_big"] as? String)
+            return (knownID, artName, imgStr.flatMap { URL(string: $0) }, dict["nb_fan"] as? Int)
+        }
+
+        guard let encoded = name.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+              let url = URL(string: "https://api.deezer.com/search/artist?limit=5&q=\(encoded)"),
+              let dict = await getJSON(url: url) as? [String: Any],
+              let rows = dict["data"] as? [[String: Any]],
+              !rows.isEmpty else {
+            return (knownID, nil, nil, nil)
+        }
+
+        let targetNorm = ArtistDatabase.normalizeLookupKey(name)
+        let match = rows.first {
+            ArtistDatabase.normalizeLookupKey(($0["name"] as? String) ?? "") == targetNorm
+        } ?? rows[0]
+        let imgStr = (match["picture_xl"] as? String) ?? (match["picture_big"] as? String)
+        return (
+            match["id"] as? Int,
+            match["name"] as? String,
+            imgStr.flatMap { URL(string: $0) },
+            match["nb_fan"] as? Int
+        )
+    }
+
+    private static func fetchITunesArtistReleases(artistId: Int?, fallbackName: String) async -> [ArtistReleaseItem] {
+        var rows: [[String: Any]] = []
+        if let artistId,
+           let url = URL(string: "https://itunes.apple.com/lookup?id=\(artistId)&entity=album&limit=80"),
+           let dict = await getJSON(url: url) as? [String: Any],
+           let results = dict["results"] as? [[String: Any]] {
+            rows = results.filter { ($0["wrapperType"] as? String) == "collection" }
+        } else if let encoded = fallbackName.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+                  let url = URL(string: "https://itunes.apple.com/search?media=music&entity=album&attribute=artistTerm&limit=40&term=\(encoded)"),
+                  let dict = await getJSON(url: url) as? [String: Any],
+                  let results = dict["results"] as? [[String: Any]] {
+            let normTarget = ArtistDatabase.normalizeLookupKey(fallbackName)
+            rows = results.filter {
+                ArtistDatabase.normalizeLookupKey(($0["artistName"] as? String) ?? "").contains(normTarget)
+            }
+        }
+
+        var items: [ArtistReleaseItem] = []
+        var seenNormTitleYear = Set<String>()
+
+        for row in rows {
+            guard let cid = row["collectionId"] as? Int,
+                  let title = row["collectionName"] as? String else {
+                continue
+            }
+            let art = (row["artistName"] as? String) ?? fallbackName
+            let relStr = (row["releaseDate"] as? String) ?? ""
+            let relDate = parseISODate(relStr)
+            let yearText = relStr.count >= 4 ? String(relStr.prefix(4)) : ""
+            let trackCount = (row["trackCount"] as? Int) ?? 0
+            let genre = row["primaryGenreName"] as? String
+            let artURL = ((row["artworkUrl100"] as? String)?
+                .replacingOccurrences(of: "100x100bb", with: "600x600bb"))
+                .flatMap { URL(string: $0) }
+            let lowerTitle = title.lowercased()
+            let isSingleOrEP = trackCount <= 6 || lowerTitle.hasSuffix("- single") || lowerTitle.hasSuffix("- ep")
+
+            // Clean duplicate explicit/clean releases sharing exact normalized title + year
+            let dedupKey = "\(ArtistDatabase.normalizeLookupKey(title))|\(yearText)|\(trackCount)"
+            guard seenNormTitleYear.insert(dedupKey).inserted else { continue }
+
+            items.append(
+                ArtistReleaseItem(
+                    collectionId: cid,
+                    title: title,
+                    artistName: art,
+                    releaseDate: relDate,
+                    releaseYearText: yearText,
+                    artworkURL: artURL,
+                    trackCount: trackCount,
+                    genre: genre,
+                    isSingleOrEP: isSingleOrEP
+                )
+            )
+        }
+
+        return items.sorted { lhs, rhs in
+            (lhs.releaseDate ?? .distantPast) > (rhs.releaseDate ?? .distantPast)
+        }
+    }
+
+    private static func fetchITunesArtistTopSongs(artistId: Int?, fallbackName: String) async -> [ArtistTopSongItem] {
+        var rows: [[String: Any]] = []
+        if let artistId,
+           let url = URL(string: "https://itunes.apple.com/lookup?id=\(artistId)&entity=song&limit=25"),
+           let dict = await getJSON(url: url) as? [String: Any],
+           let results = dict["results"] as? [[String: Any]] {
+            rows = results.filter { ($0["wrapperType"] as? String) == "track" }
+        } else if let encoded = fallbackName.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+                  let url = URL(string: "https://itunes.apple.com/search?media=music&entity=song&limit=15&term=\(encoded)"),
+                  let dict = await getJSON(url: url) as? [String: Any],
+                  let results = dict["results"] as? [[String: Any]] {
+            rows = results
+        }
+
+        return rows.compactMap { row in
+            guard let title = row["trackName"] as? String else { return nil }
+            let art = (row["artistName"] as? String) ?? fallbackName
+            let album = row["collectionName"] as? String
+            let ms = row["trackTimeMillis"] as? Double
+            let artURL = ((row["artworkUrl100"] as? String)?
+                .replacingOccurrences(of: "100x100bb", with: "600x600bb"))
+                .flatMap { URL(string: $0) }
+            let prev = (row["previewUrl"] as? String).flatMap { URL(string: $0) }
+            return ArtistTopSongItem(
+                title: title,
+                artistName: art,
+                albumTitle: album,
+                durationSeconds: ms.map { $0 / 1000.0 },
+                artworkURL: artURL,
+                previewURL: prev
+            )
+        }
+    }
+
+    private static func fetchITunesArtistMusicVideos(artistId: Int?) async -> [ArtistMusicVideoItem] {
+        guard let artistId,
+              let url = URL(string: "https://itunes.apple.com/lookup?id=\(artistId)&entity=musicVideo&limit=15"),
+              let dict = await getJSON(url: url) as? [String: Any],
+              let results = dict["results"] as? [[String: Any]] else {
+            return []
+        }
+
+        return results.compactMap { row in
+            guard (row["wrapperType"] as? String) == "track",
+                  let tid = row["trackId"] as? Int,
+                  let title = row["trackName"] as? String else {
+                return nil
+            }
+            let artist = (row["artistName"] as? String) ?? ""
+            let ms = row["trackTimeMillis"] as? Double
+            let rel = (row["releaseDate"] as? String).flatMap { parseISODate($0) }
+            let artURL = ((row["artworkUrl100"] as? String)?
+                .replacingOccurrences(of: "100x100bb", with: "600x600bb"))
+                .flatMap { URL(string: $0) }
+            return ArtistMusicVideoItem(
+                trackId: tid,
+                title: title,
+                artistName: artist,
+                durationSeconds: ms.map { $0 / 1000.0 },
+                artworkURL: artURL,
+                releaseDate: rel
+            )
+        }
+        .sorted { ($0.releaseDate ?? .distantPast) > ($1.releaseDate ?? .distantPast) }
+    }
+
+    private static func fetchDeezerArtistTopTracks(deezerId: Int?) async -> [ArtistTopSongItem] {
+        guard let deezerId,
+              let url = URL(string: "https://api.deezer.com/artist/\(deezerId)/top?limit=15"),
+              let dict = await getJSON(url: url) as? [String: Any],
+              let rows = dict["data"] as? [[String: Any]] else {
+            return []
+        }
+
+        return rows.compactMap { row in
+            guard let title = row["title"] as? String else { return nil }
+            let artist = (row["artist"] as? [String: Any])?["name"] as? String ?? ""
+            let albumDict = row["album"] as? [String: Any]
+            let albumTitle = albumDict?["title"] as? String
+            let artURL = ((albumDict?["cover_big"] as? String) ?? (albumDict?["cover_medium"] as? String))
+                .flatMap { URL(string: $0) }
+            let dur = row["duration"] as? Double
+            let prev = (row["preview"] as? String).flatMap { URL(string: $0) }
+            return ArtistTopSongItem(
+                title: title,
+                artistName: artist,
+                albumTitle: albumTitle,
+                durationSeconds: dur,
+                artworkURL: artURL,
+                previewURL: prev
+            )
+        }
+    }
+
+    private static func fetchDeezerSimilarArtists(deezerId: Int?) async -> [SimilarArtistItem] {
+        guard let deezerId,
+              let url = URL(string: "https://api.deezer.com/artist/\(deezerId)/related?limit=12"),
+              let dict = await getJSON(url: url) as? [String: Any],
+              let rows = dict["data"] as? [[String: Any]] else {
+            return []
+        }
+
+        return rows.compactMap { row in
+            guard let name = row["name"] as? String else { return nil }
+            let imgURL = ((row["picture_big"] as? String) ?? (row["picture_medium"] as? String))
+                .flatMap { URL(string: $0) }
+            return SimilarArtistItem(
+                name: name,
+                imageURL: imgURL,
+                deezerArtistID: row["id"] as? Int
+            )
+        }
+    }
+
+    private static func mergeTopSongs(
+        deezerSongs: [ArtistTopSongItem],
+        iTunesSongs: [ArtistTopSongItem],
+        defaultArtist: String
+    ) -> [ArtistTopSongItem] {
+        var out: [ArtistTopSongItem] = []
+        var seen = Set<String>()
+        for song in deezerSongs + iTunesSongs {
+            let key = ArtistDatabase.normalizeLookupKey(ArtistDatabase.cleanSongTitleForSearch(rawTitle: song.title).songOnly)
+            guard !key.isEmpty, seen.insert(key).inserted else { continue }
+            out.append(
+                ArtistTopSongItem(
+                    title: song.title,
+                    artistName: song.artistName.isEmpty ? defaultArtist : song.artistName,
+                    albumTitle: song.albumTitle,
+                    durationSeconds: song.durationSeconds,
+                    artworkURL: song.artworkURL,
+                    previewURL: song.previewURL
+                )
+            )
+            if out.count >= 20 { break }
+        }
+        return out
+    }
+
+    private static func getJSON(url: URL) async -> Any? {
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 12
+        req.setValue(safariUA, forHTTPHeaderField: "User-Agent")
+        req.setValue("application/json, */*", forHTTPHeaderField: "Accept")
+        guard let (data, resp) = try? await URLSession.shared.data(for: req),
+              let http = resp as? HTTPURLResponse,
+              (200...299).contains(http.statusCode) else {
+            return nil
+        }
+        return try? JSONSerialization.jsonObject(with: data)
+    }
+
+    private static func parseISODate(_ raw: String) -> Date? {
+        guard !raw.isEmpty else { return nil }
+        return isoFormatter.date(from: raw)
+    }
+
+    private static let isoFormatter: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime]
+        return f
+    }()
+
+    // MARK: - Persistence
+
+    private func saveToDisk() {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        guard let data = try? encoder.encode(state) else { return }
+        try? data.write(to: storageFileURL, options: [.atomic])
+    }
+
+    private func loadFromDisk() {
+        guard let data = try? Data(contentsOf: storageFileURL) else { return }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        if let decoded = try? decoder.decode(TrendingArtistsPersistedState.self, from: data) {
+            state = decoded
+        }
+    }
+}

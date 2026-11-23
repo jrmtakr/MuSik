@@ -323,6 +323,18 @@ struct WrappedDashboardSheet: View {
                         .foregroundStyle(.secondary)
                 }
             }
+
+            NavigationLink {
+                TrendingArtistsHubView()
+            } label: {
+                HStack {
+                    Label("Trending Artists (TikTok & Reels)", systemImage: "flame.fill")
+                    Spacer()
+                    Text("Monthly")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.pink)
+                }
+            }
         }
     }
 }
@@ -571,6 +583,15 @@ private struct WrappedArtistDetailView: View {
                 }
                 .padding(.vertical, 4)
 
+                if artist.normalizedKey != "unknown artist" {
+                    NavigationLink {
+                        ArtistProfileView(artistName: artist.canonicalName)
+                    } label: {
+                        Label("Open Artist Profile & All Releases", systemImage: "music.mic")
+                            .fontWeight(.semibold)
+                    }
+                }
+
                 Button {
                     mergedName = artist.canonicalName == "Unknown Artist" ? "" : artist.canonicalName
                     showMergeAlert = true
@@ -655,32 +676,53 @@ private struct WrappedArtistDetailView: View {
 // MARK: - Built-in Major Artist Catalog Browser
 
 private struct ArtistCatalogBrowserView: View {
+    @Environment(TrendingArtistsService.self) private var trendingService
     @State private var query = ""
 
     private var entries: [ArtistCatalogEntry] {
-        ArtistDatabase.searchCatalog(query: query, limit: 120)
+        ArtistDatabase.searchCatalog(query: query, limit: 150)
     }
 
     var body: some View {
         List(entries, id: \.canonicalName) { entry in
-            HStack {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(entry.canonicalName)
-                        .font(.subheadline.weight(.semibold))
-                    if !entry.aliases.isEmpty {
-                        Text("Also matches: \(entry.aliases.joined(separator: ", "))")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
+            let dynRec = trendingService.record(forArtistName: entry.canonicalName)
+            NavigationLink {
+                ArtistProfileView(
+                    artistName: entry.canonicalName,
+                    seedITunesID: dynRec?.iTunesArtistID,
+                    seedDeezerID: dynRec?.deezerArtistID,
+                    seedImageURL: dynRec?.imageURL
+                )
+            } label: {
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack(spacing: 6) {
+                            Text(entry.canonicalName)
+                                .font(.subheadline.weight(.semibold))
+                            if dynRec?.isNewSinceStaticCatalog == true {
+                                Text("TRENDING")
+                                    .font(.caption2.weight(.heavy))
+                                    .padding(.horizontal, 5)
+                                    .padding(.vertical, 1)
+                                    .background(Color.pink.opacity(0.18), in: Capsule())
+                                    .foregroundStyle(.pink)
+                            }
+                        }
+                        if !entry.aliases.isEmpty {
+                            Text("Also matches: \(entry.aliases.joined(separator: ", "))")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
                     }
+                    Spacer()
+                    Text(entry.genre)
+                        .font(.caption2.weight(.semibold))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .background(Color.accentColor.opacity(0.14), in: Capsule())
+                        .foregroundStyle(Color.accentColor)
                 }
-                Spacer()
-                Text(entry.genre)
-                    .font(.caption2.weight(.semibold))
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 3)
-                    .background(Color.accentColor.opacity(0.14), in: Capsule())
-                    .foregroundStyle(Color.accentColor)
             }
         }
         .listStyle(.plain)

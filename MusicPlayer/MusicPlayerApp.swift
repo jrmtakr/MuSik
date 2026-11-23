@@ -83,6 +83,7 @@ struct MusicPlayerApp: App {
     @State private var partyService = PartyQueueService.shared
     @State private var timeMachine = PlaylistTimeMachineService.shared
     @State private var wrappedService = ListeningWrappedService.shared
+    @State private var trendingService = TrendingArtistsService.shared
     @State private var actionRouter = SystemActionRouter.shared
 
     @State private var showPlayerSheet = false
@@ -101,11 +102,13 @@ struct MusicPlayerApp: App {
                 .environment(partyService)
                 .environment(timeMachine)
                 .environment(wrappedService)
+                .environment(trendingService)
                 .environment(actionRouter)
                 .task {
                     LocalMediaCacheProxy.shared.start()
                     SystemActionRouter.registerHomeQuickActions()
                     await wrappedService.requestPermissionAndScheduleDecemberDrop()
+                    await trendingService.refreshIfDue()
                     wifiServer.onFileReceived = { tempURL, fileName, folderPath in
                         mediaManager.importTemporaryFile(from: tempURL, preferredFileName: fileName, inFolder: folderPath)
                     }

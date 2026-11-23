@@ -6,6 +6,7 @@ struct DiscoveryView: View {
     @Environment(BrowserStore.self) private var browserStore
     @Environment(WebMediaDownloader.self) private var downloader
     @Environment(ListeningWrappedService.self) private var wrapped
+    @Environment(TrendingArtistsService.self) private var trendingService
 
     @Binding var showPlayerSheet: Bool
     @Binding var selectedTab: AppTab
@@ -45,6 +46,8 @@ struct DiscoveryView: View {
                     speedDialSection
 
                     wrappedBannerCard
+
+                    trendingArtistsShelfSection
 
                     mangaReaderCard
 
@@ -237,6 +240,112 @@ struct DiscoveryView: View {
             )
         }
         .buttonStyle(.plain)
+    }
+
+    private var trendingArtistsShelfSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Trending New Artists")
+                        .font(.headline)
+                    Text("TikTok • IG Reels • Monthly Auto-Refresh")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer()
+
+                NavigationLink {
+                    TrendingArtistsHubView(showPlayerSheet: $showPlayerSheet)
+                } label: {
+                    Text("See All")
+                        .font(.caption.weight(.semibold))
+                }
+            }
+
+            if trendingService.artists.isEmpty {
+                Button {
+                    Task { await trendingService.refreshTrendingArtists(force: true) }
+                } label: {
+                    HStack(spacing: 10) {
+                        if trendingService.isRefreshing {
+                            ProgressView()
+                        } else {
+                            Image(systemName: "flame.fill")
+                                .foregroundStyle(.pink)
+                        }
+                        Text(trendingService.isRefreshing ? "Discovering viral artists..." : "Load Trending Artists from TikTok & Reels")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.primary)
+                        Spacer()
+                    }
+                    .padding(12)
+                    .background(
+                        settings.hasCustomBackground ? settings.themedRowBackgroundColor : Color(.secondarySystemBackground),
+                        in: RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    )
+                }
+                .buttonStyle(.plain)
+                .disabled(trendingService.isRefreshing)
+            } else {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(alignment: .top, spacing: 14) {
+                        ForEach(Array(trendingService.artists.prefix(15))) { rec in
+                            NavigationLink {
+                                ArtistProfileView(
+                                    artistName: rec.canonicalName,
+                                    seedITunesID: rec.iTunesArtistID,
+                                    seedDeezerID: rec.deezerArtistID,
+                                    seedImageURL: rec.imageURL,
+                                    showPlayerSheet: $showPlayerSheet
+                                )
+                            } label: {
+                                VStack(spacing: 6) {
+                                    ZStack(alignment: .topTrailing) {
+                                        AsyncImage(url: rec.imageURL) { img in
+                                            img.resizable().scaledToFill()
+                                        } placeholder: {
+                                            Circle()
+                                                .fill(Color.pink.opacity(0.16))
+                                                .overlay {
+                                                    Image(systemName: "music.mic")
+                                                        .foregroundStyle(.pink)
+                                                }
+                                        }
+                                        .frame(width: 72, height: 72)
+                                        .clipShape(Circle())
+
+                                        if rec.isNewSinceStaticCatalog {
+                                            Text("NEW")
+                                                .font(.system(size: 8, weight: .black))
+                                                .padding(.horizontal, 5)
+                                                .padding(.vertical, 2)
+                                                .background(Color.pink, in: Capsule())
+                                                .foregroundStyle(.white)
+                                        }
+                                    }
+
+                                    Text(rec.canonicalName)
+                                        .font(.caption.weight(.semibold))
+                                        .foregroundStyle(.primary)
+                                        .lineLimit(1)
+
+                                    if let src = rec.trendSources.first {
+                                        Text(src.rawValue)
+                                            .font(.caption2)
+                                            .foregroundStyle(src.badgeColor)
+                                            .lineLimit(1)
+                                    }
+                                }
+                                .frame(width: 78)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                    .padding(.vertical, 2)
+                }
+            }
+        }
     }
 
     private var mangaReaderCard: some View {

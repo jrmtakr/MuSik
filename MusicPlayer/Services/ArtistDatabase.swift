@@ -16,32 +16,77 @@ struct ArtistExtractionResult: Hashable {
 
 enum ArtistDatabase {
     private static let store: CatalogStore = CatalogStore(raw: rawCatalogData)
+    private static let dynamicLock = NSLock()
+    private static var dynamicEntries: [ArtistCatalogEntry] = []
+    private static var dynamicByKey: [String: ArtistCatalogEntry] = [:]
 
     static var totalCatalogCount: Int {
-        store.entries.count
+        dynamicLock.lock()
+        let extra = dynamicEntries.count
+        dynamicLock.unlock()
+        return store.entries.count + extra
     }
 
     static var allEntries: [ArtistCatalogEntry] {
-        store.entries
+        dynamicLock.lock()
+        let combined = store.entries + dynamicEntries
+        dynamicLock.unlock()
+        return combined
+    }
+
+    static func isInStaticCatalog(_ name: String) -> Bool {
+        let key = normalizeLookupKey(name)
+        guard !key.isEmpty else { return false }
+        return store.byNormalizedKey[key] != nil
+    }
+
+    static func registerDynamicArtists(_ entries: [ArtistCatalogEntry]) {
+        dynamicLock.lock()
+        defer { dynamicLock.unlock() }
+        for entry in entries {
+            let key = normalizeLookupKey(entry.canonicalName)
+            guard !key.isEmpty, store.byNormalizedKey[key] == nil else { continue }
+            if dynamicByKey[key] == nil {
+                dynamicEntries.append(entry)
+            } else {
+                if let idx = dynamicEntries.firstIndex(where: { normalizeLookupKey($0.canonicalName) == key }) {
+                    dynamicEntries[idx] = entry
+                }
+            }
+            dynamicByKey[key] = entry
+            for alias in entry.aliases {
+                let ak = normalizeLookupKey(alias)
+                if !ak.isEmpty && store.byNormalizedKey[ak] == nil {
+                    dynamicByKey[ak] = entry
+                }
+            }
+        }
     }
 
     static func lookup(_ name: String) -> ArtistCatalogEntry? {
         let key = normalizeLookupKey(name)
         guard !key.isEmpty else { return nil }
-        return store.byNormalizedKey[key]
+        if let hit = store.byNormalizedKey[key] {
+            return hit
+        }
+        dynamicLock.lock()
+        let dynHit = dynamicByKey[key]
+        dynamicLock.unlock()
+        return dynHit
     }
 
     static func genre(forArtist name: String) -> String? {
         lookup(name)?.genre
     }
 
-    static func searchCatalog(query: String, limit: Int = 30) -> [ArtistCatalogEntry] {
+    static func searchCatalog(query: String, limit: Int = 50) -> [ArtistCatalogEntry] {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        let pool = allEntries
         guard !trimmed.isEmpty else {
-            return Array(store.entries.prefix(limit))
+            return Array(pool.prefix(limit))
         }
         let normQuery = normalizeLookupKey(trimmed)
-        return store.entries.filter { entry in
+        return pool.filter { entry in
             normalizeLookupKey(entry.canonicalName).contains(normQuery) ||
                 entry.genre.localizedCaseInsensitiveContains(trimmed) ||
                 entry.aliases.contains { normalizeLookupKey($0).contains(normQuery) }
@@ -290,7 +335,7 @@ enum ArtistDatabase {
         if let custom = customAliases[norm], !custom.isEmpty {
             return lookup(custom)?.canonicalName ?? custom
         }
-        if let catalogHit = store.byNormalizedKey[norm] {
+        if let catalogHit = lookup(trimmed) {
             return catalogHit.canonicalName
         }
         return trimmed
@@ -412,7 +457,7 @@ enum ArtistDatabase {
         return (text.trimmingCharacters(in: .whitespacesAndNewlines), featured)
     }
 
-    private static func splitAndCanonicalize(_ raw: String, customAliases: [String: String] = [:]) -> [String] {
+    static func splitAndCanonicalize(_ raw: String, customAliases: [String: String] = [:]) -> [String] {
         var working = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !working.isEmpty else { return [] }
 
@@ -421,7 +466,7 @@ enum ArtistDatabase {
         if let custom = customAliases[wholeNorm], !custom.isEmpty {
             return [canonicalizeSingle(custom, customAliases: customAliases)]
         }
-        if let exact = store.byNormalizedKey[wholeNorm] {
+        if let exact = lookup(working) {
             return [exact.canonicalName]
         }
 
