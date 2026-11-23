@@ -63,6 +63,7 @@ final class MediaManager {
     private(set) var ffmpegPlayer: KSMEPlayer?
     private(set) var isUsingFFmpegBackend = false
     private var isUsingEqualizerBackend = false
+    @ObservationIgnored private var crossfadeTriggeredForCurrentTrack = false
 
     @ObservationIgnored var externalQueueNextHandler: (() -> Bool)?
     @ObservationIgnored var externalQueuePreviousHandler: (() -> Bool)?
@@ -587,6 +588,7 @@ final class MediaManager {
         }
 
         stopCurrentEngines()
+        crossfadeTriggeredForCurrentTrack = false
         remoteStreamSourceURL = nil
         activePlaylistID = playlistID
         if let playlistID {
@@ -905,6 +907,7 @@ final class MediaManager {
     func stop() {
         ListeningWrappedService.shared.endSession(didFinishTrack: false)
         stopCurrentEngines()
+        crossfadeTriggeredForCurrentTrack = false
         remoteStreamSourceURL = nil
         activePlaylistID = nil
         currentItem = nil
@@ -924,6 +927,7 @@ final class MediaManager {
     }
 
     func seek(to seconds: Double) {
+        crossfadeTriggeredForCurrentTrack = false
         let upperBound = max(duration, 0)
         let clamped = min(max(seconds, 0), upperBound > 0 ? upperBound : max(seconds, 0))
 
@@ -3023,11 +3027,83 @@ final class MediaManager {
                 }
             }
             self.syncWrappedHeartbeat()
+
+            if !self.crossfadeTriggeredForCurrentTrack,
+               self.isPlaying,
+               AppSettings.isCrossfadeEnabled,
+               self.repeatMode != .one,
+               self.externalQueueNextHandler == nil {
+                let fadeSec = AppSettings.storedCrossfadeDuration
+                if totalDuration > fadeSec + 1.5,
+                   elapsed > 0.5,
+                   (totalDuration - elapsed) <= fadeSec {
+                    self.performAutomaticCrossfade(duration: fadeSec)
+                }
+            }
         }
 
         equalizerPlayer.onPlaybackEnded = { [weak self] in
             guard let self, self.isUsingEqualizerBackend else { return }
             self.handlePlaybackEnded()
+        }
+    }
+
+    private func peekNextCrossfadeCandidate() -> (item: MediaItem, fromUserQueue: Bool)? {
+        if let queued = upNextItems.first {
+            return (queued, true)
+        }
+        let queue = activeQueue
+        guard !queue.isEmpty else { return nil }
+        if isShuffleEnabled, queue.count > 1 {
+            if let randomNext = queue.filter({ $0.id != currentItem?.id }).randomElement() {
+                return (randomNext, false)
+            }
+            return nil
+        }
+        guard let currentItem,
+              let index = queue.firstIndex(where: { $0.id == currentItem.id }) else {
+            return queue.first.map { ($0, false) }
+        }
+        let nextIndex = index + 1
+        if nextIndex < queue.count {
+            return (queue[nextIndex], false)
+        }
+        if repeatMode == .all, let first = queue.first, queue.count > 1 {
+            return (first, false)
+        }
+        return nil
+    }
+
+    private func performAutomaticCrossfade(duration fadeSec: Double) {
+        crossfadeTriggeredForCurrentTrack = true
+        guard let candidate = peekNextCrossfadeCandidate() else { return }
+        let nextItem = candidate.item
+        guard !nextItem.isVideo,
+              !nextItem.prefersFFmpegEngine,
+              FileManager.default.fileExists(atPath: nextItem.fileURL.path) else {
+            return
+        }
+
+        if candidate.fromUserQueue {
+            _ = popNextQueuedItem()
+        }
+
+        do {
+            equalizerPlayer.setPlaybackRate(playbackRate)
+            try equalizerPlayer.crossfadeTo(url: nextItem.fileURL, duration: fadeSec)
+            ListeningWrappedService.shared.endSession(didFinishTrack: true)
+            isUsingEqualizerBackend = true
+            remoteStreamSourceURL = nil
+            currentItem = nextItem
+            currentTime = 0
+            duration = equalizerPlayer.duration > 0 ? equalizerPlayer.duration : (nextItem.durationSeconds ?? 0)
+            isPlaying = true
+            crossfadeTriggeredForCurrentTrack = false
+            recordRecent(nextItem.relativePath)
+            updateNowPlayingInfo(for: nextItem)
+            syncWrappedSessionStart(for: nextItem)
+        } catch {
+            crossfadeTriggeredForCurrentTrack = true
         }
     }
 

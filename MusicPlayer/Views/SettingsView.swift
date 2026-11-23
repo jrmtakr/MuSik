@@ -185,6 +185,41 @@ struct SettingsView: View {
                 Section("Player & Tools") {
                     Toggle("Quick access to Last Playlist", isOn: $settings.quickAccessLastPlaylist)
 
+                    Toggle(isOn: $settings.crossfadeEnabled) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Fade Between Songs (Crossfade)")
+                            Text(settings.crossfadeEnabled
+                                 ? String(format: "Smoothly blends songs over %.1fs", settings.crossfadeDurationSeconds)
+                                 : "Seamless transition between audio tracks")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    if settings.crossfadeEnabled {
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack {
+                                Text("Fade Duration")
+                                    .font(.subheadline)
+                                Spacer()
+                                Text(String(format: "%.1f sec", settings.crossfadeDurationSeconds))
+                                    .font(.subheadline.monospacedDigit().weight(.semibold))
+                                    .foregroundStyle(Color.accentColor)
+                            }
+                            Slider(value: $settings.crossfadeDurationSeconds, in: 1...12, step: 0.5)
+                            HStack {
+                                Text("1s")
+                                Spacer()
+                                Text("6s")
+                                Spacer()
+                                Text("12s")
+                            }
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                        }
+                        .padding(.vertical, 2)
+                    }
+
                     Button {
                         showEqualizerSheet = true
                     } label: {

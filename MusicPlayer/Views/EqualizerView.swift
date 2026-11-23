@@ -2,6 +2,7 @@ import SwiftUI
 
 struct EqualizerView: View {
     @Environment(MediaManager.self) private var mediaManager
+    @Environment(AppSettings.self) private var settings
     @Environment(\.dismiss) private var dismiss
 
     private var eq: EqualizerAudioPlayer {
@@ -9,6 +10,7 @@ struct EqualizerView: View {
     }
 
     var body: some View {
+        @Bindable var settings = settings
         NavigationStack {
             ScrollView {
                 VStack(spacing: 20) {
@@ -48,6 +50,37 @@ struct EqualizerView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
+
+                    VStack(alignment: .leading, spacing: 12) {
+                        Toggle(isOn: $settings.crossfadeEnabled) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Fade Between Songs (Crossfade)")
+                                    .font(.headline)
+                                Text(settings.crossfadeEnabled
+                                     ? String(format: "%.1f sec smooth overlap", settings.crossfadeDurationSeconds)
+                                     : "Off — songs play back-to-back")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+
+                        if settings.crossfadeEnabled {
+                            VStack(spacing: 4) {
+                                HStack {
+                                    Text("Fade Time")
+                                        .font(.caption.weight(.semibold))
+                                        .foregroundStyle(.secondary)
+                                    Spacer()
+                                    Text(String(format: "%.1fs", settings.crossfadeDurationSeconds))
+                                        .font(.caption.monospacedDigit().weight(.bold))
+                                        .foregroundStyle(Color.accentColor)
+                                }
+                                Slider(value: $settings.crossfadeDurationSeconds, in: 1...12, step: 0.5)
+                            }
+                        }
+                    }
+                    .padding(16)
+                    .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
                 }
                 .padding(16)
             }

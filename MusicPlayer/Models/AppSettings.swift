@@ -182,6 +182,22 @@ final class AppSettings {
     var targetDownloadPlaylistIDString: String {
         didSet { UserDefaults.standard.set(targetDownloadPlaylistIDString, forKey: Keys.targetDownloadPlaylistID) }
     }
+    var crossfadeEnabled: Bool {
+        didSet { UserDefaults.standard.set(crossfadeEnabled, forKey: Keys.crossfadeEnabled) }
+    }
+    var crossfadeDurationSeconds: Double {
+        didSet { UserDefaults.standard.set(crossfadeDurationSeconds, forKey: Keys.crossfadeDuration) }
+    }
+
+    static var isCrossfadeEnabled: Bool {
+        UserDefaults.standard.bool(forKey: Keys.crossfadeEnabled)
+    }
+
+    static var storedCrossfadeDuration: Double {
+        let d = UserDefaults.standard
+        guard d.object(forKey: Keys.crossfadeDuration) != nil else { return 4.0 }
+        return min(12.0, max(0.5, d.double(forKey: Keys.crossfadeDuration)))
+    }
 
     var targetDownloadPlaylistID: UUID? {
         UUID(uuidString: targetDownloadPlaylistIDString)
@@ -249,6 +265,8 @@ final class AppSettings {
         static let suppressedCacheHosts = "musicplayer.suppressedCacheHosts"
         static let autoAddDownloadsToPlaylist = "musicplayer.autoAddDownloadsToPlaylist"
         static let targetDownloadPlaylistID = "musicplayer.targetDownloadPlaylistID"
+        static let crossfadeEnabled = "musicplayer.crossfade.enabled"
+        static let crossfadeDuration = "musicplayer.crossfade.seconds"
     }
 
     private static var themeAssetsDirectory: URL {
@@ -319,6 +337,12 @@ final class AppSettings {
         self.suppressedCacheHosts = defaults.stringArray(forKey: Keys.suppressedCacheHosts) ?? []
         self.autoAddDownloadsToPlaylist = defaults.bool(forKey: Keys.autoAddDownloadsToPlaylist)
         self.targetDownloadPlaylistIDString = defaults.string(forKey: Keys.targetDownloadPlaylistID) ?? ""
+        self.crossfadeEnabled = defaults.bool(forKey: Keys.crossfadeEnabled)
+        if defaults.object(forKey: Keys.crossfadeDuration) != nil {
+            self.crossfadeDurationSeconds = min(12.0, max(0.5, defaults.double(forKey: Keys.crossfadeDuration)))
+        } else {
+            self.crossfadeDurationSeconds = 4.0
+        }
 
         if FileManager.default.fileExists(atPath: Self.customIconFileURL.path),
            let img = UIImage(contentsOfFile: Self.customIconFileURL.path) {

@@ -35,9 +35,16 @@ enum EqualizerPreset: String, CaseIterable, Identifiable, Codable {
 @Observable
 final class EqualizerAudioPlayer {
     private let engine = AVAudioEngine()
-    private let playerNode = AVAudioPlayerNode()
+    private let deckA = AVAudioPlayerNode()
+    private let deckB = AVAudioPlayerNode()
+    private let deckMixerNode = AVAudioMixerNode()
     private let eqNode = AVAudioUnitEQ(numberOfBands: 5)
     private let timePitchNode = AVAudioUnitTimePitch()
+
+    private var activeDeckIsA = true
+    private var activeNode: AVAudioPlayerNode { activeDeckIsA ? deckA : deckB }
+    private var outgoingNode: AVAudioPlayerNode { activeDeckIsA ? deckB : deckA }
+    private var activeBus: AVAudioNodeBus { activeDeckIsA ? 0 : 1 }
 
     let frequencies: [Float] = [60, 230, 910, 3600, 14000] // Hz
     let frequencyLabels = ["60Hz", "230Hz", "910Hz", "3.6kHz", "14kHz"]
@@ -55,10 +62,12 @@ final class EqualizerAudioPlayer {
     var onProgressUpdate: ((Double, Double) -> Void)?
 
     private var currentFile: AVAudioFile?
-    private var lastFormat: AVAudioFormat?
+    private var deckAFormat: AVAudioFormat?
+    private var deckBFormat: AVAudioFormat?
     private var seekOffsetSeconds: Double = 0
     private var scheduleGeneration: UInt64 = 0
     private var progressTimer: Timer?
+    private var crossfadeTimer: Timer?
     private var configChangeObserver: NSObjectProtocol?
 
     private static let gainsDefaultsKey = "pocketmedia.eq.gains"
@@ -69,11 +78,15 @@ final class EqualizerAudioPlayer {
         setupEQ()
         loadSavedSettings()
 
-        engine.attach(playerNode)
+        engine.attach(deckA)
+        engine.attach(deckB)
+        engine.attach(deckMixerNode)
         engine.attach(eqNode)
         engine.attach(timePitchNode)
 
-        engine.connect(playerNode, to: eqNode, format: nil)
+        engine.connect(deckA, to: deckMixerNode, fromBus: 0, toBus: 0, format: nil)
+        engine.connect(deckB, to: deckMixerNode, fromBus: 0, toBus: 1, format: nil)
+        engine.connect(deckMixerNode, to: eqNode, format: nil)
         engine.connect(eqNode, to: timePitchNode, format: nil)
         engine.connect(timePitchNode, to: engine.mainMixerNode, format: nil)
 
@@ -83,7 +96,9 @@ final class EqualizerAudioPlayer {
             queue: .main
         ) { [weak self] _ in
             guard let self else { return }
-            self.lastFormat = nil
+            self.deckAFormat = nil
+            self.deckBFormat = nil
+            self.abortCrossfade()
             if self.isPlaying {
                 self.pause()
             }
@@ -92,10 +107,12 @@ final class EqualizerAudioPlayer {
 
     deinit {
         progressTimer?.invalidate()
+        crossfadeTimer?.invalidate()
         if let configChangeObserver {
             NotificationCenter.default.removeObserver(configChangeObserver)
         }
-        playerNode.stop()
+        deckA.stop()
+        deckB.stop()
         engine.stop()
     }
 
@@ -146,7 +163,29 @@ final class EqualizerAudioPlayer {
         applyPreset(.flat)
     }
 
-    func play(url: URL) throws {
+    private var activeFormat: AVAudioFormat? {
+        get { activeDeckIsA ? deckAFormat : deckBFormat }
+        set {
+            if activeDeckIsA { deckAFormat = newValue } else { deckBFormat = newValue }
+        }
+    }
+
+    private func connectActiveDeck(format: AVAudioFormat, forceReconnect: Bool = false) {
+        if activeFormat == format && !forceReconnect { return }
+        engine.connect(activeNode, to: deckMixerNode, fromBus: 0, toBus: activeBus, format: format)
+        activeFormat = format
+    }
+
+    private func abortCrossfade() {
+        crossfadeTimer?.invalidate()
+        crossfadeTimer = nil
+        outgoingNode.stop()
+        outgoingNode.volume = 1.0
+        activeNode.volume = 1.0
+    }
+
+    func play(url: URL, fadeInDuration: Double = 0) throws {
+        abortCrossfade()
         let file = try AVAudioFile(forReading: url)
         let format = file.processingFormat
         let sampleRate = format.sampleRate
@@ -157,17 +196,12 @@ final class EqualizerAudioPlayer {
         seekOffsetSeconds = 0
 
         scheduleGeneration &+= 1
-        playerNode.stop()
+        deckA.stop()
+        deckB.stop()
+        deckA.volume = 1.0
+        deckB.volume = 1.0
 
-        if lastFormat != format {
-            if engine.isRunning {
-                engine.stop()
-            }
-            engine.connect(playerNode, to: eqNode, format: format)
-            engine.connect(eqNode, to: timePitchNode, format: format)
-            engine.connect(timePitchNode, to: engine.mainMixerNode, format: nil)
-            lastFormat = format
-        }
+        connectActiveDeck(format: format)
 
         timePitchNode.rate = playbackRate
         engine.prepare()
@@ -176,16 +210,106 @@ final class EqualizerAudioPlayer {
         }
 
         scheduleSegment(fromSeconds: 0)
-        playerNode.play()
+
+        if fadeInDuration > 0.1 {
+            activeNode.volume = 0.0
+            activeNode.play()
+            startLinearVolumeFade(node: activeNode, duration: min(fadeInDuration, 3.0))
+        } else {
+            activeNode.volume = 1.0
+            activeNode.play()
+        }
         isPlaying = true
         startProgressTimer()
     }
 
+    /// Seamlessly crossfades out the outgoing song while fading in the next song on the alternate deck
+    /// using an equal-power S-curve over `crossfadeDuration` seconds.
+    func crossfadeTo(url: URL, duration crossfadeDuration: Double) throws {
+        let clampedFade = max(0.5, crossfadeDuration)
+        let newFile = try AVAudioFile(forReading: url)
+        let format = newFile.processingFormat
+        let sampleRate = format.sampleRate
+
+        // Increment generation first so the outgoing deck's previous completion callback is cleanly ignored.
+        scheduleGeneration &+= 1
+
+        crossfadeTimer?.invalidate()
+        crossfadeTimer = nil
+
+        // Ensure any earlier stale third track is stopped cleanly before flipping decks.
+        outgoingNode.stop()
+        outgoingNode.volume = 1.0
+
+        let fadingOutNode = activeNode
+        let initialOutVolume = fadingOutNode.volume
+        activeDeckIsA.toggle()
+        let fadingInNode = activeNode
+
+        fadingInNode.stop()
+        fadingInNode.volume = 0.0
+        connectActiveDeck(format: format, forceReconnect: activeFormat != format)
+
+        currentFile = newFile
+        duration = sampleRate > 0 ? Double(newFile.length) / sampleRate : 0
+        currentTime = 0
+        seekOffsetSeconds = 0
+
+        timePitchNode.rate = playbackRate
+        if !engine.isRunning {
+            engine.prepare()
+            try engine.start()
+        }
+
+        scheduleSegment(fromSeconds: 0)
+        fadingInNode.play()
+        isPlaying = true
+        startProgressTimer()
+
+        let startDate = Date()
+        crossfadeTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30.0, repeats: true) { [weak self, weak fadingOutNode, weak fadingInNode] timer in
+            guard let self else {
+                timer.invalidate()
+                return
+            }
+            let elapsed = Date().timeIntervalSince(startDate)
+            let t = min(1.0, max(0.0, elapsed / clampedFade))
+            let angle = t * (.pi / 2.0)
+
+            fadingOutNode?.volume = initialOutVolume * Float(cos(angle))
+            fadingInNode?.volume = Float(sin(angle))
+
+            if t >= 1.0 {
+                timer.invalidate()
+                self.crossfadeTimer = nil
+                fadingOutNode?.stop()
+                fadingOutNode?.volume = 1.0
+                fadingInNode?.volume = 1.0
+            }
+        }
+    }
+
+    private func startLinearVolumeFade(node: AVAudioPlayerNode, duration: Double) {
+        crossfadeTimer?.invalidate()
+        let startDate = Date()
+        crossfadeTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30.0, repeats: true) { [weak self, weak node] timer in
+            let elapsed = Date().timeIntervalSince(startDate)
+            let t = min(1.0, max(0.0, elapsed / max(0.1, duration)))
+            node?.volume = Float(sin(t * .pi / 2.0))
+            if t >= 1.0 {
+                timer.invalidate()
+                node?.volume = 1.0
+                self?.crossfadeTimer = nil
+            }
+        }
+    }
+
     func pause() {
         guard currentFile != nil else { return }
+        abortCrossfade()
         updateElapsedTime()
         seekOffsetSeconds = currentTime
-        playerNode.pause()
+        activeNode.pause()
         isPlaying = false
         stopProgressTimer()
     }
@@ -193,31 +317,27 @@ final class EqualizerAudioPlayer {
     func resume() {
         guard let file = currentFile else { return }
         do {
-            if lastFormat == nil {
+            if activeFormat == nil {
                 let format = file.processingFormat
                 let resumeFrom = currentTime
-                if engine.isRunning {
-                    engine.stop()
-                }
-                engine.connect(playerNode, to: eqNode, format: format)
-                engine.connect(eqNode, to: timePitchNode, format: format)
-                engine.connect(timePitchNode, to: engine.mainMixerNode, format: nil)
-                lastFormat = format
+                connectActiveDeck(format: format, forceReconnect: true)
                 timePitchNode.rate = playbackRate
                 engine.prepare()
                 try engine.start()
                 scheduleSegment(fromSeconds: resumeFrom)
-                playerNode.play()
+                activeNode.volume = 1.0
+                activeNode.play()
             } else {
                 if !engine.isRunning {
                     engine.prepare()
                     try engine.start()
                 }
-                if !playerNode.isPlaying {
+                if !activeNode.isPlaying {
                     if currentTime >= duration && duration > 0 {
                         scheduleSegment(fromSeconds: 0)
                     }
-                    playerNode.play()
+                    activeNode.volume = 1.0
+                    activeNode.play()
                 }
             }
             isPlaying = true
@@ -230,7 +350,11 @@ final class EqualizerAudioPlayer {
     func stop() {
         scheduleGeneration &+= 1
         stopProgressTimer()
-        playerNode.stop()
+        abortCrossfade()
+        deckA.stop()
+        deckB.stop()
+        deckA.volume = 1.0
+        deckB.volume = 1.0
         currentFile = nil
         isPlaying = false
         currentTime = 0
@@ -240,6 +364,7 @@ final class EqualizerAudioPlayer {
 
     func seek(to seconds: Double) {
         guard currentFile != nil else { return }
+        abortCrossfade()
         let clamped = min(max(seconds, 0), max(duration, 0))
         let wasPlaying = isPlaying
 
@@ -250,7 +375,8 @@ final class EqualizerAudioPlayer {
                     engine.prepare()
                     try engine.start()
                 }
-                playerNode.play()
+                activeNode.volume = 1.0
+                activeNode.play()
                 isPlaying = true
                 startProgressTimer()
             } catch {
@@ -277,7 +403,8 @@ final class EqualizerAudioPlayer {
 
         scheduleGeneration &+= 1
         let generation = scheduleGeneration
-        playerNode.stop()
+        let targetNode = activeNode
+        targetNode.stop()
 
         seekOffsetSeconds = Double(startFrame) / sampleRate
         currentTime = seekOffsetSeconds
@@ -290,7 +417,7 @@ final class EqualizerAudioPlayer {
         }
 
         let frameCount = AVAudioFrameCount(min(remainingFrames, Int64(UInt32.max)))
-        playerNode.scheduleSegment(
+        targetNode.scheduleSegment(
             file,
             startingFrame: startFrame,
             frameCount: frameCount,
@@ -322,9 +449,10 @@ final class EqualizerAudioPlayer {
     private func updateElapsedTime() {
         guard let file = currentFile else { return }
         let sampleRate = file.processingFormat.sampleRate
+        let targetNode = activeNode
         guard sampleRate > 0,
-              let nodeTime = playerNode.lastRenderTime,
-              let playerTime = playerNode.playerTime(forNodeTime: nodeTime) else {
+              let nodeTime = targetNode.lastRenderTime,
+              let playerTime = targetNode.playerTime(forNodeTime: nodeTime) else {
             return
         }
 
