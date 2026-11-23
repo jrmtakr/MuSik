@@ -109,7 +109,8 @@ enum YouTubeStreamResolver {
         for url: URL,
         cookiesHeader: String? = nil,
         referer: String? = nil,
-        visitorData: String? = nil
+        visitorData: String? = nil,
+        skipReachabilityProbe: Bool = false
     ) async -> YouTubeResolvedResult? {
         guard let videoID = extractVideoID(from: url) else { return nil }
 
@@ -135,8 +136,8 @@ enum YouTubeStreamResolver {
 
         let visitorDataForRequests = resolvedVisitorData
 
-        // 1. Query iOS (HD/audio adaptive + HLS when un-gated) and Android in parallel with visitorData.
-        async let iosTask = fetchInnerTube(
+        // 1. Query IOS first (single request cuts InnerTube traffic in half and returns direct playable audio/video streams).
+        let iosResult = await fetchInnerTube(
             videoID: videoID,
             sourcePageURL: url,
             clientName: "IOS",
@@ -152,26 +153,30 @@ enum YouTubeStreamResolver {
             visitorData: visitorDataForRequests,
             cookiesHeader: cookiesHeader
         )
-        async let androidTask = fetchInnerTube(
-            videoID: videoID,
-            sourcePageURL: url,
-            clientName: "ANDROID",
-            clientHeaderID: "3",
-            clientVersion: androidClientVersion,
-            userAgent: androidClientUserAgent,
-            extraClientFields: [
-                "osName": "Android",
-                "osVersion": "14",
-                "androidSdkVersion": 34
-            ],
-            visitorData: visitorDataForRequests,
-            cookiesHeader: cookiesHeader
-        )
 
-        let iosResult = await iosTask
-        let androidResult = await androidTask
+        var results = [iosResult].compactMap { $0 }.filter { !$0.streams.isEmpty }
+        var androidResult: YouTubeResolvedResult?
 
-        var results = [iosResult, androidResult].compactMap { $0 }.filter { !$0.streams.isEmpty }
+        if results.isEmpty {
+            androidResult = await fetchInnerTube(
+                videoID: videoID,
+                sourcePageURL: url,
+                clientName: "ANDROID",
+                clientHeaderID: "3",
+                clientVersion: androidClientVersion,
+                userAgent: androidClientUserAgent,
+                extraClientFields: [
+                    "osName": "Android",
+                    "osVersion": "14",
+                    "androidSdkVersion": 34
+                ],
+                visitorData: visitorDataForRequests,
+                cookiesHeader: cookiesHeader
+            )
+            if let androidResult, !androidResult.streams.isEmpty {
+                results.append(androidResult)
+            }
+        }
 
         if results.isEmpty {
             if let vrResult = await fetchInnerTube(
@@ -188,7 +193,7 @@ enum YouTubeStreamResolver {
                     "osVersion": "12L",
                     "androidSdkVersion": 32
                 ],
-                visitorData: resolvedVisitorData,
+                visitorData: visitorDataForRequests,
                 cookiesHeader: cookiesHeader
             ), !vrResult.streams.isEmpty {
                 results.append(vrResult)
@@ -216,8 +221,13 @@ enum YouTubeStreamResolver {
 
         if !results.isEmpty {
             let mergedStreams = orderedMergedStreams(from: results)
-            let reachable = await filterReachableStreams(mergedStreams)
-            let finalStreams = reachable.isEmpty ? mergedStreams : reachable
+            let finalStreams: [DetectedBrowserMedia]
+            if skipReachabilityProbe {
+                finalStreams = mergedStreams
+            } else {
+                let reachable = await filterReachableStreams(mergedStreams)
+                finalStreams = reachable.isEmpty ? mergedStreams : reachable
+            }
             let primaryMeta = results[0]
             return YouTubeResolvedResult(
                 videoID: videoID,

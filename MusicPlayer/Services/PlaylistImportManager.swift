@@ -126,6 +126,7 @@ final class PlaylistImportManager {
     @ObservationIgnored private var activeResolvingTrackIDs = Set<UUID>()
     @ObservationIgnored private var discoveryTasksByJobID: [UUID: Task<Void, Never>] = [:]
     @ObservationIgnored private var pumpTask: Task<Void, Never>?
+    @ObservationIgnored private var pumpWakeupContinuation: CheckedContinuation<Void, Never>?
     @ObservationIgnored private var bgExecutionTaskID: UIBackgroundTaskIdentifier = .invalid
     @ObservationIgnored private var saveDebounceTask: Task<Void, Never>?
     @ObservationIgnored private var importedSinceLastLibraryFlush = 0
@@ -133,9 +134,10 @@ final class PlaylistImportManager {
     @ObservationIgnored private var didRegisterBGTask = false
     @ObservationIgnored private var pendingBGProcessingTask: BGProcessingTask?
 
-    private static let maxConcurrentForegroundResolvers = 2
-    private static let maxConcurrentDownloadsForeground = 3
+    private static let maxConcurrentForegroundResolvers = 3
+    private static let maxConcurrentDownloadsForeground = 4
     private static let maxConcurrentDownloadsBackground = 6
+    private static let lookaheadResolveBuffer = 2
 
     private static var jobsFileURL: URL {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -158,7 +160,9 @@ final class PlaylistImportManager {
         config.sessionSendsLaunchEvents = true
         config.isDiscretionary = false
         config.allowsCellularAccess = true
-        config.httpMaximumConnectionsPerHost = 4
+        config.allowsExpensiveNetworkAccess = true
+        config.allowsConstrainedNetworkAccess = true
+        config.httpMaximumConnectionsPerHost = 6
 
         self.backgroundSession = URLSession(configuration: config, delegate: proxy, delegateQueue: nil)
 
@@ -370,6 +374,10 @@ final class PlaylistImportManager {
             reloadLibrary: true
         )
         persistJobsNow()
+        if let wakeup = pumpWakeupContinuation {
+            pumpWakeupContinuation = nil
+            wakeup.resume()
+        }
     }
 
     func resumeJob(id: UUID) {
@@ -427,6 +435,10 @@ final class PlaylistImportManager {
         )
         BrowserYouTubeResolver.shared.releaseIdleWebView()
         persistJobsNow()
+        if let wakeup = pumpWakeupContinuation {
+            pumpWakeupContinuation = nil
+            wakeup.resume()
+        }
     }
 
     func clearFinishedJob(id: UUID) {
@@ -580,6 +592,10 @@ final class PlaylistImportManager {
     // MARK: - Worker Scheduler & Execution Loop
 
     private func ensurePumping() {
+        if let wakeup = pumpWakeupContinuation {
+            pumpWakeupContinuation = nil
+            wakeup.resume()
+        }
         guard pumpTask == nil else { return }
         guard activeJobs.contains(where: { !$0.isPaused && !$0.isCancelled }) else { return }
         pumpTask = Task { [weak self] in
@@ -587,12 +603,41 @@ final class PlaylistImportManager {
         }
     }
 
+    private func waitForQueueEvent() async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            self.pumpWakeupContinuation = continuation
+        }
+    }
+
     private func runPumpLoop() async {
-        defer { pumpTask = nil }
+        defer {
+            pumpTask = nil
+            if let wakeup = pumpWakeupContinuation {
+                pumpWakeupContinuation = nil
+                wakeup.resume()
+            }
+        }
 
         while true {
-            guard let nextPair = nextResolvableTrack() else {
-                // Check if all jobs finished downloading too
+            let isBackground = UIApplication.shared.applicationState == .background
+            let maxDownloads = isBackground ? Self.maxConcurrentDownloadsBackground : Self.maxConcurrentDownloadsForeground
+            let maxResolvers = isBackground ? 2 : Self.maxConcurrentForegroundResolvers
+
+            var startedWork = false
+            while activeResolvingTrackIDs.count < maxResolvers,
+                  activeResolvingTrackIDs.count + activeDownloadTasksByTrackID.count < maxDownloads + Self.lookaheadResolveBuffer,
+                  let nextPair = nextResolvableTrack() {
+                let (jobID, trackID) = nextPair
+                setTrackStatus(jobID: jobID, trackID: trackID, status: .resolving)
+                activeResolvingTrackIDs.insert(trackID)
+                startedWork = true
+
+                Task { [weak self] in
+                    await self?.resolveAndScheduleTrack(jobID: jobID, trackID: trackID)
+                }
+            }
+
+            if nextResolvableTrack() == nil {
                 finalizeCompletedJobsIfNeeded()
                 if activeDownloadTasksByTrackID.isEmpty && activeResolvingTrackIDs.isEmpty {
                     BrowserYouTubeResolver.shared.releaseIdleWebView()
@@ -602,27 +647,13 @@ final class PlaylistImportManager {
                     }
                     break
                 }
-                try? await Task.sleep(nanoseconds: 450_000_000)
-                continue
             }
 
-            let isBackground = UIApplication.shared.applicationState == .background
-            let maxDownloads = isBackground ? Self.maxConcurrentDownloadsBackground : Self.maxConcurrentDownloadsForeground
-            let totalInFlight = activeResolvingTrackIDs.count + activeDownloadTasksByTrackID.count
-            if totalInFlight >= maxDownloads || activeResolvingTrackIDs.count >= Self.maxConcurrentForegroundResolvers {
-                try? await Task.sleep(nanoseconds: 300_000_000)
-                continue
+            if !startedWork || activeResolvingTrackIDs.count >= maxResolvers {
+                await waitForQueueEvent()
+            } else {
+                await Task.yield()
             }
-
-            let (jobID, trackID) = nextPair
-            setTrackStatus(jobID: jobID, trackID: trackID, status: .resolving)
-            activeResolvingTrackIDs.insert(trackID)
-
-            Task { [weak self] in
-                await self?.resolveAndScheduleTrack(jobID: jobID, trackID: trackID)
-            }
-
-            try? await Task.sleep(nanoseconds: 120_000_000)
         }
     }
 
@@ -636,7 +667,10 @@ final class PlaylistImportManager {
     }
 
     private func resolveAndScheduleTrack(jobID: UUID, trackID: UUID) async {
-        defer { activeResolvingTrackIDs.remove(trackID) }
+        defer {
+            activeResolvingTrackIDs.remove(trackID)
+            ensurePumping()
+        }
 
         guard let (job, track) = lookup(jobID: jobID, trackID: trackID),
               !job.isPaused, !job.isCancelled else {
@@ -692,7 +726,8 @@ final class PlaylistImportManager {
                 for: watchURL,
                 cookiesHeader: cookiesHeader,
                 referer: watchURL.absoluteString,
-                visitorData: nil
+                visitorData: nil,
+                skipReachabilityProbe: true
             )
         }
 

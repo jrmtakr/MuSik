@@ -36,8 +36,16 @@ final class BrowserYouTubeResolver: NSObject, WKNavigationDelegate, WKScriptMess
         super.init()
     }
 
-    /// Reads current YouTube & Google session cookies from the shared built-in browser data store.
-    static func youtubeCookieHeader() async -> String? {
+    private static var cachedCookieState: (value: String?, fetchedAt: Date)?
+
+    /// Reads current YouTube & Google session cookies from the shared built-in browser data store,
+    /// caching in memory for 60s to avoid thousands of WebKit IPC round-trips during large batch imports.
+    static func youtubeCookieHeader(forceRefresh: Bool = false) async -> String? {
+        if !forceRefresh,
+           let cached = cachedCookieState,
+           Date().timeIntervalSince(cached.fetchedAt) < 60 {
+            return cached.value
+        }
         let cookies = await WKWebsiteDataStore.default().httpCookieStore.allCookies()
         let now = Date()
         let pairs = cookies.compactMap { cookie -> String? in
@@ -50,8 +58,9 @@ final class BrowserYouTubeResolver: NSObject, WKNavigationDelegate, WKScriptMess
             if let exp = cookie.expiresDate, exp <= now { return nil }
             return "\(cookie.name)=\(cookie.value)"
         }
-        guard !pairs.isEmpty else { return nil }
-        return pairs.joined(separator: "; ")
+        let result = pairs.isEmpty ? nil : pairs.joined(separator: "; ")
+        cachedCookieState = (result, now)
+        return result
     }
 
     /// Releases the internal offscreen WKWebView once a batch queue finishes to reclaim memory.
@@ -122,17 +131,18 @@ final class BrowserYouTubeResolver: NSObject, WKNavigationDelegate, WKScriptMess
         let result: YouTubeResolvedResult? = await withCheckedContinuation { continuation in
             self.activeResolveContinuation = continuation
             let isBackground = UIApplication.shared.applicationState == .background
-            let waitNs: UInt64 = isBackground ? 6_500_000_000 : 11_000_000_000
+            let maxWaitMs = isBackground ? 6_500 : 10_500
+            let stepMs = 250
+            let steps = max(1, maxWaitMs / stepMs)
 
             self.activeTimeoutTask = Task { [weak self] in
-                try? await Task.sleep(nanoseconds: 1_800_000_000)
-                guard !Task.isCancelled else { return }
-                await self?.pollPlayerResponseFromDOM()
-                try? await Task.sleep(nanoseconds: 2_000_000_000)
-                guard !Task.isCancelled else { return }
-                await self?.pollPlayerResponseFromDOM()
-                let remaining = waitNs > 3_800_000_000 ? waitNs - 3_800_000_000 : 1_500_000_000
-                try? await Task.sleep(nanoseconds: remaining)
+                for _ in 0..<steps {
+                    try? await Task.sleep(nanoseconds: UInt64(stepMs) * 1_000_000)
+                    guard !Task.isCancelled else { return }
+                    if self?.activeResolveContinuation == nil { return }
+                    await self?.pollPlayerResponseFromDOM()
+                    if self?.activeResolveContinuation == nil { return }
+                }
                 guard !Task.isCancelled else { return }
                 await self?.finishActiveResolveWithFallback()
             }
@@ -151,7 +161,7 @@ final class BrowserYouTubeResolver: NSObject, WKNavigationDelegate, WKScriptMess
         wv.loadHTMLString("", baseURL: nil)
 
         guard let result, !result.streams.isEmpty else { return nil }
-        let updatedCookies = await Self.youtubeCookieHeader() ?? cookiesHeader
+        let updatedCookies = await Self.youtubeCookieHeader(forceRefresh: true) ?? cookiesHeader
         let patchedStreams = result.streams.map { stream -> DetectedBrowserMedia in
             var mergedHeaders = stream.customHeaders ?? [:]
             if let updatedCookies, !updatedCookies.isEmpty, mergedHeaders["Cookie"] == nil {
@@ -209,7 +219,7 @@ final class BrowserYouTubeResolver: NSObject, WKNavigationDelegate, WKScriptMess
         })();
         """
         let raw = try? await wv.evaluateJavaScript(js) as? String
-        let cookies = await Self.youtubeCookieHeader()
+        let cookies = await Self.youtubeCookieHeader(forceRefresh: true)
         wv.stopLoading()
         wv.loadHTMLString("", baseURL: nil)
 
