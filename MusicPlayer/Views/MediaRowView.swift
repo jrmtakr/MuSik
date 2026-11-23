@@ -11,6 +11,7 @@ struct MediaRowView: View {
     var onMove: (() -> Void)? = nil
 
     @State private var showVerifyArtistSheet = false
+    @State private var collabSendTarget: CollabSongNoteTarget?
 
     private var isCurrent: Bool {
         mediaManager.currentItem?.relativePath == item.relativePath
@@ -174,7 +175,14 @@ struct MediaRowView: View {
                         Divider()
                         ForEach(GroupPlaylistService.shared.groups) { group in
                             Button {
-                                GroupPlaylistService.shared.sendLocalItem(item, to: group.id)
+                                collabSendTarget = CollabSongNoteTarget(
+                                    groupID: group.id,
+                                    songTitle: item.displayTitle,
+                                    songArtist: item.artist ?? "",
+                                    localItem: item,
+                                    youtubeVideoID: mediaManager.sourceVideoID(for: item),
+                                    durationSeconds: item.durationSeconds
+                                )
                             } label: {
                                 Label("Send to Group: \(group.name)", systemImage: "person.2.wave.2")
                             }
@@ -273,6 +281,9 @@ struct MediaRowView: View {
         .padding(.vertical, 4)
         .sheet(isPresented: $showVerifyArtistSheet) {
             VerifyTrackArtistSheet(item: item)
+        }
+        .sheet(item: $collabSendTarget) { target in
+            CollabSongNoteComposerSheet(target: target)
         }
     }
 }

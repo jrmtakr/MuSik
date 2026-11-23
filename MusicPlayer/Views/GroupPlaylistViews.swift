@@ -172,6 +172,7 @@ struct GroupPlaylistDetailView: View {
     @Binding var showPlayerSheet: Bool
 
     @State private var showAddSongsSheet = false
+    @State private var showMessagesSheet = false
     @State private var showRenameAlert = false
     @State private var renameText = ""
     @State private var showEditNicknameAlert = false
@@ -303,6 +304,28 @@ struct GroupPlaylistDetailView: View {
                                 }
                                 .buttonStyle(.bordered)
                             }
+
+                            Button {
+                                showMessagesSheet = true
+                            } label: {
+                                HStack {
+                                    Label("Collab Messages & Stickers", systemImage: "bubble.left.and.bubble.right.fill")
+                                        .font(.subheadline.weight(.semibold))
+                                    Spacer()
+                                    if !group.messages.isEmpty {
+                                        Text("\(group.messages.count)")
+                                            .font(.caption.weight(.bold))
+                                            .monospacedDigit()
+                                            .padding(.horizontal, 8)
+                                            .padding(.vertical, 2)
+                                            .background(Color.accentColor.opacity(0.18), in: Capsule())
+                                    }
+                                    Image(systemName: "chevron.right")
+                                        .font(.caption.weight(.semibold))
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                            .buttonStyle(.bordered)
                         }
                         .padding(.vertical, 6)
                     }
@@ -340,6 +363,13 @@ struct GroupPlaylistDetailView: View {
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbar {
                     ToolbarItemGroup(placement: .topBarTrailing) {
+                        Button {
+                            showMessagesSheet = true
+                        } label: {
+                            Image(systemName: group.messages.isEmpty ? "bubble.left.and.bubble.right" : "bubble.left.and.bubble.right.fill")
+                        }
+                        .accessibilityLabel("Collab Messages")
+
                         Button {
                             showAddSongsSheet = true
                         } label: {
@@ -382,6 +412,11 @@ struct GroupPlaylistDetailView: View {
                 .miniPlayerInset(showPlayerSheet: $showPlayerSheet)
                 .sheet(isPresented: $showAddSongsSheet) {
                     GroupAddSongsSheet(groupID: group.id)
+                }
+                .sheet(isPresented: $showMessagesSheet) {
+                    CollabMessagesSheet(groupID: group.id) { _ in
+                        showAddSongsSheet = true
+                    }
                 }
                 .alert("Rename Group Playlist", isPresented: $showRenameAlert) {
                     TextField("Playlist name", text: $renameText)
@@ -465,7 +500,7 @@ struct GroupPlaylistDetailView: View {
                         }
                     }
 
-                    VStack(alignment: .leading, spacing: 2) {
+                    VStack(alignment: .leading, spacing: 3) {
                         Text(track.title)
                             .font(.subheadline.weight(isActive ? .bold : .semibold))
                             .foregroundStyle(isActive ? Color.accentColor : .primary)
@@ -485,6 +520,28 @@ struct GroupPlaylistDetailView: View {
                         }
                         .font(.caption2)
                         .foregroundStyle(.secondary)
+
+                        if track.hasMessageOrSticker {
+                            HStack(spacing: 5) {
+                                if let sticker = track.sticker, !sticker.isEmpty {
+                                    Text(sticker)
+                                        .font(.caption)
+                                }
+                                if let note = track.note, !note.isEmpty {
+                                    Text("\"\(note)\"")
+                                        .font(.caption2.weight(.medium))
+                                        .foregroundStyle(Color.accentColor)
+                                        .lineLimit(2)
+                                } else {
+                                    Text("Sticker reaction")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 3)
+                            .background(Color.accentColor.opacity(0.10), in: Capsule())
+                        }
                     }
 
                     Spacer()
@@ -553,7 +610,7 @@ private enum GroupAddSourceTab: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
-private struct GroupAddSongsSheet: View {
+struct GroupAddSongsSheet: View {
     @Environment(GroupPlaylistService.self) private var groupService
     let groupID: UUID
 
@@ -572,7 +629,9 @@ private struct GroupAddSongsSheet: View {
                     durationSeconds: durationSeconds,
                     to: groupID
                 )
-            }
+            },
+            allowOptionalNoteComposer: true,
+            targetGroupID: groupID
         )
     }
 }
@@ -585,6 +644,8 @@ struct CollaborativeAddSongsSheet: View {
     let actionTitle: String
     let onSendLocal: (MediaItem) -> Void
     let onSendSearched: (String, String, String?, Double?) -> Void
+    var allowOptionalNoteComposer: Bool = false
+    var targetGroupID: UUID? = nil
 
     @State private var sourceTab: GroupAddSourceTab = .library
     @State private var libraryFilter = ""
@@ -592,6 +653,8 @@ struct CollaborativeAddSongsSheet: View {
     @State private var searchResults: [(videoID: String, title: String, artist: String, durationSeconds: Double?)] = []
     @State private var isSearching = false
     @State private var sentKeys: Set<String> = []
+    @State private var composerTarget: CollabSongNoteTarget?
+    @State private var pendingComposerSentKey: String?
 
     private var filteredLibraryItems: [MediaItem] {
         let trimmed = libraryFilter.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -645,6 +708,29 @@ struct CollaborativeAddSongsSheet: View {
                                     }
 
                                     Spacer()
+
+                                    if allowOptionalNoteComposer {
+                                        Button {
+                                            pendingComposerSentKey = item.relativePath
+                                            composerTarget = CollabSongNoteTarget(
+                                                groupID: targetGroupID,
+                                                songTitle: item.displayTitle,
+                                                songArtist: item.artist ?? "",
+                                                localItem: item,
+                                                youtubeVideoID: mediaManager.sourceVideoID(for: item),
+                                                durationSeconds: item.durationSeconds
+                                            )
+                                        } label: {
+                                            Image(systemName: "bubble.and.pencil")
+                                                .font(.caption.weight(.bold))
+                                                .padding(.horizontal, 9)
+                                                .padding(.vertical, 6)
+                                                .background(Color.secondary.opacity(0.14), in: Capsule())
+                                                .foregroundStyle(.primary)
+                                        }
+                                        .buttonStyle(.plain)
+                                        .accessibilityLabel("Add with Note or Sticker")
+                                    }
 
                                     Button {
                                         sentKeys.insert(item.relativePath)
@@ -717,6 +803,29 @@ struct CollaborativeAddSongsSheet: View {
 
                                     Spacer()
 
+                                    if allowOptionalNoteComposer {
+                                        Button {
+                                            pendingComposerSentKey = hit.videoID
+                                            composerTarget = CollabSongNoteTarget(
+                                                groupID: targetGroupID,
+                                                songTitle: hit.title,
+                                                songArtist: hit.artist,
+                                                localItem: nil,
+                                                youtubeVideoID: hit.videoID,
+                                                durationSeconds: hit.durationSeconds
+                                            )
+                                        } label: {
+                                            Image(systemName: "bubble.and.pencil")
+                                                .font(.caption.weight(.bold))
+                                                .padding(.horizontal, 9)
+                                                .padding(.vertical, 6)
+                                                .background(Color.secondary.opacity(0.14), in: Capsule())
+                                                .foregroundStyle(.primary)
+                                        }
+                                        .buttonStyle(.plain)
+                                        .accessibilityLabel("Add with Note or Sticker")
+                                    }
+
                                     Button {
                                         sentKeys.insert(hit.videoID)
                                         onSendSearched(hit.title, hit.artist, hit.videoID, hit.durationSeconds)
@@ -745,6 +854,14 @@ struct CollaborativeAddSongsSheet: View {
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("Done") { dismiss() }
+                }
+            }
+            .sheet(item: $composerTarget) { target in
+                CollabSongNoteComposerSheet(target: target) { _ in
+                    if let key = pendingComposerSentKey {
+                        sentKeys.insert(key)
+                    }
+                    pendingComposerSentKey = nil
                 }
             }
         }

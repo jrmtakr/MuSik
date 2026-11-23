@@ -10,11 +10,54 @@ struct GroupPlaylistTrack: Identifiable, Hashable, Codable {
     var durationSeconds: Double?
     var addedBy: String
     var addedAt: TimeInterval
+    var note: String? = nil
+    var sticker: String? = nil
 
     var formattedDuration: String? {
         guard let durationSeconds, durationSeconds.isFinite, durationSeconds > 0 else { return nil }
         return MediaTimeFormatter.format(durationSeconds)
     }
+
+    var hasMessageOrSticker: Bool {
+        let cleanNote = note?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let cleanSticker = sticker?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return !cleanNote.isEmpty || !cleanSticker.isEmpty
+    }
+}
+
+struct GroupPlaylistMessage: Identifiable, Hashable, Codable {
+    let id: UUID
+    var senderID: String
+    var senderName: String
+    var text: String?
+    var sticker: String?
+    var trackID: UUID?
+    var trackTitle: String?
+    var trackArtist: String?
+    var timestamp: TimeInterval
+
+    var hasContent: Bool {
+        let cleanText = text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let cleanSticker = sticker?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return !cleanText.isEmpty || !cleanSticker.isEmpty
+    }
+}
+
+enum GroupPlaylistStickerPalette {
+    static let presets: [(emoji: String, label: String)] = [
+        ("🔥", "Fire"),
+        ("❤️", "Love"),
+        ("😭", "Feels"),
+        ("🕺", "Vibe"),
+        ("🎧", "Late Night"),
+        ("✨", "Magic"),
+        ("💀", "Too Good"),
+        ("🌙", "Midnight"),
+        ("🚗", "Drive"),
+        ("💥", "Banger"),
+        ("🥺", "Nostalgia"),
+        ("👑", "Classic")
+    ]
 }
 
 struct GroupPlaylist: Identifiable, Hashable, Codable {
@@ -22,11 +65,67 @@ struct GroupPlaylist: Identifiable, Hashable, Codable {
     let code: String
     var name: String
     var tracks: [GroupPlaylistTrack] = []
+    var messages: [GroupPlaylistMessage] = []
     var removedTrackTimestamps: [UUID: TimeInterval] = [:]
     var appliedEventIDs: [UUID] = []
     var knownMembers: [String] = []
     var createdAt: Date = .now
     var lastSyncedAt: Date?
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case code
+        case name
+        case tracks
+        case messages
+        case removedTrackTimestamps
+        case appliedEventIDs
+        case knownMembers
+        case createdAt
+        case lastSyncedAt
+    }
+
+    init(
+        id: UUID,
+        code: String,
+        name: String,
+        tracks: [GroupPlaylistTrack] = [],
+        messages: [GroupPlaylistMessage] = [],
+        removedTrackTimestamps: [UUID: TimeInterval] = [:],
+        appliedEventIDs: [UUID] = [],
+        knownMembers: [String] = [],
+        createdAt: Date = .now,
+        lastSyncedAt: Date? = nil
+    ) {
+        self.id = id
+        self.code = code
+        self.name = name
+        self.tracks = tracks
+        self.messages = messages
+        self.removedTrackTimestamps = removedTrackTimestamps
+        self.appliedEventIDs = appliedEventIDs
+        self.knownMembers = knownMembers
+        self.createdAt = createdAt
+        self.lastSyncedAt = lastSyncedAt
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        code = try c.decode(String.self, forKey: .code)
+        name = try c.decode(String.self, forKey: .name)
+        tracks = try c.decodeIfPresent([GroupPlaylistTrack].self, forKey: .tracks) ?? []
+        messages = try c.decodeIfPresent([GroupPlaylistMessage].self, forKey: .messages) ?? []
+        removedTrackTimestamps = try c.decodeIfPresent([UUID: TimeInterval].self, forKey: .removedTrackTimestamps) ?? [:]
+        appliedEventIDs = try c.decodeIfPresent([UUID].self, forKey: .appliedEventIDs) ?? []
+        knownMembers = try c.decodeIfPresent([String].self, forKey: .knownMembers) ?? []
+        createdAt = try c.decodeIfPresent(Date.self, forKey: .createdAt) ?? .now
+        lastSyncedAt = try c.decodeIfPresent(Date.self, forKey: .lastSyncedAt)
+    }
+
+    var sortedMessages: [GroupPlaylistMessage] {
+        messages.sorted { $0.timestamp < $1.timestamp }
+    }
 
     var formattedCode: String {
         let clean = GroupPlaylistService.normalizeCode(code)
@@ -59,6 +158,7 @@ private enum GroupPlaylistEventKind: String, Codable {
     case addTrack
     case updateTrackVideoID
     case removeTrack
+    case postMessage
     case snapshot
 }
 
@@ -74,6 +174,8 @@ private struct GroupPlaylistEventPayload: Codable {
     var youtubeVideoID: String?
     var needsSnapshot: Bool?
     var tracks: [GroupPlaylistTrack]?
+    var message: GroupPlaylistMessage?
+    var messages: [GroupPlaylistMessage]?
     var removedTrackTimestamps: [UUID: TimeInterval]?
     var members: [String]?
 }
@@ -293,12 +395,37 @@ final class GroupPlaylistService {
         }
     }
 
-    // MARK: - Live Song Mutations
+    // MARK: - Live Song Mutations & Messages
 
-    func sendLocalItem(_ item: MediaItem, to groupID: UUID) {
+    var defaultMessageGroup: GroupPlaylist? {
+        if let activeGroupID, let active = groups.first(where: { $0.id == activeGroupID }) {
+            return active
+        }
+        return groups.first(where: { !$0.messages.isEmpty }) ?? groups.first
+    }
+
+    var totalMessagesCount: Int {
+        groups.reduce(0) { $0 + $1.messages.count }
+    }
+
+    private func normalizedOptional(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    func sendLocalItem(
+        _ item: MediaItem,
+        to groupID: UUID,
+        note: String? = nil,
+        sticker: String? = nil
+    ) {
         guard let group = groups.first(where: { $0.id == groupID }) else { return }
         let existingVID = MediaManager.shared.sourceVideoID(for: item)
         let cleanArtist = (item.artist ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanNote = normalizedOptional(note)
+        let cleanSticker = normalizedOptional(sticker)
+        let nowTS = Date().timeIntervalSince1970
 
         let track = GroupPlaylistTrack(
             id: UUID(),
@@ -307,16 +434,34 @@ final class GroupPlaylistService {
             youtubeVideoID: existingVID,
             durationSeconds: item.durationSeconds,
             addedBy: normalizedSenderName,
-            addedAt: Date().timeIntervalSince1970
+            addedAt: nowTS,
+            note: cleanNote,
+            sticker: cleanSticker
         )
+
+        var attachedMessage: GroupPlaylistMessage?
+        if cleanNote != nil || cleanSticker != nil {
+            attachedMessage = GroupPlaylistMessage(
+                id: UUID(),
+                senderID: deviceSenderID,
+                senderName: normalizedSenderName,
+                text: cleanNote,
+                sticker: cleanSticker,
+                trackID: track.id,
+                trackTitle: track.title,
+                trackArtist: cleanArtist,
+                timestamp: nowTS
+            )
+        }
 
         let evt = GroupPlaylistEventPayload(
             id: UUID(),
             senderID: deviceSenderID,
             senderName: normalizedSenderName,
-            timestamp: Date().timeIntervalSince1970,
+            timestamp: nowTS,
             kind: .addTrack,
-            track: track
+            track: track,
+            message: attachedMessage
         )
         applyEvent(evt, toGroupID: groupID)
         MediaManager.shared.statusMessage = "Sent \"\(track.title)\" to \(group.name)"
@@ -351,32 +496,96 @@ final class GroupPlaylistService {
         artist: String,
         youtubeVideoID: String?,
         durationSeconds: Double?,
-        to groupID: UUID
+        to groupID: UUID,
+        note: String? = nil,
+        sticker: String? = nil
     ) {
         guard let group = groups.first(where: { $0.id == groupID }) else { return }
         let cleanTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleanTitle.isEmpty else { return }
+        let cleanArtist = artist.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanNote = normalizedOptional(note)
+        let cleanSticker = normalizedOptional(sticker)
+        let nowTS = Date().timeIntervalSince1970
 
         let track = GroupPlaylistTrack(
             id: UUID(),
             title: cleanTitle,
-            artist: artist.trimmingCharacters(in: .whitespacesAndNewlines),
+            artist: cleanArtist,
             youtubeVideoID: youtubeVideoID,
             durationSeconds: durationSeconds,
             addedBy: normalizedSenderName,
-            addedAt: Date().timeIntervalSince1970
+            addedAt: nowTS,
+            note: cleanNote,
+            sticker: cleanSticker
+        )
+
+        var attachedMessage: GroupPlaylistMessage?
+        if cleanNote != nil || cleanSticker != nil {
+            attachedMessage = GroupPlaylistMessage(
+                id: UUID(),
+                senderID: deviceSenderID,
+                senderName: normalizedSenderName,
+                text: cleanNote,
+                sticker: cleanSticker,
+                trackID: track.id,
+                trackTitle: track.title,
+                trackArtist: cleanArtist,
+                timestamp: nowTS
+            )
+        }
+
+        let evt = GroupPlaylistEventPayload(
+            id: UUID(),
+            senderID: deviceSenderID,
+            senderName: normalizedSenderName,
+            timestamp: nowTS,
+            kind: .addTrack,
+            track: track,
+            message: attachedMessage
+        )
+        applyEvent(evt, toGroupID: groupID)
+        MediaManager.shared.statusMessage = "Added \"\(cleanTitle)\" to \(group.name)"
+
+        let topic = Self.topicName(forCode: group.code)
+        Task {
+            await publishEvent(evt, topic: topic)
+        }
+    }
+
+    func sendMessage(
+        text: String?,
+        sticker: String?,
+        attachedTrack: GroupPlaylistTrack? = nil,
+        to groupID: UUID
+    ) {
+        guard let group = groups.first(where: { $0.id == groupID }) else { return }
+        let cleanText = normalizedOptional(text)
+        let cleanSticker = normalizedOptional(sticker)
+        guard cleanText != nil || cleanSticker != nil else { return }
+
+        let nowTS = Date().timeIntervalSince1970
+        let msg = GroupPlaylistMessage(
+            id: UUID(),
+            senderID: deviceSenderID,
+            senderName: normalizedSenderName,
+            text: cleanText,
+            sticker: cleanSticker,
+            trackID: attachedTrack?.id,
+            trackTitle: attachedTrack?.title,
+            trackArtist: attachedTrack?.artist,
+            timestamp: nowTS
         )
 
         let evt = GroupPlaylistEventPayload(
             id: UUID(),
             senderID: deviceSenderID,
             senderName: normalizedSenderName,
-            timestamp: Date().timeIntervalSince1970,
-            kind: .addTrack,
-            track: track
+            timestamp: nowTS,
+            kind: .postMessage,
+            message: msg
         )
         applyEvent(evt, toGroupID: groupID)
-        MediaManager.shared.statusMessage = "Added \"\(cleanTitle)\" to \(group.name)"
 
         let topic = Self.topicName(forCode: group.code)
         Task {
@@ -521,7 +730,8 @@ final class GroupPlaylistService {
         applyEvent(payload, toGroupID: groupID)
 
         if payload.kind == .joinPresence && payload.needsSnapshot == true && payload.senderID != deviceSenderID {
-            if let group = groups.first(where: { $0.id == groupID }), !group.tracks.isEmpty {
+            if let group = groups.first(where: { $0.id == groupID }),
+               (!group.tracks.isEmpty || !group.messages.isEmpty) {
                 let last = lastSnapshotBroadcastByGroup[groupID] ?? .distantPast
                 if Date().timeIntervalSince(last) > 5 {
                     lastSnapshotBroadcastByGroup[groupID] = .now
@@ -533,6 +743,7 @@ final class GroupPlaylistService {
                         kind: .snapshot,
                         playlistName: group.name,
                         tracks: group.tracks,
+                        messages: group.messages,
                         removedTrackTimestamps: group.removedTrackTimestamps,
                         members: group.knownMembers
                     )
@@ -547,7 +758,7 @@ final class GroupPlaylistService {
 
     private func maybeWarmSnapshotIfNeeded(groupID: UUID) async {
         guard let group = groups.first(where: { $0.id == groupID }),
-              !group.tracks.isEmpty else { return }
+              (!group.tracks.isEmpty || !group.messages.isEmpty) else { return }
         let last = lastSnapshotBroadcastByGroup[groupID] ?? .distantPast
         guard Date().timeIntervalSince(last) > 3600 else { return }
         lastSnapshotBroadcastByGroup[groupID] = .now
@@ -560,6 +771,7 @@ final class GroupPlaylistService {
             kind: .snapshot,
             playlistName: group.name,
             tracks: group.tracks,
+            messages: group.messages,
             removedTrackTimestamps: group.removedTrackTimestamps,
             members: group.knownMembers
         )
@@ -613,6 +825,11 @@ final class GroupPlaylistService {
                 groups[idx].tracks.append(track)
                 groups[idx].tracks.sort { $0.addedAt < $1.addedAt }
             }
+            if let msg = event.message, msg.hasContent,
+               !groups[idx].messages.contains(where: { $0.id == msg.id }) {
+                groups[idx].messages.append(msg)
+                groups[idx].messages.sort { $0.timestamp < $1.timestamp }
+            }
 
         case .updateTrackVideoID:
             if let trackID = event.trackID,
@@ -628,6 +845,13 @@ final class GroupPlaylistService {
                     event.timestamp
                 )
                 groups[idx].tracks.removeAll { $0.id == trackID }
+            }
+
+        case .postMessage:
+            if let msg = event.message, msg.hasContent,
+               !groups[idx].messages.contains(where: { $0.id == msg.id }) {
+                groups[idx].messages.append(msg)
+                groups[idx].messages.sort { $0.timestamp < $1.timestamp }
             }
 
         case .snapshot:
@@ -656,6 +880,14 @@ final class GroupPlaylistService {
                     }
                 }
                 groups[idx].tracks.sort { $0.addedAt < $1.addedAt }
+            }
+            if let remoteMessages = event.messages {
+                for m in remoteMessages where m.hasContent {
+                    if !groups[idx].messages.contains(where: { $0.id == m.id }) {
+                        groups[idx].messages.append(m)
+                    }
+                }
+                groups[idx].messages.sort { $0.timestamp < $1.timestamp }
             }
         }
 

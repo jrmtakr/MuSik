@@ -1,9 +1,14 @@
 import AVKit
 import SwiftUI
 
+private struct IdentifiableUUID: Identifiable {
+    let id: UUID
+}
+
 private enum NowPlayingDisplayMode {
     case player
     case lyrics
+    case messages
     case queue
 }
 
@@ -12,6 +17,7 @@ struct NowPlayingView: View {
     @Environment(SleepTimerManager.self) private var sleepTimer
     @Environment(WebMediaDownloader.self) private var downloader
     @Environment(SyncedLyricsService.self) private var lyricsService
+    @Environment(GroupPlaylistService.self) private var groupService
     @Environment(\.dismiss) private var dismiss
 
     @State private var displayMode: NowPlayingDisplayMode = .player
@@ -27,6 +33,8 @@ struct NowPlayingView: View {
     @State private var editingInfoItem: MediaItem?
     @State private var verifyArtistItem: MediaItem?
     @State private var lyricsTarget: GeniusLyricsTarget?
+    @State private var collabSendTarget: CollabSongNoteTarget?
+    @State private var collabAddSongsGroupID: IdentifiableUUID?
     @State private var showNewPlaylistAlert = false
     @State private var newPlaylistName = ""
 
@@ -147,6 +155,17 @@ struct NowPlayingView: View {
                     Button {
                         AppHaptics.selection()
                         withAnimation(.spring(response: 0.42, dampingFraction: 0.86)) {
+                            displayMode = .messages
+                        }
+                    } label: {
+                        Image(systemName: displayMode == .messages ? "bubble.left.and.bubble.right.fill" : "bubble.left.and.bubble.right")
+                            .foregroundStyle(groupService.totalMessagesCount > 0 ? Color.accentColor : .primary)
+                    }
+                    .accessibilityLabel("Collab Playlist Messages")
+
+                    Button {
+                        AppHaptics.selection()
+                        withAnimation(.spring(response: 0.42, dampingFraction: 0.86)) {
                             displayMode = .queue
                         }
                     } label: {
@@ -180,6 +199,12 @@ struct NowPlayingView: View {
             }
             .sheet(item: $lyricsTarget) { target in
                 GeniusLyricsSheetView(target: target)
+            }
+            .sheet(item: $collabSendTarget) { target in
+                CollabSongNoteComposerSheet(target: target)
+            }
+            .sheet(item: $collabAddSongsGroupID) { selection in
+                GroupAddSongsSheet(groupID: selection.id)
             }
             .fullScreenCover(isPresented: $showFullscreenFFmpegVideo) {
                 ZStack(alignment: .topTrailing) {
@@ -691,7 +716,14 @@ struct NowPlayingView: View {
                         Divider()
                         ForEach(GroupPlaylistService.shared.groups) { group in
                             Button {
-                                GroupPlaylistService.shared.sendLocalItem(item, to: group.id)
+                                collabSendTarget = CollabSongNoteTarget(
+                                    groupID: group.id,
+                                    songTitle: item.displayTitle,
+                                    songArtist: item.artist ?? "",
+                                    localItem: item,
+                                    youtubeVideoID: MediaManager.shared.sourceVideoID(for: item),
+                                    durationSeconds: item.durationSeconds
+                                )
                             } label: {
                                 Label("Send to Group: \(group.name)", systemImage: "person.2.wave.2")
                             }
@@ -721,7 +753,7 @@ struct NowPlayingView: View {
         .padding(.top, 4)
     }
 
-    // MARK: - 1:1 Apple Music Focused Lyrics & Playing Next Surface
+    // MARK: - 1:1 Apple Music Focused Lyrics, Collab Messages & Playing Next Surface
 
     @ViewBuilder
     private func appleMusicFocusedModeView(item: MediaItem) -> some View {
@@ -738,7 +770,8 @@ struct NowPlayingView: View {
                     .padding(.top, 10)
                     .padding(.bottom, 8)
 
-                if displayMode == .lyrics {
+                switch displayMode {
+                case .lyrics:
                     AppleMusicLyricsView(
                         item: item,
                         onOpenGeniusWeb: { t, a in
@@ -746,13 +779,26 @@ struct NowPlayingView: View {
                         }
                     )
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else {
+                case .messages:
+                    CollabMessagesView(
+                        isEmbeddedDarkGlass: true,
+                        onAddSongRequested: { groupID in
+                            collabAddSongsGroupID = IdentifiableUUID(id: groupID)
+                        },
+                        onDismissParentForVideo: {
+                            dismiss()
+                        }
+                    )
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                case .queue:
                     UserQueueContentView(
                         isEmbeddedDarkGlass: true,
                         onAddSongs: { showAddToQueuePicker = true }
                     )
                     .environment(\.editMode, .constant(isEditingQueueOrder ? .active : .inactive))
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
+                case .player:
+                    EmptyView()
                 }
 
                 compactAppleMusicFooter(item: item)
@@ -936,7 +982,13 @@ struct NowPlayingView: View {
     }
 
     private func appleMusicBottomDock(item: MediaItem, darkGlass: Bool) -> some View {
-        HStack {
+        let inactiveFill = darkGlass ? Color.white.opacity(0.12) : Color.secondary.opacity(0.14)
+        let activeFill = darkGlass ? Color.white : Color.accentColor
+        let inactiveText = darkGlass ? Color.white.opacity(0.84) : Color.primary
+        let activeText = darkGlass ? Color.black : Color.white
+        let messageCount = groupService.defaultMessageGroup?.messages.count ?? groupService.totalMessagesCount
+
+        return HStack {
             Button {
                 AppHaptics.selection()
                 lyricsService.loadLyricsIfNeeded(for: item)
@@ -946,14 +998,11 @@ struct NowPlayingView: View {
             } label: {
                 let active = displayMode == .lyrics
                 Image(systemName: active ? "quote.bubble.fill" : "quote.bubble")
-                    .font(.title3.weight(.semibold))
-                    .foregroundStyle(active ? (darkGlass ? Color.black : Color.white) : (darkGlass ? Color.white.opacity(0.8) : Color.primary))
-                    .padding(.horizontal, 16)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(active ? activeText : inactiveText)
+                    .padding(.horizontal, 15)
                     .padding(.vertical, 8)
-                    .background(
-                        Capsule()
-                            .fill(active ? (darkGlass ? Color.white : Color.accentColor) : (darkGlass ? Color.white.opacity(0.12) : Color.secondary.opacity(0.14)))
-                    )
+                    .background(Capsule().fill(active ? activeFill : inactiveFill))
             }
             .buttonStyle(.plain)
             .accessibilityLabel("Synced Lyrics")
@@ -961,7 +1010,36 @@ struct NowPlayingView: View {
             Spacer()
 
             AirPlayRoutePickerView(prioritizesVideoDevices: item.isVideo)
-                .frame(width: 32, height: 32)
+                .frame(width: 24, height: 24)
+                .padding(.horizontal, 11)
+                .padding(.vertical, 5)
+                .background(Capsule().fill(inactiveFill))
+
+            Spacer()
+
+            Button {
+                AppHaptics.selection()
+                withAnimation(.spring(response: 0.42, dampingFraction: 0.86)) {
+                    displayMode = (displayMode == .messages) ? .player : .messages
+                }
+            } label: {
+                let active = displayMode == .messages
+                HStack(spacing: 5) {
+                    Image(systemName: active ? "bubble.left.and.bubble.right.fill" : "bubble.left.and.bubble.right")
+                        .font(.subheadline.weight(.semibold))
+                    if messageCount > 0 {
+                        Text("\(messageCount)")
+                            .font(.caption.weight(.bold))
+                            .monospacedDigit()
+                    }
+                }
+                .foregroundStyle(active ? activeText : inactiveText)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
+                .background(Capsule().fill(active ? activeFill : inactiveFill))
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Collab Playlist Messages")
 
             Spacer()
 
@@ -974,20 +1052,17 @@ struct NowPlayingView: View {
                 let active = displayMode == .queue
                 HStack(spacing: 5) {
                     Image(systemName: "list.bullet")
-                        .font(.title3.weight(.semibold))
+                        .font(.subheadline.weight(.semibold))
                     if !mediaManager.upNextPaths.isEmpty {
                         Text("\(mediaManager.upNextPaths.count)")
                             .font(.caption.weight(.bold))
                             .monospacedDigit()
                     }
                 }
-                .foregroundStyle(active ? (darkGlass ? Color.black : Color.white) : (darkGlass ? Color.white.opacity(0.8) : Color.primary))
-                .padding(.horizontal, 16)
+                .foregroundStyle(active ? activeText : inactiveText)
+                .padding(.horizontal, 14)
                 .padding(.vertical, 8)
-                .background(
-                    Capsule()
-                        .fill(active ? (darkGlass ? Color.white : Color.accentColor) : (darkGlass ? Color.white.opacity(0.12) : Color.secondary.opacity(0.14)))
-                )
+                .background(Capsule().fill(active ? activeFill : inactiveFill))
             }
             .buttonStyle(.plain)
             .accessibilityLabel("Playing Next Queue")
