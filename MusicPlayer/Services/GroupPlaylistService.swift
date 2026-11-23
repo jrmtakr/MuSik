@@ -111,7 +111,7 @@ final class GroupPlaylistService {
     private static let memberNameDefaultsKey = "musicplayer.group.memberName"
     private static let senderIDDefaultsKey = "musicplayer.group.senderID"
     private static let autoSaveDefaultsKey = "musicplayer.group.autoSave"
-    private static let alphabet = Array("ABCDEFGHJKLMNPQRSTUVWXYZ23456789")
+    nonisolated private static let alphabet = Array("ABCDEFGHJKLMNPQRSTUVWXYZ23456789")
 
     private init() {
         let d = UserDefaults.standard
@@ -131,21 +131,21 @@ final class GroupPlaylistService {
 
     // MARK: - Code / Link Parsing
 
-    static func generateRoomCode() -> String {
+    nonisolated static func generateRoomCode() -> String {
         let chars = (0..<8).map { _ in alphabet.randomElement()! }
         return "\(String(chars.prefix(4)))-\(String(chars.suffix(4)))"
     }
 
-    static func normalizeCode(_ raw: String) -> String {
+    nonisolated static func normalizeCode(_ raw: String) -> String {
         let upper = raw.uppercased().filter { $0.isASCII && ($0.isLetter || $0.isNumber) }
         return upper
     }
 
-    static func topicName(forCode code: String) -> String {
+    nonisolated static func topicName(forCode code: String) -> String {
         "mpgp_\(normalizeCode(code).lowercased())"
     }
 
-    static func parseInviteInput(_ rawInput: String) -> (code: String, name: String?)? {
+    nonisolated static func parseInviteInput(_ rawInput: String) -> (code: String, name: String?)? {
         let trimmed = rawInput.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
 
@@ -769,11 +769,14 @@ final class GroupPlaylistService {
         )
 
         if saveOfflineOnly || autoSaveIncomingTracks {
-            let localOrSaved: MediaItem? = matchingLocalItem(for: track) ?? (await downloader.downloadGroupTrackOffline(
-                taggedPrimary,
-                fallbackStreams: Array(preferred.dropFirst()),
-                sourceVideoID: vid
-            ))
+            var localOrSaved: MediaItem? = matchingLocalItem(for: track)
+            if localOrSaved == nil {
+                localOrSaved = await downloader.downloadGroupTrackOffline(
+                    taggedPrimary,
+                    fallbackStreams: Array(preferred.dropFirst()),
+                    sourceVideoID: vid
+                )
+            }
             if !saveOfflineOnly, let savedItem = localOrSaved {
                 MediaManager.shared.play(savedItem, inPlaylist: nil, keepExternalQueue: true)
                 return true
