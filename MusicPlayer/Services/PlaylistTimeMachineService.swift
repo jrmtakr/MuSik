@@ -129,7 +129,6 @@ struct ArchivedDeletedPlaylistSummary: Identifiable {
     let totalVersions: Int
 }
 
-@MainActor
 @Observable
 final class PlaylistTimeMachineService {
     static let shared = PlaylistTimeMachineService()
@@ -552,6 +551,7 @@ final class PlaylistTimeMachineService {
 
     // MARK: - Missing Track Re-Download & Export
 
+    @MainActor
     func reDownloadMissingTrack(
         _ track: PlaylistSnapshotTrack,
         into playlistID: UUID?,
@@ -771,7 +771,7 @@ final class PlaylistTimeMachineService {
 
     private func scheduleDiskSave() {
         saveTask?.cancel()
-        saveTask = Task { [weak self] in
+        saveTask = Task { @MainActor [weak self] in
             try? await Task.sleep(for: .milliseconds(350))
             guard !Task.isCancelled else { return }
             self?.writeToDisk()

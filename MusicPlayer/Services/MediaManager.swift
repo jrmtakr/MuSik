@@ -607,6 +607,7 @@ final class MediaManager {
                 duration = equalizerPlayer.duration > 0 ? equalizerPlayer.duration : (item.durationSeconds ?? 0)
                 isPlaying = true
                 updateNowPlayingInfo(for: item)
+                syncWrappedSessionStart(for: item)
                 return
             } catch {
                 equalizerPlayer.stop()
@@ -631,6 +632,7 @@ final class MediaManager {
         newPlayer.rate = playbackRate
         isPlaying = true
         updateNowPlayingInfo(for: item)
+        syncWrappedSessionStart(for: item)
     }
 
     func playRemoteStream(
@@ -695,6 +697,7 @@ final class MediaManager {
             newPlayer.rate = playbackRate
             isPlaying = true
             updateNowPlayingInfo(for: virtualItem)
+            syncWrappedSessionStart(for: virtualItem)
         } else {
             playWithFFmpegEngine(url: url, item: virtualItem, headers: headers)
         }
@@ -780,6 +783,7 @@ final class MediaManager {
                     self.updateNowPlayingInfo(for: currentItem)
                 }
             }
+            self.syncWrappedHeartbeat()
         }
     }
 
@@ -799,6 +803,7 @@ final class MediaManager {
         isPlaying = true
         if let currentItem {
             updateNowPlayingInfo(for: currentItem)
+            syncWrappedSessionStart(for: currentItem)
         }
     }
 
@@ -821,6 +826,7 @@ final class MediaManager {
         guard isUsingFFmpegBackend else { return }
         if let error {
             isPlaying = false
+            ListeningWrappedService.shared.pauseSession()
             errorMessage = "Playback error: \(error.localizedDescription)"
             return
         }
@@ -841,6 +847,7 @@ final class MediaManager {
             ks.play()
             isPlaying = true
             updateNowPlayingInfo(for: currentItem)
+            syncWrappedSessionStart(for: currentItem)
             return
         }
 
@@ -848,6 +855,9 @@ final class MediaManager {
             equalizerPlayer.resume()
             isPlaying = equalizerPlayer.isPlaying
             updateNowPlayingInfo(for: currentItem)
+            if isPlaying {
+                syncWrappedSessionStart(for: currentItem)
+            }
             return
         }
 
@@ -856,9 +866,11 @@ final class MediaManager {
         player.rate = playbackRate
         isPlaying = true
         updateNowPlayingInfo(for: currentItem)
+        syncWrappedSessionStart(for: currentItem)
     }
 
     func pause() {
+        ListeningWrappedService.shared.pauseSession()
         if isUsingFFmpegBackend, let ks = ffmpegPlayer {
             ks.pause()
             currentTime = ks.currentPlaybackTime
@@ -888,6 +900,7 @@ final class MediaManager {
     }
 
     func stop() {
+        ListeningWrappedService.shared.endSession(didFinishTrack: false)
         stopCurrentEngines()
         remoteStreamSourceURL = nil
         activePlaylistID = nil
@@ -2638,6 +2651,7 @@ final class MediaManager {
                     self.updateNowPlayingInfo(for: currentItem)
                 }
             }
+            self.syncWrappedHeartbeat()
         }
     }
 
@@ -2652,6 +2666,7 @@ final class MediaManager {
     }
 
     private func handlePlaybackEnded() {
+        ListeningWrappedService.shared.endSession(didFinishTrack: true)
         if repeatMode == .one {
             seek(to: 0)
             resume()
@@ -2733,12 +2748,40 @@ final class MediaManager {
                     self.updateNowPlayingInfo(for: currentItem)
                 }
             }
+            self.syncWrappedHeartbeat()
         }
 
         equalizerPlayer.onPlaybackEnded = { [weak self] in
             guard let self, self.isUsingEqualizerBackend else { return }
             self.handlePlaybackEnded()
         }
+    }
+
+    private func resolvedTitleAndRawArtist(for item: MediaItem) -> (title: String, rawArtist: String?) {
+        let custom = customMetadataByPath[item.relativePath]
+        let title = custom?.title ?? item.metadataTitle ?? titlesByPath[item.relativePath] ?? item.name
+        let artist = custom?.artist ?? item.artist ?? artistsByPath[item.relativePath]
+        return (title, artist)
+    }
+
+    private func syncWrappedSessionStart(for item: MediaItem) {
+        let meta = resolvedTitleAndRawArtist(for: item)
+        ListeningWrappedService.shared.beginOrResumeSession(
+            for: item,
+            resolvedTitle: meta.title,
+            resolvedArtistTag: meta.rawArtist
+        )
+    }
+
+    private func syncWrappedHeartbeat() {
+        guard isPlaying, let item = currentItem else { return }
+        let meta = resolvedTitleAndRawArtist(for: item)
+        ListeningWrappedService.shared.recordPlaybackHeartbeat(
+            for: item,
+            resolvedTitle: meta.title,
+            resolvedArtistTag: meta.rawArtist,
+            isPlaying: true
+        )
     }
 
     private func setupRemoteCommands() {

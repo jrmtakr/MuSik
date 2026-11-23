@@ -5,6 +5,7 @@ struct DiscoveryView: View {
     @Environment(AppSettings.self) private var settings
     @Environment(BrowserStore.self) private var browserStore
     @Environment(WebMediaDownloader.self) private var downloader
+    @Environment(ListeningWrappedService.self) private var wrapped
 
     @Binding var showPlayerSheet: Bool
     @Binding var selectedTab: AppTab
@@ -17,6 +18,7 @@ struct DiscoveryView: View {
     @State private var siteTitle = ""
     @State private var siteURL = ""
     @State private var showMangaReaderHub = false
+    @State private var showWrappedSheet = false
 
     private let columns = [
         GridItem(.adaptive(minimum: 74, maximum: 92), spacing: 12)
@@ -41,6 +43,8 @@ struct DiscoveryView: View {
                     searchBarSection
 
                     speedDialSection
+
+                    wrappedBannerCard
 
                     mangaReaderCard
 
@@ -77,6 +81,12 @@ struct DiscoveryView: View {
             .toolbar {
                 ToolbarItemGroup(placement: .topBarTrailing) {
                     Button {
+                        showWrappedSheet = true
+                    } label: {
+                        Label("Wrapped", systemImage: "sparkles")
+                    }
+
+                    Button {
                         showMangaReaderHub = true
                     } label: {
                         Label("Manga Reader", systemImage: "book.pages")
@@ -92,6 +102,9 @@ struct DiscoveryView: View {
             .miniPlayerInset(showPlayerSheet: $showPlayerSheet)
             .sheet(isPresented: $showMangaReaderHub) {
                 MangaLibrarySheetView()
+            }
+            .sheet(isPresented: $showWrappedSheet) {
+                WrappedDashboardSheet()
             }
             .alert("Save Media Link", isPresented: $showSaveLinkAlert) {
                 TextField("https://... (.mp4, .mp3, .m3u8, or page)", text: $saveLinkText)
@@ -167,6 +180,63 @@ struct DiscoveryView: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
         .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+    }
+
+    private var wrappedBannerCard: some View {
+        let _ = wrapped.lastUpdatedTick
+        let year = Calendar.current.component(.year, from: .now)
+        let report = wrapped.report(forYear: year)
+        let isDec = ListeningWrappedService.isDecemberRevealActive()
+        let daysLeft = ListeningWrappedService.daysUntilDecemberFirst()
+
+        return Button {
+            showWrappedSheet = true
+        } label: {
+            HStack(spacing: 14) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .fill(
+                            LinearGradient(
+                                colors: [Color(red: 0.45, green: 0.14, blue: 0.85), Color.pink],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            )
+                        )
+                        .frame(width: 48, height: 48)
+                    Image(systemName: isDec ? "crown.fill" : "sparkles")
+                        .font(.title3.weight(.semibold))
+                        .foregroundStyle(isDec ? .yellow : .white)
+                }
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(isDec ? "\(String(year)) Wrapped Drop Is Ready!" : "\(String(year)) Listening Wrapped")
+                        .font(.subheadline.weight(.bold))
+                        .foregroundStyle(.primary)
+                    Text(
+                        report.heroTopArtist.map { hero in
+                            isDec
+                                ? "#1 Artist of the Year: \(hero.canonicalName) • \(ListeningWrappedService.formatHoursMinutes(hero.totalSeconds))"
+                                : "Dec 1 Drop in \(daysLeft)d • Leading: \(hero.canonicalName)"
+                        } ?? "Tracks your top artists for the Dec 1st Year-End Reveal"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                }
+
+                Spacer()
+
+                Image(systemName: "chevron.right")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.tertiary)
+            }
+            .padding(12)
+            .background(
+                settings.hasCustomBackground ? settings.themedRowBackgroundColor : Color(.secondarySystemBackground),
+                in: RoundedRectangle(cornerRadius: 14, style: .continuous)
+            )
+        }
+        .buttonStyle(.plain)
     }
 
     private var mangaReaderCard: some View {

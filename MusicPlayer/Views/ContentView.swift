@@ -42,6 +42,7 @@ struct ContentView: View {
                     quickPlaylistName: $quickPlaylistName
                 )
             )
+            .modifier(WrappedPresentationModifier())
     }
 
     private var mainTabView: some View {
@@ -248,5 +249,50 @@ private struct ContentSheetsAndAlertsModifier: ViewModifier {
                     mediaManager.statusMessage = nil
                 }
             }
+    }
+}
+
+private struct WrappedPresentationModifier: ViewModifier {
+    @Environment(ListeningWrappedService.self) private var wrapped
+
+    @State private var showWrappedSheet = false
+    @State private var showDecemberPremiere = false
+
+    private var currentYear: Int {
+        Calendar.current.component(.year, from: .now)
+    }
+
+    func body(content: Content) -> some View {
+        content
+            .onAppear {
+                wrapped.evaluateDecemberPremiereIfNeeded()
+                syncWrappedTriggers()
+            }
+            .onChange(of: wrapped.pendingOpenWrappedSheet) { _, _ in
+                syncWrappedTriggers()
+            }
+            .onChange(of: wrapped.shouldPresentDecemberPremiere) { _, _ in
+                syncWrappedTriggers()
+            }
+            .sheet(isPresented: $showWrappedSheet) {
+                WrappedDashboardSheet(initialStartStory: true)
+            }
+            .fullScreenCover(isPresented: $showDecemberPremiere) {
+                WrappedStoryView(
+                    year: currentYear,
+                    isDecemberPremiere: true,
+                    isPresented: $showDecemberPremiere
+                )
+            }
+    }
+
+    private func syncWrappedTriggers() {
+        if wrapped.pendingOpenWrappedSheet {
+            wrapped.pendingOpenWrappedSheet = false
+            showWrappedSheet = true
+        }
+        if wrapped.shouldPresentDecemberPremiere && !showDecemberPremiere {
+            showDecemberPremiere = true
+        }
     }
 }

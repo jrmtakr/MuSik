@@ -1,14 +1,37 @@
 import CoreSpotlight
 import SwiftUI
 import UIKit
+import UserNotifications
 
-final class AppDelegate: NSObject, UIApplicationDelegate {
+final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDelegate {
     func application(
         _ application: UIApplication,
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
     ) -> Bool {
+        UNUserNotificationCenter.current().delegate = self
         SystemActionRouter.registerHomeQuickActions()
         return true
+    }
+
+    nonisolated func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
+        completionHandler([.banner, .sound])
+    }
+
+    nonisolated func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        didReceive response: UNNotificationResponse,
+        withCompletionHandler completionHandler: @escaping () -> Void
+    ) {
+        if response.notification.request.content.userInfo["wrappedDeepLink"] != nil {
+            Task { @MainActor in
+                ListeningWrappedService.shared.pendingOpenWrappedSheet = true
+            }
+        }
+        completionHandler()
     }
 
     func application(
@@ -48,6 +71,7 @@ final class QuickActionSceneDelegate: NSObject, UIWindowSceneDelegate {
 @main
 struct MusicPlayerApp: App {
     @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+    @Environment(\.scenePhase) private var scenePhase
 
     @State private var mediaManager = MediaManager.shared
     @State private var wifiServer = WiFiTransferServer()
@@ -58,6 +82,7 @@ struct MusicPlayerApp: App {
     @State private var groupService = GroupPlaylistService.shared
     @State private var partyService = PartyQueueService.shared
     @State private var timeMachine = PlaylistTimeMachineService.shared
+    @State private var wrappedService = ListeningWrappedService.shared
     @State private var actionRouter = SystemActionRouter.shared
 
     @State private var showPlayerSheet = false
@@ -75,15 +100,23 @@ struct MusicPlayerApp: App {
                 .environment(groupService)
                 .environment(partyService)
                 .environment(timeMachine)
+                .environment(wrappedService)
                 .environment(actionRouter)
                 .task {
                     LocalMediaCacheProxy.shared.start()
                     SystemActionRouter.registerHomeQuickActions()
+                    await wrappedService.requestPermissionAndScheduleDecemberDrop()
                     wifiServer.onFileReceived = { tempURL, fileName, folderPath in
                         mediaManager.importTemporaryFile(from: tempURL, preferredFileName: fileName, inFolder: folderPath)
                     }
                     wifiServer.onLibraryChanged = {
                         mediaManager.loadLocalFiles()
+                    }
+                }
+                .onChange(of: scenePhase) { _, phase in
+                    if phase == .background || phase == .inactive {
+                        wrappedService.flushDiskSave()
+                        timeMachine.flushDiskSave()
                     }
                 }
                 .onOpenURL { url in

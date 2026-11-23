@@ -137,6 +137,10 @@ final class SystemActionRouter {
             requestedTab = .playlists
             return true
 
+        case "wrapped":
+            ListeningWrappedService.shared.pendingOpenWrappedSheet = true
+            return true
+
         case "shuffle":
             MediaManager.shared.shuffleAllOfflineMusic()
             shouldPresentPlayerSheet = MediaManager.shared.currentItem != nil

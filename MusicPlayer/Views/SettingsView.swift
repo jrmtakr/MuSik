@@ -29,6 +29,7 @@ struct SettingsView: View {
     @State private var showWiFiSheet = false
     @State private var showEqualizerSheet = false
     @State private var showMangaReaderSheet = false
+    @State private var showWrappedSheet = false
     @State private var showClearedAlert = false
     @State private var iconErrorMessage: String?
 
@@ -188,6 +189,12 @@ struct SettingsView: View {
                         showEqualizerSheet = true
                     } label: {
                         Label("5-Band Audio Equalizer", systemImage: "slider.vertical.3")
+                    }
+
+                    Button {
+                        showWrappedSheet = true
+                    } label: {
+                        Label("Listening Wrapped & Dec 1st Reveal", systemImage: "sparkles")
                     }
 
                     Button {
@@ -366,6 +373,9 @@ struct SettingsView: View {
             }
             .sheet(isPresented: $showMangaReaderSheet) {
                 MangaLibrarySheetView()
+            }
+            .sheet(isPresented: $showWrappedSheet) {
+                WrappedDashboardSheet()
             }
             .alert("History Cleared", isPresented: $showClearedAlert) {
                 Button("OK", role: .cancel) {}
