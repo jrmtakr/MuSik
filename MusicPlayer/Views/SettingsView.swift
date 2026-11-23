@@ -1,5 +1,21 @@
 import SwiftUI
+import UIKit
 import WebKit
+
+private struct AppIconChoice: Identifiable {
+    let id: String
+    let title: String
+    let iconName: String
+    let previewColor: Color
+
+    static let all: [AppIconChoice] = [
+        AppIconChoice(id: "default", title: "Default", iconName: "", previewColor: .indigo),
+        AppIconChoice(id: "dark", title: "Dark", iconName: "AppIcon-Dark", previewColor: Color(white: 0.15)),
+        AppIconChoice(id: "light", title: "Light", iconName: "AppIcon-Light", previewColor: Color(red: 0.2, green: 0.45, blue: 0.9)),
+        AppIconChoice(id: "midnight", title: "Midnight", iconName: "AppIcon-Midnight", previewColor: Color(red: 0.12, green: 0.22, blue: 0.55)),
+        AppIconChoice(id: "amber", title: "Amber", iconName: "AppIcon-Amber", previewColor: .orange)
+    ]
+}
 
 struct SettingsView: View {
     @Environment(MediaManager.self) private var mediaManager
@@ -11,6 +27,7 @@ struct SettingsView: View {
     @State private var showWiFiSheet = false
     @State private var showEqualizerSheet = false
     @State private var showClearedAlert = false
+    @State private var iconErrorMessage: String?
 
     private let durationOptions = [0, 10, 30, 60, 120]
 
@@ -26,10 +43,21 @@ struct SettingsView: View {
                         }
                     }
                     .pickerStyle(.segmented)
+
+                    NavigationLink {
+                        AppIconsPickerView(iconErrorMessage: $iconErrorMessage)
+                    } label: {
+                        HStack {
+                            Label("App Icons", systemImage: "app.badge")
+                            Spacer()
+                            Text(currentIconLabel)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
                 }
 
                 Section("Player & Tools") {
-                    Toggle("Quick Access to Last Playlist", isOn: $settings.quickAccessLastPlaylist)
+                    Toggle("Quick access to Last Playlist", isOn: $settings.quickAccessLastPlaylist)
 
                     Button {
                         showEqualizerSheet = true
@@ -52,21 +80,9 @@ struct SettingsView: View {
                     }
                 }
 
-                Section("Browser & Ad-Block") {
-                    Toggle("Enable Browser Ad-Block", isOn: $settings.adBlockEnabled)
-
-                    Toggle("Web Page Dark Mode", isOn: $settings.webDarkModeEnabled)
-
-                    Picker("Search Engine", selection: $settings.searchEngine) {
-                        ForEach(SearchEngineOption.allCases) { engine in
-                            Text(engine.rawValue).tag(engine)
-                        }
-                    }
-                }
-
-                Section("Video & Audio Caching") {
+                Section("Video Setting") {
                     Toggle(
-                        "Ask Before Caching",
+                        "Ask before caching",
                         isOn: Binding(
                             get: { settings.askBeforeCaching },
                             set: { settings.setAskBeforeCaching($0) }
@@ -74,22 +90,48 @@ struct SettingsView: View {
                     )
 
                     Toggle(
-                        "Auto-Cache Detected Media",
+                        "Enable Automatic Caching",
                         isOn: Binding(
                             get: { settings.autoCacheDetectedMedia },
                             set: { settings.setAutoCacheDetectedMedia($0) }
                         )
                     )
 
-                    Picker("Duration Limit", selection: $settings.maxCacheDurationMinutes) {
+                    Picker("Only cache videos with duration less than", selection: $settings.maxCacheDurationMinutes) {
                         Text("No Limit").tag(0)
                         ForEach(durationOptions.filter { $0 > 0 }, id: \.self) { mins in
-                            Text("Under \(mins) min").tag(mins)
+                            Text("\(mins) min").tag(mins)
+                        }
+                    }
+
+                    Toggle("Inline video player", isOn: $settings.inlineVideoPlayback)
+                    Toggle("Web page dark mode", isOn: $settings.webDarkModeEnabled)
+                    Toggle("Ad-Block", isOn: $settings.adBlockEnabled)
+                }
+
+                Section("Browser & Reader") {
+                    Picker("Search Engine", selection: $settings.searchEngine) {
+                        ForEach(SearchEngineOption.allCases) { engine in
+                            Text(engine.rawValue).tag(engine)
+                        }
+                    }
+
+                    Picker("Reading Direction", selection: $settings.readingDirection) {
+                        ForEach(ReadingDirection.allCases) { dir in
+                            Text(dir.rawValue).tag(dir)
                         }
                     }
                 }
 
-                Section("Privacy & Data") {
+                Section("System & Privacy") {
+                    Button {
+                        if let url = URL(string: UIApplication.openSettingsURLString) {
+                            UIApplication.shared.open(url)
+                        }
+                    } label: {
+                        Label("Language", systemImage: "globe")
+                    }
+
                     Button(role: .destructive) {
                         browserStore.clearHistory()
                         let dataStore = WKWebsiteDataStore.default()
@@ -98,7 +140,7 @@ struct SettingsView: View {
                         }
                         showClearedAlert = true
                     } label: {
-                        Label("Clear Browser History & Website Data", systemImage: "trash")
+                        Label("Clear History", systemImage: "trash")
                     }
                 }
 
@@ -110,7 +152,7 @@ struct SettingsView: View {
                     LabeledContent("Ads & Tracking", value: "None (100% Ad-Free)")
                 }
             }
-            .navigationTitle("Settings")
+            .navigationTitle("Setting")
             .miniPlayerInset(showPlayerSheet: $showPlayerSheet)
             .sheet(isPresented: $showWiFiSheet) {
                 WiFiTransferView()
@@ -118,10 +160,83 @@ struct SettingsView: View {
             .sheet(isPresented: $showEqualizerSheet) {
                 EqualizerView()
             }
-            .alert("Browser Data Cleared", isPresented: $showClearedAlert) {
+            .alert("History Cleared", isPresented: $showClearedAlert) {
                 Button("OK", role: .cancel) {}
             } message: {
                 Text("Browsing history, cookies, and website caches have been removed.")
+            }
+            .alert(
+                "App Icon Notice",
+                isPresented: Binding(
+                    get: { iconErrorMessage != nil },
+                    set: { if !$0 { iconErrorMessage = nil } }
+                )
+            ) {
+                Button("OK", role: .cancel) { iconErrorMessage = nil }
+            } message: {
+                Text(iconErrorMessage ?? "")
+            }
+        }
+    }
+
+    private var currentIconLabel: String {
+        AppIconChoice.all.first(where: { $0.iconName == settings.selectedAppIconName })?.title ?? "Default"
+    }
+}
+
+private struct AppIconsPickerView: View {
+    @Environment(AppSettings.self) private var settings
+    @Binding var iconErrorMessage: String?
+
+    var body: some View {
+        List {
+            ForEach(AppIconChoice.all) { choice in
+                let isSelected = settings.selectedAppIconName == choice.iconName
+                Button {
+                    applyIcon(choice)
+                } label: {
+                    HStack(spacing: 14) {
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .fill(choice.previewColor.gradient)
+                            .frame(width: 48, height: 48)
+                            .overlay {
+                                Image(systemName: "play.circle.fill")
+                                    .font(.title2)
+                                    .foregroundStyle(.white)
+                            }
+
+                        Text(choice.title)
+                            .font(.body.weight(.medium))
+                            .foregroundStyle(.primary)
+
+                        Spacer()
+
+                        if isSelected {
+                            Image(systemName: "checkmark.circle.fill")
+                                .foregroundStyle(Color.accentColor)
+                        }
+                    }
+                    .padding(.vertical, 4)
+                }
+            }
+        }
+        .navigationTitle("App Icons")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+
+    private func applyIcon(_ choice: AppIconChoice) {
+        guard UIApplication.shared.supportsAlternateIcons else {
+            iconErrorMessage = "Alternate app icons are not supported on this device."
+            return
+        }
+        let target: String? = choice.iconName.isEmpty ? nil : choice.iconName
+        UIApplication.shared.setAlternateIconName(target) { error in
+            DispatchQueue.main.async {
+                if let error {
+                    iconErrorMessage = "Could not switch app icon: \(error.localizedDescription)"
+                } else {
+                    settings.selectedAppIconName = choice.iconName
+                }
             }
         }
     }

@@ -1,32 +1,45 @@
 import SwiftUI
 
+enum AppTab: Hashable {
+    case discovery
+    case playlists
+    case files
+    case setting
+}
+
 struct ContentView: View {
     @Environment(MediaManager.self) private var mediaManager
     @Environment(AppSettings.self) private var settings
     @Binding var showPlayerSheet: Bool
     @Binding var quickLookTarget: QuickLookTarget?
 
+    @State private var selectedTab: AppTab = .discovery
+
     var body: some View {
-        TabView {
-            LibraryView(showPlayerSheet: $showPlayerSheet, quickLookTarget: $quickLookTarget)
+        TabView(selection: $selectedTab) {
+            DiscoveryView(showPlayerSheet: $showPlayerSheet, selectedTab: $selectedTab)
                 .tabItem {
-                    Label("Library", systemImage: "music.note.list")
+                    Label("Discovery", systemImage: "safari")
                 }
+                .tag(AppTab.discovery)
 
             PlaylistsView(showPlayerSheet: $showPlayerSheet, quickLookTarget: $quickLookTarget)
                 .tabItem {
-                    Label("Playlists", systemImage: "rectangle.stack.badge.play")
+                    Label("Playlists", systemImage: "music.note.list")
                 }
+                .tag(AppTab.playlists)
 
-            BrowserTabView(showPlayerSheet: $showPlayerSheet)
+            LibraryView(showPlayerSheet: $showPlayerSheet, quickLookTarget: $quickLookTarget)
                 .tabItem {
-                    Label("Browser", systemImage: "globe")
+                    Label("Files", systemImage: "folder")
                 }
+                .tag(AppTab.files)
 
             SettingsView(showPlayerSheet: $showPlayerSheet)
                 .tabItem {
-                    Label("Settings", systemImage: "gearshape")
+                    Label("Setting", systemImage: "gearshape")
                 }
+                .tag(AppTab.setting)
         }
         .preferredColorScheme(settings.appearanceMode.colorScheme)
         .sheet(isPresented: $showPlayerSheet) {

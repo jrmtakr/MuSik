@@ -79,17 +79,27 @@ struct LocalFile: Identifiable, Hashable, Codable {
     }
 
     var isImage: Bool {
-        ["png", "jpg", "jpeg", "heic", "gif", "webp"].contains(fileExtension)
+        ["png", "jpg", "jpeg", "heic", "gif", "webp", "bmp"].contains(fileExtension)
+    }
+
+    var isArchive: Bool {
+        ["zip", "cbz"].contains(fileExtension)
+    }
+
+    var isReadableText: Bool {
+        ["txt", "md", "rtf", "html", "htm", "log", "json", "xml", "csv"].contains(fileExtension)
     }
 
     var systemImage: String {
         switch fileExtension {
         case "pdf": return "doc.richtext.fill"
-        case "png", "jpg", "jpeg", "heic", "gif", "webp": return "photo.fill"
-        case "txt", "md", "rtf": return "doc.text.fill"
-        case "zip", "tar", "gz", "7z": return "archivebox.fill"
-        case "csv", "xls", "xlsx": return "tablecells.fill"
-        case "json", "xml", "swift", "py", "js", "html": return "chevron.left.forwardslash.chevron.right"
+        case "png", "jpg", "jpeg", "heic", "gif", "webp", "bmp": return "photo.fill"
+        case "txt", "md", "rtf", "log": return "doc.text.fill"
+        case "zip", "cbz", "tar", "gz", "7z": return "archivebox.fill"
+        case "csv", "xls", "xlsx", "numbers": return "tablecells.fill"
+        case "doc", "docx", "pages": return "doc.fill"
+        case "ppt", "pptx", "key": return "rectangle.on.rectangle.angled"
+        case "json", "xml", "swift", "py", "js", "html", "htm": return "chevron.left.forwardslash.chevron.right"
         default: return "doc.fill"
         }
     }
@@ -117,6 +127,7 @@ struct Playlist: Identifiable, Hashable, Codable {
     var name: String
     var itemFileNames: [String]
     var dateCreated: Date = .now
+    var customCoverFileName: String?
 }
 
 enum RepeatMode: String, CaseIterable, Codable {
@@ -146,6 +157,11 @@ enum RepeatMode: String, CaseIterable, Codable {
         case .one: return .off
         }
     }
+}
+
+enum DuplicateConflictAction {
+    case overwrite
+    case keepBoth
 }
 
 enum MediaTimeFormatter {

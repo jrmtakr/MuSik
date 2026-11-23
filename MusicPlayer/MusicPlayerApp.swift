@@ -22,8 +22,11 @@ struct MusicPlayerApp: App {
                 .environment(browserStore)
                 .environment(downloader)
                 .task {
-                    wifiServer.onFileReceived = { tempURL, fileName in
-                        mediaManager.importTemporaryFile(from: tempURL, preferredFileName: fileName)
+                    wifiServer.onFileReceived = { tempURL, fileName, folderPath in
+                        mediaManager.importTemporaryFile(from: tempURL, preferredFileName: fileName, inFolder: folderPath)
+                    }
+                    wifiServer.onLibraryChanged = {
+                        mediaManager.loadLocalFiles()
                     }
                 }
                 .onOpenURL { url in

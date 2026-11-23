@@ -9,13 +9,40 @@ struct BrowserTabItem: Identifiable, Codable, Hashable {
     init(
         id: UUID = UUID(),
         title: String = "New Tab",
-        urlString: String = "https://duckduckgo.com",
+        urlString: String = "https://www.google.com",
         isPrivate: Bool = false
     ) {
         self.id = id
         self.title = title
         self.urlString = urlString
         self.isPrivate = isPrivate
+    }
+}
+
+struct SpeedDialSite: Identifiable, Codable, Hashable {
+    let id: UUID
+    var title: String
+    var urlString: String
+    var shortLabel: String
+    var hexColor: String
+
+    init(
+        id: UUID = UUID(),
+        title: String,
+        urlString: String,
+        shortLabel: String? = nil,
+        hexColor: String = "#5B7CFA"
+    ) {
+        self.id = id
+        self.title = title
+        self.urlString = urlString
+        let trimmed = (shortLabel ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty {
+            self.shortLabel = String(trimmed.prefix(3))
+        } else {
+            self.shortLabel = String(title.trimmingCharacters(in: .whitespacesAndNewlines).prefix(2)).uppercased()
+        }
+        self.hexColor = hexColor
     }
 }
 

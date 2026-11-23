@@ -5,7 +5,7 @@ import WebKit
 @Observable
 final class ContentBlockerManager {
     private static let enabledDefaultsKey = "musicplayer.adblock.enabled"
-    private let ruleListIdentifier = "MusicPlayerAdBlockRulesV2"
+    private let ruleListIdentifier = "MusicPlayerAdBlockRulesV3"
 
     var isBlockingEnabled: Bool {
         didSet {
@@ -15,56 +15,65 @@ final class ContentBlockerManager {
 
     private(set) var cachedRuleList: WKContentRuleList?
 
-    private let blockRulesJSON = """
-    [
-        {
-            "trigger": {
-                "url-filter": ".*",
-                "if-domain": [
-                    "*doubleclick.net",
-                    "*googlesyndication.com",
-                    "*googleadservices.com",
-                    "*google-analytics.com",
-                    "*googletagmanager.com",
-                    "*adnxs.com",
-                    "*taboola.com",
-                    "*outbrain.com",
-                    "*popads.net",
-                    "*popcash.net",
-                    "*propellerads.com",
-                    "*adsterra.com",
-                    "*exoclick.com",
-                    "*juicyads.com",
-                    "*trafficjunky.net",
-                    "*revcontent.com",
-                    "*criteo.com",
-                    "*rubiconproject.com",
-                    "*pubmatic.com",
-                    "*openx.net",
-                    "*casalemedia.com",
-                    "*amazon-adsystem.com",
-                    "*scorecardresearch.com",
-                    "*quantserve.com",
-                    "*moatads.com",
-                    "*adsafeprotected.com",
-                    "*mc.yandex.ru"
-                ]
-            },
-            "action": {
-                "type": "block"
-            }
-        },
-        {
-            "trigger": {
-                "url-filter": ".*",
-                "resource-type": ["popup"]
-            },
-            "action": {
-                "type": "block"
-            }
-        }
+    private static let blockedAdDomains: [String] = [
+        "*247realmedia.com", "*2mdn.net", "*adblade.com", "*adcolony.com",
+        "*adform.net", "*adition.com", "*adkengage.com", "*admagnet.net",
+        "*admob.com", "*adnxs.com", "*adobetag.com", "*adroll.com",
+        "*adsafeprotected.com", "*adscale.de", "*adserver.yahoo.com",
+        "*adskeeper.co.uk", "*adsterra.com", "*advertising.com",
+        "*amazon-adsystem.com", "*amobee.com", "*appnexus.com",
+        "*atdmt.com", "*bidswitch.net", "*bidvertiser.com",
+        "*bluekai.com", "*casalemedia.com", "*chartbeat.com",
+        "*clickadu.com", "*criteo.com", "*criteo.net",
+        "*demdex.net", "*dotomi.com", "*doubleclick.net",
+        "*doubleverify.com", "*exoclick.com", "*exosrv.com",
+        "*fastclick.net", "*flurry.com", "*google-analytics.com",
+        "*googleadservices.com", "*googlesyndication.com", "*googletagmanager.com",
+        "*hilltopads.net", "*imrworldwide.com", "*infolinks.com",
+        "*juicyads.com", "*krxd.net", "*lijit.com",
+        "*mathtag.com", "*mc.yandex.ru", "*mediaplex.com",
+        "*mgid.com", "*moatads.com", "*mookie1.com",
+        "*onclickads.net", "*openx.net", "*outbrain.com",
+        "*popads.net", "*popcash.net", "*propellerads.com",
+        "*pubmatic.com", "*quantcount.com", "*quantserve.com",
+        "*revcontent.com", "*richaudience.com", "*rlcdn.com",
+        "*rubiconproject.com", "*scorecardresearch.com", "*serving-sys.com",
+        "*sharethrough.com", "*smartadserver.com", "*sonobi.com",
+        "*spotxchange.com", "*taboola.com", "*tapad.com",
+        "*teads.tv", "*trafficfactory.biz", "*trafficjunky.net",
+        "*tribalfusion.com", "*turn.com", "*undertone.com",
+        "*unityads.unity3d.com", "*vungle.com", "*yieldmo.com",
+        "*zedo.com"
     ]
-    """
+
+    private var blockRulesJSON: String {
+        let domainEntries = Self.blockedAdDomains.map { "\"\($0)\"" }.joined(separator: ",")
+        return """
+        [
+            {
+                "trigger": {
+                    "url-filter": ".*",
+                    "if-domain": [\(domainEntries)]
+                },
+                "action": { "type": "block" }
+            },
+            {
+                "trigger": {
+                    "url-filter": ".*",
+                    "resource-type": ["popup"]
+                },
+                "action": { "type": "block" }
+            },
+            {
+                "trigger": {
+                    "url-filter": "^https?://[^/]+/(ads|adserver|popunder|banner_ads)/",
+                    "load-type": ["third-party"]
+                },
+                "action": { "type": "block" }
+            }
+        ]
+        """
+    }
 
     init() {
         if UserDefaults.standard.object(forKey: Self.enabledDefaultsKey) != nil {
@@ -126,9 +135,7 @@ final class ContentBlockerManager {
         }
 
         if let ruleList {
-            await MainActor.run {
-                self.cachedRuleList = ruleList
-            }
+            self.cachedRuleList = ruleList
         }
         return ruleList
     }

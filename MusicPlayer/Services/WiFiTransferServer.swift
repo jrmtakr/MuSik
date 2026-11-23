@@ -22,7 +22,8 @@ final class WiFiTransferServer {
     var errorMessage: String?
     var recentUploads: [UploadedEntry] = []
 
-    var onFileReceived: ((URL, String) -> Void)?
+    var onFileReceived: ((URL, String, String) -> Void)?
+    var onLibraryChanged: (() -> Void)?
 
     func start(port: UInt16 = 8080) {
         stop()
@@ -98,14 +99,20 @@ final class WiFiTransferServer {
         let session = HTTPConnectionSession(
             connection: connection,
             docsURL: docsURL,
-            onUploadComplete: { [weak self] tempURL, fileName in
+            onUploadComplete: { [weak self] tempURL, fileName, folderPath in
                 DispatchQueue.main.async {
                     guard let self else { return }
-                    self.recentUploads.insert(UploadedEntry(fileName: fileName), at: 0)
+                    let display = folderPath.isEmpty ? fileName : "\(folderPath)/\(fileName)"
+                    self.recentUploads.insert(UploadedEntry(fileName: display), at: 0)
                     if self.recentUploads.count > 20 {
                         self.recentUploads.removeLast(self.recentUploads.count - 20)
                     }
-                    self.onFileReceived?(tempURL, fileName)
+                    self.onFileReceived?(tempURL, fileName, folderPath)
+                }
+            },
+            onLibraryChanged: { [weak self] in
+                DispatchQueue.main.async {
+                    self?.onLibraryChanged?()
                 }
             },
             onFinished: { [weak self] in
@@ -127,7 +134,6 @@ final class WiFiTransferServer {
         serverAddress = "http://\(getWiFiIPAddress() ?? "localhost"):\(port)"
     }
 
-    // Helper to retrieve local Wi-Fi (or hotspot) IPv4 address
     private func getWiFiIPAddress() -> String? {
         var fallbackAddress: String?
         var ifaddr: UnsafeMutablePointer<ifaddrs>?
@@ -174,7 +180,8 @@ final class WiFiTransferServer {
 private final class HTTPConnectionSession {
     private let connection: NWConnection
     private let docsURL: URL
-    private let onUploadComplete: (URL, String) -> Void
+    private let onUploadComplete: (URL, String, String) -> Void
+    private let onLibraryChanged: () -> Void
     private let onFinished: () -> Void
 
     private var headerBuffer = Data()
@@ -195,12 +202,14 @@ private final class HTTPConnectionSession {
     init(
         connection: NWConnection,
         docsURL: URL,
-        onUploadComplete: @escaping (URL, String) -> Void,
+        onUploadComplete: @escaping (URL, String, String) -> Void,
+        onLibraryChanged: @escaping () -> Void,
         onFinished: @escaping () -> Void
     ) {
         self.connection = connection
         self.docsURL = docsURL
         self.onUploadComplete = onUploadComplete
+        self.onLibraryChanged = onLibraryChanged
         self.onFinished = onFinished
     }
 
@@ -237,7 +246,7 @@ private final class HTTPConnectionSession {
 
             if isComplete && !self.hasFinished {
                 if self.headersParsed && (self.method == "POST" || self.method == "PUT") {
-                    self.finalizeUpload()
+                    self.finalizePostOrPut()
                 } else {
                     self.cleanupAndCancel()
                 }
@@ -277,7 +286,7 @@ private final class HTTPConnectionSession {
             case "GET":
                 handleGetRequest()
             case "POST", "PUT":
-                beginReceivingUpload(initialRemainder: remainder)
+                beginReceivingBody(initialRemainder: remainder)
             default:
                 sendResponse(status: "405 Method Not Allowed", contentType: "text/plain", body: Data("Method not allowed".utf8))
             }
@@ -286,7 +295,7 @@ private final class HTTPConnectionSession {
 
         writeBodyChunk(chunk)
         if expectedBodyLength > 0 && receivedBodyBytes >= expectedBodyLength {
-            finalizeUpload()
+            finalizePostOrPut()
         } else {
             receiveNextChunk()
         }
@@ -317,33 +326,57 @@ private final class HTTPConnectionSession {
         return true
     }
 
-    private func handleGetRequest() {
-        let cleanPath = rawPath.split(separator: "?", maxSplits: 1).first.map(String.init) ?? rawPath
+    private var cleanPath: String {
+        rawPath.split(separator: "?", maxSplits: 1).first.map(String.init) ?? rawPath
+    }
 
-        if cleanPath == "/" {
+    private func queryParam(_ name: String) -> String? {
+        guard let comps = URLComponents(string: "http://localhost\(rawPath)") else { return nil }
+        return comps.queryItems?.first(where: { $0.name == name })?.value
+    }
+
+    private func safeRelativePath(_ raw: String?) -> String? {
+        guard let raw else { return "" }
+        let trimmed = raw.trimmingCharacters(in: CharacterSet(charactersIn: "/ "))
+        if trimmed.isEmpty { return "" }
+        let parts = trimmed.split(separator: "/").map(String.init)
+        for part in parts {
+            if part.isEmpty || part == "." || part == ".." || part.hasPrefix(".") {
+                return nil
+            }
+        }
+        return parts.joined(separator: "/")
+    }
+
+    private func resolvedURL(forRelativePath relPath: String) -> URL? {
+        let rootPath = docsURL.standardizedFileURL.path
+        if relPath.isEmpty { return docsURL.standardizedFileURL }
+        let candidate = docsURL.appendingPathComponent(relPath).standardizedFileURL
+        guard candidate.path.hasPrefix(rootPath + "/") else { return nil }
+        return candidate
+    }
+
+    private func handleGetRequest() {
+        let path = cleanPath
+
+        if path == "/" {
             sendResponse(status: "200 OK", contentType: "text/html; charset=utf-8", body: Data(Self.uploaderHTML.utf8))
             return
         }
 
-        if cleanPath == "/api/files" {
-            let filesPayload = buildFilesJSON()
-            sendResponse(status: "200 OK", contentType: "application/json; charset=utf-8", body: filesPayload)
+        if path == "/api/files" {
+            let requestedDir = safeRelativePath(queryParam("dir")) ?? ""
+            let payload = buildDirectoryJSON(dirRelPath: requestedDir)
+            sendResponse(status: "200 OK", contentType: "application/json; charset=utf-8", body: payload)
             return
         }
 
-        if cleanPath.hasPrefix("/files/") {
-            let encodedName = String(cleanPath.dropFirst("/files/".count))
-            let decodedPath = (encodedName.removingPercentEncoding ?? encodedName)
-                .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-            guard !decodedPath.isEmpty,
-                  !decodedPath.contains("..") else {
-                sendResponse(status: "404 Not Found", contentType: "text/plain", body: Data("File not found".utf8))
-                return
-            }
-            let targetURL = docsURL.appendingPathComponent(decodedPath).standardizedFileURL
-            let rootPath = docsURL.standardizedFileURL.path
-            guard targetURL.path.hasPrefix(rootPath + "/"),
-                  !targetURL.lastPathComponent.hasPrefix("."),
+        if path.hasPrefix("/files/") {
+            let encoded = String(path.dropFirst("/files/".count))
+            let decoded = encoded.removingPercentEncoding ?? encoded
+            guard let relPath = safeRelativePath(decoded),
+                  !relPath.isEmpty,
+                  let targetURL = resolvedURL(forRelativePath: relPath),
                   FileManager.default.fileExists(atPath: targetURL.path) else {
                 sendResponse(status: "404 Not Found", contentType: "text/plain", body: Data("File not found".utf8))
                 return
@@ -355,7 +388,7 @@ private final class HTTPConnectionSession {
         sendResponse(status: "404 Not Found", contentType: "text/plain", body: Data("Not found".utf8))
     }
 
-    private func beginReceivingUpload(initialRemainder: Data) {
+    private func beginReceivingBody(initialRemainder: Data) {
         let tempURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("wifi_raw_\(UUID().uuidString).tmp")
         FileManager.default.createFile(atPath: tempURL.path, contents: nil)
@@ -373,9 +406,11 @@ private final class HTTPConnectionSession {
         }
 
         if expectedBodyLength > 0 && receivedBodyBytes >= expectedBodyLength {
-            finalizeUpload()
+            finalizePostOrPut()
         } else if expectedBodyLength == 0 && !initialRemainder.isEmpty {
-            finalizeUpload()
+            finalizePostOrPut()
+        } else if expectedBodyLength == 0 && cleanPath.hasPrefix("/api/") {
+            finalizePostOrPut()
         } else {
             receiveNextChunk()
         }
@@ -386,11 +421,7 @@ private final class HTTPConnectionSession {
         let sliceToWrite: Data
         if expectedBodyLength > 0 {
             let remaining = max(Int64(0), expectedBodyLength - receivedBodyBytes)
-            if Int64(chunk.count) > remaining {
-                sliceToWrite = chunk.prefix(Int(remaining))
-            } else {
-                sliceToWrite = chunk
-            }
+            sliceToWrite = Int64(chunk.count) > remaining ? chunk.prefix(Int(remaining)) : chunk
         } else {
             sliceToWrite = chunk
         }
@@ -404,31 +435,33 @@ private final class HTTPConnectionSession {
         }
     }
 
-    private func finalizeUpload() {
+    private func finalizePostOrPut() {
         guard !hasFinished else { return }
         try? tempFileHandle?.close()
         tempFileHandle = nil
 
         guard let rawURL = tempBodyURL else {
-            sendResponse(status: "400 Bad Request", contentType: "text/plain", body: Data("No upload data".utf8))
+            sendResponse(status: "400 Bad Request", contentType: "text/plain", body: Data("No request data".utf8))
             return
         }
         tempBodyURL = nil
 
+        let path = cleanPath
+        if path == "/api/mkdir" || path == "/api/rename" || path == "/api/delete" {
+            handleJSONAction(path: path, bodyURL: rawURL)
+            try? FileManager.default.removeItem(at: rawURL)
+            return
+        }
+
+        let targetDir = safeRelativePath(headers["x-target-dir"]?.removingPercentEncoding ?? queryParam("dir")) ?? ""
         let contentType = headers["content-type"] ?? ""
+
         if contentType.lowercased().contains("multipart/form-data"),
            let boundary = extractBoundary(from: contentType) {
             if let extracted = extractMultipartFile(from: rawURL, boundary: boundary) {
                 try? FileManager.default.removeItem(at: rawURL)
-                onUploadComplete(extracted.tempURL, extracted.fileName)
-                let html = """
-                <!DOCTYPE html><html><head><meta charset="utf-8"><meta http-equiv="refresh" content="1;url=/"></head>
-                <body style="font-family:-apple-system,sans-serif;padding:32px;background:#111;color:#fff;">
-                <h2>Uploaded \(Self.escapeHTML(extracted.fileName))</h2>
-                <p>Returning to uploader...</p><p><a href="/" style="color:#6c8cff;">Back</a></p>
-                </body></html>
-                """
-                sendResponse(status: "200 OK", contentType: "text/html; charset=utf-8", body: Data(html.utf8))
+                onUploadComplete(extracted.tempURL, extracted.fileName, targetDir)
+                sendJSON(["ok": true, "fileName": extracted.fileName])
             } else {
                 try? FileManager.default.removeItem(at: rawURL)
                 sendResponse(status: "400 Bad Request", contentType: "text/plain", body: Data("Could not parse uploaded file".utf8))
@@ -438,9 +471,8 @@ private final class HTTPConnectionSession {
 
         let headerName = headers["x-file-name"]?.removingPercentEncoding
         let pathName: String? = {
-            let clean = rawPath.split(separator: "?", maxSplits: 1).first.map(String.init) ?? ""
-            if clean.hasPrefix("/upload/") {
-                let raw = String(clean.dropFirst("/upload/".count))
+            if path.hasPrefix("/upload/") {
+                let raw = String(path.dropFirst("/upload/".count))
                 return raw.removingPercentEncoding ?? raw
             }
             return nil
@@ -448,10 +480,73 @@ private final class HTTPConnectionSession {
 
         let rawCandidate = (headerName?.isEmpty == false ? headerName : pathName) ?? "upload_\(Int(Date().timeIntervalSince1970)).bin"
         let safeFileName = sanitizeFileName(rawCandidate)
-        onUploadComplete(rawURL, safeFileName)
+        onUploadComplete(rawURL, safeFileName, targetDir)
+        sendJSON(["ok": true, "fileName": safeFileName])
+    }
 
-        let json = "{\"ok\":true,\"fileName\":\"\(safeFileName.replacingOccurrences(of: "\"", with: "\\\""))\"}"
-        sendResponse(status: "200 OK", contentType: "application/json; charset=utf-8", body: Data(json.utf8))
+    private func handleJSONAction(path: String, bodyURL: URL) {
+        guard let data = try? Data(contentsOf: bodyURL),
+              let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+            sendResponse(status: "400 Bad Request", contentType: "application/json", body: Data("{\"ok\":false}".utf8))
+            return
+        }
+
+        switch path {
+        case "/api/mkdir":
+            let dir = safeRelativePath(json["dir"] as? String) ?? ""
+            let name = sanitizeFileName(json["name"] as? String ?? "")
+            guard !name.isEmpty,
+                  let parentURL = resolvedURL(forRelativePath: dir) else {
+                sendResponse(status: "400 Bad Request", contentType: "application/json", body: Data("{\"ok\":false}".utf8))
+                return
+            }
+            let target = parentURL.appendingPathComponent(name, isDirectory: true)
+            try? FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
+            onLibraryChanged()
+            sendJSON(["ok": true])
+
+        case "/api/rename":
+            guard let fromRel = safeRelativePath(json["from"] as? String),
+                  !fromRel.isEmpty,
+                  let fromURL = resolvedURL(forRelativePath: fromRel),
+                  FileManager.default.fileExists(atPath: fromURL.path) else {
+                sendResponse(status: "404 Not Found", contentType: "application/json", body: Data("{\"ok\":false}".utf8))
+                return
+            }
+            let newName = sanitizeFileName(json["name"] as? String ?? "")
+            guard !newName.isEmpty else {
+                sendResponse(status: "400 Bad Request", contentType: "application/json", body: Data("{\"ok\":false}".utf8))
+                return
+            }
+            let destURL = fromURL.deletingLastPathComponent().appendingPathComponent(newName)
+            guard !FileManager.default.fileExists(atPath: destURL.path) else {
+                sendResponse(status: "409 Conflict", contentType: "application/json", body: Data("{\"ok\":false}".utf8))
+                return
+            }
+            try? FileManager.default.moveItem(at: fromURL, to: destURL)
+            onLibraryChanged()
+            sendJSON(["ok": true])
+
+        case "/api/delete":
+            guard let rel = safeRelativePath(json["path"] as? String),
+                  !rel.isEmpty,
+                  let targetURL = resolvedURL(forRelativePath: rel),
+                  FileManager.default.fileExists(atPath: targetURL.path) else {
+                sendResponse(status: "404 Not Found", contentType: "application/json", body: Data("{\"ok\":false}".utf8))
+                return
+            }
+            try? FileManager.default.removeItem(at: targetURL)
+            onLibraryChanged()
+            sendJSON(["ok": true])
+
+        default:
+            sendResponse(status: "404 Not Found", contentType: "application/json", body: Data("{\"ok\":false}".utf8))
+        }
+    }
+
+    private func sendJSON(_ obj: [String: Any]) {
+        let data = (try? JSONSerialization.data(withJSONObject: obj)) ?? Data("{\"ok\":true}".utf8)
+        sendResponse(status: "200 OK", contentType: "application/json; charset=utf-8", body: data)
     }
 
     private func extractBoundary(from contentType: String) -> String? {
@@ -547,44 +642,43 @@ private final class HTTPConnectionSession {
         return cleaned.isEmpty ? "upload_\(Int(Date().timeIntervalSince1970)).bin" : cleaned
     }
 
-    private func buildFilesJSON() -> Data {
-        struct FileEntry: Encodable {
+    private func buildDirectoryJSON(dirRelPath: String) -> Data {
+        struct Entry: Encodable {
             let name: String
+            let path: String
+            let isDir: Bool
             let size: String
         }
-
-        let keys: [URLResourceKey] = [.fileSizeKey, .isDirectoryKey]
-        let rootPath = docsURL.standardizedFileURL.path
-        var entries: [FileEntry] = []
-
-        if let enumerator = FileManager.default.enumerator(
-            at: docsURL,
-            includingPropertiesForKeys: keys,
-            options: [.skipsHiddenFiles]
-        ) {
-            for case let url as URL in enumerator {
-                let values = try? url.resourceValues(forKeys: Set(keys))
-                if values?.isDirectory == true {
-                    if url.pathExtension.lowercased() == "movpkg" || url.lastPathComponent == "Inbox" {
-                        enumerator.skipDescendants()
-                    }
-                    continue
-                }
-                let fullPath = url.standardizedFileURL.path
-                guard fullPath.hasPrefix(rootPath + "/") else { continue }
-                let relPath = String(fullPath.dropFirst(rootPath.count + 1))
-                let bytes = Int64(values?.fileSize ?? 0)
-                entries.append(
-                    FileEntry(
-                        name: relPath,
-                        size: ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
-                    )
-                )
-            }
+        struct Response: Encodable {
+            let dir: String
+            let entries: [Entry]
         }
 
-        entries.sort { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
-        return (try? JSONEncoder().encode(entries)) ?? Data("[]".utf8)
+        let targetURL = resolvedURL(forRelativePath: dirRelPath) ?? docsURL
+        let keys: [URLResourceKey] = [.fileSizeKey, .isDirectoryKey]
+        let urls = (try? FileManager.default.contentsOfDirectory(
+            at: targetURL,
+            includingPropertiesForKeys: keys,
+            options: [.skipsHiddenFiles]
+        )) ?? []
+
+        var entries: [Entry] = []
+        for url in urls {
+            let values = try? url.resourceValues(forKeys: Set(keys))
+            let name = url.lastPathComponent
+            if dirRelPath.isEmpty && name == "Inbox" { continue }
+            let isDir = (values?.isDirectory == true) && url.pathExtension.lowercased() != "movpkg"
+            let relPath = dirRelPath.isEmpty ? name : "\(dirRelPath)/\(name)"
+            let sizeText = isDir ? "Folder" : ByteCountFormatter.string(fromByteCount: Int64(values?.fileSize ?? 0), countStyle: .file)
+            entries.append(Entry(name: name, path: relPath, isDir: isDir, size: sizeText))
+        }
+
+        entries.sort {
+            if $0.isDir != $1.isDir { return $0.isDir }
+            return $0.name.localizedStandardCompare($1.name) == .orderedAscending
+        }
+
+        return (try? JSONEncoder().encode(Response(dir: dirRelPath, entries: entries))) ?? Data("{\"dir\":\"\",\"entries\":[]}".utf8)
     }
 
     private func streamFileDownload(at fileURL: URL, fileName: String) {
@@ -659,13 +753,6 @@ private final class HTTPConnectionSession {
         onFinished()
     }
 
-    private static func escapeHTML(_ value: String) -> String {
-        value
-            .replacingOccurrences(of: "&", with: "&amp;")
-            .replacingOccurrences(of: "<", with: "&lt;")
-            .replacingOccurrences(of: ">", with: "&gt;")
-    }
-
     private static let uploaderHTML = """
     <!DOCTYPE html>
     <html lang="en">
@@ -676,51 +763,58 @@ private final class HTTPConnectionSession {
       <style>
         :root { color-scheme: light dark; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
         body { margin: 0; padding: 24px; background: #0f1117; color: #f5f7fb; display: flex; justify-content: center; }
-        .wrap { width: 100%; max-width: 680px; }
-        .card { background: #181c26; border: 1px solid #2a3040; border-radius: 16px; padding: 24px; margin-bottom: 20px; }
+        .wrap { width: 100%; max-width: 760px; }
+        .card { background: #181c26; border: 1px solid #2a3040; border-radius: 16px; padding: 22px; margin-bottom: 18px; }
         h1 { margin: 0 0 6px; font-size: 22px; }
-        p.sub { margin: 0 0 18px; color: #9aa3b2; font-size: 14px; }
-        .drop { border: 2px dashed #4a556e; border-radius: 14px; padding: 34px 20px; text-align: center; cursor: pointer; transition: border-color .15s, background .15s; }
+        p.sub { margin: 0 0 16px; color: #9aa3b2; font-size: 14px; }
+        .drop { border: 2px dashed #4a556e; border-radius: 14px; padding: 28px 20px; text-align: center; cursor: pointer; }
         .drop.over { border-color: #637ef5; background: rgba(99,126,245,.12); }
-        .btn { display: inline-block; margin-top: 12px; padding: 10px 18px; border-radius: 10px; background: #637ef5; color: #fff; font-weight: 600; border: 0; cursor: pointer; font-size: 14px; }
-        .status { margin-top: 16px; font-size: 14px; color: #b7c0d1; }
+        .toolbar { display: flex; gap: 10px; flex-wrap: wrap; justify-content: center; margin-top: 12px; }
+        .btn { padding: 9px 16px; border-radius: 10px; background: #637ef5; color: #fff; font-weight: 600; border: 0; cursor: pointer; font-size: 13px; }
+        .btn.sec { background: #272e3f; }
+        .btn.sm { padding: 5px 10px; font-size: 12px; border-radius: 7px; }
+        .btn.del { background: #7f2930; }
+        .status { margin-top: 14px; font-size: 13px; color: #b7c0d1; }
         progress { width: 100%; height: 10px; margin-top: 8px; accent-color: #637ef5; }
-        ul { list-style: none; padding: 0; margin: 12px 0 0; }
+        .crumbs { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; margin-bottom: 12px; font-size: 13px; }
+        .crumbs a { color: #8ea4ff; cursor: pointer; text-decoration: none; font-weight: 600; }
+        ul { list-style: none; padding: 0; margin: 0; }
         li { display: flex; justify-content: space-between; align-items: center; padding: 10px 0; border-bottom: 1px solid #252b3a; font-size: 14px; gap: 12px; }
         li:last-child { border-bottom: 0; }
-        a.dl { color: #8ea4ff; text-decoration: none; font-weight: 600; white-space: nowrap; }
-        .meta { color: #8b94a7; font-size: 12px; white-space: nowrap; }
+        .item-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .folder-link { color: #8ea4ff; cursor: pointer; font-weight: 600; }
+        .actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+        .meta { color: #8b94a7; font-size: 12px; }
       </style>
     </head>
     <body>
       <div class="wrap">
         <div class="card">
           <h1>Music Player Wi-Fi Transfer</h1>
-          <p class="sub">Upload audio, video, PDFs, or documents directly to your iPhone.</p>
+          <p class="sub">Upload songs, videos, ZIPs, or documents directly into the selected folder on your iPhone.</p>
           <div id="dropZone" class="drop">
-            <div>Drop files here or choose from your computer</div>
-            <button type="button" class="btn" onclick="document.getElementById('fileInput').click()">Select Files</button>
+            <div>Drop files here or use the controls below</div>
+            <div class="toolbar">
+              <button type="button" class="btn" onclick="document.getElementById('fileInput').click()">Upload Files</button>
+              <button type="button" class="btn sec" onclick="createFolder()">New Folder</button>
+              <button type="button" class="btn sec" onclick="loadFiles()">Refresh</button>
+            </div>
             <input id="fileInput" type="file" multiple style="display:none" />
           </div>
           <div id="uploadStatus" class="status" style="display:none">
             <div id="uploadLabel">Uploading...</div>
             <progress id="uploadBar" value="0" max="100"></progress>
           </div>
-          <noscript>
-            <form method="POST" enctype="multipart/form-data" style="margin-top:16px">
-              <input type="file" name="file" />
-              <input type="submit" value="Upload to iPhone" />
-            </form>
-          </noscript>
         </div>
 
         <div class="card">
-          <h2 style="margin:0 0 6px;font-size:17px;">Files on iPhone</h2>
+          <div class="crumbs" id="breadcrumbs"></div>
           <ul id="fileList"><li class="meta">Loading...</li></ul>
         </div>
       </div>
 
       <script>
+        let currentDir = '';
         const dropZone = document.getElementById('dropZone');
         const fileInput = document.getElementById('fileInput');
         const statusBox = document.getElementById('uploadStatus');
@@ -758,8 +852,9 @@ private final class HTTPConnectionSession {
         function uploadSingle(file) {
           return new Promise((resolve, reject) => {
             const xhr = new XMLHttpRequest();
-            xhr.open('POST', '/upload', true);
+            xhr.open('POST', '/upload?dir=' + encodeURIComponent(currentDir), true);
             xhr.setRequestHeader('X-File-Name', encodeURIComponent(file.name));
+            xhr.setRequestHeader('X-Target-Dir', encodeURIComponent(currentDir));
             xhr.upload.onprogress = e => {
               if (e.lengthComputable) uploadBar.value = Math.round((e.loaded / e.total) * 100);
             };
@@ -772,25 +867,94 @@ private final class HTTPConnectionSession {
           });
         }
 
+        async function createFolder() {
+          const name = prompt('New folder name:');
+          if (!name || !name.trim()) return;
+          await fetch('/api/mkdir', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ dir: currentDir, name: name.trim() })
+          });
+          loadFiles();
+        }
+
+        async function renameEntry(path, oldName) {
+          const name = prompt('Rename to:', oldName);
+          if (!name || !name.trim() || name.trim() === oldName) return;
+          await fetch('/api/rename', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ from: path, name: name.trim() })
+          });
+          loadFiles();
+        }
+
+        async function deleteEntry(path, name) {
+          if (!confirm(`Delete "${name}"?`)) return;
+          await fetch('/api/delete', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ path })
+          });
+          loadFiles();
+        }
+
+        function openFolder(dir) {
+          currentDir = dir;
+          loadFiles();
+        }
+
+        function renderBreadcrumbs() {
+          const el = document.getElementById('breadcrumbs');
+          const parts = currentDir ? currentDir.split('/') : [];
+          let html = `<a onclick="openFolder('')">This iPhone</a>`;
+          let running = '';
+          for (const part of parts) {
+            running = running ? `${running}/${part}` : part;
+            const target = running;
+            html += ` <span>/</span> <a onclick="openFolder('${escAttr(target)}')">${esc(part)}</a>`;
+          }
+          el.innerHTML = html;
+        }
+
         async function loadFiles() {
+          renderBreadcrumbs();
           const list = document.getElementById('fileList');
           try {
-            const res = await fetch('/api/files');
-            const files = await res.json();
-            if (!files.length) {
-              list.innerHTML = '<li class="meta">No files saved yet.</li>';
+            const res = await fetch('/api/files?dir=' + encodeURIComponent(currentDir));
+            const data = await res.json();
+            const entries = data.entries || [];
+            if (!entries.length) {
+              list.innerHTML = '<li class="meta">This folder is empty.</li>';
               return;
             }
-            list.innerHTML = files.map(f =>
-              `<li><span style="overflow:hidden;text-overflow:ellipsis;">${esc(f.name)}</span><span><span class="meta">${esc(f.size)}</span> &nbsp; <a class="dl" href="/files/${encodeURIComponent(f.name)}">Download</a></span></li>`
-            ).join('');
+            list.innerHTML = entries.map(e => {
+              const titleHtml = e.isDir
+                ? `<span class="item-name folder-link" onclick="openFolder('${escAttr(e.path)}')">&#128193; ${esc(e.name)}</span>`
+                : `<span class="item-name">${esc(e.name)}</span>`;
+              const dlBtn = e.isDir
+                ? `<button class="btn sec sm" onclick="openFolder('${escAttr(e.path)}')">Open</button>`
+                : `<a class="btn sm" style="text-decoration:none" href="/files/${encodeURIComponent(e.path)}">Download</a>`;
+              return `<li>
+                ${titleHtml}
+                <div class="actions">
+                  <span class="meta">${esc(e.size)}</span>
+                  ${dlBtn}
+                  <button class="btn sec sm" onclick="renameEntry('${escAttr(e.path)}','${escAttr(e.name)}')">Rename</button>
+                  <button class="btn del sm" onclick="deleteEntry('${escAttr(e.path)}','${escAttr(e.name)}')">Delete</button>
+                </div>
+              </li>`;
+            }).join('');
           } catch {
             list.innerHTML = '<li class="meta">Could not load files.</li>';
           }
         }
 
         function esc(s) {
-          return s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+          return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+        }
+        function escAttr(s) {
+          return String(s).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
         }
 
         loadFiles();

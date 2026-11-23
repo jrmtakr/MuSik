@@ -6,18 +6,20 @@ enum MediaFilter: String, CaseIterable, Identifiable {
     case all = "All"
     case songs = "Songs"
     case videos = "Videos"
-    case files = "Files"
-    case favorites = "Favorites"
-    case recents = "Recents"
+    case pictures = "Pictures"
+    case documents = "Documents"
 
     var id: String { rawValue }
 }
 
 enum MediaSortOrder: String, CaseIterable, Identifiable {
-    case newest = "Newest"
-    case name = "Name"
-    case size = "Largest"
-    case duration = "Duration"
+    case `default` = "Sort by Default"
+    case newest = "Sort by Date"
+    case name = "Sort by Name"
+    case artist = "Sort by Artist"
+    case duration = "Sort by Duration"
+    case size = "Sort by Size"
+    case type = "Sort by Type"
 
     var id: String { rawValue }
 }
@@ -35,14 +37,6 @@ private enum RenameTarget: Identifiable {
         }
     }
 
-    var currentName: String {
-        switch self {
-        case .media(let item): return item.name
-        case .file(let file): return file.name
-        case .folder(let folder): return folder.name
-        }
-    }
-
     var label: String {
         switch self {
         case .media(let item): return item.fileName
@@ -56,6 +50,11 @@ private struct MoveTarget: Identifiable {
     let id = UUID()
     let mediaItems: [MediaItem]
     let otherFiles: [LocalFile]
+}
+
+private struct PendingImportItem {
+    let url: URL
+    let folderPath: String
 }
 
 struct LibraryView: View {
@@ -84,6 +83,10 @@ struct LibraryView: View {
     @State private var editingInfoItem: MediaItem?
     @State private var moveTarget: MoveTarget?
 
+    @State private var imageReaderTarget: ImageReaderTarget?
+    @State private var textReaderFile: LocalFile?
+    @State private var pendingConflicts: [PendingImportItem] = []
+
     @State private var isSelecting = false
     @State private var selectedMediaPaths: Set<String> = []
     @State private var selectedOtherPaths: Set<String> = []
@@ -94,7 +97,7 @@ struct LibraryView: View {
     }
 
     private var showsFolderHierarchy: Bool {
-        (filter == .all || filter == .files) && trimmedSearch.isEmpty
+        (filter == .all || filter == .pictures || filter == .documents) && trimmedSearch.isEmpty
     }
 
     private var visibleFolders: [LocalFolder] {
@@ -105,14 +108,10 @@ struct LibraryView: View {
     }
 
     private var filteredMediaItems: [MediaItem] {
-        guard filter != .files else { return [] }
+        guard filter == .all || filter == .songs || filter == .videos else { return [] }
 
         let sourceItems: [MediaItem]
         switch filter {
-        case .favorites:
-            sourceItems = mediaManager.favoriteItems
-        case .recents:
-            sourceItems = mediaManager.recentItems
         case .songs:
             sourceItems = mediaManager.items.filter { !$0.isVideo }
         case .videos:
@@ -123,7 +122,7 @@ struct LibraryView: View {
             } else {
                 sourceItems = mediaManager.items
             }
-        case .files:
+        case .pictures, .documents:
             sourceItems = []
         }
 
@@ -135,41 +134,33 @@ struct LibraryView: View {
                 item.fileExtension.localizedCaseInsensitiveContains(trimmedSearch)
         }
 
-        if filter == .recents && trimmedSearch.isEmpty && sortOrder == .newest {
-            return matched
-        }
-
-        switch sortOrder {
-        case .newest:
-            return matched.sorted { $0.dateAdded > $1.dateAdded }
-        case .name:
-            return matched.sorted { $0.displayTitle.localizedStandardCompare($1.displayTitle) == .orderedAscending }
-        case .size:
-            return matched.sorted { $0.fileSize > $1.fileSize }
-        case .duration:
-            return matched.sorted { ($0.durationSeconds ?? 0) > ($1.durationSeconds ?? 0) }
-        }
+        return sortMedia(matched)
     }
 
     private var filteredOtherFiles: [LocalFile] {
-        guard filter == .all || filter == .files else { return [] }
+        guard filter == .all || filter == .pictures || filter == .documents else { return [] }
 
         let base = mediaManager.otherFiles.filter { file in
-            let matchesFolder = !trimmedSearch.isEmpty || file.folderRelativePath == currentFolderPath
+            let matchesCategory: Bool
+            switch filter {
+            case .pictures: matchesCategory = file.isImage
+            case .documents: matchesCategory = !file.isImage
+            case .all: matchesCategory = true
+            case .songs, .videos: matchesCategory = false
+            }
+
+            let matchesFolder = !trimmedSearch.isEmpty || !showsFolderHierarchy || file.folderRelativePath == currentFolderPath
             let matchesSearch = trimmedSearch.isEmpty ||
                 file.name.localizedCaseInsensitiveContains(trimmedSearch) ||
                 file.fileExtension.localizedCaseInsensitiveContains(trimmedSearch)
-            return matchesFolder && matchesSearch
+            return matchesCategory && matchesFolder && matchesSearch
         }
 
-        switch sortOrder {
-        case .newest:
-            return base.sorted { $0.dateAdded > $1.dateAdded }
-        case .name:
-            return base.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
-        case .size, .duration:
-            return base.sorted { $0.fileSize > $1.fileSize }
-        }
+        return sortOtherFiles(base)
+    }
+
+    private var currentFolderImages: [LocalFile] {
+        mediaManager.images(inFolder: currentFolderPath)
     }
 
     private var hasAnyStoredItems: Bool {
@@ -179,7 +170,7 @@ struct LibraryView: View {
     private var breadcrumbSegments: [(label: String, path: String)] {
         guard !currentFolderPath.isEmpty else { return [] }
         let parts = currentFolderPath.split(separator: "/").map(String.init)
-        var result: [(String, String)] = [("Root", "")]
+        var result: [(String, String)] = [("This iPhone", "")]
         var running = ""
         for part in parts {
             running = running.isEmpty ? part : "\(running)/\(part)"
@@ -212,12 +203,28 @@ struct LibraryView: View {
                         } else {
                             ContentUnavailableView(
                                 currentFolderPath.isEmpty ? "Nothing in \(filter.rawValue)" : "Folder is Empty",
-                                systemImage: filter == .files ? "doc" : (currentFolderPath.isEmpty ? "music.note" : "folder"),
-                                description: Text("Import files, create a subfolder, or move media here.")
+                                systemImage: filter == .documents ? "doc" : (currentFolderPath.isEmpty ? "music.note" : "folder"),
+                                description: Text("Import files, create a subfolder, or transfer over Wi-Fi.")
                             )
                         }
                     } else {
                         List {
+                            if showsFolderHierarchy && currentFolderImages.count > 1 {
+                                Section {
+                                    Button {
+                                        let title = currentFolderPath.isEmpty ? "Pictures" : (currentFolderPath as NSString).lastPathComponent
+                                        imageReaderTarget = ImageReaderTarget(
+                                            title: title,
+                                            files: currentFolderImages,
+                                            initialIndex: 0
+                                        )
+                                    } label: {
+                                        Label("Read Gallery / Comic (\(currentFolderImages.count) images)", systemImage: "book.pages")
+                                            .font(.subheadline.weight(.semibold))
+                                    }
+                                }
+                            }
+
                             if !visibleFolders.isEmpty {
                                 Section("Folders") {
                                     ForEach(visibleFolders) { folder in
@@ -261,8 +268,8 @@ struct LibraryView: View {
                     batchSelectionBar
                 }
             }
-            .navigationTitle(currentFolderPath.isEmpty ? "Music Player" : (currentFolderPath as NSString).lastPathComponent)
-            .searchable(text: $searchText, prompt: "Search songs, videos, files")
+            .navigationTitle(currentFolderPath.isEmpty ? "This iPhone" : (currentFolderPath as NSString).lastPathComponent)
+            .searchable(text: $searchText, prompt: "Search on Library")
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
                     HStack(spacing: 12) {
@@ -275,7 +282,7 @@ struct LibraryView: View {
                         }
 
                         Menu {
-                            Picker("Sort By", selection: $sortOrder) {
+                            Picker("Sort", selection: $sortOrder) {
                                 ForEach(MediaSortOrder.allCases) { order in
                                     Text(order.rawValue).tag(order)
                                 }
@@ -315,13 +322,13 @@ struct LibraryView: View {
                         Button {
                             showFileImporter = true
                         } label: {
-                            Label("Import from Files", systemImage: "doc.badge.plus")
+                            Label("Add Files (Files App)", systemImage: "doc.badge.plus")
                         }
 
                         Button {
                             showPhotosPicker = true
                         } label: {
-                            Label("Import Video from Photos", systemImage: "photo.on.rectangle.angled")
+                            Label("Import from Photos", systemImage: "photo.on.rectangle.angled")
                         }
 
                         Button {
@@ -341,7 +348,7 @@ struct LibraryView: View {
                         Button {
                             mediaManager.loadLocalFiles()
                         } label: {
-                            Label("Refresh Library", systemImage: "arrow.clockwise")
+                            Label("Refresh", systemImage: "arrow.clockwise")
                         }
                     } label: {
                         Image(systemName: "plus.circle.fill")
@@ -378,6 +385,12 @@ struct LibraryView: View {
                     }
                 )
             }
+            .fullScreenCover(item: $imageReaderTarget) { target in
+                ImageReaderView(target: target)
+            }
+            .fullScreenCover(item: $textReaderFile) { file in
+                TextStoryReaderView(file: file)
+            }
             .miniPlayerInset(showPlayerSheet: $showPlayerSheet)
             .fileImporter(
                 isPresented: $showFileImporter,
@@ -388,7 +401,11 @@ struct LibraryView: View {
                 case .success(let urls):
                     let folder = showsFolderHierarchy ? currentFolderPath : ""
                     for url in urls {
-                        mediaManager.importAnyFile(from: url, inFolder: folder)
+                        if mediaManager.fileExists(named: url.lastPathComponent, inFolder: folder) {
+                            pendingConflicts.append(PendingImportItem(url: url, folderPath: folder))
+                        } else {
+                            mediaManager.importAnyFile(from: url, inFolder: folder)
+                        }
                     }
                 case .failure(let error):
                     mediaManager.errorMessage = "File picker failed: \(error.localizedDescription)"
@@ -397,8 +414,8 @@ struct LibraryView: View {
             .photosPicker(
                 isPresented: $showPhotosPicker,
                 selection: $selectedPhotoItems,
-                maxSelectionCount: 5,
-                matching: .videos
+                maxSelectionCount: 10,
+                matching: .any(of: [.videos, .images])
             )
             .onChange(of: selectedPhotoItems) { _, newItems in
                 guard !newItems.isEmpty else { return }
@@ -407,21 +424,55 @@ struct LibraryView: View {
                 selectedPhotoItems = []
                 Task {
                     for pickedItem in picked {
-                        do {
-                            if let movie = try await pickedItem.loadTransferable(type: MovieTransferable.self) {
+                        let isVideo = pickedItem.supportedContentTypes.contains(where: { $0.conforms(to: .movie) })
+                        if isVideo, let movie = try? await pickedItem.loadTransferable(type: MovieTransferable.self) {
+                            await MainActor.run {
+                                mediaManager.importTemporaryFile(
+                                    from: movie.url,
+                                    preferredFileName: movie.suggestedFileName,
+                                    inFolder: targetFolder
+                                )
+                            }
+                        } else if let data = try? await pickedItem.loadTransferable(type: Data.self) {
+                            let ext = pickedItem.supportedContentTypes.first?.preferredFilenameExtension ?? "jpg"
+                            let fileName = "Photo_\(Int(Date().timeIntervalSince1970))_\(UUID().uuidString.prefix(4)).\(ext)"
+                            let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent(fileName)
+                            if (try? data.write(to: tempURL)) != nil {
                                 await MainActor.run {
                                     mediaManager.importTemporaryFile(
-                                        from: movie.url,
-                                        preferredFileName: movie.suggestedFileName,
+                                        from: tempURL,
+                                        preferredFileName: fileName,
                                         inFolder: targetFolder
                                     )
                                 }
                             }
-                        } catch {
-                            await MainActor.run {
-                                mediaManager.errorMessage = "Could not import video: \(error.localizedDescription)"
-                            }
                         }
+                    }
+                }
+            }
+            .confirmationDialog(
+                "\"\(pendingConflicts.first?.url.lastPathComponent ?? "")\" already exists, how to do with it?",
+                isPresented: Binding(
+                    get: { !pendingConflicts.isEmpty },
+                    set: { if !$0 { pendingConflicts.removeAll() } }
+                ),
+                titleVisibility: .visible
+            ) {
+                Button("Overwrite", role: .destructive) {
+                    if let first = pendingConflicts.first {
+                        pendingConflicts.removeFirst()
+                        mediaManager.importAnyFile(from: first.url, inFolder: first.folderPath, conflictAction: .overwrite)
+                    }
+                }
+                Button("Keep Both") {
+                    if let first = pendingConflicts.first {
+                        pendingConflicts.removeFirst()
+                        mediaManager.importAnyFile(from: first.url, inFolder: first.folderPath, conflictAction: .keepBoth)
+                    }
+                }
+                Button("Cancel", role: .cancel) {
+                    if !pendingConflicts.isEmpty {
+                        pendingConflicts.removeFirst()
                     }
                 }
             }
@@ -489,6 +540,36 @@ struct LibraryView: View {
             } message: {
                 Text("All files inside this folder will be permanently deleted.")
             }
+        }
+    }
+
+    private func sortMedia(_ list: [MediaItem]) -> [MediaItem] {
+        switch sortOrder {
+        case .default, .newest:
+            return list.sorted { $0.dateAdded > $1.dateAdded }
+        case .name:
+            return list.sorted { $0.displayTitle.localizedStandardCompare($1.displayTitle) == .orderedAscending }
+        case .artist:
+            return list.sorted { ($0.artist ?? "zzz").localizedStandardCompare($1.artist ?? "zzz") == .orderedAscending }
+        case .duration:
+            return list.sorted { ($0.durationSeconds ?? 0) > ($1.durationSeconds ?? 0) }
+        case .size:
+            return list.sorted { $0.fileSize > $1.fileSize }
+        case .type:
+            return list.sorted { $0.fileExtension.localizedStandardCompare($1.fileExtension) == .orderedAscending }
+        }
+    }
+
+    private func sortOtherFiles(_ list: [LocalFile]) -> [LocalFile] {
+        switch sortOrder {
+        case .default, .newest:
+            return list.sorted { $0.dateAdded > $1.dateAdded }
+        case .name, .artist:
+            return list.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        case .size, .duration:
+            return list.sorted { $0.fileSize > $1.fileSize }
+        case .type:
+            return list.sorted { $0.fileExtension.localizedStandardCompare($1.fileExtension) == .orderedAscending }
         }
     }
 
@@ -602,6 +683,16 @@ struct LibraryView: View {
         }
         .padding(.vertical, 4)
         .contextMenu {
+            Button {
+                let imgs = mediaManager.images(inFolder: folder.relativePath)
+                if !imgs.isEmpty {
+                    imageReaderTarget = ImageReaderTarget(title: folder.name, files: imgs, initialIndex: 0)
+                }
+            } label: {
+                Label("Read Images as Comic", systemImage: "book.pages")
+            }
+            .disabled(mediaManager.images(inFolder: folder.relativePath).isEmpty)
+
             Button {
                 renameText = folder.name
                 renameTarget = .folder(folder)
@@ -737,7 +828,7 @@ struct LibraryView: View {
                         }
                         return
                     }
-                    quickLookTarget = QuickLookTarget(title: file.name, fileURL: file.fileURL)
+                    openOtherFile(file)
                 },
                 onRename: {
                     renameText = file.name
@@ -747,6 +838,50 @@ struct LibraryView: View {
                     moveTarget = MoveTarget(mediaItems: [], otherFiles: [file])
                 }
             )
+            .contextMenu {
+                if file.isArchive {
+                    Button {
+                        mediaManager.extractArchive(file)
+                    } label: {
+                        Label("Unzip Archive", systemImage: "archivebox")
+                    }
+                }
+                if file.isImage {
+                    Button {
+                        let imgs = mediaManager.images(inFolder: file.folderRelativePath)
+                        let idx = imgs.firstIndex(where: { $0.relativePath == file.relativePath }) ?? 0
+                        imageReaderTarget = ImageReaderTarget(
+                            title: file.folderRelativePath.isEmpty ? "Pictures" : (file.folderRelativePath as NSString).lastPathComponent,
+                            files: imgs.isEmpty ? [file] : imgs,
+                            initialIndex: idx
+                        )
+                    } label: {
+                        Label("Open in Image Reader", systemImage: "book.pages")
+                    }
+                }
+                if file.isReadableText {
+                    Button {
+                        textReaderFile = file
+                    } label: {
+                        Label("Open in Story Reader", systemImage: "doc.text")
+                    }
+                }
+                Button {
+                    quickLookTarget = QuickLookTarget(title: file.name, fileURL: file.fileURL)
+                } label: {
+                    Label("Quick Look", systemImage: "eye")
+                }
+            }
+        }
+        .swipeActions(edge: .leading, allowsFullSwipe: false) {
+            if file.isArchive {
+                Button {
+                    mediaManager.extractArchive(file)
+                } label: {
+                    Label("Unzip", systemImage: "archivebox")
+                }
+                .tint(.orange)
+            }
         }
         .swipeActions(edge: .trailing, allowsFullSwipe: true) {
             Button(role: .destructive) {
@@ -754,6 +889,24 @@ struct LibraryView: View {
             } label: {
                 Label("Delete", systemImage: "trash")
             }
+        }
+    }
+
+    private func openOtherFile(_ file: LocalFile) {
+        if file.isArchive {
+            mediaManager.extractArchive(file)
+        } else if file.isImage {
+            let imgs = mediaManager.images(inFolder: file.folderRelativePath)
+            let idx = imgs.firstIndex(where: { $0.relativePath == file.relativePath }) ?? 0
+            imageReaderTarget = ImageReaderTarget(
+                title: file.folderRelativePath.isEmpty ? "Pictures" : (file.folderRelativePath as NSString).lastPathComponent,
+                files: imgs.isEmpty ? [file] : imgs,
+                initialIndex: idx
+            )
+        } else if file.isReadableText {
+            textReaderFile = file
+        } else {
+            quickLookTarget = QuickLookTarget(title: file.name, fileURL: file.fileURL)
         }
     }
 
@@ -825,13 +978,13 @@ struct LibraryView: View {
         ContentUnavailableView {
             Label("No Local Files Yet", systemImage: "play.square.stack")
         } description: {
-            Text("Import songs, videos, or documents from Files, Photos, Wi-Fi Transfer, or the built-in ad-free Browser.")
+            Text("Import songs, videos, ZIPs, or photos from Files, Photos, Wi-Fi Transfer, or Discovery.")
         } actions: {
             HStack(spacing: 12) {
                 Button {
                     showFileImporter = true
                 } label: {
-                    Label("Import Files", systemImage: "folder.badge.plus")
+                    Label("Add Files", systemImage: "folder.badge.plus")
                 }
                 .buttonStyle(.borderedProminent)
 
@@ -862,7 +1015,7 @@ private struct MoveToFolderSheet: View {
                 Button {
                     moveAll(to: "")
                 } label: {
-                    Label("Root (Library)", systemImage: "house")
+                    Label("This iPhone (Root)", systemImage: "house")
                 }
 
                 if !mediaManager.folders.isEmpty {

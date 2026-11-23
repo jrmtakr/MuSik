@@ -41,6 +41,7 @@ struct WebViewWrapper: UIViewRepresentable {
     let isPrivate: Bool
     let darkModeEnabled: Bool
     let adBlockEnabled: Bool
+    let inlineVideoPlayback: Bool
     var controller: BrowserController? = nil
     var contentBlocker: ContentBlockerManager? = nil
     var onURLChange: (URL, String?) -> Void = { _, _ in }
@@ -176,7 +177,7 @@ struct WebViewWrapper: UIViewRepresentable {
         let config = WKWebViewConfiguration()
         config.userContentController = userController
         config.websiteDataStore = isPrivate ? .nonPersistent() : .default()
-        config.allowsInlineMediaPlayback = true
+        config.allowsInlineMediaPlayback = inlineVideoPlayback
         config.allowsPictureInPictureMediaPlayback = true
         config.mediaTypesRequiringUserActionForPlayback = []
 
@@ -471,8 +472,10 @@ struct BrowserTabView: View {
     @Environment(AppSettings.self) private var settings
     @Environment(BrowserStore.self) private var browserStore
     @Environment(WebMediaDownloader.self) private var downloader
+    @Environment(\.dismiss) private var dismiss
 
     @Binding var showPlayerSheet: Bool
+    var isModal: Bool = false
 
     @State private var urlString = ""
     @State private var activeURL = URL(string: "https://duckduckgo.com")!
@@ -518,6 +521,7 @@ struct BrowserTabView: View {
                     isPrivate: browserStore.activeTab.isPrivate,
                     darkModeEnabled: settings.webDarkModeEnabled,
                     adBlockEnabled: settings.adBlockEnabled,
+                    inlineVideoPlayback: settings.inlineVideoPlayback,
                     controller: browser,
                     contentBlocker: contentBlocker,
                     onURLChange: { newURL, newTitle in
@@ -564,6 +568,12 @@ struct BrowserTabView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItemGroup(placement: .topBarLeading) {
+                    if isModal {
+                        Button("Done") {
+                            dismiss()
+                        }
+                    }
+
                     Button {
                         browser.goBack()
                     } label: {
@@ -629,7 +639,25 @@ struct BrowserTabView: View {
                             )
                         }
 
+                        Button {
+                            settings.inlineVideoPlayback.toggle()
+                            mediaManager.statusMessage = settings.inlineVideoPlayback
+                                ? "Inline video player enabled"
+                                : "Inline video player disabled"
+                        } label: {
+                            Label(
+                                settings.inlineVideoPlayback ? "Inline Player: On" : "Inline Player: Off",
+                                systemImage: "play.rectangle"
+                            )
+                        }
+
                         Divider()
+
+                        Button {
+                            extractAndSavePageImages()
+                        } label: {
+                            Label("Download Images", systemImage: "photo.stack")
+                        }
 
                         Button {
                             let target = targetDownloadURL
@@ -899,6 +927,30 @@ struct BrowserTabView: View {
         }
 
         return settings.searchEngine.searchURL(for: trimmed)
+    }
+
+    private func extractAndSavePageImages() {
+        guard let webView = browser.webView else { return }
+        let script = """
+        Array.from(document.images || [])
+          .filter(img => (img.naturalWidth || 0) >= 80 && (img.naturalHeight || 0) >= 80)
+          .map(img => img.currentSrc || img.src)
+          .filter(u => /^https?:\\/\\//i.test(u));
+        """
+        let pageTitle = browser.pageTitle.isEmpty ? (browser.currentURL?.host ?? "Web Images") : browser.pageTitle
+        let referer = browser.currentURL?.absoluteString
+
+        webView.evaluateJavaScript(script) { result, _ in
+            let rawStrings = (result as? [String]) ?? []
+            var seen = Set<String>()
+            let urls = rawStrings.compactMap { s -> URL? in
+                guard seen.insert(s).inserted else { return nil }
+                return URL(string: s)
+            }
+            Task { @MainActor in
+                await mediaManager.saveImagesFromWeb(urls, folderName: pageTitle, referer: referer)
+            }
+        }
     }
 
     private func handleDetectedMedia(_ media: DetectedBrowserMedia, autoMode: Bool) {

@@ -8,6 +8,7 @@ final class BrowserStore {
     var activeTabID: UUID
     var bookmarks: [BookmarkItem] = []
     var history: [HistoryEntry] = []
+    var speedDialSites: [SpeedDialSite] = []
 
     private static var appSupportDirectory: URL {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -23,6 +24,20 @@ final class BrowserStore {
         appSupportDirectory.appendingPathComponent("browser_history.json")
     }
 
+    private static var speedDialURL: URL {
+        appSupportDirectory.appendingPathComponent("browser_speed_dial.json")
+    }
+
+    private static let defaultSpeedDialSites: [SpeedDialSite] = [
+        SpeedDialSite(title: "YouTube", urlString: "https://m.youtube.com", shortLabel: "▶", hexColor: "#FF0000"),
+        SpeedDialSite(title: "YT Music", urlString: "https://music.youtube.com", shortLabel: "♫", hexColor: "#FF0033"),
+        SpeedDialSite(title: "SoundCloud", urlString: "https://m.soundcloud.com", shortLabel: "SC", hexColor: "#FF5500"),
+        SpeedDialSite(title: "Archive", urlString: "https://archive.org", shortLabel: "AR", hexColor: "#2C3E50"),
+        SpeedDialSite(title: "Google", urlString: "https://www.google.com", shortLabel: "G", hexColor: "#4285F4"),
+        SpeedDialSite(title: "DuckDuckGo", urlString: "https://duckduckgo.com", shortLabel: "DDG", hexColor: "#DE5833"),
+        SpeedDialSite(title: "Wikipedia", urlString: "https://en.m.wikipedia.org", shortLabel: "W", hexColor: "#3A3A44")
+    ]
+
     init() {
         let initial = BrowserTabItem()
         self.tabs = [initial]
@@ -34,7 +49,7 @@ final class BrowserStore {
         tabs.first(where: { $0.id == activeTabID }) ?? tabs[0]
     }
 
-    func addTab(isPrivate: Bool = false, urlString: String = "https://duckduckgo.com") {
+    func addTab(isPrivate: Bool = false, urlString: String = "https://www.google.com") {
         let tab = BrowserTabItem(
             title: isPrivate ? "Private Tab" : "New Tab",
             urlString: urlString,
@@ -55,6 +70,14 @@ final class BrowserStore {
         }
     }
 
+    func openInActiveTab(urlString: String, title: String? = nil) {
+        guard let idx = tabs.firstIndex(where: { $0.id == activeTabID }) else { return }
+        tabs[idx].urlString = normalizedURLString(urlString)
+        if let title, !title.isEmpty {
+            tabs[idx].title = title
+        }
+    }
+
     func updateActiveTab(urlString: String, title: String?) {
         guard let idx = tabs.firstIndex(where: { $0.id == activeTabID }) else { return }
         tabs[idx].urlString = urlString
@@ -65,6 +88,33 @@ final class BrowserStore {
             recordHistory(title: title ?? urlString, urlString: urlString)
         }
     }
+
+    // MARK: - Speed Dial Websites
+
+    func addOrUpdateSpeedDial(id: UUID? = nil, title: String, urlString: String) {
+        let resolvedURL = normalizedURLString(urlString)
+        guard !resolvedURL.isEmpty else { return }
+        let cleanTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let resolvedTitle = cleanTitle.isEmpty ? (URL(string: resolvedURL)?.host ?? resolvedURL) : cleanTitle
+
+        if let id, let idx = speedDialSites.firstIndex(where: { $0.id == id }) {
+            speedDialSites[idx].title = resolvedTitle
+            speedDialSites[idx].urlString = resolvedURL
+            speedDialSites[idx].shortLabel = String(resolvedTitle.prefix(2)).uppercased()
+        } else {
+            speedDialSites.append(
+                SpeedDialSite(title: resolvedTitle, urlString: resolvedURL)
+            )
+        }
+        saveSpeedDial()
+    }
+
+    func deleteSpeedDial(_ site: SpeedDialSite) {
+        speedDialSites.removeAll { $0.id == site.id }
+        saveSpeedDial()
+    }
+
+    // MARK: - Bookmarks & History
 
     func toggleBookmark(title: String, urlString: String) {
         let cleaned = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -144,6 +194,13 @@ final class BrowserStore {
            let decoded = try? JSONDecoder().decode([HistoryEntry].self, from: data) {
             history = decoded
         }
+        if let data = try? Data(contentsOf: Self.speedDialURL),
+           let decoded = try? JSONDecoder().decode([SpeedDialSite].self, from: data),
+           !decoded.isEmpty {
+            speedDialSites = decoded
+        } else {
+            speedDialSites = Self.defaultSpeedDialSites
+        }
     }
 
     private func saveBookmarks() {
@@ -154,5 +211,10 @@ final class BrowserStore {
     private func saveHistory() {
         guard let data = try? JSONEncoder().encode(history) else { return }
         try? data.write(to: Self.historyURL, options: [.atomic])
+    }
+
+    private func saveSpeedDial() {
+        guard let data = try? JSONEncoder().encode(speedDialSites) else { return }
+        try? data.write(to: Self.speedDialURL, options: [.atomic])
     }
 }

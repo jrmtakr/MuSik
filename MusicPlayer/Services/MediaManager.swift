@@ -52,6 +52,7 @@ final class MediaManager {
     var statusMessage: String?
     var errorMessage: String?
     var thumbnails: [String: UIImage] = [:]
+    var playlistCovers: [UUID: UIImage] = [:]
 
     let equalizerPlayer = EqualizerAudioPlayer()
     private(set) var player: AVPlayer?
@@ -79,6 +80,7 @@ final class MediaManager {
         setupRemoteCommands()
         setupEqualizerCallbacks()
         loadPlaylists()
+        loadPlaylistCovers()
         loadLibraryState()
         loadLocalFiles()
     }
@@ -320,8 +322,17 @@ final class MediaManager {
         case document(LocalFile)
     }
 
+    func fileExists(named fileName: String, inFolder folderPath: String = "") -> Bool {
+        let targetURL = folderURL(for: folderPath).appendingPathComponent(fileName)
+        return FileManager.default.fileExists(atPath: targetURL.path)
+    }
+
     @discardableResult
-    func importAnyFile(from sourceURL: URL, inFolder folderPath: String = "") -> ImportedOutcome? {
+    func importAnyFile(
+        from sourceURL: URL,
+        inFolder folderPath: String = "",
+        conflictAction: DuplicateConflictAction = .keepBoth
+    ) -> ImportedOutcome? {
         let didAccess = sourceURL.startAccessingSecurityScopedResource()
         defer {
             if didAccess {
@@ -336,13 +347,27 @@ final class MediaManager {
             return outcomeForRelativePath(rel)
         }
 
-        let destURL = uniqueDestinationURL(for: sourceURL.lastPathComponent, inFolder: folderPath)
+        let destURL: URL
+        if conflictAction == .overwrite {
+            destURL = targetDir.appendingPathComponent(sourceURL.lastPathComponent)
+        } else {
+            destURL = uniqueDestinationURL(for: sourceURL.lastPathComponent, inFolder: folderPath)
+        }
+
         do {
             try FileManager.default.createDirectory(at: targetDir, withIntermediateDirectories: true)
+            if conflictAction == .overwrite, FileManager.default.fileExists(atPath: destURL.path) {
+                try FileManager.default.removeItem(at: destURL)
+            }
             try FileManager.default.copyItem(at: sourceURL, to: destURL)
+            let rel = folderPath.isEmpty ? destURL.lastPathComponent : "\(folderPath)/\(destURL.lastPathComponent)"
+            if conflictAction == .overwrite {
+                durationsByPath.removeValue(forKey: rel)
+                metadataLoadedPaths.remove(rel)
+                thumbnails.removeValue(forKey: rel)
+            }
             loadLocalFiles()
             statusMessage = "Saved \(destURL.lastPathComponent)"
-            let rel = folderPath.isEmpty ? destURL.lastPathComponent : "\(folderPath)/\(destURL.lastPathComponent)"
             return outcomeForRelativePath(rel)
         } catch {
             errorMessage = "Import failed: \(error.localizedDescription)"
@@ -359,15 +384,32 @@ final class MediaManager {
     }
 
     @discardableResult
-    func importTemporaryFile(from tempURL: URL, preferredFileName: String? = nil, inFolder folderPath: String = "") -> MediaItem? {
+    func importTemporaryFile(
+        from tempURL: URL,
+        preferredFileName: String? = nil,
+        inFolder folderPath: String = "",
+        conflictAction: DuplicateConflictAction = .keepBoth
+    ) -> MediaItem? {
         let targetName = preferredFileName ?? tempURL.lastPathComponent
-        let destURL = uniqueDestinationURL(for: targetName, inFolder: folderPath)
+        let targetDir = folderURL(for: folderPath)
+        let destURL = conflictAction == .overwrite
+            ? targetDir.appendingPathComponent(targetName)
+            : uniqueDestinationURL(for: targetName, inFolder: folderPath)
+
         do {
             try FileManager.default.createDirectory(at: destURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            if conflictAction == .overwrite, FileManager.default.fileExists(atPath: destURL.path) {
+                try FileManager.default.removeItem(at: destURL)
+            }
             try FileManager.default.moveItem(at: tempURL, to: destURL)
+            let rel = folderPath.isEmpty ? destURL.lastPathComponent : "\(folderPath)/\(destURL.lastPathComponent)"
+            if conflictAction == .overwrite {
+                durationsByPath.removeValue(forKey: rel)
+                metadataLoadedPaths.remove(rel)
+                thumbnails.removeValue(forKey: rel)
+            }
             loadLocalFiles()
             statusMessage = "Saved \(destURL.lastPathComponent)"
-            let rel = folderPath.isEmpty ? destURL.lastPathComponent : "\(folderPath)/\(destURL.lastPathComponent)"
             return items.first(where: { $0.relativePath == rel })
         } catch {
             try? FileManager.default.removeItem(at: tempURL)
@@ -898,9 +940,46 @@ final class MediaManager {
             lastPlaylistID = nil
             saveLibraryState()
         }
+        if let coverFile = playlist.customCoverFileName {
+            try? FileManager.default.removeItem(at: coversDirectoryURL.appendingPathComponent(coverFile))
+        }
+        playlistCovers.removeValue(forKey: playlist.id)
         playlists.removeAll { $0.id == playlist.id }
         savePlaylists()
         statusMessage = "Deleted playlist \"\(playlist.name)\""
+    }
+
+    func updatePlaylistCover(for playlist: Playlist, image: UIImage?, remove: Bool = false) {
+        guard let index = playlists.firstIndex(where: { $0.id == playlist.id }) else { return }
+
+        if let oldCover = playlists[index].customCoverFileName {
+            try? FileManager.default.removeItem(at: coversDirectoryURL.appendingPathComponent(oldCover))
+        }
+
+        if remove || image == nil {
+            playlists[index].customCoverFileName = nil
+            playlistCovers.removeValue(forKey: playlist.id)
+        } else if let image, let jpeg = image.jpegData(compressionQuality: 0.85) {
+            let fileName = "playlist_\(playlist.id.uuidString).jpg"
+            try? FileManager.default.createDirectory(at: coversDirectoryURL, withIntermediateDirectories: true)
+            try? jpeg.write(to: coversDirectoryURL.appendingPathComponent(fileName), options: [.atomic])
+            playlists[index].customCoverFileName = fileName
+            playlistCovers[playlist.id] = image
+        }
+
+        savePlaylists()
+        statusMessage = remove ? "Reset playlist cover" : "Updated playlist cover"
+    }
+
+    private func loadPlaylistCovers() {
+        for playlist in playlists {
+            guard let coverName = playlist.customCoverFileName,
+                  let data = try? Data(contentsOf: coversDirectoryURL.appendingPathComponent(coverName)),
+                  let image = UIImage(data: data) else {
+                continue
+            }
+            playlistCovers[playlist.id] = image
+        }
     }
 
     func renamePlaylist(_ playlist: Playlist, to newName: String) {
@@ -1110,6 +1189,79 @@ final class MediaManager {
             statusMessage = "MP4 conversion cancelled."
         default:
             break
+        }
+    }
+
+    func extractArchive(_ file: LocalFile) {
+        let baseName = sanitizeName(file.name)
+        let folderTitle = baseName.isEmpty ? "Extracted" : baseName
+        let destURL = uniqueDestinationURL(for: folderTitle, inFolder: file.folderRelativePath)
+
+        do {
+            let count = try ZipExtractor.extract(archiveURL: file.fileURL, to: destURL)
+            loadLocalFiles()
+            statusMessage = "Extracted \(count) \(count == 1 ? "file" : "files") to \(destURL.lastPathComponent)"
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func images(inFolder folderPath: String) -> [LocalFile] {
+        otherFiles
+            .filter { $0.isImage && $0.folderRelativePath == folderPath }
+            .sorted { $0.fileName.localizedStandardCompare($1.fileName) == .orderedAscending }
+    }
+
+    @MainActor
+    func saveImagesFromWeb(_ imageURLs: [URL], folderName: String, referer: String? = nil) async {
+        guard !imageURLs.isEmpty else {
+            errorMessage = "No downloadable images found on this page."
+            return
+        }
+
+        let cleanFolder = sanitizeName(folderName)
+        let targetName = cleanFolder.isEmpty ? "Web Images" : String(cleanFolder.prefix(60))
+        let folderURL = uniqueDestinationURL(for: targetName, inFolder: "")
+        do {
+            try FileManager.default.createDirectory(at: folderURL, withIntermediateDirectories: true)
+        } catch {
+            errorMessage = "Could not create images folder: \(error.localizedDescription)"
+            return
+        }
+
+        let folderRel = folderURL.lastPathComponent
+        var saved = 0
+        for (idx, url) in imageURLs.prefix(100).enumerated() {
+            var request = URLRequest(url: url)
+            if let referer {
+                request.setValue(referer, forHTTPHeaderField: "Referer")
+            }
+            guard let (tempURL, resp) = try? await URLSession.shared.download(for: request) else { continue }
+            let mime = resp.mimeType?.lowercased() ?? ""
+            let ext: String
+            switch mime {
+            case "image/png": ext = "png"
+            case "image/webp": ext = "webp"
+            case "image/gif": ext = "gif"
+            default:
+                let urlExt = url.pathExtension.lowercased()
+                ext = ["png", "jpg", "jpeg", "webp", "gif"].contains(urlExt) ? urlExt : "jpg"
+            }
+            let fileName = String(format: "%03d.%@", idx + 1, ext)
+            let dest = folderURL.appendingPathComponent(fileName)
+            if (try? FileManager.default.moveItem(at: tempURL, to: dest)) != nil {
+                saved += 1
+            } else {
+                try? FileManager.default.removeItem(at: tempURL)
+            }
+        }
+
+        loadLocalFiles()
+        if saved > 0 {
+            statusMessage = "Saved \(saved) images into \"\(folderRel)\""
+        } else {
+            try? FileManager.default.removeItem(at: folderURL)
+            errorMessage = "Could not download images from this page."
         }
     }
 
