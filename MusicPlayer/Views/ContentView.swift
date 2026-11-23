@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 enum AppTab: Hashable {
     case discovery
@@ -51,6 +52,16 @@ struct ContentView: View {
                     .tag(AppTab.setting)
             }
             .preferredColorScheme(settings.appearanceMode.colorScheme)
+            .applyCustomTextStyle()
+            .onAppear {
+                updateNavigationBarAppearance()
+            }
+            .onChange(of: settings.useCustomTextColor) { _, _ in
+                updateNavigationBarAppearance()
+            }
+            .onChange(of: settings.customTextHex) { _, _ in
+                updateNavigationBarAppearance()
+            }
             .sheet(isPresented: $showPlayerSheet) {
                 NowPlayingView()
             }
@@ -104,6 +115,17 @@ struct ContentView: View {
             }
         } message: {
             Text("Enter a name for your new offline playlist.")
+        }
+    }
+
+    private func updateNavigationBarAppearance() {
+        if settings.useCustomTextColor {
+            let uiColor = UIColor(settings.customTextColor)
+            UINavigationBar.appearance().titleTextAttributes = [.foregroundColor: uiColor]
+            UINavigationBar.appearance().largeTitleTextAttributes = [.foregroundColor: uiColor]
+        } else {
+            UINavigationBar.appearance().titleTextAttributes = nil
+            UINavigationBar.appearance().largeTitleTextAttributes = nil
         }
     }
 }

@@ -87,6 +87,7 @@ struct LibraryView: View {
 
     @State private var imageReaderTarget: ImageReaderTarget?
     @State private var textReaderFile: LocalFile?
+    @State private var showMangaLibrarySheet = false
     @State private var pendingConflicts: [PendingImportItem] = []
 
     @State private var isSelecting = false
@@ -340,6 +341,12 @@ struct LibraryView: View {
                         }
 
                         Button {
+                            showMangaLibrarySheet = true
+                        } label: {
+                            Label("Manga & Story Reader", systemImage: "book.pages")
+                        }
+
+                        Button {
                             showWiFiSheet = true
                         } label: {
                             Label("Wi-Fi Transfer", systemImage: "antenna.radiowaves.left.and.right")
@@ -369,6 +376,9 @@ struct LibraryView: View {
             }
             .sheet(isPresented: $showEqualizerSheet) {
                 EqualizerView()
+            }
+            .sheet(isPresented: $showMangaLibrarySheet) {
+                MangaLibrarySheetView()
             }
             .sheet(item: $editingInfoItem) { item in
                 EditTrackInfoSheet(item: item)
@@ -661,7 +671,8 @@ struct LibraryView: View {
     }
 
     private func folderRow(_ folder: LocalFolder) -> some View {
-        HStack(spacing: 14) {
+        let folderImages = mediaManager.imagesRecursive(inFolder: folder.relativePath)
+        return HStack(spacing: 12) {
             Button {
                 currentFolderPath = folder.relativePath
             } label: {
@@ -685,25 +696,43 @@ struct LibraryView: View {
                             .foregroundStyle(.secondary)
                     }
                     Spacer()
-                    Image(systemName: "chevron.right")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.tertiary)
                 }
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+
+            if !folderImages.isEmpty {
+                Button {
+                    imageReaderTarget = ImageReaderTarget(
+                        title: folder.name,
+                        files: folderImages,
+                        initialIndex: 0
+                    )
+                } label: {
+                    Label("Read", systemImage: "book.pages")
+                        .font(.caption.weight(.semibold))
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(Color.accentColor.opacity(0.15), in: Capsule())
+                        .foregroundStyle(Color.accentColor)
+                }
+                .buttonStyle(.plain)
+            }
+
+            Image(systemName: "chevron.right")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.tertiary)
         }
         .padding(.vertical, 4)
         .contextMenu {
             Button {
-                let imgs = mediaManager.images(inFolder: folder.relativePath)
-                if !imgs.isEmpty {
-                    imageReaderTarget = ImageReaderTarget(title: folder.name, files: imgs, initialIndex: 0)
+                if !folderImages.isEmpty {
+                    imageReaderTarget = ImageReaderTarget(title: folder.name, files: folderImages, initialIndex: 0)
                 }
             } label: {
-                Label("Read Images as Comic", systemImage: "book.pages")
+                Label("Read in Manga / Comic Reader", systemImage: "book.pages")
             }
-            .disabled(mediaManager.images(inFolder: folder.relativePath).isEmpty)
+            .disabled(folderImages.isEmpty)
 
             Button {
                 renameText = folder.name
@@ -906,7 +935,16 @@ struct LibraryView: View {
 
     private func openOtherFile(_ file: LocalFile) {
         if file.isArchive {
-            mediaManager.extractArchive(file)
+            if let extractedFolder = mediaManager.extractArchive(file) {
+                let imgs = mediaManager.imagesRecursive(inFolder: extractedFolder)
+                if !imgs.isEmpty {
+                    imageReaderTarget = ImageReaderTarget(
+                        title: file.name,
+                        files: imgs,
+                        initialIndex: 0
+                    )
+                }
+            }
         } else if file.isImage {
             let imgs = mediaManager.images(inFolder: file.folderRelativePath)
             let idx = imgs.firstIndex(where: { $0.relativePath == file.relativePath }) ?? 0

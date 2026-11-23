@@ -1,5 +1,7 @@
+import PhotosUI
 import SwiftUI
 import UIKit
+import UniformTypeIdentifiers
 import WebKit
 
 private struct AppIconChoice: Identifiable {
@@ -26,8 +28,12 @@ struct SettingsView: View {
 
     @State private var showWiFiSheet = false
     @State private var showEqualizerSheet = false
+    @State private var showMangaReaderSheet = false
     @State private var showClearedAlert = false
     @State private var iconErrorMessage: String?
+
+    @State private var selectedBackgroundPhoto: PhotosPickerItem?
+    @State private var showBackgroundFileImporter = false
 
     private let durationOptions = [0, 10, 30, 60, 120]
 
@@ -36,7 +42,7 @@ struct SettingsView: View {
 
         NavigationStack {
             Form {
-                Section("Appearance") {
+                Section("Appearance & Custom Theme") {
                     Picker("Theme", selection: $settings.appearanceMode) {
                         ForEach(AppearanceMode.allCases) { mode in
                             Text(mode.rawValue).tag(mode)
@@ -47,11 +53,130 @@ struct SettingsView: View {
                     NavigationLink {
                         AppIconsPickerView(iconErrorMessage: $iconErrorMessage)
                     } label: {
-                        HStack {
-                            Label("App Icons", systemImage: "app.badge")
+                        HStack(spacing: 12) {
+                            if settings.useCustomAppIcon, let customIcon = settings.customAppIconImage {
+                                Image(uiImage: customIcon)
+                                    .resizable()
+                                    .scaledToFill()
+                                    .frame(width: 28, height: 28)
+                                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                            } else {
+                                Image(systemName: "app.badge")
+                                    .foregroundStyle(Color.accentColor)
+                            }
+                            Text("App Icon")
                             Spacer()
                             Text(currentIconLabel)
                                 .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    VStack(alignment: .leading, spacing: 10) {
+                        HStack(spacing: 12) {
+                            if let bgImage = settings.customBackgroundImage {
+                                Image(uiImage: bgImage)
+                                    .resizable()
+                                    .scaledToFill()
+                                    .frame(width: 48, height: 48)
+                                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                            } else {
+                                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                    .fill(Color.accentColor.opacity(0.15))
+                                    .frame(width: 48, height: 48)
+                                    .overlay {
+                                        Image(systemName: "photo.on.rectangle")
+                                            .foregroundStyle(Color.accentColor)
+                                    }
+                            }
+
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("App Background Picture")
+                                    .font(.subheadline.weight(.semibold))
+                                Text(settings.customBackgroundImage != nil ? "Custom background active" : "Upload a photo for the app background")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+
+                        HStack(spacing: 10) {
+                            PhotosPicker(selection: $selectedBackgroundPhoto, matching: .images) {
+                                Label("Photos", systemImage: "photo")
+                                    .font(.caption.weight(.semibold))
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(.borderedProminent)
+
+                            Button {
+                                showBackgroundFileImporter = true
+                            } label: {
+                                Label("Files", systemImage: "folder")
+                                    .font(.caption.weight(.semibold))
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(.bordered)
+
+                            if settings.customBackgroundImage != nil {
+                                Button(role: .destructive) {
+                                    settings.clearCustomBackgroundImage()
+                                    mediaManager.statusMessage = "Removed background picture"
+                                } label: {
+                                    Image(systemName: "trash")
+                                        .font(.caption.weight(.semibold))
+                                }
+                                .buttonStyle(.bordered)
+                            }
+                        }
+                    }
+                    .padding(.vertical, 4)
+
+                    if settings.customBackgroundImage != nil {
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack {
+                                Text("Background Dimming")
+                                    .font(.subheadline)
+                                Spacer()
+                                Text("\(Int(settings.backgroundDimOpacity * 100))%")
+                                    .font(.caption.monospacedDigit())
+                                    .foregroundStyle(.secondary)
+                            }
+                            Slider(value: $settings.backgroundDimOpacity, in: 0.0...0.85, step: 0.05)
+                        }
+
+                        Toggle("Blur Background Picture", isOn: $settings.backgroundBlurEnabled)
+                    }
+
+                    Toggle("Custom Background Color", isOn: $settings.useCustomBackgroundColor)
+
+                    if settings.useCustomBackgroundColor {
+                        ColorPicker(
+                            "App Background Color",
+                            selection: Binding(
+                                get: { settings.customBackgroundColor },
+                                set: { settings.customBackgroundColor = $0 }
+                            ),
+                            supportsOpacity: false
+                        )
+                    }
+
+                    Toggle("Custom Letters / Text Color", isOn: $settings.useCustomTextColor)
+
+                    if settings.useCustomTextColor {
+                        ColorPicker(
+                            "Letters & Text Color",
+                            selection: Binding(
+                                get: { settings.customTextColor },
+                                set: { settings.customTextColor = $0 }
+                            ),
+                            supportsOpacity: false
+                        )
+                    }
+
+                    if settings.hasCustomBackground || settings.hasCustomTextColor {
+                        Button(role: .destructive) {
+                            settings.resetCustomTheme()
+                            mediaManager.statusMessage = "Reset background & text colors to default"
+                        } label: {
+                            Label("Reset Background & Text Colors", systemImage: "arrow.counterclockwise")
                         }
                     }
                 }
@@ -130,6 +255,12 @@ struct SettingsView: View {
                 }
 
                 Section("Browser & Reader") {
+                    Button {
+                        showMangaReaderSheet = true
+                    } label: {
+                        Label("Open Manga & Story Reader", systemImage: "book.pages")
+                    }
+
                     Picker("Search Engine", selection: $settings.searchEngine) {
                         ForEach(SearchEngineOption.allCases) { engine in
                             Text(engine.rawValue).tag(engine)
@@ -138,7 +269,7 @@ struct SettingsView: View {
 
                     Picker("Reading Direction", selection: $settings.readingDirection) {
                         ForEach(ReadingDirection.allCases) { dir in
-                            Text(dir.rawValue).tag(dir)
+                            Text(dir.displayTitle).tag(dir)
                         }
                     }
                 }
@@ -194,12 +325,47 @@ struct SettingsView: View {
             .onChange(of: mediaManager.playlists) { _, _ in
                 syncTargetDownloadPlaylist()
             }
+            .onChange(of: selectedBackgroundPhoto) { _, newItem in
+                guard let newItem else { return }
+                selectedBackgroundPhoto = nil
+                Task {
+                    if let data = try? await newItem.loadTransferable(type: Data.self),
+                       let image = UIImage(data: data) {
+                        await MainActor.run {
+                            settings.saveCustomBackgroundImage(image)
+                            mediaManager.statusMessage = "Updated app background picture"
+                        }
+                    }
+                }
+            }
+            .fileImporter(
+                isPresented: $showBackgroundFileImporter,
+                allowedContentTypes: [.image],
+                allowsMultipleSelection: false
+            ) { result in
+                if case .success(let urls) = result, let url = urls.first {
+                    let didAccess = url.startAccessingSecurityScopedResource()
+                    defer {
+                        if didAccess { url.stopAccessingSecurityScopedResource() }
+                    }
+                    if let data = try? Data(contentsOf: url),
+                       let image = UIImage(data: data) {
+                        settings.saveCustomBackgroundImage(image)
+                        mediaManager.statusMessage = "Updated app background picture"
+                    } else {
+                        mediaManager.errorMessage = "Could not load selected image file."
+                    }
+                }
+            }
             .miniPlayerInset(showPlayerSheet: $showPlayerSheet)
             .sheet(isPresented: $showWiFiSheet) {
                 WiFiTransferView()
             }
             .sheet(isPresented: $showEqualizerSheet) {
                 EqualizerView()
+            }
+            .sheet(isPresented: $showMangaReaderSheet) {
+                MangaLibrarySheetView()
             }
             .alert("History Cleared", isPresented: $showClearedAlert) {
                 Button("OK", role: .cancel) {}
@@ -221,7 +387,10 @@ struct SettingsView: View {
     }
 
     private var currentIconLabel: String {
-        AppIconChoice.all.first(where: { $0.iconName == settings.selectedAppIconName })?.title ?? "Default"
+        if settings.useCustomAppIcon && settings.customAppIconImage != nil {
+            return "Custom Picture"
+        }
+        return AppIconChoice.all.first(where: { $0.iconName == settings.selectedAppIconName })?.title ?? "Default"
     }
 
     private func syncTargetDownloadPlaylist() {
@@ -234,45 +403,173 @@ struct SettingsView: View {
 
 private struct AppIconsPickerView: View {
     @Environment(AppSettings.self) private var settings
+    @Environment(MediaManager.self) private var mediaManager
     @Binding var iconErrorMessage: String?
+
+    @State private var selectedIconPhoto: PhotosPickerItem?
+    @State private var showIconFileImporter = false
 
     var body: some View {
         List {
-            ForEach(AppIconChoice.all) { choice in
-                let isSelected = settings.selectedAppIconName == choice.iconName
-                Button {
-                    applyIcon(choice)
-                } label: {
+            Section {
+                VStack(alignment: .leading, spacing: 12) {
                     HStack(spacing: 14) {
-                        RoundedRectangle(cornerRadius: 12, style: .continuous)
-                            .fill(choice.previewColor.gradient)
-                            .frame(width: 48, height: 48)
-                            .overlay {
-                                Image(systemName: "play.circle.fill")
-                                    .font(.title2)
-                                    .foregroundStyle(.white)
-                            }
+                        if let customIcon = settings.customAppIconImage {
+                            Image(uiImage: customIcon)
+                                .resizable()
+                                .scaledToFill()
+                                .frame(width: 56, height: 56)
+                                .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
+                        } else {
+                            RoundedRectangle(cornerRadius: 13, style: .continuous)
+                                .fill(Color.accentColor.opacity(0.16))
+                                .frame(width: 56, height: 56)
+                                .overlay {
+                                    Image(systemName: "photo.badge.plus")
+                                        .font(.title3)
+                                        .foregroundStyle(Color.accentColor)
+                                }
+                        }
 
-                        Text(choice.title)
-                            .font(.body.weight(.medium))
-                            .foregroundStyle(.primary)
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("Custom App Icon Picture")
+                                .font(.body.weight(.semibold))
+                            Text(
+                                settings.customAppIconImage != nil
+                                    ? "Used for in-app branding & default player artwork"
+                                    : "Upload any picture from Photos or Files"
+                            )
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        }
 
                         Spacer()
 
-                        if isSelected {
+                        if settings.useCustomAppIcon && settings.customAppIconImage != nil {
                             Image(systemName: "checkmark.circle.fill")
                                 .foregroundStyle(Color.accentColor)
                         }
                     }
-                    .padding(.vertical, 4)
+
+                    HStack(spacing: 10) {
+                        PhotosPicker(selection: $selectedIconPhoto, matching: .images) {
+                            Label("Upload Photo", systemImage: "photo")
+                                .font(.caption.weight(.semibold))
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.borderedProminent)
+
+                        Button {
+                            showIconFileImporter = true
+                        } label: {
+                            Label("From Files", systemImage: "folder")
+                                .font(.caption.weight(.semibold))
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.bordered)
+                    }
+
+                    if settings.customAppIconImage != nil {
+                        HStack(spacing: 10) {
+                            if !settings.useCustomAppIcon {
+                                Button {
+                                    settings.useCustomAppIcon = true
+                                } label: {
+                                    Label("Use Custom Picture", systemImage: "checkmark.circle")
+                                        .font(.caption.weight(.semibold))
+                                }
+                                .buttonStyle(.bordered)
+                            }
+
+                            Button(role: .destructive) {
+                                settings.clearCustomAppIcon()
+                                mediaManager.statusMessage = "Removed custom app icon picture"
+                            } label: {
+                                Label("Remove Custom Picture", systemImage: "trash")
+                                    .font(.caption.weight(.semibold))
+                            }
+                            .buttonStyle(.bordered)
+                        }
+                    }
+                }
+                .padding(.vertical, 4)
+            } header: {
+                Text("Custom Uploaded Picture")
+            } footer: {
+                Text("Your custom uploaded picture is displayed across the app and as default player artwork. You can also select one of the built-in iOS Home Screen icons below.")
+            }
+
+            Section("Home Screen Icons") {
+                ForEach(AppIconChoice.all) { choice in
+                    let isSelected = !settings.useCustomAppIcon && settings.selectedAppIconName == choice.iconName
+                    Button {
+                        applyIcon(choice)
+                    } label: {
+                        HStack(spacing: 14) {
+                            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                .fill(choice.previewColor.gradient)
+                                .frame(width: 48, height: 48)
+                                .overlay {
+                                    Image(systemName: "play.circle.fill")
+                                        .font(.title2)
+                                        .foregroundStyle(.white)
+                                }
+
+                            Text(choice.title)
+                                .font(.body.weight(.medium))
+                                .foregroundStyle(.primary)
+
+                            Spacer()
+
+                            if isSelected {
+                                Image(systemName: "checkmark.circle.fill")
+                                    .foregroundStyle(Color.accentColor)
+                            }
+                        }
+                        .padding(.vertical, 4)
+                    }
                 }
             }
         }
+        .applyAppTheme()
         .navigationTitle("App Icons")
         .navigationBarTitleDisplayMode(.inline)
+        .onChange(of: selectedIconPhoto) { _, newItem in
+            guard let newItem else { return }
+            selectedIconPhoto = nil
+            Task {
+                if let data = try? await newItem.loadTransferable(type: Data.self),
+                   let image = UIImage(data: data) {
+                    await MainActor.run {
+                        settings.saveCustomAppIcon(image)
+                        mediaManager.statusMessage = "Saved custom app icon picture"
+                    }
+                }
+            }
+        }
+        .fileImporter(
+            isPresented: $showIconFileImporter,
+            allowedContentTypes: [.image],
+            allowsMultipleSelection: false
+        ) { result in
+            if case .success(let urls) = result, let url = urls.first {
+                let didAccess = url.startAccessingSecurityScopedResource()
+                defer {
+                    if didAccess { url.stopAccessingSecurityScopedResource() }
+                }
+                if let data = try? Data(contentsOf: url),
+                   let image = UIImage(data: data) {
+                    settings.saveCustomAppIcon(image)
+                    mediaManager.statusMessage = "Saved custom app icon picture"
+                } else {
+                    iconErrorMessage = "Could not load the selected image file."
+                }
+            }
+        }
     }
 
     private func applyIcon(_ choice: AppIconChoice) {
+        settings.useCustomAppIcon = false
         guard UIApplication.shared.supportsAlternateIcons else {
             iconErrorMessage = "Alternate app icons are not supported on this device."
             return

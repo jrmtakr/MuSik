@@ -1754,17 +1754,23 @@ final class MediaManager {
         }
     }
 
-    func extractArchive(_ file: LocalFile) {
+    @discardableResult
+    func extractArchive(_ file: LocalFile) -> String? {
         let baseName = sanitizeName(file.name)
         let folderTitle = baseName.isEmpty ? "Extracted" : baseName
         let destURL = uniqueDestinationURL(for: folderTitle, inFolder: file.folderRelativePath)
+        let relFolder = file.folderRelativePath.isEmpty
+            ? destURL.lastPathComponent
+            : "\(file.folderRelativePath)/\(destURL.lastPathComponent)"
 
         do {
             let count = try ZipExtractor.extract(archiveURL: file.fileURL, to: destURL)
             loadLocalFiles()
             statusMessage = "Extracted \(count) \(count == 1 ? "file" : "files") to \(destURL.lastPathComponent)"
+            return relFolder
         } catch {
             errorMessage = error.localizedDescription
+            return nil
         }
     }
 
@@ -1774,11 +1780,40 @@ final class MediaManager {
             .sorted { $0.fileName.localizedStandardCompare($1.fileName) == .orderedAscending }
     }
 
+    func imagesRecursive(inFolder folderPath: String) -> [LocalFile] {
+        let prefix = folderPath + "/"
+        return otherFiles
+            .filter { file in
+                guard file.isImage else { return false }
+                if folderPath.isEmpty { return true }
+                return file.folderRelativePath == folderPath || file.folderRelativePath.hasPrefix(prefix)
+            }
+            .sorted { $0.relativePath.localizedStandardCompare($1.relativePath) == .orderedAscending }
+    }
+
+    func mangaImageChapters() -> [(title: String, folderPath: String, files: [LocalFile])] {
+        var grouped: [String: [LocalFile]] = [:]
+        for file in otherFiles where file.isImage {
+            grouped[file.folderRelativePath, default: []].append(file)
+        }
+        return grouped.keys
+            .sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+            .compactMap { folderPath in
+                let sortedFiles = (grouped[folderPath] ?? []).sorted {
+                    $0.fileName.localizedStandardCompare($1.fileName) == .orderedAscending
+                }
+                guard !sortedFiles.isEmpty else { return nil }
+                let title = folderPath.isEmpty ? "Library Pictures" : (folderPath as NSString).lastPathComponent
+                return (title: title, folderPath: folderPath, files: sortedFiles)
+            }
+    }
+
     @MainActor
-    func saveImagesFromWeb(_ imageURLs: [URL], folderName: String, referer: String? = nil) async {
+    @discardableResult
+    func saveImagesFromWeb(_ imageURLs: [URL], folderName: String, referer: String? = nil) async -> [LocalFile] {
         guard !imageURLs.isEmpty else {
             errorMessage = "No downloadable images found on this page."
-            return
+            return []
         }
 
         let cleanFolder = sanitizeName(folderName)
@@ -1788,7 +1823,7 @@ final class MediaManager {
             try FileManager.default.createDirectory(at: folderURL, withIntermediateDirectories: true)
         } catch {
             errorMessage = "Could not create images folder: \(error.localizedDescription)"
-            return
+            return []
         }
 
         let folderRel = folderURL.lastPathComponent
@@ -1821,9 +1856,11 @@ final class MediaManager {
         loadLocalFiles()
         if saved > 0 {
             statusMessage = "Saved \(saved) images into \"\(folderRel)\""
+            return images(inFolder: folderRel)
         } else {
             try? FileManager.default.removeItem(at: folderURL)
             errorMessage = "Could not download images from this page."
+            return []
         }
     }
 

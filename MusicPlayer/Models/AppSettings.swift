@@ -1,6 +1,45 @@
 import Foundation
 import Observation
 import SwiftUI
+import UIKit
+
+extension Color {
+    init?(hexString: String) {
+        let cleaned = hexString.trimmingCharacters(in: .whitespacesAndNewlines).replacingOccurrences(of: "#", with: "")
+        guard cleaned.count == 6 || cleaned.count == 8,
+              let value = UInt64(cleaned, radix: 16) else {
+            return nil
+        }
+        let r, g, b, a: Double
+        if cleaned.count == 8 {
+            r = Double((value >> 24) & 0xFF) / 255.0
+            g = Double((value >> 16) & 0xFF) / 255.0
+            b = Double((value >> 8) & 0xFF) / 255.0
+            a = Double(value & 0xFF) / 255.0
+        } else {
+            r = Double((value >> 16) & 0xFF) / 255.0
+            g = Double((value >> 8) & 0xFF) / 255.0
+            b = Double(value & 0xFF) / 255.0
+            a = 1.0
+        }
+        self.init(.sRGB, red: r, green: g, blue: b, opacity: a)
+    }
+
+    func toHexString() -> String {
+        let uiColor = UIColor(self)
+        var r: CGFloat = 0
+        var g: CGFloat = 0
+        var b: CGFloat = 0
+        var a: CGFloat = 0
+        guard uiColor.getRed(&r, green: &g, blue: &b, alpha: &a) else {
+            return "#12131A"
+        }
+        let ri = Int(round(min(max(r, 0), 1) * 255))
+        let gi = Int(round(min(max(g, 0), 1) * 255))
+        let bi = Int(round(min(max(b, 0), 1) * 255))
+        return String(format: "#%02X%02X%02X", ri, gi, bi)
+    }
+}
 
 enum AppearanceMode: String, CaseIterable, Identifiable {
     case system = "System"
@@ -54,8 +93,17 @@ enum SearchEngineOption: String, CaseIterable, Identifiable {
 enum ReadingDirection: String, CaseIterable, Identifiable {
     case scroll = "Scroll"
     case page = "Page"
+    case mangaRTL = "Manga (Right-to-Left)"
 
     var id: String { rawValue }
+
+    var displayTitle: String {
+        switch self {
+        case .scroll: return "Vertical Scroll (Webtoon)"
+        case .page: return "Page (Left-to-Right)"
+        case .mangaRTL: return "Manga (Right-to-Left)"
+        }
+    }
 }
 
 @Observable
@@ -102,6 +150,29 @@ final class AppSettings {
     var selectedAppIconName: String {
         didSet { UserDefaults.standard.set(selectedAppIconName, forKey: Keys.selectedAppIconName) }
     }
+    var useCustomAppIcon: Bool {
+        didSet { UserDefaults.standard.set(useCustomAppIcon, forKey: Keys.useCustomAppIcon) }
+    }
+    var customAppIconImage: UIImage?
+    var customBackgroundImage: UIImage?
+    var backgroundDimOpacity: Double {
+        didSet { UserDefaults.standard.set(backgroundDimOpacity, forKey: Keys.backgroundDimOpacity) }
+    }
+    var backgroundBlurEnabled: Bool {
+        didSet { UserDefaults.standard.set(backgroundBlurEnabled, forKey: Keys.backgroundBlurEnabled) }
+    }
+    var useCustomBackgroundColor: Bool {
+        didSet { UserDefaults.standard.set(useCustomBackgroundColor, forKey: Keys.useCustomBackgroundColor) }
+    }
+    var customBackgroundHex: String {
+        didSet { UserDefaults.standard.set(customBackgroundHex, forKey: Keys.customBackgroundHex) }
+    }
+    var useCustomTextColor: Bool {
+        didSet { UserDefaults.standard.set(useCustomTextColor, forKey: Keys.useCustomTextColor) }
+    }
+    var customTextHex: String {
+        didSet { UserDefaults.standard.set(customTextHex, forKey: Keys.customTextHex) }
+    }
     var suppressedCacheHosts: [String] {
         didSet { UserDefaults.standard.set(suppressedCacheHosts, forKey: Keys.suppressedCacheHosts) }
     }
@@ -114,6 +185,31 @@ final class AppSettings {
 
     var targetDownloadPlaylistID: UUID? {
         UUID(uuidString: targetDownloadPlaylistIDString)
+    }
+
+    var customBackgroundColor: Color {
+        get { Color(hexString: customBackgroundHex) ?? Color(red: 0.07, green: 0.08, blue: 0.11) }
+        set { customBackgroundHex = newValue.toHexString() }
+    }
+
+    var customTextColor: Color {
+        get { Color(hexString: customTextHex) ?? Color.white }
+        set { customTextHex = newValue.toHexString() }
+    }
+
+    var hasCustomBackground: Bool {
+        customBackgroundImage != nil || useCustomBackgroundColor
+    }
+
+    var hasCustomTextColor: Bool {
+        useCustomTextColor
+    }
+
+    var themedRowBackgroundColor: Color {
+        if useCustomBackgroundColor {
+            return customBackgroundColor.opacity(customBackgroundImage != nil ? 0.62 : 0.85)
+        }
+        return Color(.secondarySystemBackground).opacity(0.68)
     }
 
     static var isAutoAddDownloadsToPlaylistEnabled: Bool {
@@ -143,9 +239,32 @@ final class AppSettings {
         static let readerFontSize = "musicplayer.readerFontSize"
         static let readerDarkTheme = "musicplayer.readerDarkTheme"
         static let selectedAppIconName = "musicplayer.selectedAppIconName"
+        static let useCustomAppIcon = "musicplayer.useCustomAppIcon"
+        static let backgroundDimOpacity = "musicplayer.backgroundDimOpacity"
+        static let backgroundBlurEnabled = "musicplayer.backgroundBlurEnabled"
+        static let useCustomBackgroundColor = "musicplayer.useCustomBackgroundColor"
+        static let customBackgroundHex = "musicplayer.customBackgroundHex"
+        static let useCustomTextColor = "musicplayer.useCustomTextColor"
+        static let customTextHex = "musicplayer.customTextHex"
         static let suppressedCacheHosts = "musicplayer.suppressedCacheHosts"
         static let autoAddDownloadsToPlaylist = "musicplayer.autoAddDownloadsToPlaylist"
         static let targetDownloadPlaylistID = "musicplayer.targetDownloadPlaylistID"
+    }
+
+    private static var themeAssetsDirectory: URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        let dir = base.appendingPathComponent("ThemeAssets", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+
+    private static var customIconFileURL: URL {
+        themeAssetsDirectory.appendingPathComponent("custom_app_icon.png")
+    }
+
+    private static var customBackgroundFileURL: URL {
+        themeAssetsDirectory.appendingPathComponent("custom_app_background.jpg")
     }
 
     init() {
@@ -172,6 +291,9 @@ final class AppSettings {
         if defaults.object(forKey: Keys.autoAddDownloadsToPlaylist) == nil {
             defaults.set(true, forKey: Keys.autoAddDownloadsToPlaylist)
         }
+        if defaults.object(forKey: Keys.backgroundDimOpacity) == nil {
+            defaults.set(0.35, forKey: Keys.backgroundDimOpacity)
+        }
 
         self.appearanceMode = AppearanceMode(rawValue: defaults.string(forKey: Keys.appearance) ?? "") ?? .system
         self.searchEngine = SearchEngineOption(rawValue: defaults.string(forKey: Keys.searchEngine) ?? "") ?? .google
@@ -187,9 +309,79 @@ final class AppSettings {
         self.readerFontSize = defaults.double(forKey: Keys.readerFontSize)
         self.readerDarkTheme = defaults.bool(forKey: Keys.readerDarkTheme)
         self.selectedAppIconName = defaults.string(forKey: Keys.selectedAppIconName) ?? ""
+        self.useCustomAppIcon = defaults.bool(forKey: Keys.useCustomAppIcon)
+        self.backgroundDimOpacity = defaults.double(forKey: Keys.backgroundDimOpacity)
+        self.backgroundBlurEnabled = defaults.bool(forKey: Keys.backgroundBlurEnabled)
+        self.useCustomBackgroundColor = defaults.bool(forKey: Keys.useCustomBackgroundColor)
+        self.customBackgroundHex = defaults.string(forKey: Keys.customBackgroundHex) ?? "#12131A"
+        self.useCustomTextColor = defaults.bool(forKey: Keys.useCustomTextColor)
+        self.customTextHex = defaults.string(forKey: Keys.customTextHex) ?? "#F5F7FF"
         self.suppressedCacheHosts = defaults.stringArray(forKey: Keys.suppressedCacheHosts) ?? []
         self.autoAddDownloadsToPlaylist = defaults.bool(forKey: Keys.autoAddDownloadsToPlaylist)
         self.targetDownloadPlaylistIDString = defaults.string(forKey: Keys.targetDownloadPlaylistID) ?? ""
+
+        if FileManager.default.fileExists(atPath: Self.customIconFileURL.path),
+           let img = UIImage(contentsOfFile: Self.customIconFileURL.path) {
+            self.customAppIconImage = img
+        } else {
+            self.customAppIconImage = nil
+            self.useCustomAppIcon = false
+        }
+
+        if FileManager.default.fileExists(atPath: Self.customBackgroundFileURL.path),
+           let bg = UIImage(contentsOfFile: Self.customBackgroundFileURL.path) {
+            self.customBackgroundImage = bg
+        } else {
+            self.customBackgroundImage = nil
+        }
+    }
+
+    func saveCustomAppIcon(_ image: UIImage) {
+        let targetSize = CGSize(width: 512, height: 512)
+        let renderer = UIGraphicsImageRenderer(size: targetSize)
+        let squared = renderer.image { _ in
+            let aspect = max(targetSize.width / max(image.size.width, 1), targetSize.height / max(image.size.height, 1))
+            let drawWidth = image.size.width * aspect
+            let drawHeight = image.size.height * aspect
+            let rect = CGRect(
+                x: (targetSize.width - drawWidth) / 2,
+                y: (targetSize.height - drawHeight) / 2,
+                width: drawWidth,
+                height: drawHeight
+            )
+            image.draw(in: rect)
+        }
+        if let data = squared.pngData() {
+            try? data.write(to: Self.customIconFileURL, options: .atomic)
+            customAppIconImage = squared
+            useCustomAppIcon = true
+        }
+    }
+
+    func clearCustomAppIcon() {
+        try? FileManager.default.removeItem(at: Self.customIconFileURL)
+        customAppIconImage = nil
+        useCustomAppIcon = false
+    }
+
+    func saveCustomBackgroundImage(_ image: UIImage) {
+        if let data = image.jpegData(compressionQuality: 0.86) {
+            try? data.write(to: Self.customBackgroundFileURL, options: .atomic)
+            customBackgroundImage = UIImage(data: data) ?? image
+        }
+    }
+
+    func clearCustomBackgroundImage() {
+        try? FileManager.default.removeItem(at: Self.customBackgroundFileURL)
+        customBackgroundImage = nil
+    }
+
+    func resetCustomTheme() {
+        clearCustomBackgroundImage()
+        useCustomBackgroundColor = false
+        useCustomTextColor = false
+        backgroundDimOpacity = 0.35
+        backgroundBlurEnabled = false
     }
 
     func setAskBeforeCaching(_ enabled: Bool) {

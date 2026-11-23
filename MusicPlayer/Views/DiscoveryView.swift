@@ -16,6 +16,7 @@ struct DiscoveryView: View {
     @State private var editingSite: SpeedDialSite?
     @State private var siteTitle = ""
     @State private var siteURL = ""
+    @State private var showMangaReaderHub = false
 
     private let columns = [
         GridItem(.adaptive(minimum: 74, maximum: 92), spacing: 12)
@@ -29,6 +30,10 @@ struct DiscoveryView: View {
         Array(mediaManager.recentItems.prefix(8))
     }
 
+    private var mangaChapterCount: Int {
+        mediaManager.mangaImageChapters().count + mediaManager.otherFiles.filter { $0.isArchive || $0.isReadableText }.count
+    }
+
     var body: some View {
         NavigationStack {
             ScrollView {
@@ -36,6 +41,8 @@ struct DiscoveryView: View {
                     searchBarSection
 
                     speedDialSection
+
+                    mangaReaderCard
 
                     if !offlineSongs.isEmpty {
                         shelfSection(
@@ -68,7 +75,13 @@ struct DiscoveryView: View {
             }
             .navigationTitle("Discovery")
             .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
+                ToolbarItemGroup(placement: .topBarTrailing) {
+                    Button {
+                        showMangaReaderHub = true
+                    } label: {
+                        Label("Manga Reader", systemImage: "book.pages")
+                    }
+
                     Button {
                         selectedTab = .browser
                     } label: {
@@ -77,6 +90,9 @@ struct DiscoveryView: View {
                 }
             }
             .miniPlayerInset(showPlayerSheet: $showPlayerSheet)
+            .sheet(isPresented: $showMangaReaderHub) {
+                MangaLibrarySheetView()
+            }
             .alert("Save Media Link", isPresented: $showSaveLinkAlert) {
                 TextField("https://... (.mp4, .mp3, .m3u8, or page)", text: $saveLinkText)
                     .keyboardType(.URL)
@@ -151,6 +167,55 @@ struct DiscoveryView: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
         .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+    }
+
+    private var mangaReaderCard: some View {
+        Button {
+            showMangaReaderHub = true
+        } label: {
+            HStack(spacing: 14) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .fill(
+                            LinearGradient(
+                                colors: [Color.orange.opacity(0.85), Color.pink.opacity(0.85)],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            )
+                        )
+                        .frame(width: 48, height: 48)
+                    Image(systemName: "book.pages.fill")
+                        .font(.title3.weight(.semibold))
+                        .foregroundStyle(.white)
+                }
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Manga, Comic & Story Reader")
+                        .font(.subheadline.weight(.bold))
+                        .foregroundStyle(.primary)
+                    Text(
+                        mangaChapterCount > 0
+                            ? "\(mangaChapterCount) \(mangaChapterCount == 1 ? "item" : "items") ready • Scroll, Page & Manga RTL"
+                            : "Read image folders, .CBZ/.ZIP comics & .TXT stories offline"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                }
+
+                Spacer()
+
+                Image(systemName: "chevron.right")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.tertiary)
+            }
+            .padding(12)
+            .background(
+                settings.hasCustomBackground ? settings.themedRowBackgroundColor : Color(.secondarySystemBackground),
+                in: RoundedRectangle(cornerRadius: 14, style: .continuous)
+            )
+        }
+        .buttonStyle(.plain)
     }
 
     private var speedDialSection: some View {

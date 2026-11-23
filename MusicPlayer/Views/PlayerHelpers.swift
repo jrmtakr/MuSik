@@ -97,6 +97,7 @@ struct AirPlayRoutePickerView: UIViewRepresentable {
 }
 
 struct MediaArtworkView: View {
+    @Environment(AppSettings.self) private var settings
     let item: MediaItem
     let image: UIImage?
     var cornerRadius: CGFloat = 12
@@ -106,6 +107,10 @@ struct MediaArtworkView: View {
         Group {
             if let image {
                 Image(uiImage: image)
+                    .resizable()
+                    .scaledToFill()
+            } else if settings.useCustomAppIcon, let customIcon = settings.customAppIconImage {
+                Image(uiImage: customIcon)
                     .resizable()
                     .scaledToFill()
             } else {
@@ -223,12 +228,76 @@ struct EditTrackInfoSheet: View {
     }
 }
 
+struct AppThemeBackgroundView: View {
+    @Environment(AppSettings.self) private var settings
+
+    var body: some View {
+        if settings.hasCustomBackground {
+            GeometryReader { proxy in
+                ZStack {
+                    if settings.useCustomBackgroundColor {
+                        settings.customBackgroundColor
+                    } else {
+                        Color(.systemBackground)
+                    }
+
+                    if let bgImage = settings.customBackgroundImage {
+                        Image(uiImage: bgImage)
+                            .resizable()
+                            .scaledToFill()
+                            .frame(width: proxy.size.width, height: proxy.size.height)
+                            .clipped()
+                            .blur(radius: settings.backgroundBlurEnabled ? 10 : 0)
+
+                        if settings.useCustomBackgroundColor {
+                            settings.customBackgroundColor
+                                .opacity(settings.backgroundDimOpacity)
+                        } else if settings.backgroundDimOpacity > 0 {
+                            Color.black
+                                .opacity(settings.backgroundDimOpacity)
+                        }
+                    }
+                }
+            }
+            .ignoresSafeArea()
+        }
+    }
+}
+
+struct CustomTextStyleModifier: ViewModifier {
+    @Environment(AppSettings.self) private var settings
+
+    func body(content: Content) -> some View {
+        if settings.hasCustomTextColor {
+            let color = settings.customTextColor
+            content
+                .foregroundStyle(color, color.opacity(0.76), color.opacity(0.52))
+        } else {
+            content
+        }
+    }
+}
+
+struct AppThemeContainerModifier: ViewModifier {
+    @Environment(AppSettings.self) private var settings
+
+    func body(content: Content) -> some View {
+        content
+            .scrollContentBackground(settings.hasCustomBackground ? .hidden : .automatic)
+            .background {
+                AppThemeBackgroundView()
+            }
+            .modifier(CustomTextStyleModifier())
+    }
+}
+
 struct MiniPlayerInsetModifier: ViewModifier {
     @Environment(MediaManager.self) private var mediaManager
     @Binding var showPlayerSheet: Bool
 
     func body(content: Content) -> some View {
         content
+            .modifier(AppThemeContainerModifier())
             .safeAreaInset(edge: .bottom) {
                 VStack(spacing: 6) {
                     if let status = mediaManager.statusMessage {
@@ -253,5 +322,13 @@ struct MiniPlayerInsetModifier: ViewModifier {
 extension View {
     func miniPlayerInset(showPlayerSheet: Binding<Bool>) -> some View {
         modifier(MiniPlayerInsetModifier(showPlayerSheet: showPlayerSheet))
+    }
+
+    func applyAppTheme() -> some View {
+        modifier(AppThemeContainerModifier())
+    }
+
+    func applyCustomTextStyle() -> some View {
+        modifier(CustomTextStyleModifier())
     }
 }

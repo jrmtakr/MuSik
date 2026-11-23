@@ -1108,6 +1108,7 @@ struct BrowserTabView: View {
     @State private var hlsQualityRequest: DetectedBrowserMedia?
     @State private var hlsVariants: [HLSQualityVariant] = []
     @State private var loadingVariants = false
+    @State private var browserMangaReaderTarget: ImageReaderTarget?
 
     @State private var showingTabsSheet = false
     @State private var showingBookmarksSheet = false
@@ -1431,7 +1432,13 @@ struct BrowserTabView: View {
                         Divider()
 
                         Button {
-                            extractAndSavePageImages()
+                            extractAndSavePageImages(openInReader: true)
+                        } label: {
+                            Label("Read Page in Manga Reader", systemImage: "book.pages")
+                        }
+
+                        Button {
+                            extractAndSavePageImages(openInReader: false)
                         } label: {
                             Label("Download Images", systemImage: "photo.stack")
                         }
@@ -1469,6 +1476,9 @@ struct BrowserTabView: View {
                 }
             }
             .miniPlayerInset(showPlayerSheet: $showPlayerSheet)
+            .fullScreenCover(item: $browserMangaReaderTarget) { target in
+                ImageReaderView(target: target)
+            }
             .confirmationDialog(
                 "\(pendingMediaPrompt?.kindLabel ?? "Media") Detected",
                 isPresented: Binding(
@@ -1976,7 +1986,7 @@ struct BrowserTabView: View {
         }
     }
 
-    private func extractAndSavePageImages() {
+    private func extractAndSavePageImages(openInReader: Bool = false) {
         guard let webView = browser.webView else { return }
         let script = """
         Array.from(document.images || [])
@@ -1995,7 +2005,14 @@ struct BrowserTabView: View {
                 return URL(string: s)
             }
             Task { @MainActor in
-                await mediaManager.saveImagesFromWeb(urls, folderName: pageTitle, referer: referer)
+                let savedFiles = await mediaManager.saveImagesFromWeb(urls, folderName: pageTitle, referer: referer)
+                if openInReader && !savedFiles.isEmpty {
+                    browserMangaReaderTarget = ImageReaderTarget(
+                        title: pageTitle,
+                        files: savedFiles,
+                        initialIndex: 0
+                    )
+                }
             }
         }
     }

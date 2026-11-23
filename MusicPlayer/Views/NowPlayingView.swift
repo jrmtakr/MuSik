@@ -70,6 +70,7 @@ struct NowPlayingView: View {
                     )
                 }
             }
+            .applyAppTheme()
             .navigationBarTitleDisplayMode(.inline)
             .alert("New Playlist", isPresented: $showNewPlaylistAlert) {
                 TextField("Playlist name", text: $newPlaylistName)
