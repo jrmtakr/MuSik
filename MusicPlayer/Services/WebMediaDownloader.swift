@@ -941,7 +941,7 @@ final class WebMediaDownloader {
         return dict
     }
 
-    private static func defaultHLSIV(sequence: Int) -> Data {
+    nonisolated private static func defaultHLSIV(sequence: Int) -> Data {
         var iv = Data(count: 16)
         var bigEndianSeq = UInt64(max(0, sequence)).bigEndian
         withUnsafeBytes(of: &bigEndianSeq) { bytes in
@@ -966,7 +966,7 @@ final class WebMediaDownloader {
         return data
     }
 
-    private static func decryptAES128CBC(_ encrypted: Data, key: Data, iv: Data) -> Data? {
+    nonisolated private static func decryptAES128CBC(_ encrypted: Data, key: Data, iv: Data) -> Data? {
         guard key.count == kCCKeySizeAES128, iv.count == kCCBlockSizeAES128 else { return nil }
         let outLength = encrypted.count + kCCBlockSizeAES128
         var outData = Data(count: outLength)
@@ -1173,7 +1173,7 @@ final class WebMediaDownloader {
         }
     }
 
-    static func extensionFor(mimeType: String, fallbackName: String) -> String {
+    nonisolated static func extensionFor(mimeType: String, fallbackName: String) -> String {
         let nameExt = (fallbackName as NSString).pathExtension.lowercased()
         if MediaItem.allSupportedExtensions.contains(nameExt) {
             return nameExt

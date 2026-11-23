@@ -516,7 +516,7 @@ final class MediaManager {
 
         let isHLS = ext == "m3u8" || url.absoluteString.lowercased().contains(".m3u8")
         if isHLS || !MediaItem.ffmpegVideoExtensions.contains(ext) {
-            let playURL = isHLS ? url : LocalMediaCacheProxy.shared.proxiedURL(for: url, headers: headers)
+            let playURL = isHLS ? url : LocalMediaCacheProxy.proxiedURL(for: url, headers: headers)
             let asset = AVURLAsset(
                 url: playURL,
                 options: headers.map { ["AVURLAssetHTTPHeaderFieldsKey": $0] }
@@ -2076,16 +2076,23 @@ final class MediaManager {
     }
 }
 
+private final class WeakManagerBox: @unchecked Sendable {
+    weak var value: MediaManager?
+    init(_ value: MediaManager) {
+        self.value = value
+    }
+}
+
 @MainActor
 private final class KSMEPlayerBridge: MediaPlayerDelegate {
-    weak var manager: MediaManager?
+    private let managerBox: WeakManagerBox
 
-    init(manager: MediaManager) {
-        self.manager = manager
+    nonisolated init(manager: MediaManager) {
+        self.managerBox = WeakManagerBox(manager)
     }
 
     func readyToPlay(player: some MediaPlayerProtocol) {
-        manager?.handleFFmpegReady(player: player)
+        managerBox.value?.handleFFmpegReady(player: player)
     }
 
     func changeLoadState(player: some MediaPlayerProtocol) {
@@ -2102,6 +2109,6 @@ private final class KSMEPlayerBridge: MediaPlayerDelegate {
 
     func finish(player: some MediaPlayerProtocol, error: Error?) {
         _ = player
-        manager?.handleFFmpegFinish(error: error)
+        managerBox.value?.handleFFmpegFinish(error: error)
     }
 }

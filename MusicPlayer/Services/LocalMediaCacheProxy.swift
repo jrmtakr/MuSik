@@ -3,6 +3,42 @@ import Foundation
 import Network
 import Observation
 
+private final class ProxyRuntimeState: @unchecked Sendable {
+    private let lock = NSLock()
+    var port: UInt16?
+    var storedHeadersByKey: [String: [String: String]] = [:]
+
+    func setPort(_ port: UInt16?) {
+        lock.lock()
+        self.port = port
+        lock.unlock()
+    }
+
+    func getPort() -> UInt16? {
+        lock.lock()
+        defer { lock.unlock() }
+        return port
+    }
+
+    func setHeaders(_ headers: [String: String], forKey key: String) {
+        lock.lock()
+        storedHeadersByKey[key] = headers
+        lock.unlock()
+    }
+
+    func headers(forKey key: String) -> [String: String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedHeadersByKey[key] ?? [:]
+    }
+
+    func clearHeaders() {
+        lock.lock()
+        storedHeadersByKey.removeAll()
+        lock.unlock()
+    }
+}
+
 @MainActor
 @Observable
 final class LocalMediaCacheProxy {
@@ -12,8 +48,7 @@ final class LocalMediaCacheProxy {
     private(set) var cachedBytes: Int64 = 0
 
     @ObservationIgnored private var listener: NWListener?
-    @ObservationIgnored nonisolated private static let headerLock = NSLock()
-    @ObservationIgnored nonisolated private static var storedHeadersByKey: [String: [String: String]] = [:]
+    private static let runtimeState = ProxyRuntimeState()
 
     nonisolated static var proxyCacheDirectory: URL {
         let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
@@ -34,6 +69,7 @@ final class LocalMediaCacheProxy {
             }
             newListener.stateUpdateHandler = { [weak self] state in
                 if case .ready = state, let actualPort = newListener.port?.rawValue {
+                    Self.runtimeState.setPort(actualPort)
                     Task { @MainActor in self?.port = actualPort }
                 }
             }
@@ -44,19 +80,21 @@ final class LocalMediaCacheProxy {
         }
     }
 
-    func proxiedURL(for remoteURL: URL, headers: [String: String]? = nil) -> URL {
+    nonisolated static func proxiedURL(for remoteURL: URL, headers: [String: String]? = nil) -> URL {
         if let headers, !headers.isEmpty {
-            let key = Self.cacheKey(for: remoteURL.absoluteString)
-            Self.headerLock.lock()
-            Self.storedHeadersByKey[key] = headers
-            Self.headerLock.unlock()
+            let key = cacheKey(for: remoteURL.absoluteString)
+            runtimeState.setHeaders(headers, forKey: key)
         }
-        guard let port,
+        guard let port = runtimeState.getPort(),
               var comps = URLComponents(string: "http://127.0.0.1:\(port)/proxy") else {
             return remoteURL
         }
         comps.queryItems = [URLQueryItem(name: "url", value: remoteURL.absoluteString)]
         return comps.url ?? remoteURL
+    }
+
+    nonisolated func proxiedURL(for remoteURL: URL, headers: [String: String]? = nil) -> URL {
+        Self.proxiedURL(for: remoteURL, headers: headers)
     }
 
     nonisolated static func cachedDataURL(for remoteURL: URL) -> URL? {
@@ -78,9 +116,7 @@ final class LocalMediaCacheProxy {
     func clearCache() {
         try? FileManager.default.removeItem(at: Self.proxyCacheDirectory)
         try? FileManager.default.createDirectory(at: Self.proxyCacheDirectory, withIntermediateDirectories: true)
-        Self.headerLock.lock()
-        Self.storedHeadersByKey.removeAll()
-        Self.headerLock.unlock()
+        Self.runtimeState.clearHeaders()
         cachedBytes = 0
     }
 
@@ -90,9 +126,7 @@ final class LocalMediaCacheProxy {
     }
 
     nonisolated private static func storedHeaders(for key: String) -> [String: String] {
-        headerLock.lock()
-        defer { headerLock.unlock() }
-        return storedHeadersByKey[key] ?? [:]
+        runtimeState.headers(forKey: key)
     }
 
     nonisolated private static func readHTTPRequestHeader(
