@@ -492,7 +492,7 @@ struct MangaLibrarySheetView: View {
                                         Text(archive.fileName)
                                             .font(.subheadline.weight(.medium))
                                             .foregroundStyle(.primary)
-                                        Text("\(archive.formattedSize) • Tap to extract & open in Manga Reader")
+                                        Text("\(archive.formattedFileSize) • Tap to extract & open in Manga Reader")
                                             .font(.caption2)
                                             .foregroundStyle(.secondary)
                                     }
@@ -521,7 +521,7 @@ struct MangaLibrarySheetView: View {
                                         Text(story.fileName)
                                             .font(.subheadline.weight(.medium))
                                             .foregroundStyle(.primary)
-                                        Text(story.formattedSize)
+                                        Text(story.formattedFileSize)
                                             .font(.caption2)
                                             .foregroundStyle(.secondary)
                                     }

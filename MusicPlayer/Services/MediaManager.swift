@@ -1127,7 +1127,9 @@ final class MediaManager {
     func applyDownloadedMetadataAndPlaylist(
         for item: MediaItem,
         title: String? = nil,
-        artist: String? = nil
+        artist: String? = nil,
+        explicitPlaylistID: UUID? = nil,
+        appendOrder: Bool = false
     ) -> MediaItem {
         let cleanTitle = title?.trimmingCharacters(in: .whitespacesAndNewlines)
         let cleanArtist = artist?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1141,6 +1143,21 @@ final class MediaManager {
         }
 
         let refreshedItem = items.first(where: { $0.relativePath == item.relativePath }) ?? item
+
+        if let explicitPlaylistID,
+           let idx = playlists.firstIndex(where: { $0.id == explicitPlaylistID }) {
+            if !playlistContains(refreshedItem, in: playlists[idx]) {
+                if appendOrder {
+                    playlists[idx].itemFileNames.append(refreshedItem.relativePath)
+                } else {
+                    playlists[idx].itemFileNames.insert(refreshedItem.relativePath, at: 0)
+                }
+                savePlaylists()
+            }
+            statusMessage = "Saved to \(playlists[idx].name): \(refreshedItem.displayTitle)"
+            return refreshedItem
+        }
+
         recordRecent(refreshedItem.relativePath)
 
         if AppSettings.isAutoAddDownloadsToPlaylistEnabled,

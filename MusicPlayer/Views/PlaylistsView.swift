@@ -48,6 +48,7 @@ struct PlaylistsView: View {
     @State private var searchText = ""
     @State private var sortOrder: PlaylistSortOrder = .date
     @State private var showCreateAlert = false
+    @State private var showImportURLSheet = false
     @State private var newPlaylistName = ""
     @State private var createdPlaylistID: UUID?
     @State private var playlistToRename: Playlist?
@@ -151,6 +152,28 @@ struct PlaylistsView: View {
                                     .font(.body.weight(.semibold))
                             }
                         }
+
+                        Button {
+                            showImportURLSheet = true
+                        } label: {
+                            HStack(spacing: 14) {
+                                ZStack {
+                                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                        .fill(Color.purple.opacity(0.15))
+                                        .frame(width: 50, height: 50)
+                                    Image(systemName: "link.badge.plus")
+                                        .font(.title3.weight(.semibold))
+                                        .foregroundStyle(.purple)
+                                }
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("Import Playlist URL")
+                                        .font(.body.weight(.semibold))
+                                    Text("Spotify, Apple Music, YouTube & YT Music")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                        }
                     }
 
                     if sortedPlaylists.isEmpty && !trimmedSearch.isEmpty {
@@ -210,9 +233,19 @@ struct PlaylistsView: View {
                 }
 
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button {
-                        newPlaylistName = ""
-                        showCreateAlert = true
+                    Menu {
+                        Button {
+                            newPlaylistName = ""
+                            showCreateAlert = true
+                        } label: {
+                            Label("New Playlist", systemImage: "plus.rectangle.on.folder")
+                        }
+
+                        Button {
+                            showImportURLSheet = true
+                        } label: {
+                            Label("Import Playlist URL (Spotify / Apple / YT)", systemImage: "link.badge.plus")
+                        }
                     } label: {
                         Image(systemName: "plus.circle.fill")
                             .font(.title3)
@@ -247,6 +280,11 @@ struct PlaylistsView: View {
             }
             .sheet(item: $searchEditingInfoItem) { item in
                 EditTrackInfoSheet(item: item)
+            }
+            .sheet(isPresented: $showImportURLSheet) {
+                ImportPlaylistSheetView { importedID in
+                    createdPlaylistID = importedID
+                }
             }
             .alert("New Playlist", isPresented: $showCreateAlert) {
                 TextField("Playlist name", text: $newPlaylistName)

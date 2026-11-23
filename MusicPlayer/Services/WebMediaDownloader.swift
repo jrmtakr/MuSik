@@ -1674,6 +1674,116 @@ final class WebMediaDownloader {
         default: return "mp4"
         }
     }
+
+    func downloadTrackIntoPlaylist(
+        _ media: DetectedBrowserMedia,
+        fallbackStreams: [DetectedBrowserMedia] = [],
+        targetPlaylistID: UUID,
+        maxDurationMinutes: Int = 0
+    ) async -> MediaItem? {
+        let candidates = ([media] + fallbackStreams).filter { !$0.isHLS }
+        let maxSec = maxDurationMinutes > 0 ? Double(maxDurationMinutes * 60) : nil
+        let cleanTitle = sanitizedTitle(media.title, fallbackURL: media.url, defaultTitle: "Track")
+
+        if let maxSec,
+           let known = media.durationSeconds,
+           known.isFinite, known > 0,
+           known > maxSec {
+            return nil
+        }
+
+        let downloadID = UUID()
+        activeDownloads.append(
+            BrowserDownloadItem(id: downloadID, title: cleanTitle, sourceURL: media.url, progress: 0.05, isHLS: false)
+        )
+        defer {
+            activeDownloads.removeAll { $0.id == downloadID }
+        }
+
+        for candidate in candidates {
+            if Task.isCancelled { return nil }
+            let primaryHeaders = enrichedHeaders(candidate.customHeaders, for: candidate.url)
+            let minimalHeaders = [
+                "User-Agent": primaryHeaders["User-Agent"] ?? Self.browserUserAgent,
+                "Accept": "*/*"
+            ]
+
+            if let pairedAudio = candidate.pairedAudioURL {
+                let cleanVideo = cleanedStreamURLIfRangeFragment(candidate.url)
+                let cleanAudio = cleanedStreamURLIfRangeFragment(pairedAudio)
+                async let videoTemp = fetchTempFile(from: cleanVideo, ext: "mp4", headers: primaryHeaders, using: ephemeralDataSession)
+                async let audioTemp = fetchTempFile(from: cleanAudio, ext: "m4a", headers: primaryHeaders, using: ephemeralDataSession)
+                guard let vURL = await videoTemp, let aURL = await audioTemp else {
+                    continue
+                }
+                defer {
+                    try? FileManager.default.removeItem(at: vURL)
+                    try? FileManager.default.removeItem(at: aURL)
+                }
+                if Task.isCancelled { return nil }
+                updateProgress(downloadID: downloadID, fraction: 0.75)
+
+                let muxedTemp = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString).mp4")
+                let muxOK = await Task.detached(priority: .userInitiated) {
+                    FFmpegMediaService.muxVideoAndAudioToMP4(videoURL: vURL, audioURL: aURL, outputURL: muxedTemp)
+                }.value
+                guard muxOK else {
+                    try? FileManager.default.removeItem(at: muxedTemp)
+                    continue
+                }
+
+                if let maxSec, let dur = await resolveLocalDuration(at: muxedTemp), dur > maxSec {
+                    try? FileManager.default.removeItem(at: muxedTemp)
+                    return nil
+                }
+                updateProgress(downloadID: downloadID, fraction: 0.95)
+                if let saved = MediaManager.shared.importTemporaryFile(
+                    from: muxedTemp,
+                    preferredFileName: "\(cleanTitle).mp4"
+                ) {
+                    LocalMediaCacheProxy.shared.refreshCacheSize()
+                    return MediaManager.shared.applyDownloadedMetadataAndPlaylist(
+                        for: saved,
+                        title: candidate.title ?? cleanTitle,
+                        artist: candidate.author,
+                        explicitPlaylistID: targetPlaylistID,
+                        appendOrder: true
+                    )
+                }
+            } else {
+                let cleanURL = cleanedStreamURLIfRangeFragment(candidate.url)
+                let ext = candidate.isAudio ? "m4a" : "mp4"
+                var tempURL = await fetchTempFile(from: cleanURL, ext: ext, headers: primaryHeaders, using: ephemeralDataSession)
+                if tempURL == nil && !Task.isCancelled {
+                    tempURL = await fetchTempFile(from: cleanURL, ext: ext, headers: minimalHeaders, using: ephemeralDataSession)
+                }
+                guard let downloadedURL = tempURL else { continue }
+                if Task.isCancelled {
+                    try? FileManager.default.removeItem(at: downloadedURL)
+                    return nil
+                }
+                if let maxSec, let dur = await resolveLocalDuration(at: downloadedURL), dur > maxSec {
+                    try? FileManager.default.removeItem(at: downloadedURL)
+                    return nil
+                }
+                updateProgress(downloadID: downloadID, fraction: 0.92)
+                if let saved = MediaManager.shared.importTemporaryFile(
+                    from: downloadedURL,
+                    preferredFileName: "\(cleanTitle).\(ext)"
+                ) {
+                    LocalMediaCacheProxy.shared.refreshCacheSize()
+                    return MediaManager.shared.applyDownloadedMetadataAndPlaylist(
+                        for: saved,
+                        title: candidate.title ?? cleanTitle,
+                        artist: candidate.author,
+                        explicitPlaylistID: targetPlaylistID,
+                        appendOrder: true
+                    )
+                }
+            }
+        }
+        return nil
+    }
 }
 
 private final class DownloadDelegateProxy: NSObject, AVAssetDownloadDelegate, URLSessionDownloadDelegate {
