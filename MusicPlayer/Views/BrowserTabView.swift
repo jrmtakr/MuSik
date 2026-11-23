@@ -1984,24 +1984,44 @@ struct BrowserTabView: View {
         if let visitorData, !visitorData.isEmpty {
             latestYouTubeVisitorData = visitorData
         }
-        let baseHeaders: [String: String] = [
-            "User-Agent": WebMediaDownloader.browserUserAgent,
-            "Referer": pageURL?.absoluteString ?? "https://m.youtube.com/"
-        ]
-        guard let result = YouTubeStreamResolver.parsePlayerResponseJSON(
-            jsonData,
-            videoID: videoID,
-            sourcePageURL: pageURL,
-            headers: baseHeaders
-        ), !result.streams.isEmpty else {
-            return
+        let rawTargetURL = pageURL ?? activeURL
+        let targetURL = YouTubeStreamResolver.extractVideoID(from: rawTargetURL) != nil
+            ? rawTargetURL
+            : (URL(string: "https://m.youtube.com/watch?v=\(videoID)") ?? rawTargetURL)
+        if (currentYouTubeVideoID == nil || currentYouTubeVideoID == videoID)
+            && inFlightYouTubeResolveID != videoID
+            && !startedYouTubeCacheIDs.contains(videoID) {
+            handleYouTubeVideoNavigation(videoID: videoID, url: targetURL, visitorData: visitorData)
         }
-        if currentYouTubeVideoID == nil || currentYouTubeVideoID == videoID {
-            currentYouTubeVideoID = videoID
-            browser.mergeResolvedYouTubeStreams(result.streams)
-            // Let InnerTube IOS/ANDROID_VR go first while in-flight; back up immediately once finished or unstarted
-            if inFlightYouTubeResolveID != videoID {
-                beginYouTubeCacheIfNeeded(videoID: videoID, result: result)
+
+        Task {
+            var baseHeaders = await buildRequestHeaders(for: targetURL, referer: targetURL.absoluteString)
+            baseHeaders["Referer"] = pageURL?.absoluteString ?? "https://m.youtube.com/"
+            guard let parsed = YouTubeStreamResolver.parsePlayerResponseJSON(
+                jsonData,
+                videoID: videoID,
+                sourcePageURL: pageURL,
+                headers: baseHeaders
+            ), !parsed.streams.isEmpty else {
+                return
+            }
+
+            let reachableStreams = await YouTubeStreamResolver.filterReachableStreams(parsed.streams)
+            guard !reachableStreams.isEmpty else { return }
+            let verifiedResult = YouTubeResolvedResult(
+                videoID: parsed.videoID,
+                title: parsed.title,
+                author: parsed.author,
+                durationSeconds: parsed.durationSeconds,
+                streams: reachableStreams,
+                errorReason: nil
+            )
+            if currentYouTubeVideoID == nil || currentYouTubeVideoID == videoID {
+                currentYouTubeVideoID = videoID
+                browser.mergeResolvedYouTubeStreams(verifiedResult.streams)
+                if inFlightYouTubeResolveID != videoID && !startedYouTubeCacheIDs.contains(videoID) {
+                    beginYouTubeCacheIfNeeded(videoID: videoID, result: verifiedResult)
+                }
             }
         }
     }

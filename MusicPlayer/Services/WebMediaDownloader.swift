@@ -124,8 +124,6 @@ final class WebMediaDownloader {
 
     @ObservationIgnored lazy var browserSession: URLSession = {
         let config = URLSessionConfiguration.default
-        config.urlCache = MediaInterceptURLProtocol.sharedCache
-        config.protocolClasses = [MediaInterceptURLProtocol.self] + (config.protocolClasses ?? [])
         config.waitsForConnectivity = true
         config.httpShouldSetCookies = true
         return URLSession(configuration: config, delegate: delegateProxy, delegateQueue: nil)
@@ -133,8 +131,6 @@ final class WebMediaDownloader {
 
     @ObservationIgnored private lazy var ephemeralDataSession: URLSession = {
         let config = URLSessionConfiguration.default
-        config.urlCache = MediaInterceptURLProtocol.sharedCache
-        config.protocolClasses = [MediaInterceptURLProtocol.self] + (config.protocolClasses ?? [])
         config.waitsForConnectivity = true
         config.httpShouldSetCookies = true
         return URLSession(configuration: config)
@@ -158,6 +154,9 @@ final class WebMediaDownloader {
         let isHLS: Bool
         let destinationFolder: String
         let fallbackStreams: [DetectedBrowserMedia]
+        let userAgent: String
+        let hadRefererOrCookie: Bool
+        let didRetryHeaderless: Bool
     }
 
     private struct ParsedHLSMedia {
@@ -180,9 +179,7 @@ final class WebMediaDownloader {
         let isLiveWithoutEndList: Bool
     }
 
-    init() {
-        URLProtocol.registerClass(MediaInterceptURLProtocol.self)
-    }
+    init() {}
 
     // MARK: - Public API
 
@@ -236,7 +233,8 @@ final class WebMediaDownloader {
         destinationFolder: String = ""
     ) {
         var reqHeaders = media.customHeaders ?? [:]
-        if let ref = media.referer, !ref.isEmpty, reqHeaders["Referer"] == nil {
+        let isNativeGoogleClient = reqHeaders["User-Agent"]?.hasPrefix("com.google.") ?? false
+        if !isNativeGoogleClient, let ref = media.referer, !ref.isEmpty, reqHeaders["Referer"] == nil {
             reqHeaders["Referer"] = ref
         }
         if media.isHLS {
@@ -1093,7 +1091,10 @@ final class WebMediaDownloader {
             maxDurationMinutes: maxDurationMinutes,
             isHLS: true,
             destinationFolder: destinationFolder,
-            fallbackStreams: fallbackStreams
+            fallbackStreams: fallbackStreams,
+            userAgent: headers["User-Agent"] ?? Self.browserUserAgent,
+            hadRefererOrCookie: false,
+            didRetryHeaderless: false
         )
         taskToDownloadID[task.taskIdentifier] = downloadID
         activeURLTasks[downloadID] = task
@@ -1111,7 +1112,8 @@ final class WebMediaDownloader {
         maxDurationSeconds: Double?,
         maxDurationMinutes: Int = 0,
         destinationFolder: String,
-        fallbackStreams: [DetectedBrowserMedia] = []
+        fallbackStreams: [DetectedBrowserMedia] = [],
+        didRetryHeaderless: Bool = false
     ) {
         downloadMeta[downloadID] = DownloadMeta(
             title: cleanTitle,
@@ -1121,7 +1123,10 @@ final class WebMediaDownloader {
             maxDurationMinutes: maxDurationMinutes,
             isHLS: false,
             destinationFolder: destinationFolder,
-            fallbackStreams: fallbackStreams
+            fallbackStreams: fallbackStreams,
+            userAgent: headers["User-Agent"] ?? Self.browserUserAgent,
+            hadRefererOrCookie: headers["Referer"] != nil || headers["Cookie"] != nil || headers["Origin"] != nil,
+            didRetryHeaderless: didRetryHeaderless
         )
 
         var request = URLRequest(url: url)
@@ -1416,12 +1421,14 @@ final class WebMediaDownloader {
         if merged["User-Agent"] == nil {
             merged["User-Agent"] = Self.browserUserAgent
         }
-        if merged["Origin"] == nil,
-           let refererStr = merged["Referer"],
-           let refURL = URL(string: refererStr),
-           let scheme = refURL.scheme,
-           let host = refURL.host {
-            merged["Origin"] = "\(scheme)://\(host)"
+        if let ua = merged["User-Agent"], ua.hasPrefix("com.google.") {
+            // Native InnerTube client streams (IOS / ANDROID) must not receive browser Referer/Origin/Cookie headers.
+            merged.removeValue(forKey: "Referer")
+            merged.removeValue(forKey: "Origin")
+            merged.removeValue(forKey: "Cookie")
+        }
+        if merged["Accept"] == nil {
+            merged["Accept"] = "*/*"
         }
         _ = url
         return merged
@@ -1544,6 +1551,27 @@ final class WebMediaDownloader {
         if !isHLS {
             if !(200...299).contains(statusCode) && statusCode != 0 {
                 try? FileManager.default.removeItem(at: tempFileURL)
+                if statusCode == 403 && meta.fallbackStreams.isEmpty && !meta.didRetryHeaderless && meta.hadRefererOrCookie {
+                    let cleanID = UUID()
+                    let minimalHeaders = [
+                        "User-Agent": meta.userAgent,
+                        "Accept": "*/*"
+                    ]
+                    activeDownloads.append(BrowserDownloadItem(id: cleanID, title: meta.title, sourceURL: meta.sourceURL, progress: 0, isHLS: false))
+                    enqueueDirectDownloadTask(
+                        downloadID: cleanID,
+                        url: meta.sourceURL,
+                        cleanTitle: meta.title,
+                        artist: meta.artist,
+                        headers: minimalHeaders,
+                        maxDurationSeconds: meta.maxDurationSeconds,
+                        maxDurationMinutes: meta.maxDurationMinutes,
+                        destinationFolder: meta.destinationFolder,
+                        fallbackStreams: [],
+                        didRetryHeaderless: true
+                    )
+                    return
+                }
                 tryNextFallbackOrFail(
                     fallbacks: meta.fallbackStreams,
                     maxDurationMinutes: meta.maxDurationMinutes,
@@ -1706,8 +1734,13 @@ private final class DownloadDelegateProxy: NSObject, AVAssetDownloadDelegate, UR
         totalBytesWritten: Int64,
         totalBytesExpectedToWrite: Int64
     ) {
-        guard totalBytesExpectedToWrite > 0 else { return }
-        let fraction = Double(totalBytesWritten) / Double(totalBytesExpectedToWrite)
+        let fraction: Double
+        if totalBytesExpectedToWrite > 0 {
+            fraction = Double(totalBytesWritten) / Double(totalBytesExpectedToWrite)
+        } else {
+            let mbWritten = Double(totalBytesWritten) / (1024.0 * 1024.0)
+            fraction = min(0.92, mbWritten / (mbWritten + 8.0))
+        }
         let tid = downloadTask.taskIdentifier
         Task { @MainActor [weak owner] in
             owner?.updateProgress(taskIdentifier: tid, fraction: fraction)

@@ -13,8 +13,31 @@ enum YouTubeStreamResolver {
     static let iosClientVersion = "20.10.4"
     static let iosClientUserAgent =
         "com.google.ios.youtube/\(iosClientVersion) (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X; en_US)"
+    static let androidClientVersion = "20.10.38"
+    static let androidClientUserAgent =
+        "com.google.android.youtube/\(androidClientVersion) (Linux; U; Android 14; en_US) gzip"
     static let androidVRUserAgent =
         "com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip"
+
+    private enum ProbeBucket: Hashable {
+        case progressive(String)
+        case adaptiveMux(String)
+        case hls(String)
+        case audio(String)
+
+        init(media: DetectedBrowserMedia) {
+            let ua = media.customHeaders?["User-Agent"] ?? ""
+            if media.isHLS {
+                self = .hls(ua)
+            } else if media.isAudio {
+                self = .audio(ua)
+            } else if media.pairedAudioURL != nil {
+                self = .adaptiveMux(ua)
+            } else {
+                self = .progressive(ua)
+            }
+        }
+    }
 
     static func isYouTubeURL(_ url: URL) -> Bool {
         guard let host = url.host?.lowercased() else { return false }
@@ -68,8 +91,8 @@ enum YouTubeStreamResolver {
     ) async -> YouTubeResolvedResult? {
         guard let videoID = extractVideoID(from: url) else { return nil }
 
-        // 1. iOS InnerTube client often yields clean HLS + progressive MP4 + unencrypted adaptive URLs.
-        if let iosResult = await fetchInnerTube(
+        // 1. Query iOS (for HD/HLS when un-gated) and Android (for reliable HTTP 200 itag=18 MP4) in parallel.
+        async let iosTask = fetchInnerTube(
             videoID: videoID,
             sourcePageURL: url,
             clientName: "IOS",
@@ -84,49 +107,166 @@ enum YouTubeStreamResolver {
             ],
             visitorData: visitorData,
             cookiesHeader: nil
-        ), !iosResult.streams.isEmpty {
-            return iosResult
-        }
-
-        // 2. Android VR client fallback.
-        if let vrResult = await fetchInnerTube(
+        )
+        async let androidTask = fetchInnerTube(
             videoID: videoID,
             sourcePageURL: url,
-            clientName: "ANDROID_VR",
-            clientHeaderID: "28",
-            clientVersion: "1.60.19",
-            userAgent: androidVRUserAgent,
+            clientName: "ANDROID",
+            clientHeaderID: "3",
+            clientVersion: androidClientVersion,
+            userAgent: androidClientUserAgent,
             extraClientFields: [
-                "deviceMake": "Oculus",
-                "deviceModel": "Quest 3",
                 "osName": "Android",
-                "osVersion": "12L",
-                "androidSdkVersion": 32
+                "osVersion": "14",
+                "androidSdkVersion": 34
             ],
             visitorData: visitorData,
             cookiesHeader: nil
-        ), !vrResult.streams.isEmpty {
-            return vrResult
+        )
+
+        let iosResult = await iosTask
+        let androidResult = await androidTask
+
+        var results = [iosResult, androidResult].compactMap { $0 }.filter { !$0.streams.isEmpty }
+
+        if results.isEmpty {
+            if let vrResult = await fetchInnerTube(
+                videoID: videoID,
+                sourcePageURL: url,
+                clientName: "ANDROID_VR",
+                clientHeaderID: "28",
+                clientVersion: "1.60.19",
+                userAgent: androidVRUserAgent,
+                extraClientFields: [
+                    "deviceMake": "Oculus",
+                    "deviceModel": "Quest 3",
+                    "osName": "Android",
+                    "osVersion": "12L",
+                    "androidSdkVersion": 32
+                ],
+                visitorData: visitorData,
+                cookiesHeader: nil
+            ), !vrResult.streams.isEmpty {
+                results.append(vrResult)
+            }
         }
 
-        // 3. Mobile web watch page HTML ytInitialPlayerResponse fallback (passes cookies if provided).
-        if let htmlResult = await fetchMobileWebHTML(
-            videoID: videoID,
-            sourcePageURL: url,
-            cookiesHeader: cookiesHeader,
-            referer: referer
-        ) {
-            return htmlResult
+        if results.isEmpty {
+            if let htmlResult = await fetchMobileWebHTML(
+                videoID: videoID,
+                sourcePageURL: url,
+                cookiesHeader: cookiesHeader,
+                referer: referer
+            ), !htmlResult.streams.isEmpty {
+                results.append(htmlResult)
+            }
         }
 
+        if !results.isEmpty {
+            let mergedStreams = orderedMergedStreams(from: results)
+            let reachable = await filterReachableStreams(mergedStreams)
+            let finalStreams = reachable.isEmpty ? mergedStreams : reachable
+            let primaryMeta = results[0]
+            return YouTubeResolvedResult(
+                videoID: videoID,
+                title: primaryMeta.title,
+                author: primaryMeta.author ?? results.compactMap(\.author).first,
+                durationSeconds: primaryMeta.durationSeconds ?? results.compactMap(\.durationSeconds).first,
+                streams: finalStreams,
+                errorReason: nil
+            )
+        }
+
+        let err = iosResult?.errorReason ?? androidResult?.errorReason
         return YouTubeResolvedResult(
             videoID: videoID,
-            title: "YouTube Video",
-            author: nil,
-            durationSeconds: nil,
+            title: iosResult?.title ?? androidResult?.title ?? "YouTube Video",
+            author: iosResult?.author ?? androidResult?.author,
+            durationSeconds: iosResult?.durationSeconds ?? androidResult?.durationSeconds,
             streams: [],
-            errorReason: "Could not resolve direct YouTube stream for this video."
+            errorReason: err ?? "Could not resolve direct YouTube stream for this video."
         )
+    }
+
+    static func filterReachableStreams(_ streams: [DetectedBrowserMedia]) async -> [DetectedBrowserMedia] {
+        guard !streams.isEmpty else { return [] }
+
+        var representativeByBucket: [ProbeBucket: DetectedBrowserMedia] = [:]
+        for s in streams {
+            let bucket = ProbeBucket(media: s)
+            if representativeByBucket[bucket] == nil {
+                representativeByBucket[bucket] = s
+            }
+        }
+
+        let probes = Array(representativeByBucket)
+        var allowedBuckets = Set<ProbeBucket>()
+        await withTaskGroup(of: (ProbeBucket, Bool).self) { group in
+            for (bucket, sample) in probes {
+                group.addTask {
+                    let mainOK = await isURLReachable(sample.url, headers: sample.customHeaders)
+                    guard mainOK else { return (bucket, false) }
+                    if let paired = sample.pairedAudioURL {
+                        let audioOK = await isURLReachable(paired, headers: sample.customHeaders)
+                        return (bucket, audioOK)
+                    }
+                    return (bucket, true)
+                }
+            }
+            for await (bucket, ok) in group where ok {
+                allowedBuckets.insert(bucket)
+            }
+        }
+
+        guard !allowedBuckets.isEmpty else { return [] }
+        return streams.filter { allowedBuckets.contains(ProbeBucket(media: $0)) }
+    }
+
+    private static func orderedMergedStreams(from results: [YouTubeResolvedResult]) -> [DetectedBrowserMedia] {
+        var progressiveHD: [DetectedBrowserMedia] = []
+        var adaptiveMux: [DetectedBrowserMedia] = []
+        var hls: [DetectedBrowserMedia] = []
+        var progressiveSD: [DetectedBrowserMedia] = []
+        var audioOnly: [DetectedBrowserMedia] = []
+        var seenKeys = Set<String>()
+
+        for res in results {
+            for s in res.streams {
+                let key = "\(s.url.absoluteString)|\(s.pairedAudioURL?.absoluteString ?? "")|\(s.customHeaders?["User-Agent"] ?? "")"
+                guard seenKeys.insert(key).inserted else { continue }
+                if s.isAudio {
+                    audioOnly.append(s)
+                } else if s.isHLS {
+                    hls.append(s)
+                } else if s.pairedAudioURL != nil {
+                    adaptiveMux.append(s)
+                } else if (s.qualityLabel?.contains("720p") == true) || (s.qualityLabel?.contains("1080p") == true) {
+                    progressiveHD.append(s)
+                } else {
+                    progressiveSD.append(s)
+                }
+            }
+        }
+
+        return progressiveHD + adaptiveMux + hls + progressiveSD + audioOnly
+    }
+
+    private static func isURLReachable(_ url: URL, headers: [String: String]?) async -> Bool {
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        req.timeoutInterval = 7
+        headers?.forEach { req.setValue($0.value, forHTTPHeaderField: $0.key) }
+        do {
+            let (bytes, resp) = try await URLSession.shared.bytes(for: req)
+            guard let http = resp as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
+                return false
+            }
+            var iter = bytes.makeAsyncIterator()
+            _ = try? await iter.next()
+            return true
+        } catch {
+            return false
+        }
     }
 
     static func parsePlayerResponseJSON(
@@ -210,7 +350,8 @@ enum YouTubeStreamResolver {
             dict: dict,
             videoID: videoID,
             sourcePageURL: sourcePageURL,
-            headers: headers
+            headers: headers,
+            includeReferer: false
         )
     }
 
@@ -299,7 +440,8 @@ enum YouTubeStreamResolver {
         dict: [String: Any],
         videoID: String,
         sourcePageURL: URL?,
-        headers: [String: String]?
+        headers: [String: String]?,
+        includeReferer: Bool = true
     ) -> YouTubeResolvedResult {
         let videoDetails = dict["videoDetails"] as? [String: Any]
         let rawTitle = (videoDetails?["title"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -329,7 +471,7 @@ enum YouTubeStreamResolver {
         var adaptiveHD: [DetectedBrowserMedia] = []
         var hlsStreams: [DetectedBrowserMedia] = []
         var audioOnlyStreams: [DetectedBrowserMedia] = []
-        let refererStr = sourcePageURL?.absoluteString ?? "https://m.youtube.com/watch?v=\(videoID)"
+        let refererStr: String? = includeReferer ? (sourcePageURL?.absoluteString ?? "https://m.youtube.com/watch?v=\(videoID)") : nil
 
         // Progressive muxed MP4s (Video + Audio together: e.g. 720p, 360p)
         if let formats = streamingData["formats"] as? [[String: Any]] {
@@ -428,8 +570,8 @@ enum YouTubeStreamResolver {
             }
 
             if let bestAudio {
-                // Pair top H.264/MP4 adaptive streams (>= 480p) with best M4A audio
-                for v in adaptiveVideos.filter({ $0.height >= 480 }).prefix(3) {
+                // Pair top H.264/MP4 adaptive streams with best M4A audio (including 360p/240p videos)
+                for v in adaptiveVideos.prefix(3) {
                     adaptiveHD.append(
                         DetectedBrowserMedia(
                             url: v.url,
