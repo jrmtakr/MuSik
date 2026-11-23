@@ -83,6 +83,28 @@ enum YouTubeStreamResolver {
         return comps.url ?? url
     }
 
+    private actor VisitorDataCache {
+        private var cached: (value: String, date: Date)?
+
+        func current() -> String? {
+            guard let cached, Date().timeIntervalSince(cached.date) < 900 else { return nil }
+            return cached.value
+        }
+
+        func store(_ value: String) {
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return }
+            cached = (trimmed, Date())
+        }
+    }
+
+    private static let visitorCache = VisitorDataCache()
+
+    static func cacheVisitorData(_ value: String?) async {
+        guard let value, !value.isEmpty else { return }
+        await visitorCache.store(value)
+    }
+
     static func resolveStreams(
         for url: URL,
         cookiesHeader: String? = nil,
@@ -91,7 +113,27 @@ enum YouTubeStreamResolver {
     ) async -> YouTubeResolvedResult? {
         guard let videoID = extractVideoID(from: url) else { return nil }
 
-        // 1. Query iOS (for HD/HLS when un-gated) and Android (for reliable HTTP 200 itag=18 MP4) in parallel.
+        var resolvedVisitorData = (visitorData?.isEmpty == false) ? visitorData : await visitorCache.current()
+        var mobilePrefetchResult: YouTubeResolvedResult?
+
+        // Bootstrap visitorData once from mobile HTML when missing so iOS/Android InnerTube calls avoid HTTP 400 / LOGIN_REQUIRED.
+        if resolvedVisitorData?.isEmpty != false {
+            let mobileHTML = await fetchMobileWebHTML(
+                videoID: videoID,
+                sourcePageURL: url,
+                cookiesHeader: cookiesHeader,
+                referer: referer
+            )
+            mobilePrefetchResult = mobileHTML.result
+            if let vd = mobileHTML.visitorData, !vd.isEmpty {
+                resolvedVisitorData = vd
+                await visitorCache.store(vd)
+            }
+        } else if let visitorData, !visitorData.isEmpty {
+            await visitorCache.store(visitorData)
+        }
+
+        // 1. Query iOS (HD/audio adaptive + HLS when un-gated) and Android in parallel with visitorData.
         async let iosTask = fetchInnerTube(
             videoID: videoID,
             sourcePageURL: url,
@@ -105,8 +147,8 @@ enum YouTubeStreamResolver {
                 "osName": "iPhone",
                 "osVersion": "18.3.2"
             ],
-            visitorData: visitorData,
-            cookiesHeader: nil
+            visitorData: resolvedVisitorData,
+            cookiesHeader: cookiesHeader
         )
         async let androidTask = fetchInnerTube(
             videoID: videoID,
@@ -120,8 +162,8 @@ enum YouTubeStreamResolver {
                 "osVersion": "14",
                 "androidSdkVersion": 34
             ],
-            visitorData: visitorData,
-            cookiesHeader: nil
+            visitorData: resolvedVisitorData,
+            cookiesHeader: cookiesHeader
         )
 
         let iosResult = await iosTask
@@ -135,8 +177,8 @@ enum YouTubeStreamResolver {
                 sourcePageURL: url,
                 clientName: "ANDROID_VR",
                 clientHeaderID: "28",
-                clientVersion: "1.60.19",
-                userAgent: androidVRUserAgent,
+                clientVersion: "1.62.27",
+                userAgent: "com.google.android.apps.youtube.vr.oculus/1.62.27 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip",
                 extraClientFields: [
                     "deviceMake": "Oculus",
                     "deviceModel": "Quest 3",
@@ -144,21 +186,29 @@ enum YouTubeStreamResolver {
                     "osVersion": "12L",
                     "androidSdkVersion": 32
                 ],
-                visitorData: visitorData,
-                cookiesHeader: nil
+                visitorData: resolvedVisitorData,
+                cookiesHeader: cookiesHeader
             ), !vrResult.streams.isEmpty {
                 results.append(vrResult)
             }
         }
 
         if results.isEmpty {
-            if let htmlResult = await fetchMobileWebHTML(
-                videoID: videoID,
-                sourcePageURL: url,
-                cookiesHeader: cookiesHeader,
-                referer: referer
-            ), !htmlResult.streams.isEmpty {
-                results.append(htmlResult)
+            if let prefetched = mobilePrefetchResult, !prefetched.streams.isEmpty {
+                results.append(prefetched)
+            } else {
+                let mobileHTML = await fetchMobileWebHTML(
+                    videoID: videoID,
+                    sourcePageURL: url,
+                    cookiesHeader: cookiesHeader,
+                    referer: referer
+                )
+                if let vd = mobileHTML.visitorData, !vd.isEmpty {
+                    await visitorCache.store(vd)
+                }
+                if let htmlResult = mobileHTML.result, !htmlResult.streams.isEmpty {
+                    results.append(htmlResult)
+                }
             }
         }
 
@@ -360,9 +410,9 @@ enum YouTubeStreamResolver {
         sourcePageURL: URL,
         cookiesHeader: String?,
         referer: String?
-    ) async -> YouTubeResolvedResult? {
+    ) async -> (result: YouTubeResolvedResult?, visitorData: String?) {
         guard let watchURL = URL(string: "https://m.youtube.com/watch?v=\(videoID)") else {
-            return nil
+            return (nil, nil)
         }
         var req = URLRequest(url: watchURL)
         req.timeoutInterval = 15
@@ -377,21 +427,36 @@ enum YouTubeStreamResolver {
         guard let (data, resp) = try? await URLSession.shared.data(for: req),
               let http = resp as? HTTPURLResponse,
               (200...299).contains(http.statusCode),
-              let html = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1),
-              let playerDict = extractPlayerResponseFromHTML(html) else {
-            return nil
+              let html = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1) else {
+            return (nil, nil)
+        }
+
+        let extractedVD = extractVisitorData(fromHTML: html)
+        guard let playerDict = extractPlayerResponseFromHTML(html) else {
+            return (nil, extractedVD)
         }
 
         var headers = ["User-Agent": WebMediaDownloader.browserUserAgent, "Referer": watchURL.absoluteString]
         if let cookiesHeader, !cookiesHeader.isEmpty {
             headers["Cookie"] = cookiesHeader
         }
-        return parsePlayerResponse(
+        let parsed = parsePlayerResponse(
             dict: playerDict,
             videoID: videoID,
             sourcePageURL: sourcePageURL,
             headers: headers
         )
+        let responseVD = ((playerDict["responseContext"] as? [String: Any])?["visitorData"] as? String) ?? extractedVD
+        return (parsed, responseVD)
+    }
+
+    private static func extractVisitorData(fromHTML html: String) -> String? {
+        guard let regex = try? NSRegularExpression(pattern: #""visitorData"\s*:\s*"([^"]+)""#),
+              let match = regex.firstMatch(in: html, range: NSRange(html.startIndex..., in: html)),
+              let range = Range(match.range(at: 1), in: html) else {
+            return nil
+        }
+        return String(html[range])
     }
 
     private static func extractPlayerResponseFromHTML(_ html: String) -> [String: Any]? {

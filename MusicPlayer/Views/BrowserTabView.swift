@@ -1073,6 +1073,7 @@ struct BrowserTabView: View {
     @Environment(AppSettings.self) private var settings
     @Environment(BrowserStore.self) private var browserStore
     @Environment(WebMediaDownloader.self) private var downloader
+    @Environment(PlaylistImportManager.self) private var playlistImportManager
     @Environment(\.dismiss) private var dismiss
 
     @Binding var showPlayerSheet: Bool
@@ -1113,6 +1114,17 @@ struct BrowserTabView: View {
     @State private var showingTabsSheet = false
     @State private var showingBookmarksSheet = false
     @State private var showingStreamsSheet = false
+    @State private var showingPlaylistImportSheet = false
+    @State private var playlistImportSheetURL = ""
+
+    private var detectedBrowserYouTubePlaylist: ParsedExternalPlaylistURL? {
+        guard let url = browser.currentURL,
+              let parsed = PlaylistURLImporter.parsePlaylistURL(url.absoluteString),
+              parsed.platform == .youtubeMusic else {
+            return nil
+        }
+        return parsed
+    }
 
     private var showCachingOverlay: Bool {
         isResolvingYouTubeCache || (cachingOverlayTitle != nil && !downloader.activeDownloads.isEmpty)
@@ -1131,6 +1143,14 @@ struct BrowserTabView: View {
 
                 if let offlineReadyItem {
                     offlineReadyBanner(offlineReadyItem)
+                }
+
+                if let ytPlaylist = detectedBrowserYouTubePlaylist, !showCachingOverlay {
+                    detectedYouTubePlaylistBanner(ytPlaylist)
+                }
+
+                if let activeJob = playlistImportManager.primaryActiveJob, !showCachingOverlay {
+                    activePlaylistJobBanner(activeJob)
                 }
 
                 if let status = downloadStatus {
@@ -1651,6 +1671,9 @@ struct BrowserTabView: View {
                     }
                 }
             }
+            .sheet(isPresented: $showingPlaylistImportSheet) {
+                ImportPlaylistSheetView(initialURL: playlistImportSheetURL)
+            }
         }
     }
 
@@ -1817,6 +1840,116 @@ struct BrowserTabView: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
         .background(Color(.secondarySystemBackground))
+    }
+
+    private func detectedYouTubePlaylistBanner(_ parsed: ParsedExternalPlaylistURL) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "music.note.list")
+                .foregroundStyle(.red)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("YouTube Playlist Detected")
+                    .font(.caption.weight(.semibold))
+                Text("Cache all videos in background (no cap)")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            Spacer()
+            Button("Audio") {
+                enqueueCurrentBrowserPlaylist(parsed: parsed, format: .audioOnly)
+            }
+            .font(.caption.weight(.semibold))
+            .buttonStyle(.borderedProminent)
+            .controlSize(.small)
+
+            Button("Video") {
+                enqueueCurrentBrowserPlaylist(parsed: parsed, format: .videoWithAudio)
+            }
+            .font(.caption.weight(.semibold))
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+
+            Button("More") {
+                playlistImportSheetURL = (browser.currentURL ?? parsed.originalURL)?.absoluteString ?? ""
+                showingPlaylistImportSheet = true
+            }
+            .font(.caption.weight(.medium))
+            .buttonStyle(.borderless)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 7)
+        .background(Color.red.opacity(0.10))
+    }
+
+    private func activePlaylistJobBanner(_ job: PlaylistImportJob) -> some View {
+        HStack(spacing: 8) {
+            ProgressView(value: job.progressFraction)
+                .progressViewStyle(.circular)
+                .controlSize(.small)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("\(job.playlistName) (\(job.processedCount)/\(job.totalCount))")
+                    .font(.caption.weight(.semibold))
+                    .lineLimit(1)
+                Text(job.isPaused ? "Paused in background queue" : "Caching playlist videos in background...")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button(job.isPaused ? "Resume" : "Pause") {
+                if job.isPaused {
+                    playlistImportManager.resumeJob(id: job.id)
+                } else {
+                    playlistImportManager.pauseJob(id: job.id)
+                }
+            }
+            .font(.caption2.weight(.semibold))
+            .buttonStyle(.bordered)
+            .controlSize(.mini)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .background(Color(.secondarySystemBackground))
+    }
+
+    private func enqueueCurrentBrowserPlaylist(
+        parsed: ParsedExternalPlaylistURL,
+        format: PlaylistImportPreferredFormat
+    ) {
+        let currentPageURL = browser.currentURL?.absoluteString ?? parsed.originalURL?.absoluteString ?? ""
+        guard !currentPageURL.isEmpty else { return }
+
+        Task { @MainActor in
+            var capturedInitialJSON: [String: Any]?
+            if let webView = browser.webView,
+               let rawJSON = try? await webView.evaluateJavaScript(
+                   "(window.ytInitialData && typeof window.ytInitialData === 'object') ? JSON.stringify(window.ytInitialData) : ''"
+               ) as? String,
+               !rawJSON.isEmpty,
+               let data = rawJSON.data(using: .utf8),
+               let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                capturedInitialJSON = dict
+            }
+
+            let rawTitle = browser.pageTitle
+                .replacingOccurrences(of: " - YouTube", with: "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let playlistName = rawTitle.isEmpty ? "YouTube Playlist" : rawTitle
+            let created = mediaManager.createPlaylist(name: playlistName)
+            guard let targetPlaylistID = created?.id ?? mediaManager.playlists.first?.id else { return }
+
+            playlistImportManager.enqueueURLImport(
+                sourceURLString: currentPageURL,
+                playlistName: created?.name ?? playlistName,
+                targetPlaylistID: targetPlaylistID,
+                preferredFormat: format,
+                alwaysUseBrowserResolver: false,
+                respectMaxDurationLimit: false,
+                initialInitialDataJSON: capturedInitialJSON,
+                listIDForInitialData: parsed.playlistID,
+                skipDiscoveryIfComplete: false
+            )
+            downloadStatus = "Background caching started for \"\(created?.name ?? playlistName)\""
+        }
     }
 
     private func detectedMediaBanner(_ media: DetectedBrowserMedia) -> some View {

@@ -1731,6 +1731,165 @@ final class MediaManager {
         )
     }
 
+    // MARK: - Fast Batch Playlist Import (No O(N^2) Scans on 5,000+ Tracks)
+
+    func existingMediaMapByVideoID() -> [String: MediaItem] {
+        let byPath = Dictionary(items.map { ($0.relativePath, $0) }, uniquingKeysWith: { first, _ in first })
+        var map: [String: MediaItem] = [:]
+        map.reserveCapacity(customMetadataByPath.count)
+        for (relPath, meta) in customMetadataByPath {
+            guard let vid = meta.sourceVideoID?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !vid.isEmpty,
+                  let item = byPath[relPath] else {
+                continue
+            }
+            if map[vid] == nil {
+                map[vid] = item
+            }
+        }
+        return map
+    }
+
+    func existingMediaItem(forVideoID videoID: String) -> MediaItem? {
+        let cleanID = videoID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanID.isEmpty else { return nil }
+        for (relPath, meta) in customMetadataByPath {
+            if meta.sourceVideoID == cleanID,
+               let match = items.first(where: { $0.relativePath == relPath }) {
+                return match
+            }
+        }
+        return nil
+    }
+
+    @discardableResult
+    func fastImportDownloadedFile(
+        from tempURL: URL,
+        preferredFileName: String,
+        title: String?,
+        artist: String?,
+        durationSeconds: Double?,
+        sourceVideoID: String?,
+        playlistID: UUID?,
+        flushState: Bool = false
+    ) -> MediaItem? {
+        let cleanBase = sanitizeName((preferredFileName as NSString).deletingPathExtension)
+        let ext = (preferredFileName as NSString).pathExtension.trimmingCharacters(in: .whitespacesAndNewlines)
+        let resolvedBase = cleanBase.isEmpty ? "Track_\(Int(Date().timeIntervalSince1970))" : String(cleanBase.prefix(120))
+        let targetName = ext.isEmpty ? "\(resolvedBase).m4a" : "\(resolvedBase).\(ext)"
+        let destURL = uniqueDestinationURL(for: targetName, inFolder: "")
+
+        do {
+            try FileManager.default.createDirectory(at: destURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try FileManager.default.moveItem(at: tempURL, to: destURL)
+        } catch {
+            try? FileManager.default.removeItem(at: tempURL)
+            return nil
+        }
+
+        let relPath = destURL.lastPathComponent
+        let fileSize = (try? destURL.resourceValues(forKeys: [.fileSizeKey]).fileSize).map(Int64.init) ?? 0
+
+        let cleanTitle = title?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanArtist = artist?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanVID = sourceVideoID?.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        var entry = customMetadataByPath[relPath] ?? CustomTrackMetadata()
+        if let cleanTitle, !cleanTitle.isEmpty { entry.title = cleanTitle }
+        if let cleanArtist, !cleanArtist.isEmpty { entry.artist = cleanArtist }
+        if let cleanVID, !cleanVID.isEmpty { entry.sourceVideoID = cleanVID }
+        customMetadataByPath[relPath] = entry
+
+        if let durationSeconds, durationSeconds.isFinite, durationSeconds > 0 {
+            durationsByPath[relPath] = durationSeconds
+        }
+
+        let newItem = MediaItem(
+            id: UUID(),
+            name: (relPath as NSString).deletingPathExtension,
+            fileName: relPath,
+            relativePath: relPath,
+            fileSize: fileSize,
+            dateAdded: .now,
+            durationSeconds: (durationSeconds?.isFinite == true && (durationSeconds ?? 0) > 0) ? durationSeconds : nil,
+            metadataTitle: (cleanTitle?.isEmpty == false ? cleanTitle : nil),
+            artist: (cleanArtist?.isEmpty == false ? cleanArtist : nil)
+        )
+        items.insert(newItem, at: 0)
+
+        if let playlistID, let pIdx = playlists.firstIndex(where: { $0.id == playlistID }) {
+            if !playlists[pIdx].itemFileNames.contains(relPath) {
+                playlists[pIdx].itemFileNames.append(relPath)
+            }
+        }
+
+        if flushState {
+            saveLibraryState()
+            savePlaylists()
+        }
+        return newItem
+    }
+
+    @discardableResult
+    func addExistingItemsToPlaylistFast(
+        _ itemsToAdd: [MediaItem],
+        playlistID: UUID,
+        flushState: Bool = false
+    ) -> Int {
+        guard !itemsToAdd.isEmpty,
+              let pIdx = playlists.firstIndex(where: { $0.id == playlistID }) else { return 0 }
+        let duplicateNames = duplicateLibraryFileNames()
+        var existingKeys = Set(playlists[pIdx].itemFileNames)
+        var added = 0
+        for item in itemsToAdd {
+            if existingKeys.contains(item.relativePath) { continue }
+            if !duplicateNames.contains(item.fileName), existingKeys.contains(item.fileName) {
+                continue
+            }
+            playlists[pIdx].itemFileNames.append(item.relativePath)
+            existingKeys.insert(item.relativePath)
+            added += 1
+        }
+        if added > 0 && flushState {
+            savePlaylists()
+        }
+        return added
+    }
+
+    @discardableResult
+    func addExistingItemToPlaylistFast(
+        _ item: MediaItem,
+        playlistID: UUID,
+        flushState: Bool = false
+    ) -> Bool {
+        addExistingItemsToPlaylistFast([item], playlistID: playlistID, flushState: flushState) > 0
+    }
+
+    func flushBatchPlaylistImport(
+        playlistID: UUID?,
+        summary: String?,
+        reloadLibrary: Bool = false
+    ) {
+        saveLibraryState()
+        savePlaylists()
+        if reloadLibrary {
+            loadLocalFiles()
+        }
+        if let playlistID,
+           let playlist = playlists.first(where: { $0.id == playlistID }) {
+            let label = (summary?.isEmpty == false)
+                ? summary!
+                : "Imported tracks (\(playlist.itemFileNames.count) total)"
+            PlaylistTimeMachineService.shared.recordSnapshot(
+                for: playlist,
+                items: items,
+                metadataByPath: customMetadataByPath,
+                trigger: .imported,
+                summary: label
+            )
+        }
+    }
+
     // MARK: - Playlist Time-Machine Restore
 
     @discardableResult

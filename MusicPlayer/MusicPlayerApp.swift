@@ -10,7 +10,20 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
     ) -> Bool {
         UNUserNotificationCenter.current().delegate = self
         SystemActionRouter.registerHomeQuickActions()
+        PlaylistImportManager.shared.registerBackgroundTasks()
         return true
+    }
+
+    func application(
+        _ application: UIApplication,
+        handleEventsForBackgroundURLSession identifier: String,
+        completionHandler: @escaping () -> Void
+    ) {
+        if identifier == PlaylistImportManager.backgroundSessionIdentifier {
+            PlaylistImportManager.shared.handleBackgroundSessionEvents(completionHandler: completionHandler)
+        } else {
+            completionHandler()
+        }
     }
 
     nonisolated func userNotificationCenter(
@@ -78,6 +91,7 @@ struct MusicPlayerApp: App {
     @State private var sleepTimer = SleepTimerManager.shared
     @State private var settings = AppSettings()
     @State private var browserStore = BrowserStore()
+    @State private var playlistImportManager = PlaylistImportManager.shared
     @State private var downloader = WebMediaDownloader()
     @State private var groupService = GroupPlaylistService.shared
     @State private var partyService = PartyQueueService.shared
@@ -98,6 +112,7 @@ struct MusicPlayerApp: App {
                 .environment(settings)
                 .environment(browserStore)
                 .environment(downloader)
+                .environment(playlistImportManager)
                 .environment(groupService)
                 .environment(partyService)
                 .environment(timeMachine)

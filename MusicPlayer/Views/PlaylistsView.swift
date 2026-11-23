@@ -45,6 +45,7 @@ struct PlaylistsView: View {
     @Environment(GroupPlaylistService.self) private var groupService
     @Environment(PartyQueueService.self) private var partyService
     @Environment(PlaylistTimeMachineService.self) private var timeMachine
+    @Environment(PlaylistImportManager.self) private var playlistImportManager
     @Binding var showPlayerSheet: Bool
     @Binding var quickLookTarget: QuickLookTarget?
 
@@ -101,6 +102,79 @@ struct PlaylistsView: View {
     var body: some View {
         NavigationStack {
             List {
+                if trimmedSearch.isEmpty && !playlistImportManager.jobs.isEmpty {
+                    Section("Background Playlist Imports") {
+                        ForEach(playlistImportManager.jobs.prefix(4)) { job in
+                            VStack(alignment: .leading, spacing: 6) {
+                                HStack(spacing: 8) {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(job.playlistName)
+                                            .font(.subheadline.weight(.semibold))
+                                            .lineLimit(1)
+                                        Text(job.isFinished
+                                             ? "Completed • \(job.completedCount + job.skippedCount) saved"
+                                             : (job.isPaused
+                                                ? "Paused • \(job.remainingCount) remaining"
+                                                : (job.isDiscoveringPages
+                                                   ? "Discovering pages (\(job.totalCount)+) & caching..."
+                                                   : "Finding & caching via browser in background...")))
+                                            .font(.caption2)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    Spacer()
+                                    if !job.isFinished {
+                                        Button(job.isPaused ? "Resume" : "Pause") {
+                                            if job.isPaused {
+                                                playlistImportManager.resumeJob(id: job.id)
+                                            } else {
+                                                playlistImportManager.pauseJob(id: job.id)
+                                            }
+                                        }
+                                        .font(.caption.weight(.semibold))
+                                        .buttonStyle(.bordered)
+                                        .controlSize(.small)
+
+                                        Button(role: .destructive) {
+                                            playlistImportManager.cancelJob(id: job.id)
+                                        } label: {
+                                            Image(systemName: "xmark.circle.fill")
+                                        }
+                                        .buttonStyle(.plain)
+                                    } else {
+                                        if job.failedCount > 0 {
+                                            Button("Retry (\(job.failedCount))") {
+                                                playlistImportManager.retryFailedTracks(inJobID: job.id)
+                                            }
+                                            .font(.caption.weight(.semibold))
+                                            .buttonStyle(.bordered)
+                                            .controlSize(.small)
+                                        }
+                                        Button("Clear") {
+                                            playlistImportManager.clearFinishedJob(id: job.id)
+                                        }
+                                        .font(.caption)
+                                        .buttonStyle(.borderless)
+                                    }
+                                }
+
+                                ProgressView(value: job.progressFraction)
+                                    .progressViewStyle(.linear)
+                                    .tint(job.isFinished && job.failedCount == 0 ? .green : .accentColor)
+
+                                HStack {
+                                    Text("\(job.processedCount) / \(job.totalCount)")
+                                        .font(.caption2.monospacedDigit().weight(.semibold))
+                                    Spacer()
+                                    Text("\(job.completedCount) downloaded • \(job.skippedCount) already cached\(job.failedCount > 0 ? " • \(job.failedCount) failed" : "")")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                            .padding(.vertical, 3)
+                        }
+                    }
+                }
+
                 if trimmedSearch.isEmpty && settings.quickAccessLastPlaylist, let last = mediaManager.lastPlaylist {
                     Section("Quick Access") {
                         let count = mediaManager.items(in: last).count
@@ -744,6 +818,7 @@ private struct SmartPlaylistDetailView: View {
 struct PlaylistDetailView: View {
     @Environment(MediaManager.self) private var mediaManager
     @Environment(PlaylistTimeMachineService.self) private var timeMachine
+    @Environment(PlaylistImportManager.self) private var playlistImportManager
     let playlistID: UUID
     @Binding var showPlayerSheet: Bool
     @Binding var quickLookTarget: QuickLookTarget?
@@ -764,32 +839,92 @@ struct PlaylistDetailView: View {
         Group {
             if let playlist {
                 let tracks = mediaManager.items(in: playlist)
+                let activeImportJob = playlistImportManager.jobs.first(where: { $0.targetPlaylistID == playlist.id && !$0.isFinished })
                 let hasNonEmptySnapshots = timeMachine.snapshots(for: playlist.id).contains { !$0.tracks.isEmpty }
                 Group {
                     if tracks.isEmpty {
-                        ContentUnavailableView {
-                            Label("Playlist Empty", systemImage: "music.note")
-                        } description: {
-                            Text("Add audio or video files from your library to this playlist.")
-                        } actions: {
-                            Button {
-                                showAddTracksSheet = true
-                            } label: {
-                                Label("Add Media", systemImage: "plus")
-                            }
-                            .buttonStyle(.borderedProminent)
-
-                            if hasNonEmptySnapshots {
-                                Button {
-                                    showTimeMachineSheet = true
-                                } label: {
-                                    Label("Restore from Time-Machine", systemImage: "clock.arrow.circlepath")
+                        if let activeImportJob {
+                            List {
+                                Section("Downloading Playlist in Background") {
+                                    VStack(alignment: .leading, spacing: 8) {
+                                        Text(activeImportJob.isDiscoveringPages
+                                             ? "Finding videos (\(activeImportJob.totalCount)+ discovered, no limit)..."
+                                             : "Resolving via browser & caching (\(activeImportJob.processedCount) / \(activeImportJob.totalCount))...")
+                                            .font(.subheadline.weight(.semibold))
+                                        ProgressView(value: activeImportJob.progressFraction)
+                                            .progressViewStyle(.linear)
+                                        HStack {
+                                            Text("\(activeImportJob.completedCount) saved • \(activeImportJob.skippedCount) cached")
+                                                .font(.caption2)
+                                                .foregroundStyle(.secondary)
+                                            Spacer()
+                                            Button(activeImportJob.isPaused ? "Resume" : "Pause") {
+                                                if activeImportJob.isPaused {
+                                                    playlistImportManager.resumeJob(id: activeImportJob.id)
+                                                } else {
+                                                    playlistImportManager.pauseJob(id: activeImportJob.id)
+                                                }
+                                            }
+                                            .font(.caption.weight(.semibold))
+                                            .buttonStyle(.bordered)
+                                            .controlSize(.small)
+                                        }
+                                    }
+                                    .padding(.vertical, 4)
                                 }
-                                .buttonStyle(.bordered)
+                            }
+                            .listStyle(.insetGrouped)
+                        } else {
+                            ContentUnavailableView {
+                                Label("Playlist Empty", systemImage: "music.note")
+                            } description: {
+                                Text("Add audio or video files from your library to this playlist.")
+                            } actions: {
+                                Button {
+                                    showAddTracksSheet = true
+                                } label: {
+                                    Label("Add Media", systemImage: "plus")
+                                }
+                                .buttonStyle(.borderedProminent)
+
+                                if hasNonEmptySnapshots {
+                                    Button {
+                                        showTimeMachineSheet = true
+                                    } label: {
+                                        Label("Restore from Time-Machine", systemImage: "clock.arrow.circlepath")
+                                    }
+                                    .buttonStyle(.bordered)
+                                }
                             }
                         }
                     } else {
                         List {
+                            if let activeImportJob {
+                                Section {
+                                    VStack(alignment: .leading, spacing: 6) {
+                                        HStack {
+                                            Text(activeImportJob.isPaused
+                                                 ? "Paused: \(activeImportJob.processedCount) / \(activeImportJob.totalCount)"
+                                                 : "Caching in background: \(activeImportJob.processedCount) / \(activeImportJob.totalCount)")
+                                                .font(.caption.weight(.semibold))
+                                            Spacer()
+                                            Button(activeImportJob.isPaused ? "Resume" : "Pause") {
+                                                if activeImportJob.isPaused {
+                                                    playlistImportManager.resumeJob(id: activeImportJob.id)
+                                                } else {
+                                                    playlistImportManager.pauseJob(id: activeImportJob.id)
+                                                }
+                                            }
+                                            .font(.caption2.weight(.semibold))
+                                            .buttonStyle(.bordered)
+                                            .controlSize(.mini)
+                                        }
+                                        ProgressView(value: activeImportJob.progressFraction)
+                                            .progressViewStyle(.linear)
+                                    }
+                                    .padding(.vertical, 2)
+                                }
+                            }
                             Section {
                                 HStack(spacing: 12) {
                                     Button {
@@ -1069,6 +1204,7 @@ private struct PlaylistsRoutingModifier: ViewModifier {
     @Environment(GroupPlaylistService.self) private var groupService
     @Environment(PartyQueueService.self) private var partyService
     @Environment(PlaylistTimeMachineService.self) private var timeMachine
+    @Environment(PlaylistImportManager.self) private var playlistImportManager
 
     @Binding var showPlayerSheet: Bool
     @Binding var quickLookTarget: QuickLookTarget?
