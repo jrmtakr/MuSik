@@ -352,9 +352,9 @@ struct NowPlayingView: View {
 
             HStack(spacing: 18) {
                 Button {
-                    mediaManager.skip(by: -15)
+                    mediaManager.skip(by: -30)
                 } label: {
-                    Label("15s", systemImage: "gobackward.15")
+                    Label("30s", systemImage: "gobackward.30")
                         .font(.subheadline.weight(.medium))
                 }
 
@@ -398,9 +398,9 @@ struct NowPlayingView: View {
                 }
 
                 Button {
-                    mediaManager.skip(by: 15)
+                    mediaManager.skip(by: 30)
                 } label: {
-                    Label("15s", systemImage: "goforward.15")
+                    Label("30s", systemImage: "goforward.30")
                         .font(.subheadline.weight(.medium))
                 }
             }
@@ -409,38 +409,71 @@ struct NowPlayingView: View {
     }
 
     private func secondaryActions(item: MediaItem) -> some View {
-        HStack(spacing: 10) {
-            Button {
-                editingInfoItem = item
-            } label: {
-                Label("Edit Info", systemImage: "pencil.and.outline")
-                    .font(.subheadline.weight(.semibold))
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 12)
-                    .background(Color.secondary.opacity(0.14), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        VStack(spacing: 10) {
+            if item.isVideo {
+                HStack(spacing: 10) {
+                    Button {
+                        Task {
+                            await mediaManager.saveVideoScreenshot(from: item, at: mediaManager.currentTime)
+                        }
+                    } label: {
+                        Label("Screenshot", systemImage: "camera.viewfinder")
+                            .font(.subheadline.weight(.semibold))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 12)
+                            .background(Color.secondary.opacity(0.14), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    }
+
+                    if !item.isHLS {
+                        Button {
+                            Task {
+                                await mediaManager.extractAudioToM4A(item: item)
+                            }
+                        } label: {
+                            Label("Extract Audio", systemImage: "music.note")
+                                .font(.subheadline.weight(.semibold))
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 12)
+                                .background(Color.secondary.opacity(0.14), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                        }
+                        .disabled(mediaManager.convertingItemID != nil)
+                    }
+                }
             }
 
-            if !item.isHLS {
+            HStack(spacing: 10) {
                 Button {
-                    Task {
-                        await mediaManager.convertToMP4(item: item)
-                    }
+                    editingInfoItem = item
                 } label: {
-                    Label("To MP4", systemImage: "film.stack")
+                    Label("Edit Info", systemImage: "pencil.and.outline")
                         .font(.subheadline.weight(.semibold))
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 12)
                         .background(Color.secondary.opacity(0.14), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
                 }
-                .disabled(mediaManager.convertingItemID != nil)
-            }
 
-            ShareLink(item: item.fileURL) {
-                Label("Share", systemImage: "square.and.arrow.up")
-                    .font(.subheadline.weight(.semibold))
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 12)
-                    .background(Color.secondary.opacity(0.14), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                if !item.isHLS {
+                    Button {
+                        Task {
+                            await mediaManager.convertToMP4(item: item)
+                        }
+                    } label: {
+                        Label("To MP4", systemImage: "film.stack")
+                            .font(.subheadline.weight(.semibold))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 12)
+                            .background(Color.secondary.opacity(0.14), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    }
+                    .disabled(mediaManager.convertingItemID != nil)
+                }
+
+                ShareLink(item: item.fileURL) {
+                    Label("Share", systemImage: "square.and.arrow.up")
+                        .font(.subheadline.weight(.semibold))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 12)
+                        .background(Color.secondary.opacity(0.14), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                }
             }
         }
         .foregroundStyle(.primary)

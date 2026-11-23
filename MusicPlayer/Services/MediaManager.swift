@@ -1192,6 +1192,86 @@ final class MediaManager {
         }
     }
 
+    @MainActor
+    func extractAudioToM4A(item: MediaItem) async {
+        guard !item.isHLS else {
+            errorMessage = "Cannot extract audio directly from an offline HLS (.movpkg) stream."
+            return
+        }
+        guard convertingItemID == nil else {
+            errorMessage = "A media conversion is already in progress."
+            return
+        }
+
+        convertingItemID = item.id
+        conversionProgress = 0
+        defer {
+            convertingItemID = nil
+            conversionProgress = 0
+        }
+
+        let asset = AVURLAsset(url: item.fileURL)
+        guard let session = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetAppleM4A) else {
+            errorMessage = "Audio extraction is not supported for this file."
+            return
+        }
+
+        let outputURL = uniqueDestinationURL(for: "\(item.name).m4a", inFolder: item.folderRelativePath)
+        try? FileManager.default.removeItem(at: outputURL)
+
+        session.outputURL = outputURL
+        session.outputFileType = .m4a
+
+        let progressTask = Task { @MainActor in
+            while !Task.isCancelled {
+                self.conversionProgress = Double(session.progress)
+                if session.status != .exporting && session.status != .waiting {
+                    break
+                }
+                try? await Task.sleep(for: .milliseconds(100))
+            }
+        }
+
+        await session.export()
+        progressTask.cancel()
+
+        switch session.status {
+        case .completed:
+            loadLocalFiles()
+            statusMessage = "Extracted \(outputURL.lastPathComponent)"
+        case .failed:
+            try? FileManager.default.removeItem(at: outputURL)
+            errorMessage = session.error?.localizedDescription ?? "Audio extraction failed."
+        case .cancelled:
+            try? FileManager.default.removeItem(at: outputURL)
+            statusMessage = "Audio extraction cancelled."
+        default:
+            break
+        }
+    }
+
+    @MainActor
+    func saveVideoScreenshot(from item: MediaItem, at seconds: Double) async {
+        let asset = AVURLAsset(url: item.fileURL)
+        let generator = AVAssetImageGenerator(asset: asset)
+        generator.appliesPreferredTrackTransform = true
+        generator.requestedTimeToleranceBefore = .zero
+        generator.requestedTimeToleranceAfter = .zero
+
+        let cmTime = CMTime(seconds: max(seconds, 0), preferredTimescale: 600)
+        do {
+            let (cgImage, _) = try await generator.image(at: cmTime)
+            let uiImage = UIImage(cgImage: cgImage)
+            guard let pngData = uiImage.pngData() else { return }
+            let destURL = uniqueDestinationURL(for: "\(item.name)_frame.png", inFolder: item.folderRelativePath)
+            try pngData.write(to: destURL, options: [.atomic])
+            loadLocalFiles()
+            statusMessage = "Saved screenshot: \(destURL.lastPathComponent)"
+        } catch {
+            errorMessage = "Could not capture screenshot: \(error.localizedDescription)"
+        }
+    }
+
     func extractArchive(_ file: LocalFile) {
         let baseName = sanitizeName(file.name)
         let folderTitle = baseName.isEmpty ? "Extracted" : baseName

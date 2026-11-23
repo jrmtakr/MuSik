@@ -2,6 +2,90 @@ import AVFoundation
 import Foundation
 import Observation
 
+final class MediaInterceptURLProtocol: URLProtocol, URLSessionDataDelegate {
+    private static let handledKey = "MusicPlayerURLProtocolHandled"
+    private var dataTask: URLSessionDataTask?
+    private var receivedData = Data()
+    private var currentResponse: URLResponse?
+
+    static let sharedCache = URLCache(
+        memoryCapacity: 32 * 1024 * 1024,
+        diskCapacity: 256 * 1024 * 1024,
+        diskPath: "MusicPlayerMediaURLCache"
+    )
+
+    private lazy var internalSession: URLSession = {
+        let config = URLSessionConfiguration.default
+        config.urlCache = Self.sharedCache
+        return URLSession(configuration: config, delegate: self, delegateQueue: nil)
+    }()
+
+    override class func canInit(with request: URLRequest) -> Bool {
+        guard URLProtocol.property(forKey: handledKey, in: request) == nil,
+              let scheme = request.url?.scheme?.lowercased(),
+              scheme == "http" || scheme == "https" else {
+            return false
+        }
+        let path = request.url?.path.lowercased() ?? ""
+        return path.hasSuffix(".mp4")
+            || path.hasSuffix(".mov")
+            || path.hasSuffix(".m4v")
+            || path.hasSuffix(".m3u8")
+            || path.hasSuffix(".mp3")
+            || path.hasSuffix(".m4a")
+    }
+
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        if let cached = Self.sharedCache.cachedResponse(for: request) {
+            client?.urlProtocol(self, didReceive: cached.response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: cached.data)
+            client?.urlProtocolDidFinishLoading(self)
+            return
+        }
+        guard let mutable = (request as NSURLRequest).mutableCopy() as? NSMutableURLRequest else { return }
+        URLProtocol.setProperty(true, forKey: Self.handledKey, in: mutable)
+        dataTask = internalSession.dataTask(with: mutable as URLRequest)
+        dataTask?.resume()
+    }
+
+    override func stopLoading() {
+        dataTask?.cancel()
+        dataTask = nil
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        dataTask: URLSessionDataTask,
+        didReceive response: URLResponse,
+        completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
+    ) {
+        currentResponse = response
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .allowed)
+        completionHandler(.allow)
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        if receivedData.count < 4 * 1024 * 1024 {
+            receivedData.append(data)
+        }
+        client?.urlProtocol(self, didLoad: data)
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        if let error {
+            client?.urlProtocol(self, didFailWithError: error)
+            return
+        }
+        if let currentResponse, !receivedData.isEmpty, receivedData.count < 4 * 1024 * 1024 {
+            let cached = CachedURLResponse(response: currentResponse, data: receivedData)
+            Self.sharedCache.storeCachedResponse(cached, for: request)
+        }
+        client?.urlProtocolDidFinishLoading(self)
+    }
+}
+
 @MainActor
 @Observable
 final class WebMediaDownloader {
@@ -15,14 +99,20 @@ final class WebMediaDownloader {
 
     @ObservationIgnored private lazy var directSession: URLSession = {
         let config = URLSessionConfiguration.default
+        config.urlCache = MediaInterceptURLProtocol.sharedCache
+        config.protocolClasses = [MediaInterceptURLProtocol.self] + (config.protocolClasses ?? [])
         config.waitsForConnectivity = true
         return URLSession(configuration: config, delegate: delegateProxy, delegateQueue: nil)
     }()
 
     @ObservationIgnored private lazy var hlsSession: AVAssetDownloadURLSession = {
         let config = URLSessionConfiguration.background(withIdentifier: "com.personal.musicplayer.hls.bg")
+        config.urlCache = MediaInterceptURLProtocol.sharedCache
         return AVAssetDownloadURLSession(configuration: config, assetDownloadDelegate: delegateProxy, delegateQueue: nil)
     }()
+
+    private static let browserUserAgent =
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1"
 
     private struct DownloadMeta {
         let title: String
@@ -33,11 +123,11 @@ final class WebMediaDownloader {
     }
 
     func fetchHLSVariants(for url: URL, headers: [String: String]? = nil) async -> [HLSQualityVariant] {
-        var options: [String: Any] = [:]
-        if let headers, !headers.isEmpty {
-            options["AVURLAssetHTTPHeaderFieldsKey"] = headers
+        var mergedHeaders = headers ?? [:]
+        if mergedHeaders["User-Agent"] == nil {
+            mergedHeaders["User-Agent"] = Self.browserUserAgent
         }
-        let asset = AVURLAsset(url: url, options: options)
+        let asset = AVURLAsset(url: url, options: ["AVURLAssetHTTPHeaderFieldsKey": mergedHeaders])
         var list = [HLSQualityVariant(id: "auto", label: "Auto (Best Available)", width: 0, height: 0, peakBitrate: 0)]
         guard let variants = try? await asset.load(.variants) else { return list }
 
@@ -73,16 +163,19 @@ final class WebMediaDownloader {
         headers: [String: String]? = nil,
         destinationFolder: String = ""
     ) {
-        guard !activeDownloads.contains(where: { $0.sourceURL == url }) else { return }
+        guard !activeDownloads.contains(where: { $0.sourceURL == url }) else {
+            MediaManager.shared.statusMessage = "Download already in progress"
+            return
+        }
 
         let downloadID = UUID()
         let cleanTitle = sanitizedTitle(title, fallbackURL: url, defaultTitle: "Stream Video")
 
-        var assetOptions: [String: Any] = [:]
-        if let headers, !headers.isEmpty {
-            assetOptions["AVURLAssetHTTPHeaderFieldsKey"] = headers
+        var mergedHeaders = headers ?? [:]
+        if mergedHeaders["User-Agent"] == nil {
+            mergedHeaders["User-Agent"] = Self.browserUserAgent
         }
-        let asset = AVURLAsset(url: url, options: assetOptions)
+        let asset = AVURLAsset(url: url, options: ["AVURLAssetHTTPHeaderFieldsKey": mergedHeaders])
 
         var taskOptions: [String: Any] = [:]
         if let minimumBitrate, minimumBitrate > 0 {
@@ -120,7 +213,7 @@ final class WebMediaDownloader {
         maxDurationMinutes: Int = 0,
         destinationFolder: String = ""
     ) {
-        if url.pathExtension.lowercased() == "m3u8" {
+        if url.pathExtension.lowercased() == "m3u8" || url.absoluteString.lowercased().contains(".m3u8") {
             startHLSDownload(
                 from: url,
                 title: title,
@@ -130,7 +223,10 @@ final class WebMediaDownloader {
             return
         }
 
-        guard !activeDownloads.contains(where: { $0.sourceURL == url }) else { return }
+        guard !activeDownloads.contains(where: { $0.sourceURL == url }) else {
+            MediaManager.shared.statusMessage = "Download already in progress"
+            return
+        }
 
         let downloadID = UUID()
         let cleanTitle = sanitizedTitle(title, fallbackURL: url, defaultTitle: "Media")
@@ -145,6 +241,7 @@ final class WebMediaDownloader {
         )
 
         var request = URLRequest(url: url)
+        request.setValue(Self.browserUserAgent, forHTTPHeaderField: "User-Agent")
         headers?.forEach { request.setValue($0.value, forHTTPHeaderField: $0.key) }
 
         let task = directSession.downloadTask(with: request)
@@ -155,11 +252,144 @@ final class WebMediaDownloader {
         MediaManager.shared.statusMessage = "Downloading \(cleanTitle)..."
     }
 
+    /// Resolves either a direct media link or an HTML webpage into a downloadable media stream.
+    func resolveAndDownload(
+        inputURLString: String,
+        title: String? = nil,
+        headers: [String: String]? = nil,
+        maxDurationMinutes: Int = 0,
+        destinationFolder: String = ""
+    ) async {
+        var normalized = inputURLString.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !normalized.contains("://") {
+            normalized = "https://\(normalized)"
+        }
+        guard let url = URL(string: normalized), url.scheme?.hasPrefix("http") == true else {
+            MediaManager.shared.errorMessage = "Please enter the correct link"
+            return
+        }
+
+        let lower = url.absoluteString.lowercased()
+        if url.pathExtension.lowercased() == "m3u8" || lower.contains(".m3u8") {
+            startHLSDownload(from: url, title: title, headers: headers, destinationFolder: destinationFolder)
+            return
+        }
+
+        var headReq = URLRequest(url: url)
+        headReq.httpMethod = "HEAD"
+        headReq.setValue(Self.browserUserAgent, forHTTPHeaderField: "User-Agent")
+        headers?.forEach { headReq.setValue($0.value, forHTTPHeaderField: $0.key) }
+
+        if let (_, resp) = try? await URLSession.shared.data(for: headReq),
+           let mime = resp.mimeType?.lowercased(),
+           !mime.contains("html") {
+            if mime.contains("mpegurl") {
+                startHLSDownload(from: url, title: title, headers: headers, destinationFolder: destinationFolder)
+            } else {
+                downloadDirectMedia(
+                    from: url,
+                    title: title,
+                    headers: headers,
+                    maxDurationMinutes: maxDurationMinutes,
+                    destinationFolder: destinationFolder
+                )
+            }
+            return
+        }
+
+        var getReq = URLRequest(url: url)
+        getReq.setValue(Self.browserUserAgent, forHTTPHeaderField: "User-Agent")
+        headers?.forEach { getReq.setValue($0.value, forHTTPHeaderField: $0.key) }
+
+        guard let (data, resp) = try? await URLSession.shared.data(for: getReq),
+              let mime = resp.mimeType?.lowercased() else {
+            downloadDirectMedia(
+                from: url,
+                title: title,
+                headers: headers,
+                maxDurationMinutes: maxDurationMinutes,
+                destinationFolder: destinationFolder
+            )
+            return
+        }
+
+        if !mime.contains("html") {
+            if mime.contains("mpegurl") {
+                startHLSDownload(from: url, title: title, headers: headers, destinationFolder: destinationFolder)
+            } else {
+                downloadDirectMedia(
+                    from: url,
+                    title: title,
+                    headers: headers,
+                    maxDurationMinutes: maxDurationMinutes,
+                    destinationFolder: destinationFolder
+                )
+            }
+            return
+        }
+
+        guard let html = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1) else {
+            MediaManager.shared.errorMessage = "Could not read webpage HTML."
+            return
+        }
+
+        let base = resp.url ?? url
+        if let extracted = extractMediaURL(from: html, baseURL: base) {
+            let pageTitle = (title?.isEmpty == false ? title : nil) ?? extractTitle(from: html)
+            var mergedHeaders = headers ?? [:]
+            mergedHeaders["Referer"] = base.absoluteString
+            if extracted.pathExtension.lowercased() == "m3u8" || extracted.absoluteString.lowercased().contains(".m3u8") {
+                startHLSDownload(from: extracted, title: pageTitle, headers: mergedHeaders, destinationFolder: destinationFolder)
+            } else {
+                downloadDirectMedia(
+                    from: extracted,
+                    title: pageTitle,
+                    headers: mergedHeaders,
+                    maxDurationMinutes: maxDurationMinutes,
+                    destinationFolder: destinationFolder
+                )
+            }
+        } else {
+            MediaManager.shared.errorMessage = "No direct media URL found in page HTML. Open the page in Browser and press Play so the live stream detector picks it up."
+        }
+    }
+
     func cancelDownload(id: UUID) {
         activeURLTasks[id]?.cancel()
         activeURLTasks.removeValue(forKey: id)
         downloadMeta.removeValue(forKey: id)
         activeDownloads.removeAll { $0.id == id }
+    }
+
+    private func extractTitle(from html: String) -> String? {
+        guard let regex = try? NSRegularExpression(pattern: "<title[^>]*>([\\s\\S]*?)</title>", options: [.caseInsensitive]),
+              let match = regex.firstMatch(in: html, range: NSRange(html.startIndex..., in: html)),
+              let range = Range(match.range(at: 1), in: html) else {
+            return nil
+        }
+        return html[range].trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func extractMediaURL(from html: String, baseURL: URL) -> URL? {
+        let patterns = [
+            "<meta[^>]+(?:property|name)=[\"'](?:og:video(?::secure_url|:url)?|og:audio(?::url)?|twitter:player:stream)[\"'][^>]+content=[\"']([^\"']+)[\"']",
+            "<(?:video|audio|source)[^>]+(?:src|data-src)=[\"']([^\"']+)[\"']",
+            "https?://[^\\s\"'<>\\\\]+\\.(?:mp4|mov|m4v|m3u8|mp3|m4a|aac|wav|flac)(?:\\?[^\\s\"'<>\\\\]*)?"
+        ]
+        for pattern in patterns {
+            guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { continue }
+            let matches = regex.matches(in: html, range: NSRange(html.startIndex..., in: html))
+            for match in matches {
+                let groupIdx = match.numberOfRanges > 1 ? 1 : 0
+                guard let range = Range(match.range(at: groupIdx), in: html) else { continue }
+                let raw = String(html[range]).replacingOccurrences(of: "\\/", with: "/")
+                if raw.hasPrefix("blob:") || raw.hasPrefix("data:") { continue }
+                if let resolved = URL(string: raw, relativeTo: baseURL)?.absoluteURL {
+                    return resolved
+                }
+            }
+        }
+        return nil
     }
 
     private func sanitizedTitle(_ raw: String?, fallbackURL: URL, defaultTitle: String) -> String {
@@ -178,7 +408,14 @@ final class WebMediaDownloader {
         activeDownloads[idx].progress = min(max(fraction, 0), 1)
     }
 
-    fileprivate func handleFinishedDownload(taskIdentifier: Int, tempFileURL: URL, suggestedExtension: String, isHLS: Bool) {
+    fileprivate func handleFinishedDownload(
+        taskIdentifier: Int,
+        tempFileURL: URL,
+        suggestedExtension: String,
+        mimeType: String,
+        statusCode: Int,
+        isHLS: Bool
+    ) {
         guard let id = taskToDownloadID.removeValue(forKey: taskIdentifier),
               let meta = downloadMeta.removeValue(forKey: id) else {
             try? FileManager.default.removeItem(at: tempFileURL)
@@ -186,6 +423,19 @@ final class WebMediaDownloader {
         }
         activeURLTasks.removeValue(forKey: id)
         activeDownloads.removeAll { $0.id == id }
+
+        if !isHLS {
+            if !(200...299).contains(statusCode) && statusCode != 0 {
+                try? FileManager.default.removeItem(at: tempFileURL)
+                MediaManager.shared.errorMessage = "Download blocked (HTTP \(statusCode)). Try playing the video in Browser first."
+                return
+            }
+            if mimeType.contains("html") {
+                try? FileManager.default.removeItem(at: tempFileURL)
+                MediaManager.shared.errorMessage = "Server returned a webpage instead of media. Try playing inside the Browser."
+                return
+            }
+        }
 
         Task {
             if let limit = meta.maxDurationSeconds, !isHLS {
@@ -207,6 +457,7 @@ final class WebMediaDownloader {
                 preferredFileName: preferredName,
                 inFolder: meta.destinationFolder
             )
+            LocalMediaCacheProxy.shared.refreshCacheSize()
         }
     }
 
@@ -258,7 +509,14 @@ private final class DownloadDelegateProxy: NSObject, AVAssetDownloadDelegate, UR
         do {
             try FileManager.default.moveItem(at: location, to: staged)
             Task { @MainActor [weak owner] in
-                owner?.handleFinishedDownload(taskIdentifier: tid, tempFileURL: staged, suggestedExtension: "movpkg", isHLS: true)
+                owner?.handleFinishedDownload(
+                    taskIdentifier: tid,
+                    tempFileURL: staged,
+                    suggestedExtension: "movpkg",
+                    mimeType: "application/vnd.apple.mpegurl",
+                    statusCode: 200,
+                    isHLS: true
+                )
             }
         } catch {
             Task { @MainActor [weak owner] in
@@ -289,12 +547,21 @@ private final class DownloadDelegateProxy: NSObject, AVAssetDownloadDelegate, UR
     ) {
         let tid = downloadTask.taskIdentifier
         let responseExt = Self.extensionFrom(response: downloadTask.response, url: downloadTask.originalRequest?.url)
+        let mime = downloadTask.response?.mimeType?.lowercased() ?? ""
+        let statusCode = (downloadTask.response as? HTTPURLResponse)?.statusCode ?? 200
         let staged = FileManager.default.temporaryDirectory
             .appendingPathComponent("\(UUID().uuidString).\(responseExt)")
         do {
             try FileManager.default.moveItem(at: location, to: staged)
             Task { @MainActor [weak owner] in
-                owner?.handleFinishedDownload(taskIdentifier: tid, tempFileURL: staged, suggestedExtension: responseExt, isHLS: false)
+                owner?.handleFinishedDownload(
+                    taskIdentifier: tid,
+                    tempFileURL: staged,
+                    suggestedExtension: responseExt,
+                    mimeType: mime,
+                    statusCode: statusCode,
+                    isHLS: false
+                )
             }
         } catch {
             Task { @MainActor [weak owner] in
@@ -312,15 +579,22 @@ private final class DownloadDelegateProxy: NSObject, AVAssetDownloadDelegate, UR
     }
 
     private static func extensionFrom(response: URLResponse?, url: URL?) -> String {
-        if let urlExt = url?.pathExtension.lowercased(), !urlExt.isEmpty, urlExt.count <= 6 {
+        if let suggested = response?.suggestedFilename as NSString? {
+            let ext = suggested.pathExtension.lowercased()
+            if !ext.isEmpty && ext.count <= 6 && ext != "html" && ext != "php" {
+                return ext
+            }
+        }
+        if let urlExt = url?.pathExtension.lowercased(), !urlExt.isEmpty, urlExt.count <= 6, urlExt != "html", urlExt != "php" {
             return urlExt
         }
         switch response?.mimeType?.lowercased() ?? "" {
         case "audio/mpeg", "audio/mp3": return "mp3"
         case "audio/mp4", "audio/x-m4a", "audio/m4a": return "m4a"
-        case "audio/wav", "audio/x-wav": return "wav"
+        case "audio/wav", "audio/x-wav", "audio/wave": return "wav"
         case "audio/aac", "audio/aacp": return "aac"
         case "audio/flac", "audio/x-flac": return "flac"
+        case "audio/ogg": return "ogg"
         case "video/quicktime": return "mov"
         case "video/x-m4v": return "m4v"
         default: return "mp4"

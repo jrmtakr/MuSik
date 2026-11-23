@@ -3,6 +3,7 @@ import SwiftUI
 enum AppTab: Hashable {
     case discovery
     case playlists
+    case browser
     case files
     case setting
 }
@@ -28,6 +29,12 @@ struct ContentView: View {
                     Label("Playlists", systemImage: "music.note.list")
                 }
                 .tag(AppTab.playlists)
+
+            BrowserTabView(showPlayerSheet: $showPlayerSheet)
+                .tabItem {
+                    Label("Browser", systemImage: "globe")
+                }
+                .tag(AppTab.browser)
 
             LibraryView(showPlayerSheet: $showPlayerSheet, quickLookTarget: $quickLookTarget)
                 .tabItem {

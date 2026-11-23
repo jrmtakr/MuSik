@@ -6,6 +6,7 @@ import Observation
 final class BrowserStore {
     var tabs: [BrowserTabItem] = []
     var activeTabID: UUID
+    var navigationRequestNonce: Int = 0
     var bookmarks: [BookmarkItem] = []
     var history: [HistoryEntry] = []
     var speedDialSites: [SpeedDialSite] = []
@@ -76,6 +77,7 @@ final class BrowserStore {
         if let title, !title.isEmpty {
             tabs[idx].title = title
         }
+        navigationRequestNonce &+= 1
     }
 
     func updateActiveTab(urlString: String, title: String?) {

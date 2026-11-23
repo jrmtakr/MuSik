@@ -168,6 +168,17 @@ struct MediaRowView: View {
                 }
 
                 if !item.isHLS {
+                    if item.isVideo {
+                        Button {
+                            Task {
+                                await mediaManager.extractAudioToM4A(item: item)
+                            }
+                        } label: {
+                            Label("Extract Audio (.m4a)", systemImage: "music.note")
+                        }
+                        .disabled(mediaManager.convertingItemID != nil)
+                    }
+
                     Button {
                         Task {
                             await mediaManager.convertToMP4(item: item)

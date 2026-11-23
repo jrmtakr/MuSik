@@ -22,6 +22,7 @@ struct MusicPlayerApp: App {
                 .environment(browserStore)
                 .environment(downloader)
                 .task {
+                    LocalMediaCacheProxy.shared.start()
                     wifiServer.onFileReceived = { tempURL, fileName, folderPath in
                         mediaManager.importTemporaryFile(from: tempURL, preferredFileName: fileName, inFolder: folderPath)
                     }

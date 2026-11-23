@@ -133,6 +133,21 @@ struct SettingsView: View {
                     }
 
                     Button(role: .destructive) {
+                        LocalMediaCacheProxy.shared.clearCache()
+                        URLCache.shared.removeAllCachedResponses()
+                        MediaInterceptURLProtocol.sharedCache.removeAllCachedResponses()
+                        mediaManager.statusMessage = "Cleared media stream cache"
+                    } label: {
+                        HStack {
+                            Label("Clear Stream Cache", systemImage: "internaldrive")
+                            Spacer()
+                            Text(ByteCountFormatter.string(fromByteCount: LocalMediaCacheProxy.shared.cachedBytes, countStyle: .file))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    Button(role: .destructive) {
                         browserStore.clearHistory()
                         let dataStore = WKWebsiteDataStore.default()
                         dataStore.fetchDataRecords(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes()) { records in

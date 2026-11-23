@@ -10,7 +10,6 @@ struct DiscoveryView: View {
     @Binding var selectedTab: AppTab
 
     @State private var searchInput = ""
-    @State private var showBrowserSheet = false
     @State private var showSaveLinkAlert = false
     @State private var saveLinkText = ""
     @State private var showWebsiteEditor = false
@@ -31,8 +30,6 @@ struct DiscoveryView: View {
     }
 
     var body: some View {
-        @Bindable var settings = settings
-
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 22) {
@@ -73,34 +70,30 @@ struct DiscoveryView: View {
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
-                        showBrowserSheet = true
+                        selectedTab = .browser
                     } label: {
-                        Label("Browser", systemImage: "safari")
+                        Label("Browser", systemImage: "globe")
                     }
                 }
             }
             .miniPlayerInset(showPlayerSheet: $showPlayerSheet)
-            .fullScreenCover(isPresented: $showBrowserSheet) {
-                BrowserTabView(showPlayerSheet: $showPlayerSheet, isModal: true)
-            }
             .alert("Save Media Link", isPresented: $showSaveLinkAlert) {
-                TextField("https://... (.mp4, .mp3, .m3u8)", text: $saveLinkText)
+                TextField("https://... (.mp4, .mp3, .m3u8, or page)", text: $saveLinkText)
                     .keyboardType(.URL)
                     .textInputAutocapitalization(.never)
                 Button("Cancel", role: .cancel) { saveLinkText = "" }
                 Button("Download") {
-                    if let url = resolvedInputURL(saveLinkText) {
-                        downloader.downloadDirectMedia(
-                            from: url,
+                    let raw = saveLinkText
+                    saveLinkText = ""
+                    Task {
+                        await downloader.resolveAndDownload(
+                            inputURLString: raw,
                             maxDurationMinutes: settings.maxCacheDurationMinutes
                         )
-                    } else {
-                        mediaManager.errorMessage = "Please enter the correct link"
                     }
-                    saveLinkText = ""
                 }
             } message: {
-                Text("Paste a direct audio, video, or HLS (.m3u8) link to download offline.")
+                Text("Paste a direct media URL or webpage link to download for offline playback.")
             }
             .alert(editingSite == nil ? "New website" : "Modify website", isPresented: $showWebsiteEditor) {
                 TextField("Website title", text: $siteTitle)
@@ -350,7 +343,7 @@ struct DiscoveryView: View {
 
     private func openURLInBrowser(_ urlString: String, title: String? = nil) {
         browserStore.openInActiveTab(urlString: urlString, title: title)
-        showBrowserSheet = true
+        selectedTab = .browser
     }
 }
 
