@@ -1340,7 +1340,7 @@ struct BrowserTabView: View {
                                 Button {
                                     hlsQualityRequest = nil
                                     Task {
-                                        let headers = media.customHeaders ?? (await buildRequestHeaders(for: media.url, referer: media.referer))
+                                        let headers = await resolvedHeaders(for: media)
                                         downloader.startHLSDownload(
                                             from: media.url,
                                             selectedVariantURL: variant.variantURL,
@@ -1755,9 +1755,16 @@ struct BrowserTabView: View {
         }
     }
 
+    private func resolvedHeaders(for media: DetectedBrowserMedia) async -> [String: String] {
+        if let custom = media.customHeaders {
+            return custom
+        }
+        return await buildRequestHeaders(for: media.url, referer: media.referer)
+    }
+
     private func streamDetectedMedia(_ media: DetectedBrowserMedia) {
         Task {
-            let headers = media.customHeaders ?? (await buildRequestHeaders(for: media.url, referer: media.referer))
+            let headers = await resolvedHeaders(for: media)
             mediaManager.playRemoteStream(
                 url: media.url,
                 title: media.title ?? (browser.pageTitle.isEmpty ? media.url.lastPathComponent : browser.pageTitle),
@@ -1777,7 +1784,7 @@ struct BrowserTabView: View {
         if media.isHLS {
             if autoMode {
                 Task {
-                    let headers = media.customHeaders ?? (await buildRequestHeaders(for: media.url, referer: media.referer))
+                    let headers = await resolvedHeaders(for: media)
                     downloader.startHLSDownload(
                         from: media.url,
                         title: media.title ?? browser.pageTitle,
@@ -1791,7 +1798,7 @@ struct BrowserTabView: View {
                 loadingVariants = true
                 hlsVariants = []
                 Task {
-                    let headers = media.customHeaders ?? (await buildRequestHeaders(for: media.url, referer: media.referer))
+                    let headers = await resolvedHeaders(for: media)
                     hlsVariants = await downloader.fetchHLSVariants(
                         for: media.url,
                         headers: headers
@@ -1801,7 +1808,7 @@ struct BrowserTabView: View {
             }
         } else if let pairedAudio = media.pairedAudioURL {
             Task {
-                let headers = media.customHeaders ?? (await buildRequestHeaders(for: media.url, referer: media.referer))
+                let headers = await resolvedHeaders(for: media)
                 downloader.downloadMuxedVideoAndAudio(
                     videoURL: media.url,
                     audioURL: pairedAudio,
@@ -1814,7 +1821,7 @@ struct BrowserTabView: View {
             }
         } else {
             Task {
-                let headers = media.customHeaders ?? (await buildRequestHeaders(for: media.url, referer: media.referer))
+                let headers = await resolvedHeaders(for: media)
                 downloader.downloadDirectMedia(
                     from: media.url,
                     title: media.title ?? browser.pageTitle,
