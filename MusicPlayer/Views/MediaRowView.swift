@@ -10,6 +10,8 @@ struct MediaRowView: View {
     var onEditInfo: (() -> Void)? = nil
     var onMove: (() -> Void)? = nil
 
+    @State private var showVerifyArtistSheet = false
+
     private var isCurrent: Bool {
         mediaManager.currentItem?.relativePath == item.relativePath
     }
@@ -61,10 +63,17 @@ struct MediaRowView: View {
                         }
 
                         if let artist = item.artist, !artist.isEmpty {
-                            Text(artist)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
+                            HStack(spacing: 4) {
+                                Text(artist)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                                if mediaManager.isArtistVerified(for: item) {
+                                    Image(systemName: "checkmark.seal.fill")
+                                        .font(.caption2)
+                                        .foregroundStyle(.green)
+                                }
+                            }
                         }
 
                         HStack(spacing: 6) {
@@ -194,6 +203,14 @@ struct MediaRowView: View {
                     }
                 }
 
+                if !item.relativePath.hasPrefix("__remote__/") {
+                    Button {
+                        showVerifyArtistSheet = true
+                    } label: {
+                        Label("Verify Artist (Wrapped)", systemImage: "checkmark.seal")
+                    }
+                }
+
                 if let onMove {
                     Button(action: onMove) {
                         Label("Move to Folder", systemImage: "folder")
@@ -254,6 +271,9 @@ struct MediaRowView: View {
             }
         }
         .padding(.vertical, 4)
+        .sheet(isPresented: $showVerifyArtistSheet) {
+            VerifyTrackArtistSheet(item: item)
+        }
     }
 }
 

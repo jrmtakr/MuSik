@@ -116,7 +116,12 @@ struct WrappedDashboardSheet: View {
     }
 
     private var statsGridSection: some View {
-        Section("Year Overview") {
+        let auditCount = wrapped.auditItems(
+            libraryItems: mediaManager.items,
+            metadataByPath: mediaManager.customMetadataByPath
+        ).count
+
+        return Section("Year Overview") {
             LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
                 WrappedStatTile(
                     title: "Time Listened",
@@ -144,6 +149,22 @@ struct WrappedDashboardSheet: View {
                 )
             }
             .padding(.vertical, 4)
+
+            NavigationLink {
+                WrappedAuditQueueView()
+            } label: {
+                HStack {
+                    Label("Confirm Artists & Check Channels", systemImage: "checkmark.seal.fill")
+                        .font(.subheadline.weight(.semibold))
+                    Spacer()
+                    Text(auditCount > 0 ? "\(auditCount) To Review" : "All Clear")
+                        .font(.caption.weight(.bold))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .background((auditCount > 0 ? Color.orange : Color.green).opacity(0.15), in: Capsule())
+                        .foregroundStyle(auditCount > 0 ? .orange : .green)
+                }
+            }
 
             HStack(spacing: 12) {
                 ZStack {
@@ -186,6 +207,21 @@ struct WrappedDashboardSheet: View {
                         editingArtist = artist
                     } label: {
                         Label("Assign / Merge Artist Name", systemImage: "pencil")
+                    }
+
+                    if artist.normalizedKey != "unknown artist" {
+                        Button(role: .destructive) {
+                            let moved = wrapped.markAsUploaderChannel(
+                                artist.normalizedKey,
+                                libraryItems: mediaManager.items,
+                                metadataByPath: mediaManager.customMetadataByPath
+                            )
+                            mediaManager.statusMessage = moved > 0
+                                ? "Marked \"\(artist.canonicalName)\" as uploader channel (\(moved) tracks rescanned)"
+                                : "Marked \"\(artist.canonicalName)\" as uploader channel"
+                        } label: {
+                            Label("Not an Artist (Uploader Channel)", systemImage: "tv.slash")
+                        }
                     }
                 }
             }
@@ -513,6 +549,7 @@ private struct WrappedArtistDetailView: View {
 
     @State private var showMergeAlert = false
     @State private var mergedName = ""
+    @State private var verifyTargetItem: MediaItem?
 
     var body: some View {
         List {
@@ -540,6 +577,19 @@ private struct WrappedArtistDetailView: View {
                 } label: {
                     Label("Assign or Merge Artist Name", systemImage: "pencil.and.outline")
                 }
+
+                if artist.normalizedKey != "unknown artist" {
+                    Button(role: .destructive) {
+                        _ = wrapped.markAsUploaderChannel(
+                            artist.normalizedKey,
+                            libraryItems: mediaManager.items,
+                            metadataByPath: mediaManager.customMetadataByPath
+                        )
+                        dismiss()
+                    } label: {
+                        Label("Not an Artist (Uploader Channel)", systemImage: "tv.slash")
+                    }
+                }
             }
 
             Section("Songs Listened By \(artist.canonicalName)") {
@@ -561,6 +611,15 @@ private struct WrappedArtistDetailView: View {
                         if let rel = entry.relativePath,
                            let localItem = mediaManager.items.first(where: { $0.relativePath == rel }) {
                             Button {
+                                verifyTargetItem = localItem
+                            } label: {
+                                Image(systemName: mediaManager.isArtistVerified(for: localItem) ? "checkmark.seal.fill" : "checkmark.seal")
+                                    .font(.body)
+                                    .foregroundStyle(mediaManager.isArtistVerified(for: localItem) ? .green : .orange)
+                            }
+                            .buttonStyle(.plain)
+
+                            Button {
                                 mediaManager.play(localItem)
                             } label: {
                                 Image(systemName: "play.circle.fill")
@@ -577,6 +636,9 @@ private struct WrappedArtistDetailView: View {
         .applyAppTheme()
         .navigationTitle(artist.canonicalName)
         .navigationBarTitleDisplayMode(.inline)
+        .sheet(item: $verifyTargetItem) { target in
+            VerifyTrackArtistSheet(item: target)
+        }
         .alert("Assign or Merge Artist", isPresented: $showMergeAlert) {
             TextField("Artist name (e.g. Drake)", text: $mergedName)
             Button("Cancel", role: .cancel) {}

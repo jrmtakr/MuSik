@@ -62,6 +62,8 @@
 	<string>Import videos from your Photos library and choose custom cover images for tracks and playlists.</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Run a local Wi-Fi transfer web server so you can upload and download media between your computer and iPhone.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>Music Player uses Speech Recognition locally on your device to hear a short vocal clip from untagged songs and match lyrics to the real artist.</string>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsArbitraryLoads</key>

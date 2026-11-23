@@ -50,32 +50,144 @@ enum ArtistDatabase {
         .map { $0 }
     }
 
+    // MARK: - Uploader Channel Detection & Query Cleaning
+
+    private static let builtInKnownChannels: Set<String> = [
+        "7clouds", "trap nation", "chill nation", "trap city", "cloudkid", "mrsuicidesheep",
+        "suicide sheep", "syrebralvibes", "proximity", "majestic casual", "lyrical lemonade",
+        "colors", "colorsxstudios", "rap nation", "bass nation", "indie nation", "house nation",
+        "nocopyrightsounds", "ncs", "taz network", "nightcore reality", "wave music",
+        "selected", "koala kontrol", "future house music", "spinnin records", "monstercat",
+        "worldstarhiphop", "genius", "vevo", "chillcity", "arctic empire", "david dean burkhart",
+        "alexrainbirdmusic", "chilledcow", "lofi girl", "unique vibes", "royal bass", "cloud vibes"
+    ]
+
+    private static let channelKeywordTokens: [String] = [
+        "lyrics", "lyric", "nightcore", "slowed", "reverb", "playlists", "playlist",
+        "music channel", "official channel", "top hits", "vibes", "mixes", "mixtape",
+        "unofficial", "audio only", "karaoke", "instrumental", "covers", "cover",
+        "fanpage", "fan page", "archive", "vault", "records", "promotions", "promo",
+        "network", "radio"
+    ]
+
+    static func looksLikeUploaderChannel(_ raw: String, customIgnoredChannels: Set<String> = []) -> Bool {
+        let norm = normalizeLookupKey(raw)
+        if norm.isEmpty { return false }
+        if customIgnoredChannels.contains(norm) { return true }
+        if builtInKnownChannels.contains(norm) { return true }
+        if lookup(norm) != nil { return false }
+
+        let padded = " \(norm) "
+        for kw in channelKeywordTokens {
+            if padded.contains(" \(kw) ") || norm.hasSuffix(kw) || norm.hasPrefix(kw) {
+                return true
+            }
+        }
+        if norm.contains("yt") && norm.count <= 14 { return true }
+        return false
+    }
+
+    static func cleanSongTitleForSearch(
+        rawTitle: String,
+        rawArtistTag: String? = nil,
+        ignoredChannels: Set<String> = []
+    ) -> (songOnly: String, artistHint: String?) {
+        let trimmed = stripFileExtension(rawTitle).trimmingCharacters(in: .whitespacesAndNewlines)
+        let (withoutNoise, _) = extractFeaturesAndStripNoise(from: trimmed)
+        let cleanedArtistTag = rawArtistTag.flatMap { cleanChannelOrTagNoise($0) }
+        let tagIsChannel = cleanedArtistTag.map {
+            isJunkArtistString($0) || looksLikeUploaderChannel($0, customIgnoredChannels: ignoredChannels)
+        } ?? false
+
+        for separator in [" - ", " — ", " – ", " | "] {
+            if let range = withoutNoise.range(of: separator) {
+                let left = stripLeadingTrackNumber(String(withoutNoise[..<range.lowerBound]))
+                let right = String(withoutNoise[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+                if !left.isEmpty && !right.isEmpty {
+                    let leftIsChannel = looksLikeUploaderChannel(left, customIgnoredChannels: ignoredChannels) ||
+                        (cleanedArtistTag.map { normalizeLookupKey($0) == normalizeLookupKey(left) } ?? false)
+                    let rightIsChannel = looksLikeUploaderChannel(right, customIgnoredChannels: ignoredChannels) ||
+                        (cleanedArtistTag.map { normalizeLookupKey($0) == normalizeLookupKey(right) } ?? false)
+
+                    if leftIsChannel && !rightIsChannel {
+                        return (right, nil)
+                    }
+                    if rightIsChannel && !leftIsChannel {
+                        return (left, nil)
+                    }
+
+                    let leftKnown = lookup(left) != nil || splitAndCanonicalize(left).contains { lookup($0) != nil }
+                    let rightKnown = lookup(right) != nil || splitAndCanonicalize(right).contains { lookup($0) != nil }
+
+                    if rightKnown && !leftKnown {
+                        return (left, splitAndCanonicalize(right).first)
+                    }
+                    if leftKnown && !rightKnown {
+                        return (right, splitAndCanonicalize(left).first)
+                    }
+
+                    // Standard YouTube music upload pattern: "Artist - Song Title"
+                    if let cleanedArtistTag, !tagIsChannel,
+                       normalizeLookupKey(cleanedArtistTag) == normalizeLookupKey(left) {
+                        return (right, left)
+                    }
+                    return (right, tagIsChannel ? nil : cleanedArtistTag)
+                }
+            }
+        }
+
+        return (
+            stripLeadingTrackNumber(withoutNoise.isEmpty ? trimmed : withoutNoise),
+            tagIsChannel ? nil : cleanedArtistTag
+        )
+    }
+
     // MARK: - Smart Artist Recognition
 
     static func extractArtists(
         rawArtistTag: String?,
         rawTitle: String?,
         fileName: String? = nil,
-        customAliases: [String: String] = [:]
+        customAliases: [String: String] = [:],
+        ignoredChannels: Set<String> = [],
+        isArtistVerified: Bool = false
     ) -> ArtistExtractionResult {
-        // 1. Check explicit artist metadata (cleaned of YouTube/channel noise)
-        if let rawArtistTag,
-           let cleanedTag = cleanChannelOrTagNoise(rawArtistTag),
-           !isJunkArtistString(cleanedTag) {
+        let cleanedTag = rawArtistTag.flatMap { cleanChannelOrTagNoise($0) }
+        let tagBlocked = cleanedTag.map {
+            isJunkArtistString($0) || looksLikeUploaderChannel($0, customIgnoredChannels: ignoredChannels)
+        } ?? true
+
+        if let cleanedTag, !isJunkArtistString(cleanedTag), isArtistVerified {
             let split = splitAndCanonicalize(cleanedTag, customAliases: customAliases)
             if let first = split.first, !isJunkArtistString(first) {
                 let resolvedGenre = split.compactMap { lookup($0)?.genre }.first
-                let matchedAny = split.contains { lookup($0) != nil }
                 return ArtistExtractionResult(
                     primaryArtist: first,
                     allArtists: split,
                     genre: resolvedGenre,
-                    matchedFromCatalog: matchedAny
+                    matchedFromCatalog: true
                 )
             }
         }
 
-        // 2. Parse title & filename cleanly
+        let tagArtists: [String] = {
+            guard let cleanedTag, !tagBlocked else { return [] }
+            return splitAndCanonicalize(cleanedTag, customAliases: customAliases)
+                .filter { !isJunkArtistString($0) }
+        }()
+        let tagMatchedCatalog = tagArtists.contains { lookup($0) != nil }
+
+        if tagMatchedCatalog, let first = tagArtists.first {
+            let resolvedGenre = tagArtists.compactMap { lookup($0)?.genre }.first
+            return ArtistExtractionResult(
+                primaryArtist: first,
+                allArtists: tagArtists,
+                genre: resolvedGenre,
+                matchedFromCatalog: true
+            )
+        }
+
+        // Parse title & filename: can override uncatalogued / channel artist tags when title names a real artist!
         let candidateSources = [rawTitle, fileName.map { stripFileExtension($0) }]
             .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
@@ -83,48 +195,63 @@ enum ArtistDatabase {
         for source in candidateSources {
             let (withoutNoise, featuredFromBrackets) = extractFeaturesAndStripNoise(from: source)
 
-            // 2A. Try explicit delimiter separation ("Artist - Title" or "Title - Artist")
             for separator in [" - ", " — ", " – ", " | "] {
                 if let range = withoutNoise.range(of: separator) {
-                    let leftRaw = String(withoutNoise[..<range.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
-                    let rightRaw = String(withoutNoise[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+                    let leftClean = stripLeadingTrackNumber(String(withoutNoise[..<range.lowerBound]))
+                    let rightClean = String(withoutNoise[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
 
-                    let leftClean = stripLeadingTrackNumber(leftRaw)
-                    let rightClean = rightRaw
+                    let leftIsBlocked = looksLikeUploaderChannel(leftClean, customIgnoredChannels: ignoredChannels)
+                    let rightIsBlocked = looksLikeUploaderChannel(rightClean, customIgnoredChannels: ignoredChannels)
 
-                    let leftArtists = splitAndCanonicalize(leftClean, customAliases: customAliases)
-                    let rightArtists = splitAndCanonicalize(rightClean, customAliases: customAliases)
+                    let leftArtists = leftIsBlocked ? [] : splitAndCanonicalize(leftClean, customAliases: customAliases)
+                    let rightArtists = rightIsBlocked ? [] : splitAndCanonicalize(rightClean, customAliases: customAliases)
 
                     let leftKnown = !leftArtists.isEmpty && leftArtists.contains { lookup($0) != nil }
                     let rightKnown = !rightArtists.isEmpty && rightArtists.contains { lookup($0) != nil }
 
                     if rightKnown && !leftKnown {
                         let combined = mergeUniqueArtists(rightArtists, featuredFromBrackets, customAliases: customAliases)
-                        let primary = combined.first ?? "Unknown Artist"
-                        return ArtistExtractionResult(
-                            primaryArtist: primary,
-                            allArtists: combined,
-                            genre: combined.compactMap { lookup($0)?.genre }.first,
-                            matchedFromCatalog: true
-                        )
+                        if let primary = combined.first {
+                            return ArtistExtractionResult(
+                                primaryArtist: primary,
+                                allArtists: combined,
+                                genre: combined.compactMap { lookup($0)?.genre }.first,
+                                matchedFromCatalog: true
+                            )
+                        }
                     }
 
-                    if leftKnown || (!leftClean.isEmpty && leftClean.count <= 48 && !isGenericTrackPrefix(leftClean)) {
-                        let baseArtists = leftArtists.isEmpty ? [leftClean] : leftArtists
-                        let combined = mergeUniqueArtists(baseArtists, featuredFromBrackets, customAliases: customAliases)
+                    if leftKnown {
+                        let combined = mergeUniqueArtists(leftArtists, featuredFromBrackets, customAliases: customAliases)
                         if let primary = combined.first, !isJunkArtistString(primary) {
                             return ArtistExtractionResult(
                                 primaryArtist: primary,
                                 allArtists: combined,
                                 genre: combined.compactMap { lookup($0)?.genre }.first,
-                                matchedFromCatalog: leftKnown || combined.contains { lookup($0) != nil }
+                                matchedFromCatalog: true
+                            )
+                        }
+                    }
+
+                    // If tag itself was missing or looks like a channel, allow clean "Artist - Title" left side
+                    if tagBlocked && !leftIsBlocked && !rightIsBlocked &&
+                        !leftClean.isEmpty && leftClean.count <= 48 && !isGenericTrackPrefix(leftClean) {
+                        let baseArtists = leftArtists.isEmpty ? [leftClean] : leftArtists
+                        let combined = mergeUniqueArtists(baseArtists, featuredFromBrackets, customAliases: customAliases)
+                        if let primary = combined.first,
+                           !isJunkArtistString(primary),
+                           !looksLikeUploaderChannel(primary, customIgnoredChannels: ignoredChannels) {
+                            return ArtistExtractionResult(
+                                primaryArtist: primary,
+                                allArtists: combined,
+                                genre: combined.compactMap { lookup($0)?.genre }.first,
+                                matchedFromCatalog: combined.contains { lookup($0) != nil }
                             )
                         }
                     }
                 }
             }
 
-            // 2B. Try inline unseparated catalog scan (safe against ambiguous English words)
             let directScanMatches = scanUnseparatedTitleForKnownArtists(withoutNoise)
             if !directScanMatches.isEmpty || !featuredFromBrackets.isEmpty {
                 let combined = mergeUniqueArtists(directScanMatches, featuredFromBrackets, customAliases: customAliases)
@@ -137,6 +264,16 @@ enum ArtistDatabase {
                     )
                 }
             }
+        }
+
+        // Fall back to user-provided tag only if it didn't match channel heuristics/blocklist
+        if let firstTag = tagArtists.first {
+            return ArtistExtractionResult(
+                primaryArtist: firstTag,
+                allArtists: tagArtists,
+                genre: nil,
+                matchedFromCatalog: false
+            )
         }
 
         return ArtistExtractionResult(

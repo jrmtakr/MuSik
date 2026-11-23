@@ -15,6 +15,7 @@ struct NowPlayingView: View {
     @State private var showQueueSheet = false
     @State private var showFullscreenFFmpegVideo = false
     @State private var editingInfoItem: MediaItem?
+    @State private var verifyArtistItem: MediaItem?
     @State private var lyricsTarget: GeniusLyricsTarget?
     @State private var showNewPlaylistAlert = false
     @State private var newPlaylistName = ""
@@ -139,6 +140,9 @@ struct NowPlayingView: View {
             }
             .sheet(item: $editingInfoItem) { item in
                 EditTrackInfoSheet(item: item)
+            }
+            .sheet(item: $verifyArtistItem) { item in
+                VerifyTrackArtistSheet(item: item)
             }
             .sheet(item: $lyricsTarget) { target in
                 GeniusLyricsSheetView(target: target)
@@ -319,7 +323,24 @@ struct NowPlayingView: View {
                 .buttonStyle(.plain)
             }
 
-            if let artist = item.artist, !artist.isEmpty {
+            if !item.relativePath.hasPrefix("__remote__/") {
+                let verified = mediaManager.isArtistVerified(for: item)
+                let artistLabel = item.artist ?? "Confirm Artist for Wrapped"
+                Button {
+                    verifyArtistItem = item
+                } label: {
+                    HStack(spacing: 5) {
+                        Text(artistLabel)
+                            .font(.subheadline.weight(.medium))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                        Image(systemName: verified ? "checkmark.seal.fill" : "checkmark.seal")
+                            .font(.caption)
+                            .foregroundStyle(verified ? .green : .orange)
+                    }
+                }
+                .buttonStyle(.plain)
+            } else if let artist = item.artist, !artist.isEmpty {
                 Text(artist)
                     .font(.subheadline.weight(.medium))
                     .foregroundStyle(.secondary)

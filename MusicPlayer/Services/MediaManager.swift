@@ -16,6 +16,9 @@ final class MediaManager {
         var artist: String?
         var coverFileName: String?
         var sourceVideoID: String?
+        var isArtistVerified: Bool?
+        var verifiedArtist: String?
+        var genre: String?
     }
 
     private struct LibraryPersistedState: Codable {
@@ -1152,14 +1155,31 @@ final class MediaManager {
         title: String,
         artist: String,
         coverImage: UIImage? = nil,
-        removeCustomCover: Bool = false
+        removeCustomCover: Bool = false,
+        markArtistVerified: Bool = true,
+        genre: String? = nil
     ) {
+        let previousMeta = resolvedTitleAndRawArtist(for: item)
         let cleanTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
         let cleanArtist = artist.trimmingCharacters(in: .whitespacesAndNewlines)
         var entry = customMetadataByPath[item.relativePath] ?? CustomTrackMetadata()
 
         entry.title = cleanTitle.isEmpty ? nil : cleanTitle
-        entry.artist = cleanArtist.isEmpty ? nil : cleanArtist
+        if cleanArtist.isEmpty {
+            entry.artist = nil
+            entry.verifiedArtist = nil
+            entry.isArtistVerified = false
+        } else {
+            let canonical = ArtistDatabase.canonicalizeSingle(cleanArtist)
+            entry.artist = canonical
+            if markArtistVerified {
+                entry.verifiedArtist = canonical
+                entry.isArtistVerified = true
+            }
+        }
+        if let genre, !genre.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            entry.genre = genre
+        }
 
         if removeCustomCover {
             if let oldCover = entry.coverFileName {
@@ -1179,7 +1199,7 @@ final class MediaManager {
             thumbnails[item.relativePath] = coverImage
         }
 
-        if entry.title == nil && entry.artist == nil && entry.coverFileName == nil {
+        if entry.title == nil && entry.artist == nil && entry.coverFileName == nil && entry.sourceVideoID == nil {
             customMetadataByPath.removeValue(forKey: item.relativePath)
         } else {
             customMetadataByPath[item.relativePath] = entry
@@ -1187,12 +1207,50 @@ final class MediaManager {
 
         saveLibraryState()
         loadLocalFiles()
+
+        if let verified = entry.artist, !verified.isEmpty {
+            ListeningWrappedService.shared.reattributeTrack(
+                relativePath: item.relativePath,
+                oldTrackTitle: previousMeta.title,
+                newTrackTitle: entry.title ?? previousMeta.title,
+                toVerifiedArtist: verified,
+                genre: entry.genre
+            )
+        }
+
         if currentItem?.relativePath == item.relativePath,
            let updated = items.first(where: { $0.relativePath == item.relativePath }) {
             currentItem = updated
             updateNowPlayingInfo(for: updated)
+            if isPlaying {
+                syncWrappedSessionStart(for: updated)
+            }
         }
         statusMessage = "Updated track info"
+    }
+
+    func isArtistVerified(for item: MediaItem) -> Bool {
+        let custom = customMetadataByPath[item.relativePath]
+        return custom?.isArtistVerified == true && !(custom?.artist?.isEmpty ?? true)
+    }
+
+    func confirmVerifiedArtist(
+        for item: MediaItem,
+        artistName: String,
+        updatedTitle: String? = nil,
+        genre: String? = nil
+    ) {
+        let cleanTitle = updatedTitle?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let titleToKeep = (cleanTitle?.isEmpty == false ? cleanTitle! : (customMetadataByPath[item.relativePath]?.title ?? item.displayTitle))
+        updateTrackInfo(
+            for: item,
+            title: titleToKeep,
+            artist: artistName,
+            markArtistVerified: true,
+            genre: genre
+        )
+        let canonical = ArtistDatabase.canonicalizeSingle(artistName)
+        statusMessage = "Verified \"\(titleToKeep)\" by \(canonical)"
     }
 
     func setSourceVideoID(_ videoID: String?, for item: MediaItem) {
@@ -2769,7 +2827,8 @@ final class MediaManager {
         ListeningWrappedService.shared.beginOrResumeSession(
             for: item,
             resolvedTitle: meta.title,
-            resolvedArtistTag: meta.rawArtist
+            resolvedArtistTag: meta.rawArtist,
+            isArtistVerified: isArtistVerified(for: item)
         )
     }
 
@@ -2780,6 +2839,7 @@ final class MediaManager {
             for: item,
             resolvedTitle: meta.title,
             resolvedArtistTag: meta.rawArtist,
+            isArtistVerified: isArtistVerified(for: item),
             isPlaying: true
         )
     }

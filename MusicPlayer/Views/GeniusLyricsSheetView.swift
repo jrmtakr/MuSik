@@ -63,15 +63,15 @@ private enum GeniusLyricsResolver {
 
         let query = queryParts.joined(separator: " ")
         guard let encoded = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
-              let apiURL = URL(string: "https://genius.com/api/search/multi?per_page=8&q=\(encoded)") else {
+              let apiURL = URL(string: "https://genius.com/api/search/multi?q=\(encoded)&per_page=5") else {
             return []
         }
 
         var req = URLRequest(url: apiURL)
         req.timeoutInterval = 12
         req.setValue(WebMediaDownloader.browserUserAgent, forHTTPHeaderField: "User-Agent")
-        req.setValue("application/json", forHTTPHeaderField: "Accept")
-        req.setValue("https://genius.com/", forHTTPHeaderField: "Referer")
+        req.setValue("*/*", forHTTPHeaderField: "Accept")
+        req.setValue("en-US,en;q=0.9", forHTTPHeaderField: "Accept-Language")
 
         guard let (data, resp) = try? await URLSession.shared.data(for: req),
               let http = resp as? HTTPURLResponse,

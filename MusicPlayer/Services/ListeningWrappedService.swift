@@ -35,8 +35,25 @@ struct WrappedYearStats: Codable, Hashable {
 private struct WrappedPersistedDatabase: Codable {
     var years: [Int: WrappedYearStats] = [:]
     var customArtistAliases: [String: String] = [:]
+    var ignoredChannelNames: [String]? = nil
     var revealedYears: Set<Int> = []
     var reminderNotificationsEnabled: Bool = true
+}
+
+enum WrappedAuditReason: String, Hashable {
+    case unknownArtist = "Unknown Artist"
+    case suspectedChannel = "Uploader / Channel Tag"
+    case uncataloguedArtist = "Unconfirmed Artist"
+}
+
+struct WrappedAuditItem: Identifiable, Hashable {
+    var id: String { item.relativePath }
+    let item: MediaItem
+    let detectedArtist: String
+    let detectedGenre: String?
+    let trackedSeconds: Double
+    let trackedPlays: Int
+    let reason: WrappedAuditReason
 }
 
 struct WrappedArtistRanking: Identifiable, Hashable {
@@ -140,6 +157,10 @@ final class ListeningWrappedService {
         return dir.appendingPathComponent("listening_wrapped.json")
     }
 
+    var ignoredChannels: Set<String> {
+        Set(db.ignoredChannelNames ?? [])
+    }
+
     var notificationsEnabled: Bool {
         get { db.reminderNotificationsEnabled }
         set {
@@ -163,14 +184,17 @@ final class ListeningWrappedService {
     func beginOrResumeSession(
         for item: MediaItem,
         resolvedTitle: String,
-        resolvedArtistTag: String?
+        resolvedArtistTag: String?,
+        isArtistVerified: Bool = false
     ) {
-        let sessionKey = "\(item.relativePath)|\(resolvedTitle)|\(resolvedArtistTag ?? "")"
+        let sessionKey = "\(item.relativePath)|\(resolvedTitle)|\(resolvedArtistTag ?? "")|\(isArtistVerified ? "1" : "0")"
         let extracted = ArtistDatabase.extractArtists(
             rawArtistTag: resolvedArtistTag,
             rawTitle: resolvedTitle,
             fileName: item.fileName,
-            customAliases: db.customArtistAliases
+            customAliases: db.customArtistAliases,
+            ignoredChannels: ignoredChannels,
+            isArtistVerified: isArtistVerified
         )
 
         if activeTrackKey == sessionKey {
@@ -196,6 +220,7 @@ final class ListeningWrappedService {
         for item: MediaItem?,
         resolvedTitle: String?,
         resolvedArtistTag: String?,
+        isArtistVerified: Bool = false,
         isPlaying: Bool
     ) {
         guard isPlaying, let item else {
@@ -204,10 +229,15 @@ final class ListeningWrappedService {
         }
 
         let title = (resolvedTitle?.isEmpty == false ? resolvedTitle : nil) ?? item.displayTitle
-        let sessionKey = "\(item.relativePath)|\(title)|\(resolvedArtistTag ?? "")"
+        let sessionKey = "\(item.relativePath)|\(title)|\(resolvedArtistTag ?? "")|\(isArtistVerified ? "1" : "0")"
 
         if activeTrackKey != sessionKey {
-            beginOrResumeSession(for: item, resolvedTitle: title, resolvedArtistTag: resolvedArtistTag)
+            beginOrResumeSession(
+                for: item,
+                resolvedTitle: title,
+                resolvedArtistTag: resolvedArtistTag,
+                isArtistVerified: isArtistVerified
+            )
             return
         }
 
@@ -478,6 +508,257 @@ final class ListeningWrappedService {
 
         lastUpdatedTick = .now
         scheduleDiskSave(immediate: true)
+    }
+
+    func reattributeTrack(
+        relativePath: String?,
+        oldTrackTitle: String?,
+        newTrackTitle: String? = nil,
+        toVerifiedArtist rawArtist: String,
+        genre: String? = nil
+    ) {
+        let trimmedArtist = rawArtist.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedArtist.isEmpty else { return }
+        let canonical = ArtistDatabase.canonicalizeSingle(trimmedArtist, customAliases: db.customArtistAliases)
+        let newKey = ArtistDatabase.normalizeLookupKey(canonical)
+        guard !newKey.isEmpty else { return }
+
+        let resolvedGenre = genre ?? ArtistDatabase.genre(forArtist: canonical)
+        let normOldTitle = oldTrackTitle.map { ArtistDatabase.normalizeLookupKey($0) }
+        let normNewTitle = newTrackTitle.map { ArtistDatabase.normalizeLookupKey($0) }
+        let preferredTitle = newTrackTitle?.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        var didModify = false
+        for year in Array(db.years.keys) {
+            guard var stats = db.years[year] else { continue }
+
+            for oldArtistKey in Array(stats.artists.keys) where oldArtistKey != newKey {
+                guard var oldRec = stats.artists[oldArtistKey] else { continue }
+                let matchingTitles = oldRec.tracksSeconds.keys.filter { tTitle in
+                    if let relativePath, oldRec.trackPaths[tTitle] == relativePath {
+                        return true
+                    }
+                    let tNorm = ArtistDatabase.normalizeLookupKey(tTitle)
+                    if let normOldTitle, !normOldTitle.isEmpty, tNorm == normOldTitle {
+                        return true
+                    }
+                    if let normNewTitle, !normNewTitle.isEmpty, tNorm == normNewTitle {
+                        return true
+                    }
+                    return false
+                }
+                guard !matchingTitles.isEmpty else { continue }
+
+                var target = stats.artists[newKey] ?? WrappedArtistRecord(
+                    canonicalName: canonical,
+                    genre: resolvedGenre
+                )
+                if target.genre == nil { target.genre = resolvedGenre }
+
+                var movedSecs = 0.0
+                var movedPlays = 0
+                for oldT in matchingTitles {
+                    let secs = oldRec.tracksSeconds.removeValue(forKey: oldT) ?? 0
+                    let plays = oldRec.tracksPlayCount.removeValue(forKey: oldT) ?? 0
+                    let savedPath = oldRec.trackPaths.removeValue(forKey: oldT) ?? relativePath
+                    let destTitle = (preferredTitle?.isEmpty == false ? preferredTitle! : oldT)
+
+                    target.totalSeconds += secs
+                    target.playCount += plays
+                    target.tracksSeconds[destTitle, default: 0] += secs
+                    target.tracksPlayCount[destTitle, default: 0] += plays
+                    if let savedPath {
+                        target.trackPaths[destTitle] = savedPath
+                    }
+                    movedSecs += secs
+                    movedPlays += plays
+                }
+
+                oldRec.totalSeconds = max(0, oldRec.totalSeconds - movedSecs)
+                oldRec.playCount = max(0, oldRec.playCount - movedPlays)
+                if oldRec.tracksSeconds.isEmpty || oldRec.totalSeconds < 0.05 {
+                    stats.artists.removeValue(forKey: oldArtistKey)
+                } else {
+                    stats.artists[oldArtistKey] = oldRec
+                }
+                stats.artists[newKey] = target
+                didModify = true
+            }
+
+            for (trackKey, meta) in stats.tracksMeta {
+                let matchesPath = relativePath != nil && meta.relativePath == relativePath
+                let matchesOld = normOldTitle != nil && ArtistDatabase.normalizeLookupKey(meta.title) == normOldTitle
+                if matchesPath || matchesOld {
+                    stats.tracksMeta[trackKey]?.primaryArtist = canonical
+                    if let preferredTitle, !preferredTitle.isEmpty {
+                        stats.tracksMeta[trackKey]?.title = preferredTitle
+                    }
+                    didModify = true
+                }
+            }
+
+            db.years[year] = stats
+        }
+
+        if didModify {
+            lastUpdatedTick = .now
+            scheduleDiskSave(immediate: true)
+            refreshDecemberNotificationIfDue()
+        }
+    }
+
+    @discardableResult
+    func markAsUploaderChannel(
+        _ rawNameOrKey: String,
+        libraryItems: [MediaItem],
+        metadataByPath: [String: MediaManager.CustomTrackMetadata]
+    ) -> Int {
+        let channelKey = ArtistDatabase.normalizeLookupKey(rawNameOrKey)
+        guard !channelKey.isEmpty, channelKey != "unknown artist" else { return 0 }
+
+        var existing = db.ignoredChannelNames ?? []
+        if !existing.contains(channelKey) {
+            existing.append(channelKey)
+            db.ignoredChannelNames = existing
+        }
+
+        var reassignedCount = 0
+        let updatedIgnored = Set(existing)
+
+        for year in Array(db.years.keys) {
+            guard let stats = db.years[year],
+                  let channelRec = stats.artists[channelKey] else {
+                continue
+            }
+            for tTitle in Array(channelRec.tracksSeconds.keys) {
+                let relPath = channelRec.trackPaths[tTitle]
+                let item = relPath.flatMap { p in libraryItems.first(where: { $0.relativePath == p }) }
+                let custom = relPath.flatMap { metadataByPath[$0] }
+                let isVerified = custom?.isArtistVerified == true
+                let rawTag = isVerified ? custom?.artist : nil
+                let extracted = ArtistDatabase.extractArtists(
+                    rawArtistTag: rawTag,
+                    rawTitle: tTitle,
+                    fileName: item?.fileName,
+                    customAliases: db.customArtistAliases,
+                    ignoredChannels: updatedIgnored,
+                    isArtistVerified: isVerified
+                )
+                reattributeTrack(
+                    relativePath: relPath,
+                    oldTrackTitle: tTitle,
+                    newTrackTitle: nil,
+                    toVerifiedArtist: extracted.primaryArtist,
+                    genre: extracted.genre
+                )
+                reassignedCount += 1
+            }
+        }
+
+        lastUpdatedTick = .now
+        scheduleDiskSave(immediate: true)
+        return reassignedCount
+    }
+
+    func removeIgnoredChannel(_ key: String) {
+        let norm = ArtistDatabase.normalizeLookupKey(key)
+        guard var list = db.ignoredChannelNames else { return }
+        list.removeAll { $0 == norm }
+        db.ignoredChannelNames = list
+        lastUpdatedTick = .now
+        scheduleDiskSave(immediate: true)
+    }
+
+    func trackedStatsForTrack(relativePath: String, title: String) -> (seconds: Double, plays: Int) {
+        let normTitle = ArtistDatabase.normalizeLookupKey(title)
+        var totalSecs = 0.0
+        var totalPlays = 0
+        for yearStats in db.years.values {
+            for rec in yearStats.artists.values {
+                for (tTitle, secs) in rec.tracksSeconds {
+                    if rec.trackPaths[tTitle] == relativePath ||
+                        (!normTitle.isEmpty && ArtistDatabase.normalizeLookupKey(tTitle) == normTitle) {
+                        totalSecs += secs
+                        totalPlays += rec.tracksPlayCount[tTitle] ?? 0
+                    }
+                }
+            }
+        }
+        return (totalSecs, totalPlays)
+    }
+
+    func assessItem(
+        _ item: MediaItem,
+        metadataByPath: [String: MediaManager.CustomTrackMetadata]
+    ) -> (artist: String, genre: String?, reason: WrappedAuditReason?, isVerified: Bool) {
+        let custom = metadataByPath[item.relativePath]
+        let isVerified = custom?.isArtistVerified == true && !(custom?.artist?.isEmpty ?? true)
+        let title = custom?.title ?? item.displayTitle
+        let rawTag = custom?.artist ?? item.artist
+
+        let extracted = ArtistDatabase.extractArtists(
+            rawArtistTag: rawTag,
+            rawTitle: title,
+            fileName: item.fileName,
+            customAliases: db.customArtistAliases,
+            ignoredChannels: ignoredChannels,
+            isArtistVerified: isVerified
+        )
+
+        if isVerified {
+            return (extracted.primaryArtist, custom?.genre ?? extracted.genre, nil, true)
+        }
+        let norm = ArtistDatabase.normalizeLookupKey(extracted.primaryArtist)
+        if norm.isEmpty || norm == "unknown artist" {
+            return (extracted.primaryArtist, nil, .unknownArtist, false)
+        }
+        if ArtistDatabase.looksLikeUploaderChannel(extracted.primaryArtist, customIgnoredChannels: ignoredChannels) {
+            return (extracted.primaryArtist, nil, .suspectedChannel, false)
+        }
+        if !extracted.matchedFromCatalog {
+            return (extracted.primaryArtist, extracted.genre, .uncataloguedArtist, false)
+        }
+        return (extracted.primaryArtist, extracted.genre, nil, false)
+    }
+
+    func auditItems(
+        libraryItems: [MediaItem],
+        metadataByPath: [String: MediaManager.CustomTrackMetadata]
+    ) -> [WrappedAuditItem] {
+        var list: [WrappedAuditItem] = []
+        for item in libraryItems where !item.isVideo {
+            let assessment = assessItem(item, metadataByPath: metadataByPath)
+            guard !assessment.isVerified, let reason = assessment.reason else {
+                continue
+            }
+            let stats = trackedStatsForTrack(relativePath: item.relativePath, title: item.displayTitle)
+            list.append(
+                WrappedAuditItem(
+                    item: item,
+                    detectedArtist: assessment.artist,
+                    detectedGenre: assessment.genre,
+                    trackedSeconds: stats.seconds,
+                    trackedPlays: stats.plays,
+                    reason: reason
+                )
+            )
+        }
+        return list.sorted { lhs, rhs in
+            if lhs.trackedSeconds != rhs.trackedSeconds {
+                return lhs.trackedSeconds > rhs.trackedSeconds
+            }
+            if lhs.reason != rhs.reason {
+                let rank: (WrappedAuditReason) -> Int = {
+                    switch $0 {
+                    case .suspectedChannel: return 0
+                    case .unknownArtist: return 1
+                    case .uncataloguedArtist: return 2
+                    }
+                }
+                return rank(lhs.reason) < rank(rhs.reason)
+            }
+            return lhs.item.displayTitle.localizedCaseInsensitiveCompare(rhs.item.displayTitle) == .orderedAscending
+        }
     }
 
     // MARK: - Wrapped Reporting

@@ -143,6 +143,7 @@ struct EditTrackInfoSheet: View {
     @State private var selectedPhoto: PhotosPickerItem?
     @State private var pickedCover: UIImage?
     @State private var removeCustomCover = false
+    @State private var showVerifySheet = false
 
     init(item: MediaItem) {
         self.item = item
@@ -191,10 +192,24 @@ struct EditTrackInfoSheet: View {
                 Section("Track Info") {
                     TextField("Title", text: $titleText)
                     TextField("Artist", text: $artistText)
+
+                    Button {
+                        showVerifySheet = true
+                    } label: {
+                        Label("Auto-Verify via Lyrics & Catalog", systemImage: "checkmark.seal")
+                            .font(.subheadline.weight(.semibold))
+                    }
                 }
             }
             .navigationTitle("Edit Info")
             .navigationBarTitleDisplayMode(.inline)
+            .sheet(isPresented: $showVerifySheet) {
+                VerifyTrackArtistSheet(item: item) { confirmedArtist, confirmedTitle in
+                    artistText = confirmedArtist
+                    titleText = confirmedTitle
+                    dismiss()
+                }
+            }
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") { dismiss() }
