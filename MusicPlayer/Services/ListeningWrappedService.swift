@@ -422,7 +422,7 @@ final class ListeningWrappedService {
         let report = report(forYear: currentYear)
 
         let content = UNMutableNotificationContent()
-        content.title = "\(currentYear) MusicPlayer Wrapped Is Ready!"
+        content.title = "\(currentYear) MuSeJRM Wrapped Is Ready!"
         if let hero = report.heroTopArtist {
             let formatted = Self.formatHoursMinutes(hero.totalSeconds)
             content.body = "Your #1 artist of the year is \(hero.canonicalName) (\(formatted), \(hero.playCount) streams). Tap to reveal your Wrapped!"

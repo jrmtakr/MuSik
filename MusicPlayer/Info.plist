@@ -5,7 +5,7 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>
-	<string>Music Player</string>
+	<string>MuSeJRM</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>
@@ -55,6 +55,7 @@
 			<key>CFBundleURLSchemes</key>
 			<array>
 				<string>musicplayer</string>
+				<string>musejrm</string>
 			</array>
 		</dict>
 	</array>
@@ -63,7 +64,7 @@
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Run a local Wi-Fi transfer web server so you can upload and download media between your computer and iPhone.</string>
 	<key>NSSpeechRecognitionUsageDescription</key>
-	<string>Music Player uses Speech Recognition locally on your device to hear a short vocal clip from untagged songs and match lyrics to the real artist.</string>
+	<string>MuSeJRM uses Speech Recognition locally on your device to hear a short vocal clip from untagged songs and match lyrics to the real artist.</string>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsArbitraryLoads</key>

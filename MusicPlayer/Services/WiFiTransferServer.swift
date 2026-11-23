@@ -759,7 +759,7 @@ private final class HTTPConnectionSession {
     <head>
       <meta charset="utf-8" />
       <meta name="viewport" content="width=device-width, initial-scale=1" />
-      <title>Music Player Wi-Fi Transfer</title>
+      <title>MuSeJRM Wi-Fi Transfer</title>
       <style>
         :root { color-scheme: light dark; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
         body { margin: 0; padding: 24px; background: #0f1117; color: #f5f7fb; display: flex; justify-content: center; }
@@ -790,7 +790,7 @@ private final class HTTPConnectionSession {
     <body>
       <div class="wrap">
         <div class="card">
-          <h1>Music Player Wi-Fi Transfer</h1>
+          <h1>MuSeJRM Wi-Fi Transfer</h1>
           <p class="sub">Upload songs, videos, ZIPs, or documents directly into the selected folder on your iPhone.</p>
           <div id="dropZone" class="drop">
             <div>Drop files here or use the controls below</div>

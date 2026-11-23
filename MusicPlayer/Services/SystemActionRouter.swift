@@ -112,7 +112,8 @@ final class SystemActionRouter {
         groupService: GroupPlaylistService,
         maxDurationMinutes: Int
     ) -> Bool {
-        guard url.scheme?.lowercased() == "musicplayer" else { return false }
+        let scheme = url.scheme?.lowercased() ?? ""
+        guard scheme == "musicplayer" || scheme == "musejrm" else { return false }
         let host = url.host?.lowercased() ?? ""
         let comps = URLComponents(url: url, resolvingAgainstBaseURL: false)
         let queryValue: (String) -> String? = { key in

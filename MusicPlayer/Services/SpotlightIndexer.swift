@@ -27,7 +27,7 @@ enum SpotlightIndexer {
                 attrs.artist = artist
             }
             attrs.contentDescription = "\(item.isVideo ? "Offline Video" : "Offline Song") • \(item.formattedFileSize)"
-            var keywords = [title, item.fileExtension, "music", "offline", "music player"]
+            var keywords = [title, item.fileExtension, "music", "offline", "musejrm", "music player"]
             if !artist.isEmpty { keywords.append(artist) }
             attrs.keywords = keywords
             if let dur = item.durationSeconds, dur.isFinite, dur > 0 {
@@ -50,7 +50,7 @@ enum SpotlightIndexer {
             attrs.title = playlist.name
             let count = playlist.itemFileNames.count
             attrs.contentDescription = "Offline Playlist • \(count) \(count == 1 ? "track" : "tracks")"
-            attrs.keywords = [playlist.name, "playlist", "offline", "music player"]
+            attrs.keywords = [playlist.name, "playlist", "offline", "musejrm", "music player"]
 
             let entry = CSSearchableItem(
                 uniqueIdentifier: "mp.playlist.\(playlist.id.uuidString)",

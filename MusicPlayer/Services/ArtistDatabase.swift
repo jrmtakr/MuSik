@@ -375,7 +375,7 @@ enum ArtistDatabase {
         if low.isEmpty { return true }
         let junkSet: Set<String> = [
             "unknown", "unknown artist", "various", "various artists",
-            "music player video", "artist", "none", "n a", "na",
+            "music player video", "musejrm video", "artist", "none", "n a", "na",
             "youtube", "youtube com", "m youtube com", "youtu be",
             "music youtube com", "spotify", "spotify com", "open spotify com",
             "soundcloud", "soundcloud com", "apple com", "music apple com",

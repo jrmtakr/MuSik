@@ -57,7 +57,7 @@ struct PartyQueueSession: Identifiable, Hashable, Codable {
     }
 
     var shareMessage: String {
-        "Join my live Party Queue / Blend \"\(name)\"!\n\nCode: \(formattedCode)\nLink: \(inviteLinkString)\n\nIn Music Player: Playlists -> Party Queue -> Join Code or Link."
+        "Join my live Party Queue / Blend \"\(name)\"!\n\nCode: \(formattedCode)\nLink: \(inviteLinkString)\n\nIn MuSeJRM: Playlists -> Party Queue -> Join Code or Link."
     }
 }
 
