@@ -15,6 +15,7 @@ struct NowPlayingView: View {
     @State private var showQueueSheet = false
     @State private var showFullscreenFFmpegVideo = false
     @State private var editingInfoItem: MediaItem?
+    @State private var lyricsTarget: GeniusLyricsTarget?
     @State private var showNewPlaylistAlert = false
     @State private var newPlaylistName = ""
 
@@ -103,6 +104,18 @@ struct NowPlayingView: View {
                 }
 
                 ToolbarItemGroup(placement: .topBarTrailing) {
+                    if let item = mediaManager.currentItem {
+                        Button {
+                            lyricsTarget = GeniusLyricsTarget(
+                                rawTitle: item.displayTitle,
+                                rawArtist: item.artist ?? ""
+                            )
+                        } label: {
+                            Image(systemName: "quote.bubble")
+                        }
+                        .accessibilityLabel("Lyrics on Genius")
+                    }
+
                     Button {
                         showQueueSheet = true
                     } label: {
@@ -126,6 +139,9 @@ struct NowPlayingView: View {
             }
             .sheet(item: $editingInfoItem) { item in
                 EditTrackInfoSheet(item: item)
+            }
+            .sheet(item: $lyricsTarget) { target in
+                GeniusLyricsSheetView(target: target)
             }
             .fullScreenCover(isPresented: $showFullscreenFFmpegVideo) {
                 ZStack(alignment: .topTrailing) {
@@ -482,6 +498,20 @@ struct NowPlayingView: View {
     private func secondaryActions(item: MediaItem) -> some View {
         let isRemote = item.relativePath.hasPrefix("__remote__/")
         return VStack(spacing: 10) {
+            Button {
+                lyricsTarget = GeniusLyricsTarget(
+                    rawTitle: item.displayTitle,
+                    rawArtist: item.artist ?? ""
+                )
+            } label: {
+                Label("Lyrics on Genius", systemImage: "quote.bubble.fill")
+                    .font(.subheadline.weight(.semibold))
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 12)
+                    .background(Color.accentColor.opacity(0.16), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    .foregroundStyle(Color.accentColor)
+            }
+
             if isRemote {
                 Button {
                     mediaManager.saveCurrentRemoteStreamOffline(using: downloader)
