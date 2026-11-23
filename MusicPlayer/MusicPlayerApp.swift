@@ -1,14 +1,62 @@
+import CoreSpotlight
 import SwiftUI
+import UIKit
+
+final class AppDelegate: NSObject, UIApplicationDelegate {
+    func application(
+        _ application: UIApplication,
+        didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
+    ) -> Bool {
+        SystemActionRouter.registerHomeQuickActions()
+        return true
+    }
+
+    func application(
+        _ application: UIApplication,
+        configurationForConnecting connectingSceneSession: UISceneSession,
+        options: UIScene.ConnectionOptions
+    ) -> UISceneConfiguration {
+        if let shortcutItem = options.shortcutItem,
+           let type = HomeQuickActionType(rawValue: shortcutItem.type) {
+            Task { @MainActor in
+                SystemActionRouter.shared.pendingQuickActionType = type
+            }
+        }
+        let config = UISceneConfiguration(name: nil, sessionRole: connectingSceneSession.role)
+        config.delegateClass = QuickActionSceneDelegate.self
+        return config
+    }
+}
+
+final class QuickActionSceneDelegate: NSObject, UIWindowSceneDelegate {
+    func windowScene(
+        _ windowScene: UIWindowScene,
+        performActionFor shortcutItem: UIApplicationShortcutItem,
+        completionHandler: @escaping (Bool) -> Void
+    ) {
+        if let type = HomeQuickActionType(rawValue: shortcutItem.type) {
+            Task { @MainActor in
+                SystemActionRouter.shared.pendingQuickActionType = type
+            }
+            completionHandler(true)
+        } else {
+            completionHandler(false)
+        }
+    }
+}
 
 @main
 struct MusicPlayerApp: App {
+    @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+
     @State private var mediaManager = MediaManager.shared
     @State private var wifiServer = WiFiTransferServer()
-    @State private var sleepTimer = SleepTimerManager()
+    @State private var sleepTimer = SleepTimerManager.shared
     @State private var settings = AppSettings()
     @State private var browserStore = BrowserStore()
     @State private var downloader = WebMediaDownloader()
     @State private var groupService = GroupPlaylistService.shared
+    @State private var actionRouter = SystemActionRouter.shared
 
     @State private var showPlayerSheet = false
     @State private var quickLookTarget: QuickLookTarget?
@@ -23,8 +71,10 @@ struct MusicPlayerApp: App {
                 .environment(browserStore)
                 .environment(downloader)
                 .environment(groupService)
+                .environment(actionRouter)
                 .task {
                     LocalMediaCacheProxy.shared.start()
+                    SystemActionRouter.registerHomeQuickActions()
                     wifiServer.onFileReceived = { tempURL, fileName, folderPath in
                         mediaManager.importTemporaryFile(from: tempURL, preferredFileName: fileName, inFolder: folderPath)
                     }
@@ -33,10 +83,12 @@ struct MusicPlayerApp: App {
                     }
                 }
                 .onOpenURL { url in
-                    if url.scheme?.lowercased() == "musicplayer" && url.host?.lowercased() == "group" {
-                        Task { @MainActor in
-                            await groupService.joinGroupPlaylist(input: url.absoluteString)
-                        }
+                    if actionRouter.handleDeepLink(
+                        url,
+                        downloader: downloader,
+                        groupService: groupService,
+                        maxDurationMinutes: settings.maxCacheDurationMinutes
+                    ) {
                         return
                     }
                     switch mediaManager.importAnyFile(from: url) {
@@ -50,6 +102,16 @@ struct MusicPlayerApp: App {
                     case nil:
                         break
                     }
+                }
+                .onContinueUserActivity(CSSearchableItemActionType) { activity in
+                    var nextTab: AppTab = .playlists
+                    SpotlightIndexer.handleSpotlightActivity(
+                        activity,
+                        showPlayerSheet: &showPlayerSheet,
+                        quickLookTarget: &quickLookTarget,
+                        requestedTab: &nextTab
+                    )
+                    actionRouter.requestedTab = nextTab
                 }
         }
     }

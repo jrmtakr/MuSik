@@ -3,6 +3,7 @@ import Observation
 
 @Observable
 final class SleepTimerManager {
+    static let shared = SleepTimerManager()
     var remainingSeconds: Int = 0
     private var timerTask: Task<Void, Never>?
 

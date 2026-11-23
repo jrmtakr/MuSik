@@ -12,12 +12,16 @@ enum AppTab: Hashable {
 struct ContentView: View {
     @Environment(MediaManager.self) private var mediaManager
     @Environment(AppSettings.self) private var settings
+    @Environment(BrowserStore.self) private var browserStore
+    @Environment(WebMediaDownloader.self) private var downloader
     @Environment(GroupPlaylistService.self) private var groupService
+    @Environment(SystemActionRouter.self) private var actionRouter
     @Binding var showPlayerSheet: Bool
     @Binding var quickLookTarget: QuickLookTarget?
 
     @State private var selectedTab: AppTab = .discovery
     @State private var quickPlaylistName = ""
+    @State private var shortcutImportURLItem: ShortcutImportItem?
 
     var body: some View {
         Group {
@@ -59,10 +63,32 @@ struct ContentView: View {
                 if groupService.pendingOpenGroupID != nil {
                     selectedTab = .playlists
                 }
+                consumePendingSystemActions()
             }
             .onChange(of: groupService.pendingOpenGroupID) { _, newID in
                 if newID != nil {
                     selectedTab = .playlists
+                }
+            }
+            .onChange(of: actionRouter.requestedTab) { _, _ in
+                consumePendingSystemActions()
+            }
+            .onChange(of: actionRouter.pendingQuickActionType) { _, _ in
+                consumePendingSystemActions()
+            }
+            .onChange(of: actionRouter.pendingDownloadURLString) { _, _ in
+                consumePendingSystemActions()
+            }
+            .onChange(of: actionRouter.pendingPlaylistImportURL) { _, _ in
+                consumePendingSystemActions()
+            }
+            .onChange(of: actionRouter.pendingBrowserURLString) { _, _ in
+                consumePendingSystemActions()
+            }
+            .onChange(of: actionRouter.shouldPresentPlayerSheet) { _, shouldShow in
+                if shouldShow {
+                    actionRouter.shouldPresentPlayerSheet = false
+                    showPlayerSheet = true
                 }
             }
             .onChange(of: settings.useCustomTextColor) { _, _ in
@@ -76,6 +102,9 @@ struct ContentView: View {
             }
             .sheet(item: $quickLookTarget) { target in
                 QuickLookSheetView(target: target)
+            }
+            .sheet(item: $shortcutImportURLItem) { item in
+                ImportPlaylistSheetView(initialURL: item.urlString)
             }
             .alert(
                 "Notice",
@@ -137,4 +166,46 @@ struct ContentView: View {
             UINavigationBar.appearance().largeTitleTextAttributes = nil
         }
     }
+
+    private func consumePendingSystemActions() {
+        if let quickType = actionRouter.pendingQuickActionType {
+            actionRouter.pendingQuickActionType = nil
+            actionRouter.executeQuickAction(
+                quickType,
+                downloader: downloader,
+                maxDurationMinutes: settings.maxCacheDurationMinutes
+            )
+        }
+        if let tab = actionRouter.requestedTab {
+            actionRouter.requestedTab = nil
+            selectedTab = tab
+        }
+        if actionRouter.shouldPresentPlayerSheet {
+            actionRouter.shouldPresentPlayerSheet = false
+            showPlayerSheet = true
+        }
+        if let browserURL = actionRouter.pendingBrowserURLString {
+            actionRouter.pendingBrowserURLString = nil
+            browserStore.openInActiveTab(urlString: browserURL, title: nil)
+            selectedTab = .browser
+        }
+        if let playlistURL = actionRouter.pendingPlaylistImportURL {
+            actionRouter.pendingPlaylistImportURL = nil
+            shortcutImportURLItem = ShortcutImportItem(urlString: playlistURL)
+        }
+        if let downloadURL = actionRouter.pendingDownloadURLString {
+            actionRouter.pendingDownloadURLString = nil
+            Task {
+                await downloader.resolveAndDownload(
+                    inputURLString: downloadURL,
+                    maxDurationMinutes: settings.maxCacheDurationMinutes
+                )
+            }
+        }
+    }
+}
+
+private struct ShortcutImportItem: Identifiable {
+    let id = UUID()
+    let urlString: String
 }

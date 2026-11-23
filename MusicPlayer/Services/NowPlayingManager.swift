@@ -8,7 +8,9 @@ final class NowPlayingManager {
         onNext: @escaping () -> Void,
         onPrev: @escaping () -> Void,
         onTogglePlayPause: (() -> Void)? = nil,
-        onSeek: ((TimeInterval) -> Void)? = nil
+        onSeek: ((TimeInterval) -> Void)? = nil,
+        onLikeToggle: (() -> Void)? = nil,
+        onChangeRate: ((Float) -> Void)? = nil
     ) {
         let commandCenter = MPRemoteCommandCenter.shared()
 
@@ -64,6 +66,33 @@ final class NowPlayingManager {
         } else {
             commandCenter.changePlaybackPositionCommand.isEnabled = false
         }
+
+        commandCenter.likeCommand.removeTarget(nil)
+        if let onLikeToggle {
+            commandCenter.likeCommand.isEnabled = true
+            commandCenter.likeCommand.localizedTitle = "Favorite"
+            commandCenter.likeCommand.addTarget { _ in
+                DispatchQueue.main.async { onLikeToggle() }
+                return .success
+            }
+        } else {
+            commandCenter.likeCommand.isEnabled = false
+        }
+
+        commandCenter.changePlaybackRateCommand.removeTarget(nil)
+        if let onChangeRate {
+            commandCenter.changePlaybackRateCommand.isEnabled = true
+            commandCenter.changePlaybackRateCommand.supportedPlaybackRates = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
+            commandCenter.changePlaybackRateCommand.addTarget { event in
+                guard let rateEvent = event as? MPChangePlaybackRateCommandEvent else {
+                    return .commandFailed
+                }
+                DispatchQueue.main.async { onChangeRate(rateEvent.playbackRate) }
+                return .success
+            }
+        } else {
+            commandCenter.changePlaybackRateCommand.isEnabled = false
+        }
     }
 
     static func updateNowPlayingInfo(
@@ -73,18 +102,27 @@ final class NowPlayingManager {
         elapsed: TimeInterval,
         artworkImage: UIImage?,
         playbackRate: Double = 1.0,
-        mediaType: MPMediaType = .music
+        mediaType: MPMediaType = .music,
+        isFavorite: Bool = false,
+        queueIndex: Int? = nil,
+        queueCount: Int? = nil
     ) {
         var info: [String: Any] = [
             MPMediaItemPropertyTitle: title,
             MPMediaItemPropertyArtist: artist,
             MPMediaItemPropertyMediaType: mediaType.rawValue,
             MPNowPlayingInfoPropertyElapsedPlaybackTime: elapsed,
-            MPNowPlayingInfoPropertyPlaybackRate: playbackRate
+            MPNowPlayingInfoPropertyPlaybackRate: playbackRate,
+            MPNowPlayingInfoPropertyDefaultPlaybackRate: 1.0
         ]
 
         if duration > 0 {
             info[MPMediaItemPropertyPlaybackDuration] = duration
+        }
+
+        if let queueIndex, let queueCount, queueCount > 0 {
+            info[MPNowPlayingInfoPropertyPlaybackQueueIndex] = queueIndex
+            info[MPNowPlayingInfoPropertyPlaybackQueueCount] = queueCount
         }
 
         if let artworkImage {
@@ -92,9 +130,11 @@ final class NowPlayingManager {
         }
 
         MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+        MPRemoteCommandCenter.shared().likeCommand.isActive = isFavorite
     }
 
     static func clear() {
         MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+        MPRemoteCommandCenter.shared().likeCommand.isActive = false
     }
 }

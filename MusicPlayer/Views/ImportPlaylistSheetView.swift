@@ -14,9 +14,16 @@ struct ImportPlaylistSheetView: View {
     @Environment(WebMediaDownloader.self) private var downloader
     @Environment(\.dismiss) private var dismiss
 
+    var initialURL: String? = nil
     var onPlaylistImported: ((UUID) -> Void)? = nil
 
-    @State private var playlistURL = ""
+    @State private var playlistURL: String
+
+    init(initialURL: String? = nil, onPlaylistImported: ((UUID) -> Void)? = nil) {
+        self.initialURL = initialURL
+        self.onPlaylistImported = onPlaylistImported
+        self._playlistURL = State(initialValue: initialURL ?? "")
+    }
     @State private var customPlaylistName = ""
     @State private var loadedPlatform: ExternalPlaylistPlatform?
     @State private var tracks: [ExternalPlaylistTrack] = []

@@ -82,6 +82,7 @@ final class MediaManager {
     private var artistsByPath: [String: String] = [:]
     private var metadataLoadedPaths: Set<String> = []
     private var metadataLoadTask: Task<Void, Never>?
+    @ObservationIgnored private var spotlightIndexTask: Task<Void, Never>?
 
     init() {
         KSOptions.canBackgroundPlay = true
@@ -199,6 +200,25 @@ final class MediaManager {
         metadataLoadTask?.cancel()
         metadataLoadTask = Task {
             await loadMetadataAndThumbnails(for: loadedItems)
+            await MainActor.run {
+                self.scheduleSpotlightReindex()
+            }
+        }
+        scheduleSpotlightReindex()
+    }
+
+    private func scheduleSpotlightReindex() {
+        spotlightIndexTask?.cancel()
+        spotlightIndexTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(450))
+            guard let self, !Task.isCancelled else { return }
+            SpotlightIndexer.reindex(
+                items: self.items,
+                playlists: self.playlists,
+                otherFiles: self.otherFiles,
+                thumbnails: self.thumbnails,
+                customMetadata: self.customMetadataByPath
+            )
         }
     }
 
@@ -803,6 +823,7 @@ final class MediaManager {
     }
 
     func togglePlayPause() {
+        AppHaptics.light()
         isPlaying ? pause() : resume()
     }
 
@@ -989,6 +1010,7 @@ final class MediaManager {
     }
 
     func toggleFavorite(_ item: MediaItem) {
+        AppHaptics.selection()
         if likedPaths.contains(item.relativePath) {
             likedPaths.remove(item.relativePath)
             statusMessage = "Removed from Favorites"
@@ -997,6 +1019,9 @@ final class MediaManager {
             statusMessage = "Added to Favorites"
         }
         saveLibraryState()
+        if currentItem?.relativePath == item.relativePath {
+            updateNowPlayingInfo(for: item)
+        }
     }
 
     func addToNextPlay(_ item: MediaItem) {
@@ -1043,6 +1068,7 @@ final class MediaManager {
     }
 
     func playNext(fromQueueOnly: Bool = false) {
+        AppHaptics.light()
         if let queued = popNextQueuedItem() {
             play(queued, inPlaylist: activePlaylistID)
             return
@@ -1557,6 +1583,46 @@ final class MediaManager {
         return .playing(name: playlist.name, count: playlistItems.count)
     }
 
+    @discardableResult
+    func playSong(named query: String) -> Bool {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        let matched = items.first {
+            $0.displayTitle.compare(trimmed, options: .caseInsensitive) == .orderedSame
+        } ?? items.first {
+            $0.displayTitle.localizedCaseInsensitiveContains(trimmed) ||
+                ($0.artist?.localizedCaseInsensitiveContains(trimmed) ?? false)
+        }
+        guard let matched else { return false }
+        play(matched)
+        return true
+    }
+
+    func shuffleAllOfflineMusic() {
+        let pool = audioItems.isEmpty ? items : audioItems
+        guard let pick = pool.randomElement() else {
+            errorMessage = "No offline tracks available to shuffle."
+            return
+        }
+        isShuffleEnabled = true
+        play(pick)
+        statusMessage = "Shuffling: \(pick.displayTitle)"
+    }
+
+    func resumeOrPlayMostRecent() {
+        if currentItem != nil {
+            if !isPlaying {
+                resume()
+            }
+            return
+        }
+        if let recent = recentItems.first ?? items.first {
+            play(recent)
+        } else {
+            errorMessage = "No offline media in library yet."
+        }
+    }
+
     // MARK: - Delete, Rename, & MP4 Conversion
 
     func delete(_ item: MediaItem) {
@@ -1964,6 +2030,7 @@ final class MediaManager {
     private func savePlaylists() {
         guard let data = try? JSONEncoder().encode(playlists) else { return }
         try? data.write(to: playlistsFileURL, options: [.atomic])
+        scheduleSpotlightReindex()
     }
 
     private func loadLibraryState() {
@@ -2241,6 +2308,8 @@ final class MediaManager {
         let custom = customMetadataByPath[item.relativePath]
         let resolvedTitle = custom?.title ?? item.metadataTitle ?? titlesByPath[item.relativePath] ?? item.name
         let resolvedArtist = custom?.artist ?? item.artist ?? artistsByPath[item.relativePath] ?? (item.isVideo ? "Music Player Video" : "Unknown Artist")
+        let queue = activeQueue
+        let queueIdx = queue.firstIndex(where: { $0.relativePath == item.relativePath })
         NowPlayingManager.updateNowPlayingInfo(
             title: resolvedTitle,
             artist: resolvedArtist,
@@ -2248,7 +2317,10 @@ final class MediaManager {
             elapsed: currentTime,
             artworkImage: thumbnails[item.relativePath],
             playbackRate: isPlaying ? Double(playbackRate) : 0.0,
-            mediaType: item.isVideo ? .movie : .music
+            mediaType: item.isVideo ? .movie : .music,
+            isFavorite: isFavorite(item),
+            queueIndex: queueIdx,
+            queueCount: queue.isEmpty ? nil : queue.count
         )
     }
 
@@ -2280,7 +2352,14 @@ final class MediaManager {
             onNext: { [weak self] in self?.playNext() },
             onPrev: { [weak self] in self?.playPrevious() },
             onTogglePlayPause: { [weak self] in self?.togglePlayPause() },
-            onSeek: { [weak self] time in self?.seek(to: time) }
+            onSeek: { [weak self] time in self?.seek(to: time) },
+            onLikeToggle: { [weak self] in
+                guard let self, let item = self.currentItem, !item.relativePath.hasPrefix("__remote__/") else { return }
+                self.toggleFavorite(item)
+            },
+            onChangeRate: { [weak self] rate in
+                self?.setPlaybackRate(rate)
+            }
         )
     }
 
