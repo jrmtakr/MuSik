@@ -99,6 +99,7 @@ struct MusicPlayerApp: App {
     @State private var wrappedService = ListeningWrappedService.shared
     @State private var trendingService = TrendingArtistsService.shared
     @State private var actionRouter = SystemActionRouter.shared
+    @State private var syncedLyricsService = SyncedLyricsService.shared
 
     @State private var showPlayerSheet = false
     @State private var quickLookTarget: QuickLookTarget?
@@ -119,6 +120,7 @@ struct MusicPlayerApp: App {
                 .environment(wrappedService)
                 .environment(trendingService)
                 .environment(actionRouter)
+                .environment(syncedLyricsService)
                 .task {
                     LocalMediaCacheProxy.shared.start()
                     SystemActionRouter.registerHomeQuickActions()

@@ -309,6 +309,7 @@ struct AppThemeContainerModifier: ViewModifier {
 struct MiniPlayerInsetModifier: ViewModifier {
     @Environment(MediaManager.self) private var mediaManager
     @Binding var showPlayerSheet: Bool
+    @State private var showQueueSheet = false
 
     func body(content: Content) -> some View {
         content
@@ -326,10 +327,14 @@ struct MiniPlayerInsetModifier: ViewModifier {
                             .transition(.move(edge: .bottom).combined(with: .opacity))
                     }
 
-                    MiniPlayerBar {
-                        showPlayerSheet = true
-                    }
+                    MiniPlayerBar(
+                        onExpand: { showPlayerSheet = true },
+                        onQueueTap: { showQueueSheet = true }
+                    )
                 }
+            }
+            .sheet(isPresented: $showQueueSheet) {
+                UserQueueSheetView()
             }
     }
 }

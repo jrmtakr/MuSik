@@ -128,13 +128,13 @@ struct MediaRowView: View {
                 Button {
                     mediaManager.addToNextPlay(item)
                 } label: {
-                    Label("Add to Next Play", systemImage: "text.line.first.and.arrowtriangle.forward")
+                    Label("Play Next", systemImage: "text.line.first.and.arrowtriangle.forward")
                 }
 
                 Button {
                     mediaManager.addToQueue(item)
                 } label: {
-                    Label("Add to Up Next", systemImage: "text.append")
+                    Label("Add to Queue", systemImage: "text.append")
                 }
 
                 Button {

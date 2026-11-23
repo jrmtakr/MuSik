@@ -954,6 +954,26 @@ struct PlaylistDetailView: View {
                                             .padding(.vertical, 10)
                                     }
                                     .buttonStyle(.bordered)
+
+                                    Menu {
+                                        Button {
+                                            mediaManager.addMultipleToQueue(tracks, playNext: true)
+                                        } label: {
+                                            Label("Play Next", systemImage: "text.line.first.and.arrowtriangle.forward")
+                                        }
+                                        Button {
+                                            mediaManager.addMultipleToQueue(tracks, playNext: false)
+                                        } label: {
+                                            Label("Add to Queue", systemImage: "text.append")
+                                        }
+                                    } label: {
+                                        Image(systemName: "text.badge.plus")
+                                            .font(.subheadline.weight(.semibold))
+                                            .padding(.horizontal, 12)
+                                            .padding(.vertical, 11)
+                                    }
+                                    .buttonStyle(.bordered)
+                                    .accessibilityLabel("Queue Playlist")
                                 }
                                 .listRowSeparator(.hidden)
                             }

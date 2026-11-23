@@ -818,6 +818,20 @@ struct LibraryView: View {
             )
         }
         .swipeActions(edge: .leading, allowsFullSwipe: false) {
+            Button {
+                mediaManager.addToQueue(item)
+            } label: {
+                Label("Queue", systemImage: "text.append")
+            }
+            .tint(.blue)
+
+            Button {
+                mediaManager.addToNextPlay(item)
+            } label: {
+                Label("Next", systemImage: "text.line.first.and.arrowtriangle.forward")
+            }
+            .tint(.teal)
+
             if !item.isHLS {
                 Button {
                     Task {
@@ -989,6 +1003,31 @@ struct LibraryView: View {
                     .font(.subheadline.weight(.medium))
             }
             .disabled(totalSelected == 0)
+
+            Menu {
+                Button {
+                    let selected = mediaManager.items.filter { selectedMediaPaths.contains($0.relativePath) }
+                    mediaManager.addMultipleToQueue(selected, playNext: true)
+                    selectedMediaPaths.removeAll()
+                    selectedOtherPaths.removeAll()
+                    isSelecting = false
+                } label: {
+                    Label("Play Next", systemImage: "text.line.first.and.arrowtriangle.forward")
+                }
+                Button {
+                    let selected = mediaManager.items.filter { selectedMediaPaths.contains($0.relativePath) }
+                    mediaManager.addMultipleToQueue(selected, playNext: false)
+                    selectedMediaPaths.removeAll()
+                    selectedOtherPaths.removeAll()
+                    isSelecting = false
+                } label: {
+                    Label("Add to Queue", systemImage: "text.append")
+                }
+            } label: {
+                Label("Queue", systemImage: "list.bullet")
+                    .font(.subheadline.weight(.medium))
+            }
+            .disabled(selectedMediaPaths.isEmpty)
 
             Button {
                 showBatchPlaylistSheet = true

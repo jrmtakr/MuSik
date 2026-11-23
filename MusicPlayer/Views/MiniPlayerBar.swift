@@ -4,6 +4,7 @@ struct MiniPlayerBar: View {
     @Environment(MediaManager.self) private var mediaManager
     @Environment(SleepTimerManager.self) private var sleepTimer
     let onExpand: () -> Void
+    var onQueueTap: (() -> Void)? = nil
 
     private var progress: Double {
         guard mediaManager.duration > 0 else { return 0 }
@@ -62,7 +63,7 @@ struct MiniPlayerBar: View {
                     } label: {
                         Image(systemName: mediaManager.isPlaying ? "pause.fill" : "play.fill")
                             .font(.title3)
-                            .frame(width: 38, height: 38)
+                            .frame(width: 34, height: 38)
                             .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
@@ -72,10 +73,35 @@ struct MiniPlayerBar: View {
                     } label: {
                         Image(systemName: "forward.fill")
                             .font(.body)
-                            .frame(width: 34, height: 38)
+                            .frame(width: 30, height: 38)
                             .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
+
+                    if let onQueueTap {
+                        Button {
+                            onQueueTap()
+                        } label: {
+                            ZStack(alignment: .topTrailing) {
+                                Image(systemName: "list.bullet")
+                                    .font(.body)
+                                    .foregroundStyle(mediaManager.upNextPaths.isEmpty ? Color.primary : Color.accentColor)
+                                    .frame(width: 32, height: 38)
+                                if !mediaManager.upNextPaths.isEmpty {
+                                    Text("\(min(mediaManager.upNextPaths.count, 99))")
+                                        .font(.system(size: 9, weight: .bold))
+                                        .foregroundStyle(.white)
+                                        .padding(.horizontal, 4)
+                                        .padding(.vertical, 1)
+                                        .background(Color.accentColor, in: Capsule())
+                                        .offset(x: 4, y: 2)
+                                }
+                            }
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Playing Next Queue")
+                    }
                 }
                 .padding(.horizontal, 12)
                 .padding(.vertical, 10)
@@ -91,6 +117,61 @@ struct MiniPlayerBar: View {
             .padding(.bottom, 8)
             .contentShape(Rectangle())
             .onTapGesture(perform: onExpand)
+        } else if !mediaManager.upNextItems.isEmpty, let onQueueTap {
+            let queued = mediaManager.upNextItems
+            HStack(spacing: 12) {
+                Image(systemName: "list.bullet.rectangle.fill")
+                    .font(.title3)
+                    .foregroundStyle(Color.accentColor)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("\(queued.count) \(queued.count == 1 ? "Song" : "Songs") in Queue")
+                        .font(.subheadline.weight(.semibold))
+                    if let first = queued.first {
+                        Text("Next: \(first.displayTitle)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                }
+
+                Spacer()
+
+                Button {
+                    mediaManager.playQueuedItem(at: 0)
+                    if mediaManager.currentItem?.isVideo == true {
+                        onExpand()
+                    }
+                } label: {
+                    Image(systemName: "play.fill")
+                        .font(.body)
+                        .padding(8)
+                        .background(Color.accentColor, in: Circle())
+                        .foregroundStyle(.white)
+                }
+                .buttonStyle(.plain)
+
+                Button {
+                    onQueueTap()
+                } label: {
+                    Text("Queue")
+                        .font(.caption.weight(.semibold))
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .background(.ultraThinMaterial)
+            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
+            )
+            .shadow(color: .black.opacity(0.14), radius: 12, y: 4)
+            .padding(.horizontal, 12)
+            .padding(.bottom, 8)
+            .onTapGesture(perform: onQueueTap)
         }
     }
 }

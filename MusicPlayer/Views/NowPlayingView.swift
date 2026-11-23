@@ -1,18 +1,28 @@
 import AVKit
 import SwiftUI
 
+private enum NowPlayingDisplayMode {
+    case player
+    case lyrics
+    case queue
+}
+
 struct NowPlayingView: View {
     @Environment(MediaManager.self) private var mediaManager
     @Environment(SleepTimerManager.self) private var sleepTimer
     @Environment(WebMediaDownloader.self) private var downloader
+    @Environment(SyncedLyricsService.self) private var lyricsService
     @Environment(\.dismiss) private var dismiss
 
+    @State private var displayMode: NowPlayingDisplayMode = .player
     @State private var scrubPosition: Double = 0
     @State private var isEditingScrubber = false
     @State private var showCustomSleepAlert = false
     @State private var customSleepMinutes = ""
     @State private var showEqualizerSheet = false
     @State private var showQueueSheet = false
+    @State private var showAddToQueuePicker = false
+    @State private var isEditingQueueOrder = false
     @State private var showFullscreenFFmpegVideo = false
     @State private var editingInfoItem: MediaItem?
     @State private var verifyArtistItem: MediaItem?
@@ -27,42 +37,41 @@ struct NowPlayingView: View {
         NavigationStack {
             Group {
                 if let item = mediaManager.currentItem {
-                    ScrollView {
-                        VStack(spacing: 24) {
-                            if item.isVideo {
-                                videoPlayerSection
-                            } else {
-                                audioArtworkSection(item: item)
+                    if displayMode == .player {
+                        ScrollView {
+                            VStack(spacing: 24) {
+                                if item.isVideo {
+                                    videoPlayerSection
+                                } else {
+                                    audioArtworkSection(item: item)
+                                }
+
+                                titleAndMetadata(item: item)
+
+                                if sleepTimer.isActive {
+                                    activeSleepTimerBadge
+                                }
+
+                                if mediaManager.convertingItemID == item.id {
+                                    conversionBanner
+                                }
+
+                                if !item.isVideo || mediaManager.isUsingFFmpegBackend {
+                                    scrubberSection
+                                }
+
+                                transportControls(item: item)
+
+                                appleMusicBottomDock(item: item, darkGlass: false)
+
+                                secondaryActions(item: item)
                             }
-
-                            titleAndMetadata(item: item)
-
-                            if sleepTimer.isActive {
-                                activeSleepTimerBadge
-                            }
-
-                            if mediaManager.convertingItemID == item.id {
-                                conversionBanner
-                            }
-
-                            if !item.isVideo || mediaManager.isUsingFFmpegBackend {
-                                scrubberSection
-                            }
-
-                            transportControls(item: item)
-
-                            secondaryActions(item: item)
+                            .padding(.horizontal, 20)
+                            .padding(.vertical, 16)
                         }
-                        .padding(.horizontal, 20)
-                        .padding(.vertical, 16)
-                    }
-                    .onChange(of: mediaManager.currentTime) { _, newTime in
-                        if !isEditingScrubber {
-                            scrubPosition = newTime
-                        }
-                    }
-                    .onAppear {
-                        scrubPosition = mediaManager.currentTime
+                        .applyAppTheme()
+                    } else {
+                        appleMusicFocusedModeView(item: item)
                     }
                 } else {
                     ContentUnavailableView(
@@ -70,10 +79,27 @@ struct NowPlayingView: View {
                         systemImage: "play.slash",
                         description: Text("Select an audio or video file from your library.")
                     )
+                    .applyAppTheme()
                 }
             }
-            .applyAppTheme()
+            .onChange(of: mediaManager.currentTime) { _, newTime in
+                if !isEditingScrubber {
+                    scrubPosition = newTime
+                }
+            }
+            .onChange(of: mediaManager.currentItem?.relativePath) { _, _ in
+                if let current = mediaManager.currentItem {
+                    lyricsService.loadLyricsIfNeeded(for: current)
+                }
+            }
+            .onAppear {
+                scrubPosition = mediaManager.currentTime
+                if let current = mediaManager.currentItem {
+                    lyricsService.loadLyricsIfNeeded(for: current)
+                }
+            }
             .navigationBarTitleDisplayMode(.inline)
+            .toolbar(displayMode == .player ? .visible : .hidden, for: .navigationBar)
             .alert("New Playlist", isPresented: $showNewPlaylistAlert) {
                 TextField("Playlist name", text: $newPlaylistName)
                 Button("Cancel", role: .cancel) {
@@ -107,22 +133,27 @@ struct NowPlayingView: View {
                 ToolbarItemGroup(placement: .topBarTrailing) {
                     if let item = mediaManager.currentItem {
                         Button {
-                            lyricsTarget = GeniusLyricsTarget(
-                                rawTitle: item.displayTitle,
-                                rawArtist: item.artist ?? ""
-                            )
+                            AppHaptics.selection()
+                            lyricsService.loadLyricsIfNeeded(for: item)
+                            withAnimation(.spring(response: 0.42, dampingFraction: 0.86)) {
+                                displayMode = .lyrics
+                            }
                         } label: {
-                            Image(systemName: "quote.bubble")
+                            Image(systemName: displayMode == .lyrics ? "quote.bubble.fill" : "quote.bubble")
                         }
-                        .accessibilityLabel("Lyrics on Genius")
+                        .accessibilityLabel("Synced Lyrics")
                     }
 
                     Button {
-                        showQueueSheet = true
+                        AppHaptics.selection()
+                        withAnimation(.spring(response: 0.42, dampingFraction: 0.86)) {
+                            displayMode = .queue
+                        }
                     } label: {
                         Image(systemName: "list.bullet")
                             .foregroundStyle(mediaManager.upNextItems.isEmpty ? .primary : Color.accentColor)
                     }
+                    .accessibilityLabel("Playing Next Queue")
 
                     sleepTimerMenu
 
@@ -136,7 +167,10 @@ struct NowPlayingView: View {
                 EqualizerView()
             }
             .sheet(isPresented: $showQueueSheet) {
-                UpNextQueueSheet()
+                UserQueueSheetView()
+            }
+            .sheet(isPresented: $showAddToQueuePicker) {
+                QueueSongPickerSheet()
             }
             .sheet(item: $editingInfoItem) { item in
                 EditTrackInfoSheet(item: item)
@@ -519,18 +553,31 @@ struct NowPlayingView: View {
     private func secondaryActions(item: MediaItem) -> some View {
         let isRemote = item.relativePath.hasPrefix("__remote__/")
         return VStack(spacing: 10) {
-            Button {
-                lyricsTarget = GeniusLyricsTarget(
-                    rawTitle: item.displayTitle,
-                    rawArtist: item.artist ?? ""
-                )
-            } label: {
-                Label("Lyrics on Genius", systemImage: "quote.bubble.fill")
-                    .font(.subheadline.weight(.semibold))
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 12)
-                    .background(Color.accentColor.opacity(0.16), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-                    .foregroundStyle(Color.accentColor)
+            HStack(spacing: 10) {
+                Button {
+                    AppHaptics.selection()
+                    lyricsService.loadLyricsIfNeeded(for: item)
+                    withAnimation(.spring(response: 0.42, dampingFraction: 0.86)) {
+                        displayMode = .lyrics
+                    }
+                } label: {
+                    Label("Apple-Style Lyrics", systemImage: "quote.bubble.fill")
+                        .font(.subheadline.weight(.semibold))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 12)
+                        .background(Color.accentColor.opacity(0.16), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                        .foregroundStyle(Color.accentColor)
+                }
+
+                Button {
+                    showAddToQueuePicker = true
+                } label: {
+                    Label("Add to Queue", systemImage: "text.badge.plus")
+                        .font(.subheadline.weight(.semibold))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 12)
+                        .background(Color.secondary.opacity(0.14), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                }
             }
 
             if isRemote {
@@ -673,81 +720,277 @@ struct NowPlayingView: View {
         .foregroundStyle(.primary)
         .padding(.top, 4)
     }
-}
 
-private struct UpNextQueueSheet: View {
-    @Environment(MediaManager.self) private var mediaManager
-    @Environment(\.dismiss) private var dismiss
+    // MARK: - 1:1 Apple Music Focused Lyrics & Playing Next Surface
 
-    var body: some View {
-        NavigationStack {
-            Group {
-                if mediaManager.upNextItems.isEmpty {
-                    ContentUnavailableView(
-                        "Up Next is Empty",
-                        systemImage: "list.bullet",
-                        description: Text("Use \"Add to Next Play\" or \"Add to Up Next\" from any track menu to queue songs.")
+    @ViewBuilder
+    private func appleMusicFocusedModeView(item: MediaItem) -> some View {
+        ZStack {
+            AppleMusicLivingBackground(
+                artwork: mediaManager.thumbnails[item.relativePath],
+                artworkKey: item.relativePath,
+                isPlaying: mediaManager.isPlaying
+            )
+
+            VStack(spacing: 0) {
+                compactAppleMusicHeader(item: item)
+                    .padding(.horizontal, 20)
+                    .padding(.top, 10)
+                    .padding(.bottom, 8)
+
+                if displayMode == .lyrics {
+                    AppleMusicLyricsView(
+                        item: item,
+                        onOpenGeniusWeb: { t, a in
+                            lyricsTarget = GeniusLyricsTarget(rawTitle: t, rawArtist: a)
+                        }
                     )
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else {
-                    List {
-                        ForEach(Array(mediaManager.upNextItems.enumerated()), id: \.offset) { idx, item in
-                            Button {
-                                mediaManager.removeFromUpNext(at: IndexSet(integer: idx))
-                                mediaManager.play(item, inPlaylist: mediaManager.activePlaylistID)
-                            } label: {
-                                HStack(spacing: 12) {
-                                    MediaArtworkView(
-                                        item: item,
-                                        image: mediaManager.thumbnails[item.relativePath],
-                                        cornerRadius: 8,
-                                        iconSize: 16
-                                    )
-                                    .frame(width: 44, height: 44)
+                    UserQueueContentView(
+                        isEmbeddedDarkGlass: true,
+                        onAddSongs: { showAddToQueuePicker = true }
+                    )
+                    .environment(\.editMode, .constant(isEditingQueueOrder ? .active : .inactive))
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
 
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text(item.displayTitle)
-                                            .font(.body.weight(.medium))
-                                            .foregroundStyle(.primary)
-                                            .lineLimit(1)
-                                        Text(item.artist ?? item.fileExtension.uppercased())
-                                            .font(.caption)
-                                            .foregroundStyle(.secondary)
-                                            .lineLimit(1)
-                                    }
-                                    Spacer()
-                                }
-                            }
-                            .buttonStyle(.plain)
+                compactAppleMusicFooter(item: item)
+                    .padding(.horizontal, 22)
+                    .padding(.top, 8)
+                    .padding(.bottom, 16)
+            }
+        }
+        .preferredColorScheme(.dark)
+    }
+
+    private func compactAppleMusicHeader(item: MediaItem) -> some View {
+        HStack(spacing: 12) {
+            Button {
+                withAnimation(.spring(response: 0.4, dampingFraction: 0.86)) {
+                    displayMode = .player
+                }
+            } label: {
+                MediaArtworkView(
+                    item: item,
+                    image: mediaManager.thumbnails[item.relativePath],
+                    cornerRadius: 10,
+                    iconSize: 20
+                )
+                .frame(width: 50, height: 50)
+                .shadow(color: .black.opacity(0.35), radius: 8, y: 3)
+            }
+            .buttonStyle(.plain)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(item.displayTitle)
+                    .font(.headline.weight(.bold))
+                    .foregroundStyle(.white)
+                    .lineLimit(1)
+                Text(item.artist ?? "Unknown Artist")
+                    .font(.subheadline)
+                    .foregroundStyle(.white.opacity(0.72))
+                    .lineLimit(1)
+            }
+
+            Spacer()
+
+            Button {
+                mediaManager.toggleFavorite(item)
+            } label: {
+                Image(systemName: mediaManager.isFavorite(item) ? "heart.circle.fill" : "heart.circle")
+                    .font(.title2)
+                    .foregroundStyle(mediaManager.isFavorite(item) ? .pink : .white.opacity(0.75))
+            }
+            .buttonStyle(.plain)
+
+            if displayMode == .queue {
+                Button {
+                    isEditingQueueOrder.toggle()
+                } label: {
+                    Text(isEditingQueueOrder ? "Done" : "Edit")
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(.white.opacity(0.16), in: Capsule())
+                }
+                .buttonStyle(.plain)
+            } else {
+                Menu {
+                    Button {
+                        lyricsService.loadLyricsIfNeeded(for: item, forceReload: true)
+                    } label: {
+                        Label("Reload Synced Lyrics", systemImage: "arrow.clockwise")
+                    }
+
+                    if lyricsService.currentLyrics?.isTimeSynced == true {
+                        Button {
+                            lyricsService.adjustTimingOffset(by: -0.25)
+                        } label: {
+                            Label("Timing -0.25s (Earlier)", systemImage: "minus.circle")
                         }
-                        .onDelete { offsets in
-                            mediaManager.removeFromUpNext(at: offsets)
+                        Button {
+                            lyricsService.adjustTimingOffset(by: 0.25)
+                        } label: {
+                            Label("Timing +0.25s (Later)", systemImage: "plus.circle")
                         }
-                        .onMove { source, destination in
-                            mediaManager.moveUpNext(from: source, to: destination)
+                        Button {
+                            lyricsService.resetTimingOffset()
+                        } label: {
+                            Label("Reset Timing Offset", systemImage: "clock.arrow.circlepath")
                         }
                     }
-                    .listStyle(.plain)
+
+                    Divider()
+
+                    Button {
+                        lyricsTarget = GeniusLyricsTarget(
+                            rawTitle: item.displayTitle,
+                            rawArtist: item.artist ?? ""
+                        )
+                    } label: {
+                        Label("Open on Genius Web", systemImage: "safari")
+                    }
+
+                    Button {
+                        withAnimation(.spring(response: 0.4, dampingFraction: 0.86)) {
+                            displayMode = .player
+                        }
+                    } label: {
+                        Label("Back to Artwork", systemImage: "photo")
+                    }
+                } label: {
+                    Image(systemName: "ellipsis.circle.fill")
+                        .font(.title2)
+                        .foregroundStyle(.white.opacity(0.78))
                 }
             }
-            .navigationTitle("Up Next")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    if !mediaManager.upNextItems.isEmpty {
-                        EditButton()
+
+            Button {
+                dismiss()
+            } label: {
+                Image(systemName: "chevron.down.circle.fill")
+                    .font(.title2)
+                    .foregroundStyle(.white.opacity(0.65))
+            }
+            .buttonStyle(.plain)
+        }
+    }
+
+    private func compactAppleMusicFooter(item: MediaItem) -> some View {
+        let total = max(mediaManager.duration, 1)
+        let displayedTime = isEditingScrubber ? scrubPosition : mediaManager.currentTime
+        let remaining = max(mediaManager.duration - displayedTime, 0)
+
+        return VStack(spacing: 14) {
+            VStack(spacing: 4) {
+                Slider(
+                    value: $scrubPosition,
+                    in: 0...total
+                ) { editing in
+                    isEditingScrubber = editing
+                    if editing {
+                        mediaManager.beginScrubbing()
+                    } else {
+                        mediaManager.endScrubbing(at: scrubPosition)
                     }
                 }
-                ToolbarItemGroup(placement: .topBarTrailing) {
-                    if !mediaManager.upNextItems.isEmpty {
-                        Button("Clear", role: .destructive) {
-                            mediaManager.clearUpNext()
-                        }
-                    }
-                    Button("Done") {
-                        dismiss()
-                    }
+                .tint(.white)
+
+                HStack {
+                    Text(MediaTimeFormatter.format(displayedTime))
+                    Spacer()
+                    Text("-\(MediaTimeFormatter.format(remaining))")
+                }
+                .font(.caption2.monospacedDigit().weight(.medium))
+                .foregroundStyle(.white.opacity(0.65))
+            }
+
+            HStack(spacing: 42) {
+                Button {
+                    mediaManager.playPrevious()
+                } label: {
+                    Image(systemName: "backward.fill")
+                        .font(.title2)
+                }
+
+                Button {
+                    mediaManager.togglePlayPause()
+                } label: {
+                    Image(systemName: mediaManager.isPlaying ? "pause.circle.fill" : "play.circle.fill")
+                        .font(.system(size: 56))
+                }
+
+                Button {
+                    mediaManager.playNext()
+                } label: {
+                    Image(systemName: "forward.fill")
+                        .font(.title2)
                 }
             }
+            .foregroundStyle(.white)
+
+            appleMusicBottomDock(item: item, darkGlass: true)
+        }
+    }
+
+    private func appleMusicBottomDock(item: MediaItem, darkGlass: Bool) -> some View {
+        HStack {
+            Button {
+                AppHaptics.selection()
+                lyricsService.loadLyricsIfNeeded(for: item)
+                withAnimation(.spring(response: 0.42, dampingFraction: 0.86)) {
+                    displayMode = (displayMode == .lyrics) ? .player : .lyrics
+                }
+            } label: {
+                let active = displayMode == .lyrics
+                Image(systemName: active ? "quote.bubble.fill" : "quote.bubble")
+                    .font(.title3.weight(.semibold))
+                    .foregroundStyle(active ? (darkGlass ? Color.black : Color.white) : (darkGlass ? Color.white.opacity(0.8) : Color.primary))
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 8)
+                    .background(
+                        Capsule()
+                            .fill(active ? (darkGlass ? Color.white : Color.accentColor) : (darkGlass ? Color.white.opacity(0.12) : Color.secondary.opacity(0.14)))
+                    )
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Synced Lyrics")
+
+            Spacer()
+
+            AirPlayRoutePickerView(prioritizesVideoDevices: item.isVideo)
+                .frame(width: 32, height: 32)
+
+            Spacer()
+
+            Button {
+                AppHaptics.selection()
+                withAnimation(.spring(response: 0.42, dampingFraction: 0.86)) {
+                    displayMode = (displayMode == .queue) ? .player : .queue
+                }
+            } label: {
+                let active = displayMode == .queue
+                HStack(spacing: 5) {
+                    Image(systemName: "list.bullet")
+                        .font(.title3.weight(.semibold))
+                    if !mediaManager.upNextPaths.isEmpty {
+                        Text("\(mediaManager.upNextPaths.count)")
+                            .font(.caption.weight(.bold))
+                            .monospacedDigit()
+                    }
+                }
+                .foregroundStyle(active ? (darkGlass ? Color.black : Color.white) : (darkGlass ? Color.white.opacity(0.8) : Color.primary))
+                .padding(.horizontal, 16)
+                .padding(.vertical, 8)
+                .background(
+                    Capsule()
+                        .fill(active ? (darkGlass ? Color.white : Color.accentColor) : (darkGlass ? Color.white.opacity(0.12) : Color.secondary.opacity(0.14)))
+                )
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Playing Next Queue")
         }
     }
 }

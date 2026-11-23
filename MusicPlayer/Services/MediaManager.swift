@@ -1045,17 +1045,74 @@ final class MediaManager {
         }
     }
 
+    var upcomingContextTitle: String {
+        if let activePlaylistID,
+           let playlist = playlists.first(where: { $0.id == activePlaylistID }) {
+            return playlist.name
+        }
+        return "Library"
+    }
+
+    var continuePlayingItems: [MediaItem] {
+        let queue = activeQueue
+        guard !queue.isEmpty else { return [] }
+        if isShuffleEnabled {
+            return queue.filter { $0.id != currentItem?.id }
+        }
+        guard let currentItem,
+              let index = queue.firstIndex(where: { $0.id == currentItem.id }) else {
+            return queue
+        }
+        let nextIndex = index + 1
+        guard nextIndex < queue.count else {
+            return repeatMode == .all ? Array(queue[..<index]) : []
+        }
+        return Array(queue[nextIndex...])
+    }
+
     func addToNextPlay(_ item: MediaItem) {
         upNextPaths.removeAll { $0 == item.relativePath }
         upNextPaths.insert(item.relativePath, at: 0)
         saveLibraryState()
-        statusMessage = "Added to Next Play"
+        statusMessage = "Playing Next: \(item.displayTitle)"
     }
 
     func addToQueue(_ item: MediaItem) {
         upNextPaths.append(item.relativePath)
         saveLibraryState()
-        statusMessage = "Added to Up Next"
+        statusMessage = "Added to Queue: \(item.displayTitle)"
+    }
+
+    func addMultipleToQueue(_ newItems: [MediaItem], playNext: Bool = false) {
+        let paths = newItems.map(\.relativePath).filter { !$0.isEmpty }
+        guard !paths.isEmpty else { return }
+        if playNext {
+            let set = Set(paths)
+            upNextPaths.removeAll { set.contains($0) }
+            upNextPaths.insert(contentsOf: paths, at: 0)
+            statusMessage = "Added \(paths.count) \(paths.count == 1 ? "song" : "songs") to Play Next"
+        } else {
+            upNextPaths.append(contentsOf: paths)
+            statusMessage = "Added \(paths.count) \(paths.count == 1 ? "song" : "songs") to Queue"
+        }
+        saveLibraryState()
+    }
+
+    func playQueuedItem(at queueIndex: Int) {
+        let currentUpNext = upNextItems
+        guard currentUpNext.indices.contains(queueIndex) else { return }
+        let selected = currentUpNext[queueIndex]
+        let remainingPaths = Array(currentUpNext.dropFirst(queueIndex + 1)).map(\.relativePath)
+        upNextPaths = remainingPaths
+        saveLibraryState()
+        play(selected, inPlaylist: activePlaylistID)
+    }
+
+    func moveQueuedItemToTop(at queueIndex: Int) {
+        guard upNextPaths.indices.contains(queueIndex), queueIndex > 0 else { return }
+        let path = upNextPaths.remove(at: queueIndex)
+        upNextPaths.insert(path, at: 0)
+        saveLibraryState()
     }
 
     func removeFromUpNext(at offsets: IndexSet) {
