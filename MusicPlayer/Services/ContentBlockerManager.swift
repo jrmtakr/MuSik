@@ -94,6 +94,7 @@ final class ContentBlockerManager {
         }
     }
 
+    @MainActor
     private func loadOrCompileRuleList() async -> WKContentRuleList? {
         if let cachedRuleList {
             return cachedRuleList

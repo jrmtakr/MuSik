@@ -7,19 +7,19 @@ import Observation
 final class WebMediaDownloader {
     private(set) var activeDownloads: [BrowserDownloadItem] = []
 
-    private var taskToDownloadID: [Int: UUID] = [:]
-    private var downloadMeta: [UUID: DownloadMeta] = [:]
-    private var activeURLTasks: [UUID: URLSessionTask] = [:]
+    @ObservationIgnored private var taskToDownloadID: [Int: UUID] = [:]
+    @ObservationIgnored private var downloadMeta: [UUID: DownloadMeta] = [:]
+    @ObservationIgnored private var activeURLTasks: [UUID: URLSessionTask] = [:]
 
-    private lazy var delegateProxy = DownloadDelegateProxy(owner: self)
+    @ObservationIgnored private lazy var delegateProxy = DownloadDelegateProxy(owner: self)
 
-    private lazy var directSession: URLSession = {
+    @ObservationIgnored private lazy var directSession: URLSession = {
         let config = URLSessionConfiguration.default
         config.waitsForConnectivity = true
         return URLSession(configuration: config, delegate: delegateProxy, delegateQueue: nil)
     }()
 
-    private lazy var hlsSession: AVAssetDownloadURLSession = {
+    @ObservationIgnored private lazy var hlsSession: AVAssetDownloadURLSession = {
         let config = URLSessionConfiguration.background(withIdentifier: "com.personal.musicplayer.hls.bg")
         return AVAssetDownloadURLSession(configuration: config, assetDownloadDelegate: delegateProxy, delegateQueue: nil)
     }()
@@ -43,7 +43,7 @@ final class WebMediaDownloader {
 
         var seen = Set<String>()
         for (idx, variant) in variants.enumerated() {
-            let bitrate = variant.peakBitrate ?? variant.averageBitrate ?? 0
+            let bitrate = variant.peakBitRate ?? variant.averageBitRate ?? 0
             let size = variant.videoAttributes?.presentationSize ?? .zero
             let width = Int(size.width)
             let height = Int(size.height)

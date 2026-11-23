@@ -743,6 +743,7 @@ final class MediaManager {
 
     // MARK: - Folders & Moving
 
+    @discardableResult
     func createFolder(named rawName: String, inParentFolder parentPath: String = "") -> LocalFolder? {
         let sanitized = sanitizeName(rawName)
         guard !sanitized.isEmpty else {
