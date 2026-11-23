@@ -57,6 +57,7 @@ struct MusicPlayerApp: App {
     @State private var downloader = WebMediaDownloader()
     @State private var groupService = GroupPlaylistService.shared
     @State private var partyService = PartyQueueService.shared
+    @State private var timeMachine = PlaylistTimeMachineService.shared
     @State private var actionRouter = SystemActionRouter.shared
 
     @State private var showPlayerSheet = false
@@ -73,6 +74,7 @@ struct MusicPlayerApp: App {
                 .environment(downloader)
                 .environment(groupService)
                 .environment(partyService)
+                .environment(timeMachine)
                 .environment(actionRouter)
                 .task {
                     LocalMediaCacheProxy.shared.start()

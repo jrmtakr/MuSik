@@ -95,6 +95,11 @@ final class MediaManager {
         loadPlaylistCovers()
         loadLibraryState()
         loadLocalFiles()
+        PlaylistTimeMachineService.shared.ensureBaselinesIfNeeded(
+            for: playlists,
+            items: items,
+            metadataByPath: customMetadataByPath
+        )
     }
 
     deinit {
@@ -1217,12 +1222,24 @@ final class MediaManager {
         if let explicitPlaylistID,
            let idx = playlists.firstIndex(where: { $0.id == explicitPlaylistID }) {
             if !playlistContains(refreshedItem, in: playlists[idx]) {
+                PlaylistTimeMachineService.shared.ensurePreChangeCaptured(
+                    for: playlists[idx],
+                    items: items,
+                    metadataByPath: customMetadataByPath
+                )
                 if appendOrder {
                     playlists[idx].itemFileNames.append(refreshedItem.relativePath)
                 } else {
                     playlists[idx].itemFileNames.insert(refreshedItem.relativePath, at: 0)
                 }
                 savePlaylists()
+                PlaylistTimeMachineService.shared.recordSnapshot(
+                    for: playlists[idx],
+                    items: items,
+                    metadataByPath: customMetadataByPath,
+                    trigger: .imported,
+                    summary: "Downloaded \"\(refreshedItem.displayTitle)\""
+                )
             }
             statusMessage = "Saved to \(playlists[idx].name): \(refreshedItem.displayTitle)"
             return refreshedItem
@@ -1234,8 +1251,20 @@ final class MediaManager {
            let configuredID = AppSettings.storedTargetDownloadPlaylistID,
            let idx = playlists.firstIndex(where: { $0.id == configuredID }) {
             if !playlistContains(refreshedItem, in: playlists[idx]) {
+                PlaylistTimeMachineService.shared.ensurePreChangeCaptured(
+                    for: playlists[idx],
+                    items: items,
+                    metadataByPath: customMetadataByPath
+                )
                 playlists[idx].itemFileNames.insert(refreshedItem.relativePath, at: 0)
                 savePlaylists()
+                PlaylistTimeMachineService.shared.recordSnapshot(
+                    for: playlists[idx],
+                    items: items,
+                    metadataByPath: customMetadataByPath,
+                    trigger: .imported,
+                    summary: "Downloaded \"\(refreshedItem.displayTitle)\""
+                )
             }
             statusMessage = "Saved to Files & \(playlists[idx].name): \(refreshedItem.displayTitle)"
         } else {
@@ -1418,11 +1447,28 @@ final class MediaManager {
         let playlist = Playlist(id: UUID(), name: trimmed, itemFileNames: uniqueInitial)
         playlists.insert(playlist, at: 0)
         savePlaylists()
+        PlaylistTimeMachineService.shared.recordSnapshot(
+            for: playlist,
+            items: items,
+            metadataByPath: customMetadataByPath,
+            trigger: .baseline,
+            summary: "Created playlist (\(playlist.itemFileNames.count) \(playlist.itemFileNames.count == 1 ? "track" : "tracks"))"
+        )
         statusMessage = "Created playlist \"\(trimmed)\""
         return playlist
     }
 
     func deletePlaylist(_ playlist: Playlist) {
+        let livePlaylist = playlists.first(where: { $0.id == playlist.id }) ?? playlist
+        let liveCount = items(in: livePlaylist).count
+        PlaylistTimeMachineService.shared.recordSnapshot(
+            for: livePlaylist,
+            items: items,
+            metadataByPath: customMetadataByPath,
+            trigger: .beforeDelete,
+            summary: "Before deleting \"\(livePlaylist.name)\" (\(liveCount) \(liveCount == 1 ? "track" : "tracks"))",
+            isPinned: true
+        )
         if activePlaylistID == playlist.id {
             activePlaylistID = nil
         }
@@ -1498,8 +1544,20 @@ final class MediaManager {
             return
         }
         guard let index = playlists.firstIndex(where: { $0.id == playlist.id }) else { return }
+        PlaylistTimeMachineService.shared.ensurePreChangeCaptured(
+            for: playlists[index],
+            items: items,
+            metadataByPath: customMetadataByPath
+        )
         playlists[index].name = trimmed
         savePlaylists()
+        PlaylistTimeMachineService.shared.recordSnapshot(
+            for: playlists[index],
+            items: items,
+            metadataByPath: customMetadataByPath,
+            trigger: .renamed,
+            summary: "Renamed to \"\(trimmed)\""
+        )
         statusMessage = "Renamed playlist to \"\(trimmed)\""
     }
 
@@ -1511,8 +1569,20 @@ final class MediaManager {
     func add(_ item: MediaItem, to playlist: Playlist) {
         guard let index = playlists.firstIndex(where: { $0.id == playlist.id }) else { return }
         if !playlistContains(item, in: playlists[index]) {
+            PlaylistTimeMachineService.shared.ensurePreChangeCaptured(
+                for: playlists[index],
+                items: items,
+                metadataByPath: customMetadataByPath
+            )
             playlists[index].itemFileNames.append(item.relativePath)
             savePlaylists()
+            PlaylistTimeMachineService.shared.recordSnapshot(
+                for: playlists[index],
+                items: items,
+                metadataByPath: customMetadataByPath,
+                trigger: .tracksAdded,
+                summary: "Added \"\(item.displayTitle)\""
+            )
             statusMessage = "Added to \"\(playlist.name)\""
         } else {
             statusMessage = "Already in \"\(playlist.name)\""
@@ -1522,10 +1592,25 @@ final class MediaManager {
     func remove(_ item: MediaItem, from playlist: Playlist) {
         guard let index = playlists.firstIndex(where: { $0.id == playlist.id }) else { return }
         let duplicateNames = duplicateLibraryFileNames()
+        guard playlists[index].itemFileNames.contains(where: { playlistKeyMatches($0, item: item, duplicateNames: duplicateNames) }) else {
+            return
+        }
+        PlaylistTimeMachineService.shared.ensurePreChangeCaptured(
+            for: playlists[index],
+            items: items,
+            metadataByPath: customMetadataByPath
+        )
         let before = playlists[index].itemFileNames.count
         playlists[index].itemFileNames.removeAll { playlistKeyMatches($0, item: item, duplicateNames: duplicateNames) }
         if playlists[index].itemFileNames.count != before {
             savePlaylists()
+            PlaylistTimeMachineService.shared.recordSnapshot(
+                for: playlists[index],
+                items: items,
+                metadataByPath: customMetadataByPath,
+                trigger: .tracksRemoved,
+                summary: "Removed \"\(item.displayTitle)\""
+            )
             statusMessage = "Removed from \"\(playlist.name)\""
         }
     }
@@ -1535,18 +1620,311 @@ final class MediaManager {
         let resolved = items(in: playlists[index])
         let duplicateNames = duplicateLibraryFileNames()
         let victims = offsets.compactMap { resolved.indices.contains($0) ? resolved[$0] : nil }
+        guard !victims.isEmpty else { return }
+        PlaylistTimeMachineService.shared.ensurePreChangeCaptured(
+            for: playlists[index],
+            items: items,
+            metadataByPath: customMetadataByPath
+        )
         playlists[index].itemFileNames.removeAll { key in
             victims.contains { playlistKeyMatches(key, item: $0, duplicateNames: duplicateNames) }
         }
         savePlaylists()
+        let victimSummary = victims.count == 1 ? "\"\(victims[0].displayTitle)\"" : "\(victims.count) tracks"
+        PlaylistTimeMachineService.shared.recordSnapshot(
+            for: playlists[index],
+            items: items,
+            metadataByPath: customMetadataByPath,
+            trigger: .tracksRemoved,
+            summary: "Removed \(victimSummary)"
+        )
     }
 
     func moveItems(from source: IndexSet, to destination: Int, in playlist: Playlist) {
         guard let index = playlists.firstIndex(where: { $0.id == playlist.id }) else { return }
+        PlaylistTimeMachineService.shared.ensurePreChangeCaptured(
+            for: playlists[index],
+            items: items,
+            metadataByPath: customMetadataByPath
+        )
         var resolvedPaths = items(in: playlists[index]).map(\.relativePath)
         resolvedPaths.move(fromOffsets: source, toOffset: destination)
         playlists[index].itemFileNames = resolvedPaths
         savePlaylists()
+        PlaylistTimeMachineService.shared.recordSnapshot(
+            for: playlists[index],
+            items: items,
+            metadataByPath: customMetadataByPath,
+            trigger: .reordered,
+            summary: "Reordered \(resolvedPaths.count) tracks"
+        )
+    }
+
+    // MARK: - Playlist Time-Machine Restore
+
+    @discardableResult
+    func restoreDeletedSongs(
+        tracksToRestore: [(track: PlaylistSnapshotTrack, item: MediaItem)],
+        snapshotTracks: [PlaylistSnapshotTrack],
+        into playlistID: UUID,
+        summary: String? = nil
+    ) -> Int {
+        guard let index = playlists.firstIndex(where: { $0.id == playlistID }) else { return 0 }
+        let newAdditions = tracksToRestore.filter { !playlistContains($0.item, in: playlists[index]) }
+        guard !newAdditions.isEmpty else {
+            statusMessage = "All selected tracks are already in \"\(playlists[index].name)\""
+            return 0
+        }
+
+        let backupLabel = "Before restoring \(newAdditions.count) \(newAdditions.count == 1 ? "song" : "songs")"
+        PlaylistTimeMachineService.shared.recordSnapshot(
+            for: playlists[index],
+            items: items,
+            metadataByPath: customMetadataByPath,
+            trigger: .beforeRestore,
+            summary: backupLabel
+        )
+
+        var paths = playlists[index].itemFileNames
+        var addedCount = 0
+        for (snapTrack, item) in newAdditions {
+            if paths.contains(item.relativePath) { continue }
+            insertPathPreservingOrder(
+                item.relativePath,
+                snapshotKey: snapTrack.key,
+                snapshotTracks: snapshotTracks,
+                into: &paths
+            )
+            addedCount += 1
+        }
+
+        playlists[index].itemFileNames = paths
+        savePlaylists()
+
+        let finalSummary = summary ?? "Restored \(addedCount) \(addedCount == 1 ? "song" : "songs") from Time-Machine"
+        PlaylistTimeMachineService.shared.recordSnapshot(
+            for: playlists[index],
+            items: items,
+            metadataByPath: customMetadataByPath,
+            trigger: .restored,
+            summary: finalSummary
+        )
+        statusMessage = "Restored \(addedCount) \(addedCount == 1 ? "song" : "songs") to \"\(playlists[index].name)\""
+        return addedCount
+    }
+
+    @discardableResult
+    func restoreSingleTrackFromTimeMachine(
+        _ item: MediaItem,
+        snapshotTrack: PlaylistSnapshotTrack?,
+        snapshotTracks: [PlaylistSnapshotTrack],
+        into playlistID: UUID,
+        summary: String? = nil
+    ) -> Bool {
+        let track = snapshotTrack ?? PlaylistSnapshotTrack(
+            key: item.relativePath,
+            fileName: item.fileName,
+            displayTitle: item.displayTitle,
+            artist: item.artist,
+            durationSeconds: item.durationSeconds,
+            sourceVideoID: customMetadataByPath[item.relativePath]?.sourceVideoID,
+            isVideo: item.isVideo
+        )
+        return restoreDeletedSongs(
+            tracksToRestore: [(track, item)],
+            snapshotTracks: snapshotTracks,
+            into: playlistID,
+            summary: summary ?? "Restored \"\(item.displayTitle)\""
+        ) > 0
+    }
+
+    @discardableResult
+    func revertPlaylist(
+        _ playlistID: UUID,
+        to snapshot: PlaylistSnapshot,
+        includeName: Bool = true
+    ) -> (restoredCount: Int, missingCount: Int) {
+        guard let index = playlists.firstIndex(where: { $0.id == playlistID }) else {
+            return (0, snapshot.tracks.count)
+        }
+        let stamp = PlaylistTimeMachineService.shortDateFormatter.string(from: snapshot.createdAt)
+        PlaylistTimeMachineService.shared.recordSnapshot(
+            for: playlists[index],
+            items: items,
+            metadataByPath: customMetadataByPath,
+            trigger: .beforeRestore,
+            summary: "Before reverting to \(stamp)"
+        )
+
+        var resolvedPaths: [String] = []
+        var seen = Set<String>()
+        var missingCount = 0
+        for track in snapshot.tracks {
+            if let matched = PlaylistTimeMachineService.shared.resolveLibraryItem(
+                for: track,
+                in: items,
+                metadataByPath: customMetadataByPath
+            ) {
+                if seen.insert(matched.relativePath).inserted {
+                    resolvedPaths.append(matched.relativePath)
+                }
+            } else {
+                missingCount += 1
+            }
+        }
+
+        playlists[index].itemFileNames = resolvedPaths
+        if includeName, !snapshot.playlistName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            playlists[index].name = snapshot.playlistName
+        }
+        savePlaylists()
+
+        PlaylistTimeMachineService.shared.recordSnapshot(
+            for: playlists[index],
+            items: items,
+            metadataByPath: customMetadataByPath,
+            trigger: .restored,
+            summary: "Reverted to \(stamp) (\(resolvedPaths.count) tracks)"
+        )
+
+        if missingCount > 0 {
+            statusMessage = "Reverted \"\(playlists[index].name)\" (\(resolvedPaths.count) tracks; \(missingCount) files missing from Library)"
+        } else {
+            statusMessage = "Reverted \"\(playlists[index].name)\" to \(stamp) (\(resolvedPaths.count) tracks)"
+        }
+        return (resolvedPaths.count, missingCount)
+    }
+
+    @discardableResult
+    func restoreSnapshotAsCopy(
+        _ snapshot: PlaylistSnapshot,
+        customName: String? = nil
+    ) -> (playlist: Playlist, missingCount: Int) {
+        var resolvedPaths: [String] = []
+        var seen = Set<String>()
+        var missingCount = 0
+        for track in snapshot.tracks {
+            if let matched = PlaylistTimeMachineService.shared.resolveLibraryItem(
+                for: track,
+                in: items,
+                metadataByPath: customMetadataByPath
+            ) {
+                if seen.insert(matched.relativePath).inserted {
+                    resolvedPaths.append(matched.relativePath)
+                }
+            } else {
+                missingCount += 1
+            }
+        }
+
+        let stamp = PlaylistTimeMachineService.shortDateFormatter.string(from: snapshot.createdAt)
+        let trimmedCustom = customName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let targetName = trimmedCustom.isEmpty ? "\(snapshot.playlistName) (\(stamp))" : trimmedCustom
+        let created = Playlist(id: UUID(), name: targetName, itemFileNames: resolvedPaths, dateCreated: .now)
+        playlists.insert(created, at: 0)
+        savePlaylists()
+        PlaylistTimeMachineService.shared.recordSnapshot(
+            for: created,
+            items: items,
+            metadataByPath: customMetadataByPath,
+            trigger: .restored,
+            summary: "Created from snapshot (\(resolvedPaths.count) tracks)"
+        )
+        statusMessage = "Created copy \"\(targetName)\" (\(resolvedPaths.count) tracks)"
+        return (created, missingCount)
+    }
+
+    @discardableResult
+    func restoreDeletedPlaylist(from snapshot: PlaylistSnapshot) -> (playlist: Playlist, missingCount: Int) {
+        if playlists.contains(where: { $0.id == snapshot.playlistID }) {
+            return restoreSnapshotAsCopy(snapshot, customName: "\(snapshot.playlistName) (Recovered)")
+        }
+
+        var resolvedPaths: [String] = []
+        var seen = Set<String>()
+        var missingCount = 0
+        for track in snapshot.tracks {
+            if let matched = PlaylistTimeMachineService.shared.resolveLibraryItem(
+                for: track,
+                in: items,
+                metadataByPath: customMetadataByPath
+            ) {
+                if seen.insert(matched.relativePath).inserted {
+                    resolvedPaths.append(matched.relativePath)
+                }
+            } else {
+                missingCount += 1
+            }
+        }
+
+        let restored = Playlist(
+            id: snapshot.playlistID,
+            name: snapshot.playlistName,
+            itemFileNames: resolvedPaths,
+            dateCreated: .now
+        )
+        playlists.insert(restored, at: 0)
+        savePlaylists()
+        PlaylistTimeMachineService.shared.recordSnapshot(
+            for: restored,
+            items: items,
+            metadataByPath: customMetadataByPath,
+            trigger: .restored,
+            summary: "Recovered deleted playlist (\(resolvedPaths.count) tracks)"
+        )
+        statusMessage = missingCount > 0
+            ? "Recovered \"\(restored.name)\" (\(resolvedPaths.count) tracks; \(missingCount) files missing)"
+            : "Recovered deleted playlist \"\(restored.name)\" (\(resolvedPaths.count) tracks)"
+        return (restored, missingCount)
+    }
+
+    private func insertPathPreservingOrder(
+        _ newPath: String,
+        snapshotKey: String?,
+        snapshotTracks: [PlaylistSnapshotTrack],
+        into currentPaths: inout [String]
+    ) {
+        guard let snapshotKey,
+              !snapshotTracks.isEmpty,
+              let snapIdx = snapshotTracks.firstIndex(where: { $0.key == snapshotKey }) else {
+            currentPaths.append(newPath)
+            return
+        }
+
+        let duplicateNames = duplicateLibraryFileNames()
+        func currentIndex(for snapTrack: PlaylistSnapshotTrack) -> Int? {
+            if let direct = currentPaths.firstIndex(of: snapTrack.key) {
+                return direct
+            }
+            if let matched = PlaylistTimeMachineService.shared.resolveLibraryItem(
+                for: snapTrack,
+                in: items,
+                metadataByPath: customMetadataByPath
+            ) {
+                return currentPaths.firstIndex { playlistKeyMatches($0, item: matched, duplicateNames: duplicateNames) }
+            }
+            return nil
+        }
+
+        if snapIdx > 0 {
+            for prevIdx in stride(from: snapIdx - 1, through: 0, by: -1) {
+                if let currIdx = currentIndex(for: snapshotTracks[prevIdx]) {
+                    currentPaths.insert(newPath, at: min(currIdx + 1, currentPaths.count))
+                    return
+                }
+            }
+        }
+
+        if snapIdx + 1 < snapshotTracks.count {
+            for nextIdx in (snapIdx + 1)..<snapshotTracks.count {
+                if let currIdx = currentIndex(for: snapshotTracks[nextIdx]) {
+                    currentPaths.insert(newPath, at: currIdx)
+                    return
+                }
+            }
+        }
+
+        currentPaths.append(newPath)
     }
 
     func playPlaylist(_ playlist: Playlist, startingAt startItem: MediaItem? = nil) {
@@ -2106,6 +2484,7 @@ final class MediaManager {
             }
         }
         if playlistsChanged { savePlaylists() }
+        PlaylistTimeMachineService.shared.updatePathReferences(from: oldPath, to: newPath)
         saveLibraryState()
     }
 
@@ -2139,15 +2518,32 @@ final class MediaManager {
         recentPaths.removeAll(where: predicate)
         upNextPaths.removeAll(where: predicate)
 
-        var playlistsChanged = false
+        var affectedPlaylistIDs: [UUID] = []
         for idx in playlists.indices {
-            let before = playlists[idx].itemFileNames.count
-            playlists[idx].itemFileNames.removeAll(where: predicate)
-            if playlists[idx].itemFileNames.count != before {
-                playlistsChanged = true
+            if playlists[idx].itemFileNames.contains(where: predicate) {
+                PlaylistTimeMachineService.shared.ensurePreChangeCaptured(
+                    for: playlists[idx],
+                    items: items,
+                    metadataByPath: customMetadataByPath
+                )
+                playlists[idx].itemFileNames.removeAll(where: predicate)
+                affectedPlaylistIDs.append(playlists[idx].id)
             }
         }
-        if playlistsChanged { savePlaylists() }
+        if !affectedPlaylistIDs.isEmpty {
+            savePlaylists()
+            for pid in affectedPlaylistIDs {
+                if let live = playlists.first(where: { $0.id == pid }) {
+                    PlaylistTimeMachineService.shared.recordSnapshot(
+                        for: live,
+                        items: items,
+                        metadataByPath: customMetadataByPath,
+                        trigger: .tracksRemoved,
+                        summary: "Library file deleted"
+                    )
+                }
+            }
+        }
         saveLibraryState()
     }
 

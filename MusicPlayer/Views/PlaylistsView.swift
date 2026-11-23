@@ -44,6 +44,7 @@ struct PlaylistsView: View {
     @Environment(AppSettings.self) private var settings
     @Environment(GroupPlaylistService.self) private var groupService
     @Environment(PartyQueueService.self) private var partyService
+    @Environment(PlaylistTimeMachineService.self) private var timeMachine
     @Binding var showPlayerSheet: Bool
     @Binding var quickLookTarget: QuickLookTarget?
 
@@ -57,6 +58,8 @@ struct PlaylistsView: View {
     @State private var showCreatePartySheet = false
     @State private var showJoinPartySheet = false
     @State private var selectedPartyID: UUID?
+    @State private var showTimeMachineSheet = false
+    @State private var timeMachineTargetPlaylistID: UUID?
     @State private var newPlaylistName = ""
     @State private var createdPlaylistID: UUID?
     @State private var playlistToRename: Playlist?
@@ -362,7 +365,14 @@ struct PlaylistsView: View {
                     }
                 }
 
-                ToolbarItem(placement: .topBarTrailing) {
+                ToolbarItemGroup(placement: .topBarTrailing) {
+                    Button {
+                        timeMachineTargetPlaylistID = nil
+                        showTimeMachineSheet = true
+                    } label: {
+                        Image(systemName: "clock.arrow.circlepath")
+                    }
+
                     Menu {
                         Button {
                             newPlaylistName = ""
@@ -375,6 +385,13 @@ struct PlaylistsView: View {
                             showImportURLSheet = true
                         } label: {
                             Label("Import Playlist URL (Spotify / Apple / YT)", systemImage: "link.badge.plus")
+                        }
+
+                        Button {
+                            timeMachineTargetPlaylistID = nil
+                            showTimeMachineSheet = true
+                        } label: {
+                            Label("Playlist Time-Machine / Snapshots", systemImage: "clock.arrow.circlepath")
                         }
 
                         Divider()
@@ -411,143 +428,42 @@ struct PlaylistsView: View {
                 }
             }
             .miniPlayerInset(showPlayerSheet: $showPlayerSheet)
-            .navigationDestination(item: $createdPlaylistID) { pid in
-                PlaylistDetailView(
-                    playlistID: pid,
+            .modifier(
+                PlaylistsRoutingModifier(
                     showPlayerSheet: $showPlayerSheet,
-                    quickLookTarget: $quickLookTarget
+                    quickLookTarget: $quickLookTarget,
+                    createdPlaylistID: $createdPlaylistID,
+                    selectedGroupID: $selectedGroupID,
+                    selectedPartyID: $selectedPartyID,
+                    showTimeMachineSheet: $showTimeMachineSheet,
+                    timeMachineTargetPlaylistID: $timeMachineTargetPlaylistID,
+                    showCoverPicker: $showCoverPicker,
+                    coverTargetPlaylist: $coverTargetPlaylist,
+                    selectedCoverPhoto: $selectedCoverPhoto
                 )
-            }
-            .navigationDestination(item: $selectedGroupID) { gid in
-                GroupPlaylistDetailView(
-                    groupID: gid,
-                    showPlayerSheet: $showPlayerSheet
-                )
-            }
-            .navigationDestination(item: $selectedPartyID) { pid in
-                PartyQueueDetailView(
-                    partyID: pid,
-                    showPlayerSheet: $showPlayerSheet
-                )
-            }
-            .onAppear {
-                if let pending = groupService.pendingOpenGroupID {
-                    groupService.pendingOpenGroupID = nil
-                    selectedGroupID = pending
-                }
-                if let pendingParty = partyService.pendingOpenPartyID {
-                    partyService.pendingOpenPartyID = nil
-                    selectedPartyID = pendingParty
-                }
-            }
-            .onChange(of: groupService.pendingOpenGroupID) { _, pending in
-                if let pending {
-                    groupService.pendingOpenGroupID = nil
-                    selectedGroupID = pending
-                }
-            }
-            .onChange(of: partyService.pendingOpenPartyID) { _, pendingParty in
-                if let pendingParty {
-                    partyService.pendingOpenPartyID = nil
-                    selectedPartyID = pendingParty
-                }
-            }
-            .photosPicker(isPresented: $showCoverPicker, selection: $selectedCoverPhoto, matching: .images)
-            .onChange(of: selectedCoverPhoto) { _, picked in
-                guard let picked, let target = coverTargetPlaylist else {
-                    coverTargetPlaylist = nil
-                    return
-                }
-                selectedCoverPhoto = nil
-                Task {
-                    let data = try? await picked.loadTransferable(type: Data.self)
-                    let image = data.flatMap { UIImage(data: $0) }
-                    await MainActor.run {
-                        if let image {
-                            mediaManager.updatePlaylistCover(for: target, image: image)
-                        }
-                        coverTargetPlaylist = nil
-                    }
-                }
-            }
-            .sheet(item: $searchEditingInfoItem) { item in
-                EditTrackInfoSheet(item: item)
-            }
-            .sheet(isPresented: $showImportURLSheet) {
-                ImportPlaylistSheetView { importedID in
-                    createdPlaylistID = importedID
-                }
-            }
-            .sheet(isPresented: $showCreateGroupSheet) {
-                CreateGroupPlaylistSheet { newGroupID in
-                    selectedGroupID = newGroupID
-                }
-            }
-            .sheet(isPresented: $showJoinGroupSheet) {
-                JoinGroupPlaylistSheet { joinedID in
-                    selectedGroupID = joinedID
-                }
-            }
-            .sheet(isPresented: $showCreatePartySheet) {
-                CreatePartyQueueSheet { newPartyID in
-                    selectedPartyID = newPartyID
-                }
-            }
-            .sheet(isPresented: $showJoinPartySheet) {
-                JoinPartyQueueSheet { joinedPartyID in
-                    selectedPartyID = joinedPartyID
-                }
-            }
-            .alert("New Playlist", isPresented: $showCreateAlert) {
-                TextField("Playlist name", text: $newPlaylistName)
-                Button("Cancel", role: .cancel) {
-                    newPlaylistName = ""
-                }
-                Button("Create") {
-                    if let created = mediaManager.createPlaylist(name: newPlaylistName) {
-                        createdPlaylistID = created.id
-                    }
-                    newPlaylistName = ""
-                }
-            } message: {
-                Text("Enter a name for your offline playlist.")
-            }
-            .alert(
-                "Rename Playlist",
-                isPresented: Binding(
-                    get: { playlistToRename != nil },
-                    set: { if !$0 { playlistToRename = nil } }
-                )
-            ) {
-                TextField("Playlist name", text: $renameText)
-                Button("Cancel", role: .cancel) {
-                    playlistToRename = nil
-                }
-                Button("Save") {
-                    if let playlistToRename {
-                        mediaManager.renamePlaylist(playlistToRename, to: renameText)
-                    }
-                    playlistToRename = nil
-                }
-            }
-        }
-        .alert(
-            "Rename Media",
-            isPresented: Binding(
-                get: { searchItemToRename != nil },
-                set: { if !$0 { searchItemToRename = nil } }
             )
-        ) {
-            TextField("New name", text: $searchRenameText)
-            Button("Cancel", role: .cancel) {
-                searchItemToRename = nil
-            }
-            Button("Save") {
-                if let item = searchItemToRename {
-                    mediaManager.rename(item, to: searchRenameText)
-                }
-                searchItemToRename = nil
-            }
+            .modifier(
+                PlaylistsSheetsAndAlertsModifier(
+                    showPlayerSheet: $showPlayerSheet,
+                    searchEditingInfoItem: $searchEditingInfoItem,
+                    showImportURLSheet: $showImportURLSheet,
+                    showCreateGroupSheet: $showCreateGroupSheet,
+                    showJoinGroupSheet: $showJoinGroupSheet,
+                    showCreatePartySheet: $showCreatePartySheet,
+                    showJoinPartySheet: $showJoinPartySheet,
+                    showTimeMachineSheet: $showTimeMachineSheet,
+                    timeMachineTargetPlaylistID: $timeMachineTargetPlaylistID,
+                    createdPlaylistID: $createdPlaylistID,
+                    selectedGroupID: $selectedGroupID,
+                    selectedPartyID: $selectedPartyID,
+                    showCreateAlert: $showCreateAlert,
+                    newPlaylistName: $newPlaylistName,
+                    playlistToRename: $playlistToRename,
+                    renameText: $renameText,
+                    searchItemToRename: $searchItemToRename,
+                    searchRenameText: $searchRenameText
+                )
+            )
         }
     }
 
@@ -647,6 +563,24 @@ struct PlaylistsView: View {
                 } label: {
                     Label("Reset Cover", systemImage: "arrow.uturn.backward")
                 }
+            }
+
+            Button {
+                timeMachineTargetPlaylistID = playlist.id
+                showTimeMachineSheet = true
+            } label: {
+                Label("Time-Machine / History", systemImage: "clock.arrow.circlepath")
+            }
+
+            Button {
+                let created = timeMachine.createManualSnapshot(
+                    for: playlist,
+                    items: mediaManager.items,
+                    metadataByPath: mediaManager.customMetadataByPath
+                )
+                mediaManager.statusMessage = "Saved snapshot \"\(created.label)\""
+            } label: {
+                Label("Save Snapshot Now", systemImage: "bookmark.fill")
             }
 
             Button {
@@ -809,11 +743,13 @@ private struct SmartPlaylistDetailView: View {
 
 struct PlaylistDetailView: View {
     @Environment(MediaManager.self) private var mediaManager
+    @Environment(PlaylistTimeMachineService.self) private var timeMachine
     let playlistID: UUID
     @Binding var showPlayerSheet: Bool
     @Binding var quickLookTarget: QuickLookTarget?
 
     @State private var showAddTracksSheet = false
+    @State private var showTimeMachineSheet = false
     @State private var itemToRename: MediaItem?
     @State private var editingInfoItem: MediaItem?
     @State private var renameText = ""
@@ -828,6 +764,7 @@ struct PlaylistDetailView: View {
         Group {
             if let playlist {
                 let tracks = mediaManager.items(in: playlist)
+                let hasNonEmptySnapshots = timeMachine.snapshots(for: playlist.id).contains { !$0.tracks.isEmpty }
                 Group {
                     if tracks.isEmpty {
                         ContentUnavailableView {
@@ -841,6 +778,15 @@ struct PlaylistDetailView: View {
                                 Label("Add Media", systemImage: "plus")
                             }
                             .buttonStyle(.borderedProminent)
+
+                            if hasNonEmptySnapshots {
+                                Button {
+                                    showTimeMachineSheet = true
+                                } label: {
+                                    Label("Restore from Time-Machine", systemImage: "clock.arrow.circlepath")
+                                }
+                                .buttonStyle(.bordered)
+                            }
                         }
                     } else {
                         List {
@@ -925,6 +871,11 @@ struct PlaylistDetailView: View {
                 .toolbar {
                     ToolbarItemGroup(placement: .topBarTrailing) {
                         Button {
+                            showTimeMachineSheet = true
+                        } label: {
+                            Image(systemName: "clock.arrow.circlepath")
+                        }
+                        Button {
                             showCoverPicker = true
                         } label: {
                             Image(systemName: "photo")
@@ -977,8 +928,33 @@ struct PlaylistDetailView: View {
                     }
                 }
             } else {
-                ContentUnavailableView("Playlist Deleted", systemImage: "trash")
+                let recoverable = timeMachine.snapshots(for: playlistID).first(where: { !$0.tracks.isEmpty })
+                    ?? timeMachine.latestSnapshot(for: playlistID)
+                ContentUnavailableView {
+                    Label("Playlist Deleted", systemImage: "trash")
+                } description: {
+                    Text(
+                        recoverable != nil
+                            ? "You can recover this playlist from its saved Time-Machine snapshot."
+                            : "This playlist is no longer in your library."
+                    )
+                } actions: {
+                    if let recoverable {
+                        Button {
+                            _ = mediaManager.restoreDeletedPlaylist(from: recoverable)
+                        } label: {
+                            Label("Recover Deleted Playlist", systemImage: "clock.arrow.circlepath")
+                        }
+                        .buttonStyle(.borderedProminent)
+                    }
+                }
             }
+        }
+        .sheet(isPresented: $showTimeMachineSheet) {
+            PlaylistTimeMachineSheet(
+                initialPlaylistID: playlistID,
+                showPlayerSheet: $showPlayerSheet
+            )
         }
         .miniPlayerInset(showPlayerSheet: $showPlayerSheet)
     }
@@ -1085,5 +1061,211 @@ private struct AddToPlaylistSheet: View {
                 }
             }
         }
+    }
+}
+
+private struct PlaylistsRoutingModifier: ViewModifier {
+    @Environment(MediaManager.self) private var mediaManager
+    @Environment(GroupPlaylistService.self) private var groupService
+    @Environment(PartyQueueService.self) private var partyService
+    @Environment(PlaylistTimeMachineService.self) private var timeMachine
+
+    @Binding var showPlayerSheet: Bool
+    @Binding var quickLookTarget: QuickLookTarget?
+    @Binding var createdPlaylistID: UUID?
+    @Binding var selectedGroupID: UUID?
+    @Binding var selectedPartyID: UUID?
+    @Binding var showTimeMachineSheet: Bool
+    @Binding var timeMachineTargetPlaylistID: UUID?
+    @Binding var showCoverPicker: Bool
+    @Binding var coverTargetPlaylist: Playlist?
+    @Binding var selectedCoverPhoto: PhotosPickerItem?
+
+    func body(content: Content) -> some View {
+        content
+            .navigationDestination(item: $createdPlaylistID) { pid in
+                PlaylistDetailView(
+                    playlistID: pid,
+                    showPlayerSheet: $showPlayerSheet,
+                    quickLookTarget: $quickLookTarget
+                )
+            }
+            .navigationDestination(item: $selectedGroupID) { gid in
+                GroupPlaylistDetailView(
+                    groupID: gid,
+                    showPlayerSheet: $showPlayerSheet
+                )
+            }
+            .navigationDestination(item: $selectedPartyID) { pid in
+                PartyQueueDetailView(
+                    partyID: pid,
+                    showPlayerSheet: $showPlayerSheet
+                )
+            }
+            .onAppear {
+                if let pending = groupService.pendingOpenGroupID {
+                    groupService.pendingOpenGroupID = nil
+                    selectedGroupID = pending
+                }
+                if let pendingParty = partyService.pendingOpenPartyID {
+                    partyService.pendingOpenPartyID = nil
+                    selectedPartyID = pendingParty
+                }
+                if timeMachine.pendingOpenGlobalSheet {
+                    timeMachine.pendingOpenGlobalSheet = false
+                    timeMachineTargetPlaylistID = nil
+                    showTimeMachineSheet = true
+                }
+            }
+            .onChange(of: groupService.pendingOpenGroupID) { _, pending in
+                if let pending {
+                    groupService.pendingOpenGroupID = nil
+                    selectedGroupID = pending
+                }
+            }
+            .onChange(of: partyService.pendingOpenPartyID) { _, pendingParty in
+                if let pendingParty {
+                    partyService.pendingOpenPartyID = nil
+                    selectedPartyID = pendingParty
+                }
+            }
+            .onChange(of: timeMachine.pendingOpenGlobalSheet) { _, openSheet in
+                if openSheet {
+                    timeMachine.pendingOpenGlobalSheet = false
+                    timeMachineTargetPlaylistID = nil
+                    showTimeMachineSheet = true
+                }
+            }
+            .photosPicker(isPresented: $showCoverPicker, selection: $selectedCoverPhoto, matching: .images)
+            .onChange(of: selectedCoverPhoto) { _, picked in
+                guard let picked, let target = coverTargetPlaylist else {
+                    coverTargetPlaylist = nil
+                    return
+                }
+                selectedCoverPhoto = nil
+                Task {
+                    let data = try? await picked.loadTransferable(type: Data.self)
+                    let image = data.flatMap { UIImage(data: $0) }
+                    await MainActor.run {
+                        if let image {
+                            mediaManager.updatePlaylistCover(for: target, image: image)
+                        }
+                        coverTargetPlaylist = nil
+                    }
+                }
+            }
+    }
+}
+
+private struct PlaylistsSheetsAndAlertsModifier: ViewModifier {
+    @Environment(MediaManager.self) private var mediaManager
+
+    @Binding var showPlayerSheet: Bool
+    @Binding var searchEditingInfoItem: MediaItem?
+    @Binding var showImportURLSheet: Bool
+    @Binding var showCreateGroupSheet: Bool
+    @Binding var showJoinGroupSheet: Bool
+    @Binding var showCreatePartySheet: Bool
+    @Binding var showJoinPartySheet: Bool
+    @Binding var showTimeMachineSheet: Bool
+    @Binding var timeMachineTargetPlaylistID: UUID?
+    @Binding var createdPlaylistID: UUID?
+    @Binding var selectedGroupID: UUID?
+    @Binding var selectedPartyID: UUID?
+    @Binding var showCreateAlert: Bool
+    @Binding var newPlaylistName: String
+    @Binding var playlistToRename: Playlist?
+    @Binding var renameText: String
+    @Binding var searchItemToRename: MediaItem?
+    @Binding var searchRenameText: String
+
+    func body(content: Content) -> some View {
+        content
+            .sheet(item: $searchEditingInfoItem) { item in
+                EditTrackInfoSheet(item: item)
+            }
+            .sheet(isPresented: $showImportURLSheet) {
+                ImportPlaylistSheetView { importedID in
+                    createdPlaylistID = importedID
+                }
+            }
+            .sheet(isPresented: $showCreateGroupSheet) {
+                CreateGroupPlaylistSheet { newGroupID in
+                    selectedGroupID = newGroupID
+                }
+            }
+            .sheet(isPresented: $showJoinGroupSheet) {
+                JoinGroupPlaylistSheet { joinedID in
+                    selectedGroupID = joinedID
+                }
+            }
+            .sheet(isPresented: $showCreatePartySheet) {
+                CreatePartyQueueSheet { newPartyID in
+                    selectedPartyID = newPartyID
+                }
+            }
+            .sheet(isPresented: $showJoinPartySheet) {
+                JoinPartyQueueSheet { joinedPartyID in
+                    selectedPartyID = joinedPartyID
+                }
+            }
+            .sheet(isPresented: $showTimeMachineSheet) {
+                PlaylistTimeMachineSheet(
+                    initialPlaylistID: timeMachineTargetPlaylistID,
+                    showPlayerSheet: $showPlayerSheet
+                ) { restoredPlaylistID in
+                    createdPlaylistID = restoredPlaylistID
+                }
+            }
+            .alert("New Playlist", isPresented: $showCreateAlert) {
+                TextField("Playlist name", text: $newPlaylistName)
+                Button("Cancel", role: .cancel) {
+                    newPlaylistName = ""
+                }
+                Button("Create") {
+                    if let created = mediaManager.createPlaylist(name: newPlaylistName) {
+                        createdPlaylistID = created.id
+                    }
+                    newPlaylistName = ""
+                }
+            } message: {
+                Text("Enter a name for your offline playlist.")
+            }
+            .alert(
+                "Rename Playlist",
+                isPresented: Binding(
+                    get: { playlistToRename != nil },
+                    set: { if !$0 { playlistToRename = nil } }
+                )
+            ) {
+                TextField("Playlist name", text: $renameText)
+                Button("Cancel", role: .cancel) {
+                    playlistToRename = nil
+                }
+                Button("Save") {
+                    if let playlistToRename {
+                        mediaManager.renamePlaylist(playlistToRename, to: renameText)
+                    }
+                    playlistToRename = nil
+                }
+            }
+            .alert(
+                "Rename Media",
+                isPresented: Binding(
+                    get: { searchItemToRename != nil },
+                    set: { if !$0 { searchItemToRename = nil } }
+                )
+            ) {
+                TextField("New name", text: $searchRenameText)
+                Button("Cancel", role: .cancel) {
+                    searchItemToRename = nil
+                }
+                Button("Save") {
+                    if let item = searchItemToRename {
+                        mediaManager.rename(item, to: searchRenameText)
+                    }
+                    searchItemToRename = nil
+                }
+            }
     }
 }
