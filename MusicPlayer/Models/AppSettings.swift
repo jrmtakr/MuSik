@@ -81,6 +81,9 @@ final class AppSettings {
     var autoCacheDetectedMedia: Bool {
         didSet { UserDefaults.standard.set(autoCacheDetectedMedia, forKey: Keys.autoCache) }
     }
+    var autoOpenPlayerAfterCache: Bool {
+        didSet { UserDefaults.standard.set(autoOpenPlayerAfterCache, forKey: Keys.autoOpenPlayerAfterCache) }
+    }
     var maxCacheDurationMinutes: Int {
         didSet { UserDefaults.standard.set(maxCacheDurationMinutes, forKey: Keys.maxDuration) }
     }
@@ -132,6 +135,8 @@ final class AppSettings {
         static let inlineVideoPlayback = "musicplayer.inlineVideoPlayback"
         static let askBeforeCaching = "musicplayer.askBeforeCaching"
         static let autoCache = "musicplayer.autoCache"
+        static let autoOpenPlayerAfterCache = "musicplayer.autoOpenPlayerAfterCache"
+        static let cacheFlowV2Applied = "musicplayer.defaults.cacheFlowV2"
         static let maxDuration = "musicplayer.maxDuration"
         static let quickAccessLastPlaylist = "musicplayer.quickAccessLastPlaylist"
         static let readingDirection = "musicplayer.readingDirection"
@@ -148,11 +153,15 @@ final class AppSettings {
         if defaults.object(forKey: Keys.adBlockEnabled) == nil {
             defaults.set(true, forKey: Keys.adBlockEnabled)
         }
-        if defaults.object(forKey: Keys.inlineVideoPlayback) == nil {
-            defaults.set(true, forKey: Keys.inlineVideoPlayback)
+        if !defaults.bool(forKey: Keys.cacheFlowV2Applied) {
+            defaults.set(true, forKey: Keys.autoCache)
+            defaults.set(false, forKey: Keys.askBeforeCaching)
+            defaults.set(false, forKey: Keys.inlineVideoPlayback)
+            defaults.set(true, forKey: Keys.autoOpenPlayerAfterCache)
+            defaults.set(true, forKey: Keys.cacheFlowV2Applied)
         }
-        if defaults.object(forKey: Keys.askBeforeCaching) == nil {
-            defaults.set(true, forKey: Keys.askBeforeCaching)
+        if defaults.object(forKey: Keys.autoOpenPlayerAfterCache) == nil {
+            defaults.set(true, forKey: Keys.autoOpenPlayerAfterCache)
         }
         if defaults.object(forKey: Keys.quickAccessLastPlaylist) == nil {
             defaults.set(true, forKey: Keys.quickAccessLastPlaylist)
@@ -171,6 +180,7 @@ final class AppSettings {
         self.inlineVideoPlayback = defaults.bool(forKey: Keys.inlineVideoPlayback)
         self.askBeforeCaching = defaults.bool(forKey: Keys.askBeforeCaching)
         self.autoCacheDetectedMedia = defaults.bool(forKey: Keys.autoCache)
+        self.autoOpenPlayerAfterCache = defaults.bool(forKey: Keys.autoOpenPlayerAfterCache)
         self.maxCacheDurationMinutes = defaults.integer(forKey: Keys.maxDuration)
         self.quickAccessLastPlaylist = defaults.bool(forKey: Keys.quickAccessLastPlaylist)
         self.readingDirection = ReadingDirection(rawValue: defaults.string(forKey: Keys.readingDirection) ?? "") ?? .scroll

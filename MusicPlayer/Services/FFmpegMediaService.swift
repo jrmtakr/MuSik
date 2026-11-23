@@ -655,6 +655,31 @@ enum FFmpegMediaService {
             : 0
         outAStream.pointee.codecpar.pointee.codec_tag = 0
 
+        let audioFormatName = aFmtCtx.pointee.iformat?.pointee.name.flatMap { String(cString: $0) } ?? ""
+        let needsADTSFilter = aPar.pointee.codec_id == AV_CODEC_ID_AAC
+            && (audioFormatName.contains("mpegts") || audioFormatName.contains("hls") || audioFormatName == "aac")
+        var audioBSF: UnsafeMutablePointer<AVBSFContext>?
+        defer {
+            if let bsf = audioBSF {
+                var freePtr: UnsafeMutablePointer<AVBSFContext>? = bsf
+                av_bsf_free(&freePtr)
+            }
+        }
+        if needsADTSFilter, let filter = av_bsf_get_by_name("aac_adtstoasc") {
+            var bsf: UnsafeMutablePointer<AVBSFContext>?
+            if av_bsf_alloc(filter, &bsf) >= 0, let bsf {
+                avcodec_parameters_copy(bsf.pointee.par_in, aPar)
+                bsf.pointee.time_base_in = aInStream.pointee.time_base
+                if av_bsf_init(bsf) >= 0 {
+                    avcodec_parameters_copy(outAStream.pointee.codecpar, bsf.pointee.par_out)
+                    audioBSF = bsf
+                } else {
+                    var freePtr: UnsafeMutablePointer<AVBSFContext>? = bsf
+                    av_bsf_free(&freePtr)
+                }
+            }
+        }
+
         if let flags = outputFmtCtx.pointee.oformat?.pointee.flags, (flags & AVFMT_NOFILE) == 0 {
             var pb: UnsafeMutablePointer<AVIOContext>?
             guard avio_open(&pb, outputURL.path, AVIO_FLAG_WRITE) >= 0 else { return false }
@@ -688,16 +713,37 @@ enum FFmpegMediaService {
 
         while av_read_frame(aFmtCtx, pkt) >= 0 {
             if pkt.pointee.stream_index == inAudioIdx {
-                writeRescaledPacket(
-                    pkt,
-                    inTimeBase: aInStream.pointee.time_base,
-                    outTimeBase: outAStream.pointee.time_base,
-                    outIndex: 1,
-                    outCtx: outputFmtCtx,
-                    lastDtsByOutStream: &lastDts
-                )
+                if let audioBSF {
+                    if av_bsf_send_packet(audioBSF, pkt) >= 0 {
+                        av_packet_unref(pkt)
+                        while av_bsf_receive_packet(audioBSF, pkt) >= 0 {
+                            writeRescaledPacket(
+                                pkt,
+                                inTimeBase: audioBSF.pointee.time_base_out,
+                                outTimeBase: outAStream.pointee.time_base,
+                                outIndex: 1,
+                                outCtx: outputFmtCtx,
+                                lastDtsByOutStream: &lastDts
+                            )
+                            av_packet_unref(pkt)
+                        }
+                    } else {
+                        av_packet_unref(pkt)
+                    }
+                } else {
+                    writeRescaledPacket(
+                        pkt,
+                        inTimeBase: aInStream.pointee.time_base,
+                        outTimeBase: outAStream.pointee.time_base,
+                        outIndex: 1,
+                        outCtx: outputFmtCtx,
+                        lastDtsByOutStream: &lastDts
+                    )
+                    av_packet_unref(pkt)
+                }
+            } else {
+                av_packet_unref(pkt)
             }
-            av_packet_unref(pkt)
         }
 
         let trailerRet = av_write_trailer(outputFmtCtx)

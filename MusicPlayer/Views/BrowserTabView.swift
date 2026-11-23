@@ -79,6 +79,19 @@ final class BrowserController {
         clearDetectedStreams()
         webView?.load(URLRequest(url: url))
     }
+
+    func pausePageMedia() {
+        webView?.evaluateJavaScript(
+            "window.__mpPauseWebVideo = true; document.querySelectorAll('video,audio').forEach(function(m){try{m.muted=true;m.pause();}catch(e){}});"
+        )
+    }
+
+    func resumePageMediaControl(startPlayback: Bool = false) {
+        let playPart = startPlayback
+            ? "document.querySelectorAll('video').forEach(function(m){try{m.muted=false;m.play();}catch(e){}});"
+            : "document.querySelectorAll('video,audio').forEach(function(m){try{m.muted=false;}catch(e){}});"
+        webView?.evaluateJavaScript("window.__mpPauseWebVideo = false; \(playPart)")
+    }
 }
 
 struct WebViewWrapper: UIViewRepresentable {
@@ -92,8 +105,8 @@ struct WebViewWrapper: UIViewRepresentable {
     var contentBlocker: ContentBlockerManager? = nil
     var onURLChange: (URL, String?) -> Void = { _, _ in }
     var onMediaDetected: (DetectedBrowserMedia) -> Void = { _ in }
-    var onYouTubeVideoChanged: (String, URL) -> Void = { _, _ in }
-    var onYouTubePlayerJSON: (String, Data, URL?) -> Void = { _, _, _ in }
+    var onYouTubeVideoChanged: (String, URL, String?) -> Void = { _, _, _ in }
+    var onYouTubePlayerJSON: (String, Data, URL?, String?) -> Void = { _, _, _, _ in }
     var onBlobCaptured: (Data, String, String) -> Void = { _, _, _ in }
     var onWKDownloadImported: (URL, String) -> Void = { _, _ in }
     var onWKDownloadFailed: (Error) -> Void = { _ in }
@@ -141,10 +154,28 @@ struct WebViewWrapper: UIViewRepresentable {
             }
         }
 
-        function currentYTVideoId() {
+        function isYTHost() {
             try {
                 var h = window.location.hostname.toLowerCase();
-                if (h.indexOf('youtube.com') === -1 && h !== 'youtu.be') return null;
+                return h === 'youtu.be' || h === 'youtube.com' || h.endsWith('.youtube.com');
+            } catch (e) { return false; }
+        }
+
+        function getYTVisitorData() {
+            try {
+                if (window.ytcfg && typeof window.ytcfg.get === 'function') {
+                    return window.ytcfg.get('VISITOR_DATA') || '';
+                }
+                if (window.ytcfg && window.ytcfg.data_ && window.ytcfg.data_.VISITOR_DATA) {
+                    return window.ytcfg.data_.VISITOR_DATA || '';
+                }
+            } catch (e) {}
+            return '';
+        }
+
+        function currentYTVideoId() {
+            try {
+                if (!isYTHost()) return null;
                 var u = new URL(window.location.href);
                 var v = u.searchParams.get('v');
                 if (v) return v;
@@ -167,6 +198,7 @@ struct WebViewWrapper: UIViewRepresentable {
                     type: 'playerJSON',
                     videoId: vid,
                     pageURL: window.location.href,
+                    visitorData: getYTVisitorData(),
                     json: JSON.stringify({
                         videoDetails: obj.videoDetails,
                         streamingData: obj.streamingData,
@@ -179,13 +211,18 @@ struct WebViewWrapper: UIViewRepresentable {
         function checkYouTubeState() {
             try {
                 var vid = currentYTVideoId();
+                if (!vid && lastYTVideoId !== null) {
+                    lastYTVideoId = null;
+                    window.__mpPauseWebVideo = false;
+                }
                 if (vid && vid !== lastYTVideoId) {
                     lastYTVideoId = vid;
                     seen.clear();
                     window.webkit.messageHandlers.ytDetected.postMessage({
                         type: 'videoChanged',
                         videoId: vid,
-                        pageURL: window.location.href
+                        pageURL: window.location.href,
+                        visitorData: getYTVisitorData()
                     });
                 }
                 if (vid) {
@@ -217,6 +254,7 @@ struct WebViewWrapper: UIViewRepresentable {
         function report(rawSrc, forcedKind, dur, active) {
             var src = normalizeMediaURL(rawSrc);
             if (!src) return;
+            if (isYTHost() && (/googlevideo\\.com/i.test(src) || /^blob:/i.test(src))) return;
             var kind = classify(src, forcedKind);
             if (!kind) return;
             var prev = seen.get(src);
@@ -337,13 +375,19 @@ struct WebViewWrapper: UIViewRepresentable {
             if (!el) return;
             try {
                 var src = el.currentSrc || el.src || (el.getAttribute && (el.getAttribute('src') || el.getAttribute('data-src')));
-                if (!src) return;
-                if (el.muted && el.loop && el.duration > 0 && el.duration < 3 && !isActivePlay) return;
-                var abs = /^blob:/i.test(src) ? src : new URL(src, window.location.href).toString();
-                var isAudioTag = (el.tagName && el.tagName.toLowerCase() === 'audio') ||
-                    (el.parentElement && el.parentElement.tagName && el.parentElement.tagName.toLowerCase() === 'audio');
-                var kind = /\\.m3u8/i.test(abs) ? 'hls' : (isAudioTag ? 'audio' : 'video');
-                report(abs, kind, el.duration, !!isActivePlay);
+                if (src) {
+                    if (!(el.muted && el.loop && el.duration > 0 && el.duration < 3 && !isActivePlay)) {
+                        var abs = /^blob:/i.test(src) ? src : new URL(src, window.location.href).toString();
+                        var isAudioTag = (el.tagName && el.tagName.toLowerCase() === 'audio') ||
+                            (el.parentElement && el.parentElement.tagName && el.parentElement.tagName.toLowerCase() === 'audio');
+                        var kind = /\\.m3u8/i.test(abs) ? 'hls' : (isAudioTag ? 'audio' : 'video');
+                        report(abs, kind, el.duration, !!isActivePlay);
+                    }
+                }
+                if (window.__mpPauseWebVideo && currentYTVideoId() && typeof el.pause === 'function' && !el.paused) {
+                    el.muted = true;
+                    el.pause();
+                }
             } catch (e) {}
         }
 
@@ -365,6 +409,10 @@ struct WebViewWrapper: UIViewRepresentable {
         var origPlay = HTMLMediaElement.prototype.play;
         HTMLMediaElement.prototype.play = function() {
             inspectMediaElement(this, true);
+            if (window.__mpPauseWebVideo && currentYTVideoId()) {
+                try { this.muted = true; this.pause(); } catch (e) {}
+                return Promise.resolve();
+            }
             return origPlay.apply(this, arguments);
         };
 
@@ -500,7 +548,9 @@ struct WebViewWrapper: UIViewRepresentable {
         let config = WKWebViewConfiguration()
         config.userContentController = userController
         config.websiteDataStore = isPrivate ? .nonPersistent() : .default()
-        config.allowsInlineMediaPlayback = inlineVideoPlayback
+        // Always allow inline HTML5 playback so WebKit never steals the screen with Safari's fullscreen AVPlayerViewController;
+        // when auto-caching or Inline Player is off, we pause webpage media cleanly and open NowPlayingView instead.
+        config.allowsInlineMediaPlayback = true
         config.allowsPictureInPictureMediaPlayback = true
         config.mediaTypesRequiringUserActionForPlayback = []
 
@@ -585,8 +635,8 @@ struct WebViewWrapper: UIViewRepresentable {
         var contentBlocker: ContentBlockerManager?
         var onURLChange: (URL, String?) -> Void
         var onMediaDetected: (DetectedBrowserMedia) -> Void
-        var onYouTubeVideoChanged: (String, URL) -> Void
-        var onYouTubePlayerJSON: (String, Data, URL?) -> Void
+        var onYouTubeVideoChanged: (String, URL, String?) -> Void
+        var onYouTubePlayerJSON: (String, Data, URL?, String?) -> Void
         var onBlobCaptured: (Data, String, String) -> Void
         var onWKDownloadImported: (URL, String) -> Void
         var onWKDownloadFailed: (Error) -> Void
@@ -604,8 +654,8 @@ struct WebViewWrapper: UIViewRepresentable {
             contentBlocker: ContentBlockerManager?,
             onURLChange: @escaping (URL, String?) -> Void,
             onMediaDetected: @escaping (DetectedBrowserMedia) -> Void,
-            onYouTubeVideoChanged: @escaping (String, URL) -> Void,
-            onYouTubePlayerJSON: @escaping (String, Data, URL?) -> Void,
+            onYouTubeVideoChanged: @escaping (String, URL, String?) -> Void,
+            onYouTubePlayerJSON: @escaping (String, Data, URL?, String?) -> Void,
             onBlobCaptured: @escaping (Data, String, String) -> Void,
             onWKDownloadImported: @escaping (URL, String) -> Void,
             onWKDownloadFailed: @escaping (Error) -> Void,
@@ -693,16 +743,17 @@ struct WebViewWrapper: UIViewRepresentable {
                 let videoID = (dict["videoId"] as? String) ?? ""
                 let pageURLStr = (dict["pageURL"] as? String) ?? ""
                 let pageURL = URL(string: pageURLStr)
+                let visitorData = dict["visitorData"] as? String
                 if msgType == "videoChanged", let pageURL, !videoID.isEmpty {
                     DispatchQueue.main.async {
-                        self.onYouTubeVideoChanged(videoID, pageURL)
+                        self.onYouTubeVideoChanged(videoID, pageURL, visitorData)
                     }
                 } else if msgType == "playerJSON",
                           let jsonStr = dict["json"] as? String,
                           let data = jsonStr.data(using: .utf8),
                           !videoID.isEmpty {
                     DispatchQueue.main.async {
-                        self.onYouTubePlayerJSON(videoID, data, pageURL)
+                        self.onYouTubePlayerJSON(videoID, data, pageURL, visitorData)
                     }
                 }
                 return
@@ -907,7 +958,14 @@ struct BrowserTabView: View {
     @State private var autoCachedURLs: Set<String> = []
     @State private var promptedURLsThisPage: Set<String> = []
     @State private var currentYouTubeVideoID: String?
-    @State private var resolvedYouTubeVideoIDs: Set<String> = []
+    @State private var inFlightYouTubeResolveID: String?
+    @State private var startedYouTubeCacheIDs: Set<String> = []
+    @State private var cachedMediaByYouTubeID: [String: UUID] = [:]
+    @State private var latestYouTubeVisitorData: String?
+    @State private var activeCacheVideoID: String?
+    @State private var isResolvingYouTubeCache = false
+    @State private var cachingOverlayTitle: String?
+    @State private var awaitingAutoOpenPlayer = false
     @State private var offlineReadyItem: MediaItem?
     @FocusState private var isAddressFieldFocused: Bool
 
@@ -919,6 +977,10 @@ struct BrowserTabView: View {
     @State private var showingTabsSheet = false
     @State private var showingBookmarksSheet = false
     @State private var showingStreamsSheet = false
+
+    private var showCachingOverlay: Bool {
+        isResolvingYouTubeCache || (cachingOverlayTitle != nil && !downloader.activeDownloads.isEmpty)
+    }
 
     var body: some View {
         NavigationStack {
@@ -939,67 +1001,83 @@ struct BrowserTabView: View {
                     statusBanner(status)
                 }
 
-                if !downloader.activeDownloads.isEmpty {
+                if !downloader.activeDownloads.isEmpty && !showCachingOverlay {
                     activeDownloadsStrip
                 }
 
-                if let detected = browser.detectedMedia {
+                if let detected = browser.detectedMedia, !showCachingOverlay {
                     detectedMediaBanner(detected)
                 }
 
-                WebViewWrapper(
-                    url: activeURL,
-                    tabID: browserStore.activeTab.id,
-                    isPrivate: browserStore.activeTab.isPrivate,
-                    darkModeEnabled: settings.webDarkModeEnabled,
-                    adBlockEnabled: settings.adBlockEnabled,
-                    inlineVideoPlayback: settings.inlineVideoPlayback,
-                    controller: browser,
-                    contentBlocker: contentBlocker,
-                    onURLChange: { newURL, newTitle in
-                        activeURL = newURL
-                        if !isAddressFieldFocused {
-                            urlString = newURL.absoluteString
+                ZStack {
+                    WebViewWrapper(
+                        url: activeURL,
+                        tabID: browserStore.activeTab.id,
+                        isPrivate: browserStore.activeTab.isPrivate,
+                        darkModeEnabled: settings.webDarkModeEnabled,
+                        adBlockEnabled: settings.adBlockEnabled,
+                        inlineVideoPlayback: settings.inlineVideoPlayback,
+                        controller: browser,
+                        contentBlocker: contentBlocker,
+                        onURLChange: { newURL, newTitle in
+                            activeURL = newURL
+                            if !isAddressFieldFocused {
+                                urlString = newURL.absoluteString
+                            }
+                            browserStore.updateActiveTab(urlString: newURL.absoluteString, title: newTitle)
+                            if let vid = YouTubeStreamResolver.extractVideoID(from: newURL) {
+                                if vid != currentYouTubeVideoID {
+                                    handleYouTubeVideoNavigation(
+                                        videoID: vid,
+                                        url: newURL,
+                                        visitorData: latestYouTubeVisitorData
+                                    )
+                                }
+                            } else if currentYouTubeVideoID != nil, YouTubeStreamResolver.isYouTubeURL(newURL) {
+                                clearActiveYouTubeWatchSession()
+                            }
+                        },
+                        onMediaDetected: { media in
+                            handleIncomingDetectedMedia(media)
+                        },
+                        onYouTubeVideoChanged: { videoID, pageURL, visitorData in
+                            handleYouTubeVideoNavigation(videoID: videoID, url: pageURL, visitorData: visitorData)
+                        },
+                        onYouTubePlayerJSON: { videoID, jsonData, pageURL, visitorData in
+                            handleYouTubePlayerJSON(videoID: videoID, jsonData: jsonData, pageURL: pageURL, visitorData: visitorData)
+                        },
+                        onBlobCaptured: { data, fileName, mimeType in
+                            downloader.saveBlobData(
+                                data,
+                                fileName: fileName,
+                                mimeType: mimeType,
+                                maxDurationMinutes: settings.maxCacheDurationMinutes
+                            )
+                        },
+                        onWKDownloadImported: { tempURL, fileName in
+                            if let imported = mediaManager.importTemporaryFile(from: tempURL, preferredFileName: fileName) {
+                                let updated = mediaManager.applyDownloadedMetadataAndPlaylist(for: imported, title: nil, artist: nil)
+                                offlineReadyItem = updated
+                            }
+                            downloadStatus = "Saved: \(fileName)"
+                        },
+                        onWKDownloadFailed: { error in
+                            downloadStatus = "Download failed."
+                            mediaManager.errorMessage = "Download failed: \(error.localizedDescription)"
+                        },
+                        onDownloadTriggered: { fileURL in
+                            Task { await downloadFile(from: fileURL) }
                         }
-                        browserStore.updateActiveTab(urlString: newURL.absoluteString, title: newTitle)
-                        if let vid = YouTubeStreamResolver.extractVideoID(from: newURL),
-                           vid != currentYouTubeVideoID {
-                            handleYouTubeVideoNavigation(videoID: vid, url: newURL)
-                        }
-                    },
-                    onMediaDetected: { media in
-                        handleIncomingDetectedMedia(media)
-                    },
-                    onYouTubeVideoChanged: { videoID, pageURL in
-                        handleYouTubeVideoNavigation(videoID: videoID, url: pageURL)
-                    },
-                    onYouTubePlayerJSON: { videoID, jsonData, pageURL in
-                        handleYouTubePlayerJSON(videoID: videoID, jsonData: jsonData, pageURL: pageURL)
-                    },
-                    onBlobCaptured: { data, fileName, mimeType in
-                        downloader.saveBlobData(
-                            data,
-                            fileName: fileName,
-                            mimeType: mimeType,
-                            maxDurationMinutes: settings.maxCacheDurationMinutes
-                        )
-                    },
-                    onWKDownloadImported: { tempURL, fileName in
-                        if let imported = mediaManager.importTemporaryFile(from: tempURL, preferredFileName: fileName) {
-                            let updated = mediaManager.applyDownloadedMetadataAndPlaylist(for: imported, title: nil, artist: nil)
-                            offlineReadyItem = updated
-                        }
-                        downloadStatus = "Saved: \(fileName)"
-                    },
-                    onWKDownloadFailed: { error in
-                        downloadStatus = "Download failed."
-                        mediaManager.errorMessage = "Download failed: \(error.localizedDescription)"
-                    },
-                    onDownloadTriggered: { fileURL in
-                        Task { await downloadFile(from: fileURL) }
+                    )
+                    .id(browserStore.activeTab.id.uuidString)
+
+                    if showCachingOverlay {
+                        Color.black.opacity(0.24)
+                            .ignoresSafeArea()
+                        cachingOverlayView(title: cachingOverlayTitle ?? "Loading Video...")
+                            .transition(.scale(scale: 0.95).combined(with: .opacity))
                     }
-                )
-                .id("\(browserStore.activeTab.id.uuidString)-\(settings.inlineVideoPlayback)")
+                }
             }
             .onAppear {
                 if loadedTabID != browserStore.activeTabID {
@@ -1012,9 +1090,32 @@ struct BrowserTabView: View {
             .onChange(of: browserStore.navigationRequestNonce) { _, _ in
                 syncTabState(forceReload: true)
             }
-            .onChange(of: downloader.lastCompletedMediaItem) { _, newItem in
-                if let newItem {
-                    offlineReadyItem = newItem
+            .onChange(of: downloader.lastCompletedCacheEvent) { _, event in
+                guard let event else { return }
+                let cachedItem = event.item
+                offlineReadyItem = cachedItem
+                isResolvingYouTubeCache = false
+                cachingOverlayTitle = nil
+                if let vid = activeCacheVideoID ?? currentYouTubeVideoID {
+                    cachedMediaByYouTubeID[vid] = cachedItem.id
+                }
+                activeCacheVideoID = nil
+                if awaitingAutoOpenPlayer && settings.autoOpenPlayerAfterCache {
+                    awaitingAutoOpenPlayer = false
+                    offlineReadyItem = nil
+                    browser.pausePageMedia()
+                    mediaManager.play(cachedItem)
+                    showPlayerSheet = true
+                }
+            }
+            .onChange(of: downloader.lastFailedCacheEvent) { _, event in
+                guard event != nil else { return }
+                if downloader.activeDownloads.isEmpty {
+                    isResolvingYouTubeCache = false
+                    cachingOverlayTitle = nil
+                    awaitingAutoOpenPlayer = false
+                    activeCacheVideoID = nil
+                    browser.resumePageMediaControl()
                 }
             }
             .task(id: offlineReadyItem?.id) {
@@ -1400,6 +1501,12 @@ struct BrowserTabView: View {
         let tab = browserStore.activeTab
         loadedTabID = tab.id
         promptedURLsThisPage.removeAll()
+        currentYouTubeVideoID = nil
+        inFlightYouTubeResolveID = nil
+        isResolvingYouTubeCache = false
+        cachingOverlayTitle = nil
+        awaitingAutoOpenPlayer = false
+        activeCacheVideoID = nil
         urlString = tab.urlString
         if let parsed = resolvedURL(from: tab.urlString) {
             if activeURL == parsed {
@@ -1410,6 +1517,67 @@ struct BrowserTabView: View {
                 activeURL = parsed
             }
         }
+    }
+
+    private func cachingOverlayView(title: String) -> some View {
+        let currentDownload = downloader.activeDownloads.first
+        return VStack(spacing: 14) {
+            HStack(spacing: 10) {
+                ProgressView()
+                    .controlSize(.regular)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(currentDownload != nil ? "Caching Video for Offline..." : "Loading Video Stream...")
+                        .font(.subheadline.weight(.semibold))
+                    Text(title)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
+                Spacer(minLength: 0)
+            }
+
+            if let dl = currentDownload {
+                VStack(spacing: 6) {
+                    ProgressView(value: dl.progress)
+                        .progressViewStyle(.linear)
+                        .tint(.accentColor)
+                    HStack {
+                        Text(dl.isHLS ? "Downloading & muxing HD stream" : "Caching offline media")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Text("\(Int(dl.progress * 100))%")
+                            .font(.caption2.monospacedDigit().weight(.semibold))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            } else {
+                Text("Will open player automatically when ready")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            HStack(spacing: 10) {
+                Button("Play in Web") {
+                    cancelBrowserCaching(resumeWebPlayback: true)
+                }
+                .font(.caption.weight(.medium))
+                .buttonStyle(.bordered)
+
+                Button("Cancel", role: .destructive) {
+                    cancelBrowserCaching(resumeWebPlayback: false)
+                }
+                .font(.caption.weight(.medium))
+                .buttonStyle(.bordered)
+            }
+            .frame(maxWidth: .infinity, alignment: .trailing)
+        }
+        .padding(16)
+        .frame(maxWidth: 340)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .shadow(color: .black.opacity(0.22), radius: 16, y: 6)
+        .padding(.horizontal, 20)
     }
 
     private func offlineReadyBanner(_ item: MediaItem) -> some View {
@@ -1639,6 +1807,11 @@ struct BrowserTabView: View {
             if let dur = media.durationSeconds, dur > 0, dur < 3, !media.isActivelyPlaying {
                 return
             }
+            if !media.isAudio && media.isActivelyPlaying && settings.autoOpenPlayerAfterCache {
+                awaitingAutoOpenPlayer = true
+                cachingOverlayTitle = media.title ?? (browser.pageTitle.isEmpty ? "Caching Video..." : browser.pageTitle)
+                browser.pausePageMedia()
+            }
             autoCachedURLs.insert(key)
             handleDetectedMedia(media, autoMode: true)
             return
@@ -1708,32 +1881,109 @@ struct BrowserTabView: View {
         webView.evaluateJavaScript(js)
     }
 
-    private func handleYouTubeVideoNavigation(videoID: String, url: URL) {
+    private func clearActiveYouTubeWatchSession() {
+        currentYouTubeVideoID = nil
+        inFlightYouTubeResolveID = nil
+        isResolvingYouTubeCache = false
+        cachingOverlayTitle = nil
+        awaitingAutoOpenPlayer = false
+        activeCacheVideoID = nil
+        promptedURLsThisPage.removeAll()
+        browser.clearDetectedStreams()
+        browser.resumePageMediaControl()
+    }
+
+    private func cancelBrowserCaching(resumeWebPlayback: Bool) {
+        for dl in downloader.activeDownloads {
+            downloader.cancelDownload(id: dl.id)
+        }
+        isResolvingYouTubeCache = false
+        cachingOverlayTitle = nil
+        awaitingAutoOpenPlayer = false
+        activeCacheVideoID = nil
+        inFlightYouTubeResolveID = nil
+        if resumeWebPlayback {
+            browser.resumePageMediaControl(startPlayback: true)
+        } else {
+            browser.resumePageMediaControl(startPlayback: false)
+        }
+    }
+
+    private func handleYouTubeVideoNavigation(videoID: String, url: URL, visitorData: String?) {
+        if let visitorData, !visitorData.isEmpty {
+            latestYouTubeVisitorData = visitorData
+        }
         if currentYouTubeVideoID != videoID {
             currentYouTubeVideoID = videoID
             browser.clearDetectedStreams()
             promptedURLsThisPage.removeAll()
+            startedYouTubeCacheIDs.remove(videoID)
         }
-        guard !resolvedYouTubeVideoIDs.contains(videoID) else { return }
-        resolvedYouTubeVideoIDs.insert(videoID)
+
+        if settings.autoCacheDetectedMedia,
+           let cachedID = cachedMediaByYouTubeID[videoID],
+           let existingItem = mediaManager.items.first(where: { $0.id == cachedID }) {
+            isResolvingYouTubeCache = false
+            cachingOverlayTitle = nil
+            awaitingAutoOpenPlayer = false
+            offlineReadyItem = existingItem
+            if settings.autoOpenPlayerAfterCache {
+                browser.pausePageMedia()
+                mediaManager.play(existingItem)
+                showPlayerSheet = true
+            }
+            return
+        }
+
+        if settings.autoCacheDetectedMedia && !startedYouTubeCacheIDs.contains(videoID) {
+            activeCacheVideoID = videoID
+            if settings.autoOpenPlayerAfterCache {
+                isResolvingYouTubeCache = true
+                awaitingAutoOpenPlayer = true
+                cachingOverlayTitle = browser.pageTitle.isEmpty ? "Loading YouTube video..." : browser.pageTitle
+                browser.pausePageMedia()
+            } else {
+                awaitingAutoOpenPlayer = false
+            }
+        }
+
+        guard inFlightYouTubeResolveID != videoID else { return }
+        inFlightYouTubeResolveID = videoID
 
         Task {
             let reqHeaders = await buildRequestHeaders(for: url, referer: url.absoluteString)
-            if let result = await YouTubeStreamResolver.resolveStreams(
+            let result = await YouTubeStreamResolver.resolveStreams(
                 for: url,
                 cookiesHeader: reqHeaders["Cookie"],
-                referer: url.absoluteString
-            ), !result.streams.isEmpty {
-                guard currentYouTubeVideoID == videoID else { return }
+                referer: url.absoluteString,
+                visitorData: latestYouTubeVisitorData
+            )
+
+            if inFlightYouTubeResolveID == videoID {
+                inFlightYouTubeResolveID = nil
+            }
+            guard currentYouTubeVideoID == videoID else { return }
+
+            if let result, !result.streams.isEmpty {
                 browser.mergeResolvedYouTubeStreams(result.streams)
-                if let primary = result.streams.first(where: { !$0.isAudio }) ?? result.streams.first {
-                    handleIncomingDetectedMedia(primary)
+                beginYouTubeCacheIfNeeded(videoID: videoID, result: result)
+            } else if !startedYouTubeCacheIDs.contains(videoID) {
+                isResolvingYouTubeCache = false
+                cachingOverlayTitle = nil
+                awaitingAutoOpenPlayer = false
+                activeCacheVideoID = nil
+                browser.resumePageMediaControl()
+                if settings.autoCacheDetectedMedia {
+                    downloadStatus = result?.errorReason ?? "Could not resolve downloadable stream"
                 }
             }
         }
     }
 
-    private func handleYouTubePlayerJSON(videoID: String, jsonData: Data, pageURL: URL?) {
+    private func handleYouTubePlayerJSON(videoID: String, jsonData: Data, pageURL: URL?, visitorData: String?) {
+        if let visitorData, !visitorData.isEmpty {
+            latestYouTubeVisitorData = visitorData
+        }
         let baseHeaders: [String: String] = [
             "User-Agent": WebMediaDownloader.browserUserAgent,
             "Referer": pageURL?.absoluteString ?? "https://m.youtube.com/"
@@ -1749,10 +1999,54 @@ struct BrowserTabView: View {
         if currentYouTubeVideoID == nil || currentYouTubeVideoID == videoID {
             currentYouTubeVideoID = videoID
             browser.mergeResolvedYouTubeStreams(result.streams)
-            if let primary = result.streams.first(where: { !$0.isAudio }) ?? result.streams.first {
-                handleIncomingDetectedMedia(primary)
+            // Let InnerTube IOS/ANDROID_VR go first while in-flight; back up immediately once finished or unstarted
+            if inFlightYouTubeResolveID != videoID {
+                beginYouTubeCacheIfNeeded(videoID: videoID, result: result)
             }
         }
+    }
+
+    private func beginYouTubeCacheIfNeeded(videoID: String, result: YouTubeResolvedResult) {
+        let videoStreams = result.streams.filter { !$0.isAudio }
+        let ordered = videoStreams.isEmpty ? result.streams : videoStreams
+        guard let primary = ordered.first else { return }
+
+        if settings.autoCacheDetectedMedia {
+            guard !startedYouTubeCacheIDs.contains(videoID) else { return }
+            if settings.maxCacheDurationMinutes > 0,
+               let dur = result.durationSeconds, dur.isFinite, dur > 0,
+               dur > Double(settings.maxCacheDurationMinutes * 60) {
+                isResolvingYouTubeCache = false
+                cachingOverlayTitle = nil
+                awaitingAutoOpenPlayer = false
+                activeCacheVideoID = nil
+                browser.resumePageMediaControl()
+                mediaManager.errorMessage = "Skipped \"\(result.title)\" (exceeds \(settings.maxCacheDurationMinutes) min limit)."
+                return
+            }
+
+            startedYouTubeCacheIDs.insert(videoID)
+            autoCachedURLs.insert(primary.url.absoluteString)
+            activeCacheVideoID = videoID
+            isResolvingYouTubeCache = false
+            if settings.autoOpenPlayerAfterCache {
+                cachingOverlayTitle = result.title
+                awaitingAutoOpenPlayer = true
+                browser.pausePageMedia()
+            } else {
+                cachingOverlayTitle = nil
+                awaitingAutoOpenPlayer = false
+            }
+
+            downloader.cacheMediaStream(
+                primary,
+                fallbackStreams: Array(ordered.dropFirst()),
+                maxDurationMinutes: settings.maxCacheDurationMinutes
+            )
+            return
+        }
+
+        handleIncomingDetectedMedia(primary)
     }
 
     private func resolvedHeaders(for media: DetectedBrowserMedia) async -> [String: String] {
@@ -1781,56 +2075,40 @@ struct BrowserTabView: View {
             return
         }
 
-        if media.isHLS {
-            if autoMode {
-                Task {
-                    let headers = await resolvedHeaders(for: media)
-                    downloader.startHLSDownload(
-                        from: media.url,
-                        title: media.title ?? browser.pageTitle,
-                        artist: media.author,
-                        headers: headers,
-                        maxDurationMinutes: settings.maxCacheDurationMinutes
-                    )
-                }
-            } else {
-                hlsQualityRequest = media
-                loadingVariants = true
-                hlsVariants = []
-                Task {
-                    let headers = await resolvedHeaders(for: media)
-                    hlsVariants = await downloader.fetchHLSVariants(
-                        for: media.url,
-                        headers: headers
-                    )
-                    loadingVariants = false
-                }
-            }
-        } else if let pairedAudio = media.pairedAudioURL {
+        if media.isHLS && !autoMode {
+            hlsQualityRequest = media
+            loadingVariants = true
+            hlsVariants = []
             Task {
                 let headers = await resolvedHeaders(for: media)
-                downloader.downloadMuxedVideoAndAudio(
-                    videoURL: media.url,
-                    audioURL: pairedAudio,
-                    title: media.title ?? browser.pageTitle,
-                    artist: media.author,
-                    headers: headers,
-                    knownDurationSeconds: media.durationSeconds,
-                    maxDurationMinutes: settings.maxCacheDurationMinutes
+                hlsVariants = await downloader.fetchHLSVariants(
+                    for: media.url,
+                    headers: headers
                 )
+                loadingVariants = false
             }
-        } else {
-            Task {
-                let headers = await resolvedHeaders(for: media)
-                downloader.downloadDirectMedia(
-                    from: media.url,
-                    title: media.title ?? browser.pageTitle,
-                    artist: media.author,
-                    headers: headers,
-                    knownDurationSeconds: media.durationSeconds,
-                    maxDurationMinutes: settings.maxCacheDurationMinutes
-                )
-            }
+            return
+        }
+
+        Task {
+            let headers = await resolvedHeaders(for: media)
+            let resolvedMedia = DetectedBrowserMedia(
+                url: media.url,
+                pairedAudioURL: media.pairedAudioURL,
+                isHLS: media.isHLS,
+                isAudio: media.isAudio,
+                title: media.title ?? (browser.pageTitle.isEmpty ? nil : browser.pageTitle),
+                author: media.author,
+                qualityLabel: media.qualityLabel,
+                referer: media.referer,
+                customHeaders: headers,
+                durationSeconds: media.durationSeconds,
+                isActivelyPlaying: media.isActivelyPlaying
+            )
+            downloader.cacheMediaStream(
+                resolvedMedia,
+                maxDurationMinutes: settings.maxCacheDurationMinutes
+            )
         }
     }
 

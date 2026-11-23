@@ -63,15 +63,17 @@ enum YouTubeStreamResolver {
     static func resolveStreams(
         for url: URL,
         cookiesHeader: String? = nil,
-        referer: String? = nil
+        referer: String? = nil,
+        visitorData: String? = nil
     ) async -> YouTubeResolvedResult? {
         guard let videoID = extractVideoID(from: url) else { return nil }
 
-        // 1. iOS InnerTube client often yields clean HLS + progressive MP4 without JS cipher scrambling.
+        // 1. iOS InnerTube client often yields clean HLS + progressive MP4 + unencrypted adaptive URLs.
         if let iosResult = await fetchInnerTube(
             videoID: videoID,
             sourcePageURL: url,
             clientName: "IOS",
+            clientHeaderID: "5",
             clientVersion: iosClientVersion,
             userAgent: iosClientUserAgent,
             extraClientFields: [
@@ -80,6 +82,7 @@ enum YouTubeStreamResolver {
                 "osName": "iPhone",
                 "osVersion": "18.3.2"
             ],
+            visitorData: visitorData,
             cookiesHeader: nil
         ), !iosResult.streams.isEmpty {
             return iosResult
@@ -90,6 +93,7 @@ enum YouTubeStreamResolver {
             videoID: videoID,
             sourcePageURL: url,
             clientName: "ANDROID_VR",
+            clientHeaderID: "28",
             clientVersion: "1.60.19",
             userAgent: androidVRUserAgent,
             extraClientFields: [
@@ -99,6 +103,7 @@ enum YouTubeStreamResolver {
                 "osVersion": "12L",
                 "androidSdkVersion": 32
             ],
+            visitorData: visitorData,
             cookiesHeader: nil
         ), !vrResult.streams.isEmpty {
             return vrResult
@@ -145,9 +150,11 @@ enum YouTubeStreamResolver {
         videoID: String,
         sourcePageURL: URL,
         clientName: String,
+        clientHeaderID: String,
         clientVersion: String,
         userAgent: String,
         extraClientFields: [String: Any],
+        visitorData: String?,
         cookiesHeader: String?
     ) async -> YouTubeResolvedResult? {
         guard let apiURL = URL(string: "https://www.youtube.com/youtubei/v1/player?prettyPrint=false") else {
@@ -160,6 +167,9 @@ enum YouTubeStreamResolver {
             "hl": "en",
             "gl": "US"
         ]
+        if let visitorData, !visitorData.isEmpty {
+            clientObj["visitorData"] = visitorData
+        }
         extraClientFields.forEach { clientObj[$0.key] = $0.value }
 
         let bodyDict: [String: Any] = [
@@ -179,6 +189,11 @@ enum YouTubeStreamResolver {
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.setValue(userAgent, forHTTPHeaderField: "User-Agent")
         req.setValue("https://www.youtube.com", forHTTPHeaderField: "Origin")
+        req.setValue(clientHeaderID, forHTTPHeaderField: "X-YouTube-Client-Name")
+        req.setValue(clientVersion, forHTTPHeaderField: "X-YouTube-Client-Version")
+        if let visitorData, !visitorData.isEmpty {
+            req.setValue(visitorData, forHTTPHeaderField: "X-Goog-Visitor-Id")
+        }
         if let cookiesHeader, !cookiesHeader.isEmpty {
             req.setValue(cookiesHeader, forHTTPHeaderField: "Cookie")
         }
@@ -309,7 +324,11 @@ enum YouTubeStreamResolver {
             )
         }
 
-        var streams: [DetectedBrowserMedia] = []
+        var progressiveHD: [DetectedBrowserMedia] = []
+        var progressiveSD: [DetectedBrowserMedia] = []
+        var adaptiveHD: [DetectedBrowserMedia] = []
+        var hlsStreams: [DetectedBrowserMedia] = []
+        var audioOnlyStreams: [DetectedBrowserMedia] = []
         let refererStr = sourcePageURL?.absoluteString ?? "https://m.youtube.com/watch?v=\(videoID)"
 
         // Progressive muxed MP4s (Video + Audio together: e.g. 720p, 360p)
@@ -329,28 +348,31 @@ enum YouTubeStreamResolver {
             }
 
             for item in parsed {
-                streams.append(
-                    DetectedBrowserMedia(
-                        url: item.url,
-                        pairedAudioURL: nil,
-                        isHLS: false,
-                        isAudio: false,
-                        title: title,
-                        author: author,
-                        qualityLabel: item.label,
-                        referer: refererStr,
-                        customHeaders: headers,
-                        durationSeconds: durationSeconds,
-                        isActivelyPlaying: true
-                    )
+                let media = DetectedBrowserMedia(
+                    url: item.url,
+                    pairedAudioURL: nil,
+                    isHLS: false,
+                    isAudio: false,
+                    title: title,
+                    author: author,
+                    qualityLabel: item.label,
+                    referer: refererStr,
+                    customHeaders: headers,
+                    durationSeconds: durationSeconds,
+                    isActivelyPlaying: true
                 )
+                if item.height >= 720 {
+                    progressiveHD.append(media)
+                } else {
+                    progressiveSD.append(media)
+                }
             }
         }
 
-        // HLS multi-quality manifest (full Video + Audio in one .m3u8)
+        // HLS multi-quality manifest (may include separate #EXT-X-MEDIA audio groups)
         if let hlsStr = streamingData["hlsManifestUrl"] as? String,
            let hlsURL = URL(string: hlsStr) {
-            streams.append(
+            hlsStreams.append(
                 DetectedBrowserMedia(
                     url: hlsURL,
                     pairedAudioURL: nil,
@@ -382,7 +404,7 @@ enum YouTubeStreamResolver {
                 return (bitrate, audioURL, "m4a", label)
             }.sorted { $0.bitrate > $1.bitrate }.first
 
-            let adaptiveVideos = adaptive.compactMap { fmt -> (height: Int, bitrate: Int, url: URL, label: String)? in
+            let adaptiveVideos = adaptive.compactMap { fmt -> (height: Int, isAVC: Bool, bitrate: Int, url: URL, label: String)? in
                 guard let mime = (fmt["mimeType"] as? String)?.lowercased(),
                       mime.contains("video/mp4"),
                       let urlStr = fmt["url"] as? String,
@@ -391,17 +413,24 @@ enum YouTubeStreamResolver {
                 }
                 let height = (fmt["height"] as? NSNumber)?.intValue ?? 0
                 let bitrate = (fmt["bitrate"] as? NSNumber)?.intValue ?? 0
+                let isAVC = mime.contains("avc1")
                 let qLabel = (fmt["qualityLabel"] as? String) ?? (height > 0 ? "\(height)p" : "HD")
-                return (height, bitrate, videoURL, "\(qLabel) MP4 (Muxed HD)")
+                return (height, isAVC, bitrate, videoURL, "\(qLabel) MP4 (Muxed HD)")
             }.sorted {
-                if $0.height != $1.height { return $0.height > $1.height }
+                if $0.height != $1.height {
+                    // Prefer resolutions <= 1080p first (hardware H.264 & fast offline cache), highest first
+                    let lhsCap = $0.height <= 1080 ? $0.height : (1080 - ($0.height / 100))
+                    let rhsCap = $1.height <= 1080 ? $1.height : (1080 - ($1.height / 100))
+                    if lhsCap != rhsCap { return lhsCap > rhsCap }
+                }
+                if $0.isAVC != $1.isAVC { return $0.isAVC && !$1.isAVC }
                 return $0.bitrate > $1.bitrate
             }
 
             if let bestAudio {
-                // Pair highest adaptive HD MP4 video (up to 1080p) with best M4A audio if higher than progressive MP4
-                for v in adaptiveVideos.prefix(2) where v.height >= 720 {
-                    streams.append(
+                // Pair top H.264/MP4 adaptive streams (>= 480p) with best M4A audio
+                for v in adaptiveVideos.filter({ $0.height >= 480 }).prefix(3) {
+                    adaptiveHD.append(
                         DetectedBrowserMedia(
                             url: v.url,
                             pairedAudioURL: bestAudio.url,
@@ -419,7 +448,7 @@ enum YouTubeStreamResolver {
                 }
 
                 // Standalone M4A audio option (downloads directly into Offline Songs + Playlists)
-                streams.append(
+                audioOnlyStreams.append(
                     DetectedBrowserMedia(
                         url: bestAudio.url,
                         pairedAudioURL: nil,
@@ -436,6 +465,8 @@ enum YouTubeStreamResolver {
                 )
             }
         }
+
+        let streams = progressiveHD + adaptiveHD + hlsStreams + progressiveSD + audioOnlyStreams
 
         return YouTubeResolvedResult(
             videoID: videoID,

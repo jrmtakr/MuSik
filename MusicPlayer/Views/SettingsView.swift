@@ -97,6 +97,8 @@ struct SettingsView: View {
                         )
                     )
 
+                    Toggle("Open Player After Caching", isOn: $settings.autoOpenPlayerAfterCache)
+
                     Toggle("Save Cached Media to Playlist", isOn: $settings.autoAddDownloadsToPlaylist)
 
                     if settings.autoAddDownloadsToPlaylist {

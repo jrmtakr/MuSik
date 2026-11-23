@@ -142,6 +142,7 @@ struct HLSQualityVariant: Identifiable, Hashable {
     let height: Int
     let peakBitrate: Double
     let variantURL: URL?
+    let audioGroupID: String?
 
     init(
         id: String,
@@ -149,7 +150,8 @@ struct HLSQualityVariant: Identifiable, Hashable {
         width: Int,
         height: Int,
         peakBitrate: Double,
-        variantURL: URL? = nil
+        variantURL: URL? = nil,
+        audioGroupID: String? = nil
     ) {
         self.id = id
         self.label = label
@@ -157,6 +159,7 @@ struct HLSQualityVariant: Identifiable, Hashable {
         self.height = height
         self.peakBitrate = peakBitrate
         self.variantURL = variantURL
+        self.audioGroupID = audioGroupID
     }
 }
 

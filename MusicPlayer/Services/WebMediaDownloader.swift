@@ -87,11 +87,33 @@ final class MediaInterceptURLProtocol: URLProtocol, URLSessionDataDelegate {
     }
 }
 
+struct CompletedCacheEvent: Equatable {
+    let eventID: UUID
+    let item: MediaItem
+    let sourceURL: URL
+
+    static func == (lhs: CompletedCacheEvent, rhs: CompletedCacheEvent) -> Bool {
+        lhs.eventID == rhs.eventID
+    }
+}
+
+struct FailedCacheEvent: Equatable {
+    let eventID: UUID
+    let sourceURL: URL?
+    let message: String
+
+    static func == (lhs: FailedCacheEvent, rhs: FailedCacheEvent) -> Bool {
+        lhs.eventID == rhs.eventID
+    }
+}
+
 @MainActor
 @Observable
 final class WebMediaDownloader {
     private(set) var activeDownloads: [BrowserDownloadItem] = []
     var lastCompletedMediaItem: MediaItem?
+    var lastCompletedCacheEvent: CompletedCacheEvent?
+    var lastFailedCacheEvent: FailedCacheEvent?
 
     @ObservationIgnored private var taskToDownloadID: [Int: UUID] = [:]
     @ObservationIgnored private var downloadMeta: [UUID: DownloadMeta] = [:]
@@ -132,8 +154,10 @@ final class WebMediaDownloader {
         let artist: String?
         let sourceURL: URL
         let maxDurationSeconds: Double?
+        let maxDurationMinutes: Int
         let isHLS: Bool
         let destinationFolder: String
+        let fallbackStreams: [DetectedBrowserMedia]
     }
 
     private struct ParsedHLSMedia {
@@ -148,6 +172,7 @@ final class WebMediaDownloader {
 
         let isMaster: Bool
         let variants: [HLSQualityVariant]
+        let audioGroupURLs: [String: URL]
         let mapURL: URL?
         let segments: [Segment]
         let totalDuration: Double
@@ -204,6 +229,52 @@ final class WebMediaDownloader {
         return list
     }
 
+    func cacheMediaStream(
+        _ media: DetectedBrowserMedia,
+        fallbackStreams: [DetectedBrowserMedia] = [],
+        maxDurationMinutes: Int = 0,
+        destinationFolder: String = ""
+    ) {
+        var reqHeaders = media.customHeaders ?? [:]
+        if let ref = media.referer, !ref.isEmpty, reqHeaders["Referer"] == nil {
+            reqHeaders["Referer"] = ref
+        }
+        if media.isHLS {
+            startHLSDownload(
+                from: media.url,
+                title: media.title,
+                artist: media.author,
+                headers: reqHeaders,
+                maxDurationMinutes: maxDurationMinutes,
+                destinationFolder: destinationFolder,
+                fallbackStreams: fallbackStreams
+            )
+        } else if let pairedAudio = media.pairedAudioURL {
+            downloadMuxedVideoAndAudio(
+                videoURL: media.url,
+                audioURL: pairedAudio,
+                title: media.title,
+                artist: media.author,
+                headers: reqHeaders,
+                knownDurationSeconds: media.durationSeconds,
+                maxDurationMinutes: maxDurationMinutes,
+                destinationFolder: destinationFolder,
+                fallbackStreams: fallbackStreams
+            )
+        } else {
+            downloadDirectMedia(
+                from: media.url,
+                title: media.title,
+                artist: media.author,
+                headers: reqHeaders,
+                knownDurationSeconds: media.durationSeconds,
+                maxDurationMinutes: maxDurationMinutes,
+                destinationFolder: destinationFolder,
+                fallbackStreams: fallbackStreams
+            )
+        }
+    }
+
     func startHLSDownload(
         from url: URL,
         selectedVariantURL: URL? = nil,
@@ -212,7 +283,8 @@ final class WebMediaDownloader {
         minimumBitrate: Double? = nil,
         headers: [String: String]? = nil,
         maxDurationMinutes: Int = 0,
-        destinationFolder: String = ""
+        destinationFolder: String = "",
+        fallbackStreams: [DetectedBrowserMedia] = []
     ) {
         let targetURL = selectedVariantURL ?? url
         guard !activeDownloads.contains(where: { $0.sourceURL == url || $0.sourceURL == targetURL }) else {
@@ -251,7 +323,9 @@ final class WebMediaDownloader {
                     minimumBitrate: minimumBitrate,
                     headers: mergedHeaders,
                     maxDurationSeconds: maxSec,
-                    destinationFolder: destinationFolder
+                    maxDurationMinutes: maxDurationMinutes,
+                    destinationFolder: destinationFolder,
+                    fallbackStreams: fallbackStreams
                 )
             }
         }
@@ -266,7 +340,8 @@ final class WebMediaDownloader {
         headers: [String: String]? = nil,
         knownDurationSeconds: Double? = nil,
         maxDurationMinutes: Int = 0,
-        destinationFolder: String = ""
+        destinationFolder: String = "",
+        fallbackStreams: [DetectedBrowserMedia] = []
     ) {
         let cleanVideo = cleanedStreamURLIfRangeFragment(videoURL)
         let cleanAudio = cleanedStreamURLIfRangeFragment(audioURL)
@@ -275,7 +350,10 @@ final class WebMediaDownloader {
         if let maxMin = maxDurationMinutes > 0 ? maxDurationMinutes : nil,
            let known = knownDurationSeconds, known.isFinite, known > 0,
            known > Double(maxMin * 60) {
-            MediaManager.shared.errorMessage = "Skipped \"\(cleanTitle)\" (exceeds \(maxMin) min limit)."
+            recordFailedDownload(
+                sourceURL: cleanVideo,
+                message: "Skipped \"\(cleanTitle)\" (exceeds \(maxMin) min limit)."
+            )
             return
         }
 
@@ -301,13 +379,29 @@ final class WebMediaDownloader {
             async let audioData = fetchTempFile(from: cleanAudio, ext: "m4a", headers: mergedHeaders, using: session)
 
             guard let tempVideo = await videoData else {
-                MediaManager.shared.errorMessage = "Could not download HD video track."
+                if !Task.isCancelled {
+                    tryNextFallbackOrFail(
+                        fallbacks: fallbackStreams,
+                        maxDurationMinutes: maxDurationMinutes,
+                        destinationFolder: destinationFolder,
+                        sourceURL: cleanVideo,
+                        failureMessage: "Could not download HD video track."
+                    )
+                }
                 return
             }
             updateProgress(downloadID: downloadID, fraction: 0.75)
             guard let tempAudio = await audioData else {
                 try? FileManager.default.removeItem(at: tempVideo)
-                MediaManager.shared.errorMessage = "Could not download audio track."
+                if !Task.isCancelled {
+                    tryNextFallbackOrFail(
+                        fallbacks: fallbackStreams,
+                        maxDurationMinutes: maxDurationMinutes,
+                        destinationFolder: destinationFolder,
+                        sourceURL: cleanVideo,
+                        failureMessage: "Could not download audio track."
+                    )
+                }
                 return
             }
             defer {
@@ -329,11 +423,25 @@ final class WebMediaDownloader {
                     inFolder: destinationFolder
                 ) {
                     let updated = MediaManager.shared.applyDownloadedMetadataAndPlaylist(for: saved, title: title ?? cleanTitle, artist: artist)
-                    lastCompletedMediaItem = updated
+                    recordCompletedDownload(updated, sourceURL: cleanVideo)
+                } else {
+                    tryNextFallbackOrFail(
+                        fallbacks: fallbackStreams,
+                        maxDurationMinutes: maxDurationMinutes,
+                        destinationFolder: destinationFolder,
+                        sourceURL: cleanVideo,
+                        failureMessage: "Could not save muxed video."
+                    )
                 }
             } else {
                 try? FileManager.default.removeItem(at: muxedTemp)
-                MediaManager.shared.errorMessage = "Could not mux video & audio tracks into MP4."
+                tryNextFallbackOrFail(
+                    fallbacks: fallbackStreams,
+                    maxDurationMinutes: maxDurationMinutes,
+                    destinationFolder: destinationFolder,
+                    sourceURL: cleanVideo,
+                    failureMessage: "Could not mux video & audio tracks into MP4."
+                )
             }
         }
         activeAsyncTasks[downloadID] = asyncTask
@@ -375,13 +483,17 @@ final class WebMediaDownloader {
         headers: [String: String]? = nil,
         knownDurationSeconds: Double? = nil,
         maxDurationMinutes: Int = 0,
-        destinationFolder: String = ""
+        destinationFolder: String = "",
+        fallbackStreams: [DetectedBrowserMedia] = []
     ) {
         if let maxMin = maxDurationMinutes > 0 ? maxDurationMinutes : nil,
            let known = knownDurationSeconds, known.isFinite, known > 0,
            known > Double(maxMin * 60) {
             let clean = sanitizedTitle(title, fallbackURL: url, defaultTitle: "Media")
-            MediaManager.shared.errorMessage = "Skipped \"\(clean)\" (exceeds \(maxMin) min limit)."
+            recordFailedDownload(
+                sourceURL: url,
+                message: "Skipped \"\(clean)\" (exceeds \(maxMin) min limit)."
+            )
             return
         }
 
@@ -392,7 +504,8 @@ final class WebMediaDownloader {
                 artist: artist,
                 headers: headers,
                 maxDurationMinutes: maxDurationMinutes,
-                destinationFolder: destinationFolder
+                destinationFolder: destinationFolder,
+                fallbackStreams: fallbackStreams
             )
             return
         }
@@ -428,7 +541,10 @@ final class WebMediaDownloader {
                 if let probedDuration, probedDuration > maxSec {
                     activeDownloads.removeAll { $0.id == downloadID }
                     activeAsyncTasks.removeValue(forKey: downloadID)
-                    MediaManager.shared.errorMessage = "Skipped \"\(cleanTitle)\" (exceeds \(maxDurationMinutes) min limit)."
+                    recordFailedDownload(
+                        sourceURL: normalizedURL,
+                        message: "Skipped \"\(cleanTitle)\" (exceeds \(maxDurationMinutes) min limit)."
+                    )
                     return
                 }
                 activeAsyncTasks.removeValue(forKey: downloadID)
@@ -439,7 +555,9 @@ final class WebMediaDownloader {
                     artist: artist,
                     headers: mergedHeaders,
                     maxDurationSeconds: maxSec,
-                    destinationFolder: destinationFolder
+                    maxDurationMinutes: maxDurationMinutes,
+                    destinationFolder: destinationFolder,
+                    fallbackStreams: fallbackStreams
                 )
             }
             activeAsyncTasks[downloadID] = probeTask
@@ -456,7 +574,9 @@ final class WebMediaDownloader {
             artist: artist,
             headers: mergedHeaders,
             maxDurationSeconds: maxSec,
-            destinationFolder: destinationFolder
+            maxDurationMinutes: maxDurationMinutes,
+            destinationFolder: destinationFolder,
+            fallbackStreams: fallbackStreams
         )
     }
 
@@ -490,11 +610,11 @@ final class WebMediaDownloader {
                     inFolder: destinationFolder
                 ) {
                     let updated = MediaManager.shared.applyDownloadedMetadataAndPlaylist(for: saved, title: baseName, artist: nil)
-                    lastCompletedMediaItem = updated
+                    recordCompletedDownload(updated, sourceURL: tempURL)
                 }
             }
         } catch {
-            MediaManager.shared.errorMessage = "Could not save media: \(error.localizedDescription)"
+            recordFailedDownload(sourceURL: tempURL, message: "Could not save media: \(error.localizedDescription)")
         }
     }
 
@@ -510,7 +630,7 @@ final class WebMediaDownloader {
             normalized = "https://\(normalized)"
         }
         guard let url = URL(string: normalized), url.scheme?.hasPrefix("http") == true else {
-            MediaManager.shared.errorMessage = "Please enter the correct link"
+            recordFailedDownload(sourceURL: nil, message: "Please enter the correct link")
             return
         }
 
@@ -521,40 +641,32 @@ final class WebMediaDownloader {
                 for: url,
                 cookiesHeader: headers?["Cookie"],
                 referer: headers?["Referer"]
-            ), let best = ytResult.streams.first {
-                let resolvedTitle = (title?.isEmpty == false ? title : nil) ?? ytResult.title
-                if best.isHLS {
-                    startHLSDownload(
-                        from: best.url,
+            ), !ytResult.streams.isEmpty {
+                let videoStreams = ytResult.streams.filter { !$0.isAudio }
+                let ordered = videoStreams.isEmpty ? ytResult.streams : videoStreams
+                if let primary = ordered.first {
+                    let resolvedTitle = (title?.isEmpty == false ? title : nil) ?? ytResult.title
+                    let patchedPrimary = DetectedBrowserMedia(
+                        url: primary.url,
+                        pairedAudioURL: primary.pairedAudioURL,
+                        isHLS: primary.isHLS,
+                        isAudio: primary.isAudio,
                         title: resolvedTitle,
-                        artist: ytResult.author,
-                        headers: best.customHeaders,
+                        author: ytResult.author ?? primary.author,
+                        qualityLabel: primary.qualityLabel,
+                        referer: primary.referer,
+                        customHeaders: primary.customHeaders,
+                        durationSeconds: ytResult.durationSeconds ?? primary.durationSeconds,
+                        isActivelyPlaying: primary.isActivelyPlaying
+                    )
+                    cacheMediaStream(
+                        patchedPrimary,
+                        fallbackStreams: Array(ordered.dropFirst()),
                         maxDurationMinutes: maxDurationMinutes,
                         destinationFolder: destinationFolder
                     )
-                } else if let pairedAudio = best.pairedAudioURL {
-                    downloadMuxedVideoAndAudio(
-                        videoURL: best.url,
-                        audioURL: pairedAudio,
-                        title: resolvedTitle,
-                        artist: ytResult.author,
-                        headers: best.customHeaders,
-                        knownDurationSeconds: ytResult.durationSeconds,
-                        maxDurationMinutes: maxDurationMinutes,
-                        destinationFolder: destinationFolder
-                    )
-                } else {
-                    downloadDirectMedia(
-                        from: best.url,
-                        title: resolvedTitle,
-                        artist: ytResult.author,
-                        headers: best.customHeaders,
-                        knownDurationSeconds: ytResult.durationSeconds,
-                        maxDurationMinutes: maxDurationMinutes,
-                        destinationFolder: destinationFolder
-                    )
+                    return
                 }
-                return
             }
         }
 
@@ -694,54 +806,153 @@ final class WebMediaDownloader {
             return false
         }
 
-        var mediaURL = playlistURL
-        var mediaText = initialText
-        var parsed = parseM3U8(text: initialText, baseURL: playlistURL)
+        let initialParsed = parseM3U8(text: initialText, baseURL: playlistURL)
+        var parsedVideo = initialParsed
+        var separateAudioURL: URL?
 
-        if parsed.isMaster {
-            guard !parsed.variants.isEmpty else { return false }
+        if initialParsed.isMaster {
+            guard !initialParsed.variants.isEmpty else { return false }
             let chosenVariant: HLSQualityVariant?
             if let minimumBitrate, minimumBitrate > 0 {
-                chosenVariant = parsed.variants.min { abs($0.peakBitrate - minimumBitrate) < abs($1.peakBitrate - minimumBitrate) }
+                chosenVariant = initialParsed.variants.min { abs($0.peakBitrate - minimumBitrate) < abs($1.peakBitrate - minimumBitrate) }
             } else {
-                chosenVariant = parsed.variants.max { $0.peakBitrate < $1.peakBitrate }
+                let capped = initialParsed.variants.filter { $0.height == 0 || $0.height <= 1080 }
+                chosenVariant = capped.max { $0.peakBitrate < $1.peakBitrate } ?? initialParsed.variants.last
             }
             guard let chosenURL = chosenVariant?.variantURL else { return false }
             guard let subText = await fetchText(from: chosenURL, headers: headers) else { return false }
-            mediaURL = chosenURL
-            mediaText = subText
-            parsed = parseM3U8(text: subText, baseURL: chosenURL)
+            parsedVideo = parseM3U8(text: subText, baseURL: chosenURL)
+            if let groupID = chosenVariant?.audioGroupID {
+                separateAudioURL = initialParsed.audioGroupURLs[groupID]
+            } else {
+                separateAudioURL = initialParsed.audioGroupURLs.values.first
+            }
         }
 
-        _ = mediaURL
-        _ = mediaText
-
-        if parsed.hasUnsupportedEncryption || parsed.isLiveWithoutEndList || parsed.segments.isEmpty {
+        if parsedVideo.hasUnsupportedEncryption || parsedVideo.isLiveWithoutEndList || parsedVideo.segments.isEmpty {
             return false
         }
 
-        if let maxDurationSeconds, parsed.totalDuration > maxDurationSeconds {
+        if let maxDurationSeconds, parsedVideo.totalDuration > maxDurationSeconds {
             activeDownloads.removeAll { $0.id == downloadID }
-            MediaManager.shared.errorMessage = "Skipped \"\(cleanTitle)\" (exceeds \(Int(maxDurationSeconds / 60)) min limit)."
+            recordFailedDownload(
+                sourceURL: playlistURL,
+                message: "Skipped \"\(cleanTitle)\" (exceeds \(Int(maxDurationSeconds / 60)) min limit)."
+            )
             return true
+        }
+
+        var parsedAudio: ParsedHLSMedia?
+        if let separateAudioURL,
+           let audioText = await fetchText(from: separateAudioURL, headers: headers) {
+            let candidate = parseM3U8(text: audioText, baseURL: separateAudioURL)
+            if !candidate.hasUnsupportedEncryption && !candidate.segments.isEmpty {
+                parsedAudio = candidate
+            }
         }
 
         let workDir = FileManager.default.temporaryDirectory.appendingPathComponent("hls_\(downloadID.uuidString)", isDirectory: true)
         try? FileManager.default.createDirectory(at: workDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: workDir) }
 
+        let hasSeparateAudio = parsedAudio != nil
+        guard let videoJoined = await downloadHLSSegmentSet(
+            parsed: parsedVideo,
+            workDir: workDir,
+            filePrefix: "video",
+            headers: headers,
+            downloadID: downloadID,
+            progressBase: 0,
+            progressSpan: hasSeparateAudio ? 0.72 : 0.95
+        ) else {
+            return Task.isCancelled
+        }
+
+        var audioJoined: (url: URL, ext: String)?
+        if let parsedAudio {
+            audioJoined = await downloadHLSSegmentSet(
+                parsed: parsedAudio,
+                workDir: workDir,
+                filePrefix: "audio",
+                headers: headers,
+                downloadID: downloadID,
+                progressBase: 0.72,
+                progressSpan: 0.23
+            )
+            if audioJoined == nil && Task.isCancelled {
+                return true
+            }
+        }
+
+        let finalMP4URL = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString).mp4")
+        let finalOK: Bool
+        if let audioJoined {
+            let muxOK = await Task.detached(priority: .userInitiated) {
+                FFmpegMediaService.muxVideoAndAudioToMP4(videoURL: videoJoined.url, audioURL: audioJoined.url, outputURL: finalMP4URL)
+            }.value
+            if muxOK {
+                finalOK = true
+            } else {
+                try? FileManager.default.removeItem(at: finalMP4URL)
+                finalOK = await Task.detached(priority: .userInitiated) {
+                    FFmpegMediaService.remuxToMP4(inputURL: videoJoined.url, outputURL: finalMP4URL)
+                }.value
+            }
+        } else {
+            finalOK = await Task.detached(priority: .userInitiated) {
+                FFmpegMediaService.remuxToMP4(inputURL: videoJoined.url, outputURL: finalMP4URL)
+            }.value
+        }
+
+        activeDownloads.removeAll { $0.id == downloadID }
+
+        let finalTempURL: URL
+        let finalExt: String
+        if finalOK {
+            finalTempURL = finalMP4URL
+            finalExt = "mp4"
+        } else {
+            try? FileManager.default.removeItem(at: finalMP4URL)
+            finalTempURL = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString).\(videoJoined.ext)")
+            try? FileManager.default.moveItem(at: videoJoined.url, to: finalTempURL)
+            finalExt = videoJoined.ext
+        }
+
+        if let saved = MediaManager.shared.importTemporaryFile(
+            from: finalTempURL,
+            preferredFileName: "\(cleanTitle).\(finalExt)",
+            inFolder: destinationFolder
+        ) {
+            let updated = MediaManager.shared.applyDownloadedMetadataAndPlaylist(for: saved, title: cleanTitle, artist: artist)
+            recordCompletedDownload(updated, sourceURL: playlistURL)
+        } else {
+            return false
+        }
+        LocalMediaCacheProxy.shared.refreshCacheSize()
+        return true
+    }
+
+    private func downloadHLSSegmentSet(
+        parsed: ParsedHLSMedia,
+        workDir: URL,
+        filePrefix: String,
+        headers: [String: String],
+        downloadID: UUID,
+        progressBase: Double,
+        progressSpan: Double
+    ) async -> (url: URL, ext: String)? {
         var initData: Data?
         if let mapURL = parsed.mapURL {
             initData = await fetchBinary(from: mapURL, headers: headers)
-            if initData == nil { return false }
+            if initData == nil { return nil }
         }
 
         var keyCache: [URL: Data] = [:]
         for seg in parsed.segments {
-            if Task.isCancelled { return true }
+            if Task.isCancelled { return nil }
             if let keyURI = seg.keyURI, seg.keyMethod == "AES-128", keyCache[keyURI] == nil {
                 guard let k = await fetchBinary(from: keyURI, headers: headers), k.count == 16 else {
-                    return false
+                    return nil
                 }
                 keyCache[keyURI] = k
             }
@@ -757,7 +968,7 @@ final class WebMediaDownloader {
         for startIdx in stride(from: 0, to: totalCount, by: batchSize) {
             if Task.isCancelled {
                 activeDownloads.removeAll { $0.id == downloadID }
-                return true
+                return nil
             }
             let endIdx = min(startIdx + batchSize, totalCount)
             let ok = await withTaskGroup(of: (Int, URL?).self) { group -> Bool in
@@ -789,7 +1000,7 @@ final class WebMediaDownloader {
                             } else {
                                 plainData = rawData
                             }
-                            let partURL = workDir.appendingPathComponent(String(format: "seg_%05d.bin", i))
+                            let partURL = workDir.appendingPathComponent(String(format: "%@_seg_%05d.bin", filePrefix, i))
                             do {
                                 try plainData.write(to: partURL, options: [.atomic])
                                 return (i, partURL)
@@ -813,20 +1024,21 @@ final class WebMediaDownloader {
             }
 
             if !ok {
-                return false
+                return nil
             }
-            updateProgress(downloadID: downloadID, fraction: Double(completedCount) / Double(totalCount))
+            let frac = progressBase + (Double(completedCount) / Double(max(1, totalCount))) * progressSpan
+            updateProgress(downloadID: downloadID, fraction: frac)
         }
 
         let orderedParts = segmentFiles.compactMap { $0 }
-        guard orderedParts.count == totalCount else { return false }
+        guard orderedParts.count == totalCount else { return nil }
 
         let isFMP4 = initData != nil || segments.first?.url.pathExtension.lowercased() == "m4s"
         let joinedExt = isFMP4 ? "mp4" : "ts"
-        let joinedURL = workDir.appendingPathComponent("joined.\(joinedExt)")
+        let joinedURL = workDir.appendingPathComponent("\(filePrefix)_joined.\(joinedExt)")
 
         FileManager.default.createFile(atPath: joinedURL.path, contents: nil)
-        guard let writeHandle = try? FileHandle(forWritingTo: joinedURL) else { return false }
+        guard let writeHandle = try? FileHandle(forWritingTo: joinedURL) else { return nil }
         if let initData {
             try? writeHandle.write(contentsOf: initData)
         }
@@ -836,36 +1048,7 @@ final class WebMediaDownloader {
             }
         }
         try? writeHandle.close()
-
-        let finalMP4URL = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString).mp4")
-        let remuxed = await Task.detached(priority: .userInitiated) {
-            FFmpegMediaService.remuxToMP4(inputURL: joinedURL, outputURL: finalMP4URL)
-        }.value
-
-        activeDownloads.removeAll { $0.id == downloadID }
-
-        let finalTempURL: URL
-        let finalExt: String
-        if remuxed {
-            finalTempURL = finalMP4URL
-            finalExt = "mp4"
-        } else {
-            try? FileManager.default.removeItem(at: finalMP4URL)
-            finalTempURL = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString).\(joinedExt)")
-            try? FileManager.default.moveItem(at: joinedURL, to: finalTempURL)
-            finalExt = joinedExt
-        }
-
-        if let saved = MediaManager.shared.importTemporaryFile(
-            from: finalTempURL,
-            preferredFileName: "\(cleanTitle).\(finalExt)",
-            inFolder: destinationFolder
-        ) {
-            let updated = MediaManager.shared.applyDownloadedMetadataAndPlaylist(for: saved, title: cleanTitle, artist: artist)
-            lastCompletedMediaItem = updated
-        }
-        LocalMediaCacheProxy.shared.refreshCacheSize()
-        return true
+        return (joinedURL, joinedExt)
     }
 
     private func startAppleAVAssetHLSDownload(
@@ -875,7 +1058,9 @@ final class WebMediaDownloader {
         minimumBitrate: Double?,
         headers: [String: String],
         maxDurationSeconds: Double?,
-        destinationFolder: String
+        maxDurationMinutes: Int = 0,
+        destinationFolder: String,
+        fallbackStreams: [DetectedBrowserMedia] = []
     ) {
         let downloadID = UUID()
         let asset = AVURLAsset(url: url, options: ["AVURLAssetHTTPHeaderFieldsKey": headers])
@@ -890,7 +1075,13 @@ final class WebMediaDownloader {
             assetArtworkData: nil,
             options: taskOptions.isEmpty ? nil : taskOptions
         ) else {
-            MediaManager.shared.errorMessage = "Could not start HLS download."
+            tryNextFallbackOrFail(
+                fallbacks: fallbackStreams,
+                maxDurationMinutes: maxDurationMinutes,
+                destinationFolder: destinationFolder,
+                sourceURL: url,
+                failureMessage: "Could not start HLS download."
+            )
             return
         }
 
@@ -899,8 +1090,10 @@ final class WebMediaDownloader {
             artist: artist,
             sourceURL: url,
             maxDurationSeconds: maxDurationSeconds,
+            maxDurationMinutes: maxDurationMinutes,
             isHLS: true,
-            destinationFolder: destinationFolder
+            destinationFolder: destinationFolder,
+            fallbackStreams: fallbackStreams
         )
         taskToDownloadID[task.taskIdentifier] = downloadID
         activeURLTasks[downloadID] = task
@@ -916,15 +1109,19 @@ final class WebMediaDownloader {
         artist: String?,
         headers: [String: String],
         maxDurationSeconds: Double?,
-        destinationFolder: String
+        maxDurationMinutes: Int = 0,
+        destinationFolder: String,
+        fallbackStreams: [DetectedBrowserMedia] = []
     ) {
         downloadMeta[downloadID] = DownloadMeta(
             title: cleanTitle,
             artist: artist,
             sourceURL: url,
             maxDurationSeconds: maxDurationSeconds,
+            maxDurationMinutes: maxDurationMinutes,
             isHLS: false,
-            destinationFolder: destinationFolder
+            destinationFolder: destinationFolder,
+            fallbackStreams: fallbackStreams
         )
 
         var request = URLRequest(url: url)
@@ -960,6 +1157,25 @@ final class WebMediaDownloader {
         let lines = text.components(separatedBy: .newlines).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
 
         if lines.contains(where: { $0.hasPrefix("#EXT-X-STREAM-INF") }) {
+            var audioGroupURLs: [String: URL] = [:]
+            var audioGroupDefaults: Set<String> = []
+            for line in lines where line.hasPrefix("#EXT-X-MEDIA:") {
+                let attrs = parseM3U8Attributes(String(line.dropFirst("#EXT-X-MEDIA:".count)))
+                guard attrs["TYPE"]?.uppercased() == "AUDIO",
+                      let groupID = attrs["GROUP-ID"], !groupID.isEmpty,
+                      let rawURI = attrs["URI"],
+                      let resolvedAudio = URL(string: rawURI, relativeTo: baseURL)?.absoluteURL else {
+                    continue
+                }
+                let isDefault = attrs["DEFAULT"]?.uppercased() == "YES"
+                if isDefault && !audioGroupDefaults.contains(groupID) {
+                    audioGroupURLs[groupID] = resolvedAudio
+                    audioGroupDefaults.insert(groupID)
+                } else if audioGroupURLs[groupID] == nil {
+                    audioGroupURLs[groupID] = resolvedAudio
+                }
+            }
+
             var variants: [HLSQualityVariant] = []
             var seen = Set<String>()
             var idx = 0
@@ -985,6 +1201,7 @@ final class WebMediaDownloader {
                         let mbps = bandwidth > 0 ? String(format: "%.1f Mbps", bandwidth / 1_000_000.0) : ""
                         let resLabel = h > 0 ? "\(h)p" : (attrs["NAME"] ?? "Quality \(variants.count + 1)")
                         let label = mbps.isEmpty ? resLabel : "\(resLabel) • \(mbps)"
+                        let audioGroupID = attrs["AUDIO"]?.trimmingCharacters(in: .whitespacesAndNewlines)
                         if seen.insert(resolved.absoluteString).inserted {
                             variants.append(
                                 HLSQualityVariant(
@@ -993,7 +1210,8 @@ final class WebMediaDownloader {
                                     width: w,
                                     height: h,
                                     peakBitrate: bandwidth,
-                                    variantURL: resolved
+                                    variantURL: resolved,
+                                    audioGroupID: audioGroupID?.isEmpty == false ? audioGroupID : nil
                                 )
                             )
                         }
@@ -1010,6 +1228,7 @@ final class WebMediaDownloader {
             return ParsedHLSMedia(
                 isMaster: true,
                 variants: variants,
+                audioGroupURLs: audioGroupURLs,
                 mapURL: nil,
                 segments: [],
                 totalDuration: 0,
@@ -1083,6 +1302,7 @@ final class WebMediaDownloader {
         return ParsedHLSMedia(
             isMaster: false,
             variants: [],
+            audioGroupURLs: [:],
             mapURL: mapURL,
             segments: segments,
             totalDuration: totalDuration,
@@ -1274,6 +1494,37 @@ final class WebMediaDownloader {
         activeDownloads[idx].progress = min(max(fraction, 0), 1)
     }
 
+    private func recordCompletedDownload(_ item: MediaItem, sourceURL: URL) {
+        lastCompletedMediaItem = item
+        lastCompletedCacheEvent = CompletedCacheEvent(eventID: UUID(), item: item, sourceURL: sourceURL)
+    }
+
+    private func recordFailedDownload(sourceURL: URL?, message: String) {
+        MediaManager.shared.errorMessage = message
+        lastFailedCacheEvent = FailedCacheEvent(eventID: UUID(), sourceURL: sourceURL, message: message)
+    }
+
+    private func tryNextFallbackOrFail(
+        fallbacks: [DetectedBrowserMedia],
+        maxDurationMinutes: Int,
+        destinationFolder: String,
+        sourceURL: URL?,
+        failureMessage: String
+    ) {
+        if let next = fallbacks.first {
+            let rest = Array(fallbacks.dropFirst())
+            MediaManager.shared.statusMessage = "Trying alternate stream for \(next.title ?? "video")..."
+            cacheMediaStream(
+                next,
+                fallbackStreams: rest,
+                maxDurationMinutes: maxDurationMinutes,
+                destinationFolder: destinationFolder
+            )
+            return
+        }
+        recordFailedDownload(sourceURL: sourceURL, message: failureMessage)
+    }
+
     fileprivate func handleFinishedDownload(
         taskIdentifier: Int,
         tempFileURL: URL,
@@ -1293,12 +1544,24 @@ final class WebMediaDownloader {
         if !isHLS {
             if !(200...299).contains(statusCode) && statusCode != 0 {
                 try? FileManager.default.removeItem(at: tempFileURL)
-                MediaManager.shared.errorMessage = "Download blocked (HTTP \(statusCode)). Try playing the video in Browser first."
+                tryNextFallbackOrFail(
+                    fallbacks: meta.fallbackStreams,
+                    maxDurationMinutes: meta.maxDurationMinutes,
+                    destinationFolder: meta.destinationFolder,
+                    sourceURL: meta.sourceURL,
+                    failureMessage: "Download blocked (HTTP \(statusCode)). Try playing the video in Browser first."
+                )
                 return
             }
             if mimeType.contains("html") {
                 try? FileManager.default.removeItem(at: tempURLOrFallback(tempFileURL))
-                MediaManager.shared.errorMessage = "Server returned a webpage instead of media. Try playing inside the Browser."
+                tryNextFallbackOrFail(
+                    fallbacks: meta.fallbackStreams,
+                    maxDurationMinutes: meta.maxDurationMinutes,
+                    destinationFolder: meta.destinationFolder,
+                    sourceURL: meta.sourceURL,
+                    failureMessage: "Server returned a webpage instead of media. Try playing inside the Browser."
+                )
                 return
             }
         }
@@ -1307,7 +1570,10 @@ final class WebMediaDownloader {
             if let limit = meta.maxDurationSeconds, !isHLS {
                 if let seconds = await resolveLocalDuration(at: tempFileURL), seconds > limit {
                     try? FileManager.default.removeItem(at: tempFileURL)
-                    MediaManager.shared.errorMessage = "Skipped \"\(meta.title)\" (exceeds \(Int(limit / 60)) min limit)."
+                    recordFailedDownload(
+                        sourceURL: meta.sourceURL,
+                        message: "Skipped \"\(meta.title)\" (exceeds \(Int(limit / 60)) min limit)."
+                    )
                     return
                 }
             }
@@ -1320,7 +1586,15 @@ final class WebMediaDownloader {
                 inFolder: meta.destinationFolder
             ) {
                 let updated = MediaManager.shared.applyDownloadedMetadataAndPlaylist(for: saved, title: meta.title, artist: meta.artist)
-                lastCompletedMediaItem = updated
+                recordCompletedDownload(updated, sourceURL: meta.sourceURL)
+            } else {
+                tryNextFallbackOrFail(
+                    fallbacks: meta.fallbackStreams,
+                    maxDurationMinutes: meta.maxDurationMinutes,
+                    destinationFolder: meta.destinationFolder,
+                    sourceURL: meta.sourceURL,
+                    failureMessage: "Could not import cached media file."
+                )
             }
             LocalMediaCacheProxy.shared.refreshCacheSize()
         }
@@ -1329,14 +1603,23 @@ final class WebMediaDownloader {
     private func tempURLOrFallback(_ url: URL) -> URL { url }
 
     fileprivate func handleFailedDownload(taskIdentifier: Int, error: Error) {
+        let removedMeta: DownloadMeta?
         if let id = taskToDownloadID.removeValue(forKey: taskIdentifier) {
-            downloadMeta.removeValue(forKey: id)
+            removedMeta = downloadMeta.removeValue(forKey: id)
             activeURLTasks.removeValue(forKey: id)
             activeDownloads.removeAll { $0.id == id }
+        } else {
+            removedMeta = nil
         }
         let nsErr = error as NSError
         if nsErr.code != NSURLErrorCancelled {
-            MediaManager.shared.errorMessage = "Download failed: \(error.localizedDescription)"
+            tryNextFallbackOrFail(
+                fallbacks: removedMeta?.fallbackStreams ?? [],
+                maxDurationMinutes: removedMeta?.maxDurationMinutes ?? 0,
+                destinationFolder: removedMeta?.destinationFolder ?? "",
+                sourceURL: removedMeta?.sourceURL,
+                failureMessage: "Download failed: \(error.localizedDescription)"
+            )
         }
     }
 
