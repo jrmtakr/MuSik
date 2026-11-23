@@ -55,6 +55,7 @@ private struct MoveTarget: Identifiable {
 private struct PendingImportItem {
     let url: URL
     let folderPath: String
+    let didAccessSecurityScope: Bool
 }
 
 struct LibraryView: View {
@@ -70,6 +71,7 @@ struct LibraryView: View {
     @State private var currentFolderPath = ""
 
     @State private var showFileImporter = false
+    @State private var showFolderImporter = false
     @State private var showPhotosPicker = false
     @State private var showWiFiSheet = false
     @State private var showEqualizerSheet = false
@@ -326,6 +328,12 @@ struct LibraryView: View {
                         }
 
                         Button {
+                            showFolderImporter = true
+                        } label: {
+                            Label("Add Folder (Files App)", systemImage: "folder.badge.plus")
+                        }
+
+                        Button {
                             showPhotosPicker = true
                         } label: {
                             Label("Import from Photos", systemImage: "photo.on.rectangle.angled")
@@ -394,22 +402,10 @@ struct LibraryView: View {
             .miniPlayerInset(showPlayerSheet: $showPlayerSheet)
             .fileImporter(
                 isPresented: $showFileImporter,
-                allowedContentTypes: [.item],
+                allowedContentTypes: [.item, .folder],
                 allowsMultipleSelection: true
             ) { result in
-                switch result {
-                case .success(let urls):
-                    let folder = showsFolderHierarchy ? currentFolderPath : ""
-                    for url in urls {
-                        if mediaManager.fileExists(named: url.lastPathComponent, inFolder: folder) {
-                            pendingConflicts.append(PendingImportItem(url: url, folderPath: folder))
-                        } else {
-                            mediaManager.importAnyFile(from: url, inFolder: folder)
-                        }
-                    }
-                case .failure(let error):
-                    mediaManager.errorMessage = "File picker failed: \(error.localizedDescription)"
-                }
+                handleImporterResult(result)
             }
             .photosPicker(
                 isPresented: $showPhotosPicker,
@@ -454,7 +450,7 @@ struct LibraryView: View {
                 "\"\(pendingConflicts.first?.url.lastPathComponent ?? "")\" already exists, how to do with it?",
                 isPresented: Binding(
                     get: { !pendingConflicts.isEmpty },
-                    set: { if !$0 { pendingConflicts.removeAll() } }
+                    set: { if !$0 { clearPendingConflicts() } }
                 ),
                 titleVisibility: .visible
             ) {
@@ -462,17 +458,26 @@ struct LibraryView: View {
                     if let first = pendingConflicts.first {
                         pendingConflicts.removeFirst()
                         mediaManager.importAnyFile(from: first.url, inFolder: first.folderPath, conflictAction: .overwrite)
+                        if first.didAccessSecurityScope {
+                            first.url.stopAccessingSecurityScopedResource()
+                        }
                     }
                 }
                 Button("Keep Both") {
                     if let first = pendingConflicts.first {
                         pendingConflicts.removeFirst()
                         mediaManager.importAnyFile(from: first.url, inFolder: first.folderPath, conflictAction: .keepBoth)
+                        if first.didAccessSecurityScope {
+                            first.url.stopAccessingSecurityScopedResource()
+                        }
                     }
                 }
                 Button("Cancel", role: .cancel) {
-                    if !pendingConflicts.isEmpty {
+                    if let first = pendingConflicts.first {
                         pendingConflicts.removeFirst()
+                        if first.didAccessSecurityScope {
+                            first.url.stopAccessingSecurityScopedResource()
+                        }
                     }
                 }
             }
@@ -540,6 +545,13 @@ struct LibraryView: View {
             } message: {
                 Text("All files inside this folder will be permanently deleted.")
             }
+        }
+        .fileImporter(
+            isPresented: $showFolderImporter,
+            allowedContentTypes: [.folder],
+            allowsMultipleSelection: true
+        ) { result in
+            handleImporterResult(result)
         }
     }
 
@@ -978,15 +990,22 @@ struct LibraryView: View {
         ContentUnavailableView {
             Label("No Local Files Yet", systemImage: "play.square.stack")
         } description: {
-            Text("Import songs, videos, ZIPs, or photos from Files, Photos, Wi-Fi Transfer, or Discovery.")
+            Text("Import songs, videos, folders, ZIPs, or photos from Files, Photos, Wi-Fi Transfer, or Discovery.")
         } actions: {
-            HStack(spacing: 12) {
+            HStack(spacing: 10) {
                 Button {
                     showFileImporter = true
                 } label: {
-                    Label("Add Files", systemImage: "folder.badge.plus")
+                    Label("Add Files", systemImage: "doc.badge.plus")
                 }
                 .buttonStyle(.borderedProminent)
+
+                Button {
+                    showFolderImporter = true
+                } label: {
+                    Label("Folder", systemImage: "folder.badge.plus")
+                }
+                .buttonStyle(.bordered)
 
                 Button {
                     showPhotosPicker = true
@@ -996,6 +1015,30 @@ struct LibraryView: View {
                 .buttonStyle(.bordered)
             }
         }
+    }
+
+    private func handleImporterResult(_ result: Result<[URL], Error>) {
+        switch result {
+        case .success(let urls):
+            let folder = showsFolderHierarchy ? currentFolderPath : ""
+            for url in urls {
+                if mediaManager.fileExists(named: url.lastPathComponent, inFolder: folder) {
+                    let didAccess = url.startAccessingSecurityScopedResource()
+                    pendingConflicts.append(PendingImportItem(url: url, folderPath: folder, didAccessSecurityScope: didAccess))
+                } else {
+                    mediaManager.importAnyFile(from: url, inFolder: folder)
+                }
+            }
+        case .failure(let error):
+            mediaManager.errorMessage = "File picker failed: \(error.localizedDescription)"
+        }
+    }
+
+    private func clearPendingConflicts() {
+        for conflict in pendingConflicts where conflict.didAccessSecurityScope {
+            conflict.url.stopAccessingSecurityScopedResource()
+        }
+        pendingConflicts.removeAll()
     }
 }
 

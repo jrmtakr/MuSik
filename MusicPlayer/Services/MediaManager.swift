@@ -328,6 +328,7 @@ final class MediaManager {
     enum ImportedOutcome {
         case media(MediaItem)
         case document(LocalFile)
+        case folder(name: String, fileCount: Int)
     }
 
     func fileExists(named fileName: String, inFolder folderPath: String = "") -> Bool {
@@ -349,8 +350,14 @@ final class MediaManager {
         }
 
         let targetDir = folderURL(for: folderPath)
+        let resourceValues = try? sourceURL.resourceValues(forKeys: [.isDirectoryKey])
+        let isDirectory = (resourceValues?.isDirectory == true) && sourceURL.pathExtension.lowercased() != "movpkg"
+
         if sourceURL.standardizedFileURL.deletingLastPathComponent() == targetDir.standardizedFileURL {
             loadLocalFiles()
+            if isDirectory {
+                return nil
+            }
             let rel = folderPath.isEmpty ? sourceURL.lastPathComponent : "\(folderPath)/\(sourceURL.lastPathComponent)"
             return outcomeForRelativePath(rel)
         }
@@ -364,6 +371,28 @@ final class MediaManager {
 
         do {
             try FileManager.default.createDirectory(at: targetDir, withIntermediateDirectories: true)
+
+            if isDirectory {
+                let sourceBase = sourceURL.resolvingSymlinksInPath().standardizedFileURL
+                let destBase = destURL.resolvingSymlinksInPath().standardizedFileURL
+                guard destBase != sourceBase,
+                      !destBase.path.hasPrefix(sourceBase.path + "/") else {
+                    errorMessage = "Cannot import a folder into itself."
+                    return nil
+                }
+
+                let relFolder = folderPath.isEmpty ? destURL.lastPathComponent : "\(folderPath)/\(destURL.lastPathComponent)"
+                if conflictAction == .overwrite, FileManager.default.fileExists(atPath: destURL.path) {
+                    clearCachedMetadata(underRelativePrefix: relFolder)
+                    try FileManager.default.removeItem(at: destURL)
+                }
+
+                let copiedCount = try copyDirectoryContents(from: sourceURL, to: destURL)
+                loadLocalFiles()
+                statusMessage = "Saved folder \"\(destURL.lastPathComponent)\" (\(copiedCount) \(copiedCount == 1 ? "file" : "files"))"
+                return .folder(name: destURL.lastPathComponent, fileCount: copiedCount)
+            }
+
             if conflictAction == .overwrite, FileManager.default.fileExists(atPath: destURL.path) {
                 try FileManager.default.removeItem(at: destURL)
             }
@@ -381,6 +410,76 @@ final class MediaManager {
             errorMessage = "Import failed: \(error.localizedDescription)"
             return nil
         }
+    }
+
+    private func clearCachedMetadata(underRelativePrefix relativePrefix: String) {
+        let prefixWithSlash = relativePrefix + "/"
+        for key in Array(durationsByPath.keys) where key == relativePrefix || key.hasPrefix(prefixWithSlash) {
+            durationsByPath.removeValue(forKey: key)
+        }
+        for key in metadataLoadedPaths where key == relativePrefix || key.hasPrefix(prefixWithSlash) {
+            metadataLoadedPaths.remove(key)
+        }
+        for key in Array(thumbnails.keys) where key == relativePrefix || key.hasPrefix(prefixWithSlash) {
+            thumbnails.removeValue(forKey: key)
+        }
+    }
+
+    private func copyDirectoryContents(from sourceFolderURL: URL, to destFolderURL: URL) throws -> Int {
+        try FileManager.default.createDirectory(at: destFolderURL, withIntermediateDirectories: true)
+
+        let baseComponents = sourceFolderURL.resolvingSymlinksInPath().standardizedFileURL.pathComponents
+        guard let enumerator = FileManager.default.enumerator(
+            at: sourceFolderURL,
+            includingPropertiesForKeys: [.isDirectoryKey, .isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return 0
+        }
+
+        var copiedCount = 0
+        while let childURL = enumerator.nextObject() as? URL {
+            if childURL.lastPathComponent == "__MACOSX" {
+                enumerator.skipDescendants()
+                continue
+            }
+
+            let childComponents = childURL.resolvingSymlinksInPath().standardizedFileURL.pathComponents
+            guard childComponents.count > baseComponents.count,
+                  Array(childComponents.prefix(baseComponents.count)) == baseComponents else {
+                continue
+            }
+
+            let relComponents = childComponents.dropFirst(baseComponents.count)
+            let targetChildURL = relComponents.reduce(destFolderURL) { $0.appendingPathComponent($1) }
+            let values = try? childURL.resourceValues(forKeys: [.isDirectoryKey])
+            let isChildDir = values?.isDirectory == true
+
+            if isChildDir && childURL.pathExtension.lowercased() != "movpkg" {
+                try FileManager.default.createDirectory(at: targetChildURL, withIntermediateDirectories: true)
+            } else {
+                let childDidAccess = childURL.startAccessingSecurityScopedResource()
+                defer {
+                    if childDidAccess {
+                        childURL.stopAccessingSecurityScopedResource()
+                    }
+                }
+                try FileManager.default.createDirectory(
+                    at: targetChildURL.deletingLastPathComponent(),
+                    withIntermediateDirectories: true
+                )
+                if FileManager.default.fileExists(atPath: targetChildURL.path) {
+                    try FileManager.default.removeItem(at: targetChildURL)
+                }
+                try FileManager.default.copyItem(at: childURL, to: targetChildURL)
+                copiedCount += 1
+                if childURL.pathExtension.lowercased() == "movpkg" {
+                    enumerator.skipDescendants()
+                }
+            }
+        }
+
+        return copiedCount
     }
 
     @discardableResult

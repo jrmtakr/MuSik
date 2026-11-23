@@ -37,6 +37,8 @@ struct MusicPlayerApp: App {
                         showPlayerSheet = true
                     case .document(let file):
                         quickLookTarget = QuickLookTarget(title: file.name, fileURL: file.fileURL)
+                    case .folder:
+                        break
                     case nil:
                         break
                     }
