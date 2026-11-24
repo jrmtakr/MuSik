@@ -1,4 +1,4 @@
-name: MusicPlayer
+name: MuseJRM
 options:
   bundleIdPrefix: com.personal.musicplayer
   deploymentTarget:
@@ -11,7 +11,7 @@ packages:
     url: https://github.com/kingslay/FFmpegKit.git
     exactVersion: 6.1.4
 targets:
-  MusicPlayer:
+  MuseJRM:
     type: application
     platform: iOS
     sources:
@@ -31,7 +31,7 @@ targets:
       base:
         INFOPLIST_FILE: MusicPlayer/Info.plist
         GENERATE_INFOPLIST_FILE: "NO"
-        PRODUCT_NAME: MusicPlayer
+        PRODUCT_NAME: MuseJRM
         PRODUCT_BUNDLE_IDENTIFIER: com.personal.musicplayer.offline
         MARKETING_VERSION: "1.0.0"
         CURRENT_PROJECT_VERSION: "1"

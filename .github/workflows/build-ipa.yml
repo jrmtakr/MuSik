@@ -1,4 +1,4 @@
-name: Build MusicPlayer IPA
+name: Build MuseJRM IPA
 
 on:
   workflow_dispatch:
@@ -21,8 +21,8 @@ jobs:
       - name: Archive unsigned iOS app
         run: |
           xcodebuild \
-            -project MusicPlayer.xcodeproj \
-            -scheme MusicPlayer \
+            -project MuseJRM.xcodeproj \
+            -scheme MuseJRM \
             -configuration Release \
             -sdk iphoneos \
             -destination 'generic/platform=iOS' \
@@ -30,18 +30,18 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
             archive \
-            -archivePath build/MusicPlayer.xcarchive
+            -archivePath build/MuseJRM.xcarchive
 
-      - name: Package MusicPlayer.ipa
+      - name: Package MuseJRM.ipa
         run: |
           mkdir -p build/Payload
-          cp -R build/MusicPlayer.xcarchive/Products/Applications/MusicPlayer.app build/Payload/
-          codesign --force --deep --sign - --timestamp=none build/Payload/MusicPlayer.app
+          cp -R build/MuseJRM.xcarchive/Products/Applications/MuseJRM.app build/Payload/
+          codesign --force --deep --sign - --timestamp=none build/Payload/MuseJRM.app
           cd build
-          zip -qry MusicPlayer.ipa Payload
+          zip -qry MuseJRM.ipa Payload
 
-      - name: Upload MusicPlayer.ipa artifact
+      - name: Upload MuseJRM.ipa artifact
         uses: actions/upload-artifact@v4
         with:
-          name: MusicPlayer-ipa
-          path: build/MusicPlayer.ipa
+          name: MuseJRM-ipa
+          path: build/MuseJRM.ipa
