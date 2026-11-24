@@ -25,6 +25,7 @@ final class MediaManager {
         var likedPaths: [String] = []
         var recentPaths: [String] = []
         var upNextPaths: [String] = []
+        var manualQueuePaths: [String]? = nil
         var customMetadataByPath: [String: CustomTrackMetadata] = [:]
         var lastPlaylistID: UUID?
         var repeatMode: RepeatMode = .off
@@ -40,7 +41,9 @@ final class MediaManager {
     var likedPaths: Set<String> = []
     var recentPaths: [String] = []
     var upNextPaths: [String] = []
+    var manualQueuePaths: [String] = []
     var customMetadataByPath: [String: CustomTrackMetadata] = [:]
+    @ObservationIgnored private var didUserClearQueueThisSession = false
 
     var currentItem: MediaItem?
     var isPlaying = false
@@ -99,6 +102,7 @@ final class MediaManager {
         loadPlaylistCovers()
         loadLibraryState()
         loadLocalFiles()
+        populateLaunchRandomizedQueue()
         PlaylistTimeMachineService.shared.ensureBaselinesIfNeeded(
             for: playlists,
             items: items,
@@ -194,9 +198,20 @@ final class MediaManager {
         loadedOthers.sort { $0.dateAdded > $1.dateAdded }
         loadedFolders.sort { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
 
+        let previousPathSet = Set(items.map(\.relativePath))
         items = loadedItems
         otherFiles = loadedOthers
         folders = loadedFolders
+
+        if !previousPathSet.isEmpty, !didUserClearQueueThisSession {
+            let existingQueueSet = Set(upNextPaths)
+            let newlyAdded = loadedItems
+                .filter { !previousPathSet.contains($0.relativePath) && !existingQueueSet.contains($0.relativePath) && currentItem?.relativePath != $0.relativePath }
+                .map(\.relativePath)
+            if !newlyAdded.isEmpty {
+                upNextPaths.append(contentsOf: newlyAdded.shuffled())
+            }
+        }
 
         if let currentItem, !currentItem.relativePath.hasPrefix("__remote__/") {
             if let refreshed = loadedItems.first(where: { $0.relativePath == currentItem.relativePath }) {
@@ -1074,15 +1089,54 @@ final class MediaManager {
         return Array(queue[nextIndex...])
     }
 
+    /// Builds a freshly randomized launch queue containing all cached audios & videos,
+    /// keeping any manually pinned queue items at the very front.
+    func populateLaunchRandomizedQueue() {
+        let validSet = Set(items.map(\.relativePath))
+        guard !validSet.isEmpty else {
+            upNextPaths = []
+            manualQueuePaths = []
+            return
+        }
+        let pinned = manualQueuePaths.filter { validSet.contains($0) && $0 != currentItem?.relativePath }
+        let pinnedSet = Set(pinned)
+        let remainingShuffled = items
+            .map(\.relativePath)
+            .filter { !pinnedSet.contains($0) && $0 != currentItem?.relativePath }
+            .shuffled()
+        manualQueuePaths = pinned
+        upNextPaths = pinned + remainingShuffled
+        saveLibraryState()
+    }
+
+    func reshuffleQueueWithAllCachedMedia() {
+        let currentRel = currentItem?.relativePath
+        let pool = items.map(\.relativePath).filter { $0 != currentRel }.shuffled()
+        manualQueuePaths = []
+        didUserClearQueueThisSession = false
+        upNextPaths = pool
+        saveLibraryState()
+        statusMessage = "Randomized queue (\(pool.count) items)"
+    }
+
     func addToNextPlay(_ item: MediaItem) {
+        didUserClearQueueThisSession = false
         upNextPaths.removeAll { $0 == item.relativePath }
         upNextPaths.insert(item.relativePath, at: 0)
+        manualQueuePaths.removeAll { $0 == item.relativePath }
+        manualQueuePaths.insert(item.relativePath, at: 0)
         saveLibraryState()
         statusMessage = "Playing Next: \(item.displayTitle)"
     }
 
     func addToQueue(_ item: MediaItem) {
-        upNextPaths.append(item.relativePath)
+        didUserClearQueueThisSession = false
+        upNextPaths.removeAll { $0 == item.relativePath }
+        let insertAt = manualQueuePaths.count
+        let safeIdx = min(insertAt, upNextPaths.count)
+        upNextPaths.insert(item.relativePath, at: safeIdx)
+        manualQueuePaths.removeAll { $0 == item.relativePath }
+        manualQueuePaths.append(item.relativePath)
         saveLibraryState()
         statusMessage = "Added to Queue: \(item.displayTitle)"
     }
@@ -1090,13 +1144,20 @@ final class MediaManager {
     func addMultipleToQueue(_ newItems: [MediaItem], playNext: Bool = false) {
         let paths = newItems.map(\.relativePath).filter { !$0.isEmpty }
         guard !paths.isEmpty else { return }
+        didUserClearQueueThisSession = false
+        let set = Set(paths)
         if playNext {
-            let set = Set(paths)
             upNextPaths.removeAll { set.contains($0) }
             upNextPaths.insert(contentsOf: paths, at: 0)
+            manualQueuePaths.removeAll { set.contains($0) }
+            manualQueuePaths.insert(contentsOf: paths, at: 0)
             statusMessage = "Added \(paths.count) \(paths.count == 1 ? "song" : "songs") to Play Next"
         } else {
-            upNextPaths.append(contentsOf: paths)
+            upNextPaths.removeAll { set.contains($0) }
+            let safeIdx = min(manualQueuePaths.count, upNextPaths.count)
+            upNextPaths.insert(contentsOf: paths, at: safeIdx)
+            manualQueuePaths.removeAll { set.contains($0) }
+            manualQueuePaths.append(contentsOf: paths)
             statusMessage = "Added \(paths.count) \(paths.count == 1 ? "song" : "songs") to Queue"
         }
         saveLibraryState()
@@ -1108,6 +1169,8 @@ final class MediaManager {
         let selected = currentUpNext[queueIndex]
         let remainingPaths = Array(currentUpNext.dropFirst(queueIndex + 1)).map(\.relativePath)
         upNextPaths = remainingPaths
+        let remainingSet = Set(remainingPaths)
+        manualQueuePaths.removeAll { $0 == selected.relativePath || !remainingSet.contains($0) }
         saveLibraryState()
         play(selected, inPlaylist: activePlaylistID)
     }
@@ -1116,12 +1179,15 @@ final class MediaManager {
         guard upNextPaths.indices.contains(queueIndex), queueIndex > 0 else { return }
         let path = upNextPaths.remove(at: queueIndex)
         upNextPaths.insert(path, at: 0)
+        manualQueuePaths.removeAll { $0 == path }
+        manualQueuePaths.insert(path, at: 0)
         saveLibraryState()
     }
 
     func removeFromUpNext(at offsets: IndexSet) {
         for idx in offsets.sorted(by: >) where upNextPaths.indices.contains(idx) {
-            upNextPaths.remove(at: idx)
+            let removed = upNextPaths.remove(at: idx)
+            manualQueuePaths.removeAll { $0 == removed }
         }
         saveLibraryState()
     }
@@ -1132,7 +1198,9 @@ final class MediaManager {
     }
 
     func clearUpNext() {
+        didUserClearQueueThisSession = true
         upNextPaths.removeAll()
+        manualQueuePaths.removeAll()
         saveLibraryState()
     }
 
@@ -1140,6 +1208,7 @@ final class MediaManager {
         let byPath = Dictionary(items.map { ($0.relativePath, $0) }, uniquingKeysWith: { first, _ in first })
         while !upNextPaths.isEmpty {
             let nextPath = upNextPaths.removeFirst()
+            manualQueuePaths.removeAll { $0 == nextPath }
             if let match = byPath[nextPath] {
                 saveLibraryState()
                 return match
@@ -2285,6 +2354,10 @@ final class MediaManager {
             }
             return
         }
+        if let queued = popNextQueuedItem() {
+            play(queued)
+            return
+        }
         if let recent = recentItems.first ?? items.first {
             play(recent)
         } else {
@@ -2710,6 +2783,7 @@ final class MediaManager {
         likedPaths = Set(state.likedPaths)
         recentPaths = state.recentPaths
         upNextPaths = state.upNextPaths
+        manualQueuePaths = state.manualQueuePaths ?? []
         customMetadataByPath = state.customMetadataByPath
         lastPlaylistID = state.lastPlaylistID
         repeatMode = state.repeatMode
@@ -2720,6 +2794,7 @@ final class MediaManager {
             likedPaths: Array(likedPaths),
             recentPaths: recentPaths,
             upNextPaths: upNextPaths,
+            manualQueuePaths: manualQueuePaths,
             customMetadataByPath: customMetadataByPath,
             lastPlaylistID: lastPlaylistID,
             repeatMode: repeatMode
@@ -2960,8 +3035,8 @@ final class MediaManager {
             return
         }
 
-        if let currentItem, (!currentItem.isVideo || activePlaylistID != nil), activeQueue.count > 1 {
-            playNext(fromQueueOnly: repeatMode == .off)
+        if activeQueue.count > 1 {
+            playNext(fromQueueOnly: false)
             return
         }
 

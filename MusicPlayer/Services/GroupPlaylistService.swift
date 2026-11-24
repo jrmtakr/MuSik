@@ -44,20 +44,35 @@ struct GroupPlaylistMessage: Identifiable, Hashable, Codable {
 }
 
 enum GroupPlaylistStickerPalette {
-    static let presets: [(emoji: String, label: String)] = [
-        ("🔥", "Fire"),
-        ("❤️", "Love"),
-        ("😭", "Feels"),
-        ("🕺", "Vibe"),
-        ("🎧", "Late Night"),
-        ("✨", "Magic"),
-        ("💀", "Too Good"),
-        ("🌙", "Midnight"),
-        ("🚗", "Drive"),
-        ("💥", "Banger"),
-        ("🥺", "Nostalgia"),
-        ("👑", "Classic")
+    /// Curated iconic TikTok comment/DM secret expression stickers (`[shortcode]`).
+    static let presets: [(code: String, label: String)] = [
+        ("[wronged]", "Wronged"),
+        ("[lovely]", "Lovely"),
+        ("[proud]", "Proud"),
+        ("[laughwithtears]", "LOL Tears"),
+        ("[flushed]", "Flushed"),
+        ("[cool]", "Cool"),
+        ("[cry]", "Cry"),
+        ("[scream]", "Scream"),
+        ("[rage]", "Rage"),
+        ("[yummy]", "Yummy"),
+        ("[thinking]", "Thinking"),
+        ("[nap]", "Nap"),
+        ("[angel]", "Angel"),
+        ("[evil]", "Evil"),
+        ("[wicked]", "Wicked"),
+        ("[wow]", "Wow")
     ]
+
+    static func displayName(for rawSticker: String) -> String {
+        let lower = rawSticker.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return presets.first(where: { $0.code == lower })?.label ?? rawSticker
+    }
+
+    static func isTikTokCode(_ rawSticker: String) -> Bool {
+        let lower = rawSticker.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return presets.contains(where: { $0.code == lower })
+    }
 }
 
 struct GroupPlaylist: Identifiable, Hashable, Codable {

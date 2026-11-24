@@ -524,8 +524,7 @@ struct GroupPlaylistDetailView: View {
                         if track.hasMessageOrSticker {
                             HStack(spacing: 5) {
                                 if let sticker = track.sticker, !sticker.isEmpty {
-                                    Text(sticker)
-                                        .font(.caption)
+                                    TikTokStickerView(rawSticker: sticker, size: 20)
                                 }
                                 if let note = track.note, !note.isEmpty {
                                     Text("\"\(note)\"")
@@ -533,7 +532,7 @@ struct GroupPlaylistDetailView: View {
                                         .foregroundStyle(Color.accentColor)
                                         .lineLimit(2)
                                 } else {
-                                    Text("Sticker reaction")
+                                    Text(GroupPlaylistStickerPalette.displayName(for: track.sticker ?? ""))
                                         .font(.caption2)
                                         .foregroundStyle(.secondary)
                                 }

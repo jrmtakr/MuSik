@@ -182,18 +182,29 @@ struct UserQueueContentView: View {
                         .font(.caption)
                         .foregroundStyle(isEmbeddedDarkGlass ? .white.opacity(0.65) : .secondary)
                         .multilineTextAlignment(.center)
-                    Button {
-                        if isEmbeddedDarkGlass {
-                            showAddSongsInline = true
-                        } else {
-                            onAddSongs()
+                    HStack(spacing: 8) {
+                        Button {
+                            if isEmbeddedDarkGlass {
+                                showAddSongsInline = true
+                            } else {
+                                onAddSongs()
+                            }
+                        } label: {
+                            Label("Browse Songs", systemImage: "plus.circle.fill")
+                                .font(.caption.weight(.semibold))
                         }
-                    } label: {
-                        Label("Browse Songs to Queue", systemImage: "plus.circle.fill")
-                            .font(.caption.weight(.semibold))
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+
+                        Button {
+                            mediaManager.reshuffleQueueWithAllCachedMedia()
+                        } label: {
+                            Label("Reshuffle All", systemImage: "shuffle")
+                                .font(.caption.weight(.semibold))
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
                     }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.small)
                 }
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 16)
@@ -267,6 +278,15 @@ struct UserQueueContentView: View {
                     .font(.caption.weight(.bold))
                     .foregroundStyle(isEmbeddedDarkGlass ? .white.opacity(0.82) : .secondary)
                 Spacer()
+                if !mediaManager.items.isEmpty {
+                    Button {
+                        mediaManager.reshuffleQueueWithAllCachedMedia()
+                    } label: {
+                        Label("Shuffle All", systemImage: "shuffle")
+                            .font(.caption.weight(.semibold))
+                    }
+                    .tint(isEmbeddedDarkGlass ? .white : .accentColor)
+                }
                 if !queuedRows.isEmpty {
                     Button("Clear", role: .destructive) {
                         mediaManager.clearUpNext()

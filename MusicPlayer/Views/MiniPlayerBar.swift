@@ -125,10 +125,10 @@ struct MiniPlayerBar: View {
                     .foregroundStyle(Color.accentColor)
 
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("\(queued.count) \(queued.count == 1 ? "Song" : "Songs") in Queue")
+                    Text("\(queued.count) Ready in Queue")
                         .font(.subheadline.weight(.semibold))
                     if let first = queued.first {
-                        Text("Next: \(first.displayTitle)")
+                        Text("Up Next: \(first.displayTitle)\(first.isVideo ? " (Video)" : "")")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .lineLimit(1)

@@ -315,12 +315,11 @@ struct CollabMessagesView: View {
 
             HStack(alignment: .center, spacing: 10) {
                 if let sticker = msg.sticker, !sticker.isEmpty {
-                    Text(sticker)
-                        .font(.system(size: 36))
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
+                    TikTokStickerView(rawSticker: sticker, size: 48, showCodeBadge: true)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 6)
                         .background(
-                            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            RoundedRectangle(cornerRadius: 14, style: .continuous)
                                 .fill(isEmbeddedDarkGlass ? Color.white.opacity(0.08) : Color.secondary.opacity(0.08))
                         )
                 }
@@ -344,32 +343,36 @@ struct CollabMessagesView: View {
     private func quickMessageComposer(for group: GroupPlaylist) -> some View {
         VStack(spacing: 8) {
             ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 6) {
-                    ForEach(GroupPlaylistStickerPalette.presets, id: \.emoji) { preset in
-                        let isSelected = selectedSticker == preset.emoji
+                HStack(spacing: 7) {
+                    ForEach(GroupPlaylistStickerPalette.presets, id: \.code) { preset in
+                        let isSelected = selectedSticker == preset.code
                         Button {
                             AppHaptics.selection()
-                            selectedSticker = (selectedSticker == preset.emoji) ? nil : preset.emoji
+                            selectedSticker = (selectedSticker == preset.code) ? nil : preset.code
                         } label: {
-                            Text(preset.emoji)
-                                .font(.title3)
-                                .padding(.horizontal, 8)
-                                .padding(.vertical, 4)
-                                .background(
-                                    Capsule().fill(
-                                        isSelected
-                                            ? (isEmbeddedDarkGlass ? Color.white.opacity(0.32) : Color.accentColor.opacity(0.24))
-                                            : (isEmbeddedDarkGlass ? Color.white.opacity(0.09) : Color.secondary.opacity(0.10))
-                                    )
+                            VStack(spacing: 2) {
+                                TikTokStickerView(rawSticker: preset.code, size: 30)
+                                Text(preset.label)
+                                    .font(.system(size: 9, weight: .bold))
+                                    .foregroundStyle(isEmbeddedDarkGlass ? .white.opacity(isSelected ? 1 : 0.72) : .secondary)
+                            }
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 5)
+                            .background(
+                                RoundedRectangle(cornerRadius: 12, style: .continuous).fill(
+                                    isSelected
+                                        ? (isEmbeddedDarkGlass ? Color.white.opacity(0.28) : Color.accentColor.opacity(0.22))
+                                        : (isEmbeddedDarkGlass ? Color.white.opacity(0.08) : Color.secondary.opacity(0.09))
                                 )
-                                .overlay(
-                                    Capsule().strokeBorder(
-                                        isSelected
-                                            ? (isEmbeddedDarkGlass ? Color.white.opacity(0.85) : Color.accentColor)
-                                            : .clear,
-                                        lineWidth: 1.2
-                                    )
+                            )
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(
+                                    isSelected
+                                        ? (isEmbeddedDarkGlass ? Color.white.opacity(0.88) : Color.accentColor)
+                                        : .clear,
+                                    lineWidth: 1.3
                                 )
+                            )
                         }
                         .buttonStyle(.plain)
                     }
@@ -550,19 +553,18 @@ struct CollabSongNoteComposerSheet: View {
                     }
                 }
 
-                Section("Optional Sticker") {
-                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 56), spacing: 10)], spacing: 10) {
-                        ForEach(GroupPlaylistStickerPalette.presets, id: \.emoji) { preset in
-                            let selected = selectedSticker == preset.emoji
+                Section("Optional TikTok Sticker") {
+                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 64), spacing: 10)], spacing: 10) {
+                        ForEach(GroupPlaylistStickerPalette.presets, id: \.code) { preset in
+                            let selected = selectedSticker == preset.code
                             Button {
                                 AppHaptics.selection()
-                                selectedSticker = (selectedSticker == preset.emoji) ? nil : preset.emoji
+                                selectedSticker = (selectedSticker == preset.code) ? nil : preset.code
                             } label: {
-                                VStack(spacing: 3) {
-                                    Text(preset.emoji)
-                                        .font(.title2)
+                                VStack(spacing: 4) {
+                                    TikTokStickerView(rawSticker: preset.code, size: 36)
                                     Text(preset.label)
-                                        .font(.caption2)
+                                        .font(.caption2.weight(.semibold))
                                         .foregroundStyle(selected ? .white : .secondary)
                                         .lineLimit(1)
                                 }
