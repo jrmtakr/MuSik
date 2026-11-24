@@ -188,6 +188,9 @@ final class AppSettings {
     var crossfadeDurationSeconds: Double {
         didSet { UserDefaults.standard.set(crossfadeDurationSeconds, forKey: Keys.crossfadeDuration) }
     }
+    var autoAISyncLyrics: Bool {
+        didSet { UserDefaults.standard.set(autoAISyncLyrics, forKey: Keys.autoAISyncLyrics) }
+    }
 
     static var isCrossfadeEnabled: Bool {
         UserDefaults.standard.bool(forKey: Keys.crossfadeEnabled)
@@ -267,6 +270,7 @@ final class AppSettings {
         static let targetDownloadPlaylistID = "musicplayer.targetDownloadPlaylistID"
         static let crossfadeEnabled = "musicplayer.crossfade.enabled"
         static let crossfadeDuration = "musicplayer.crossfade.seconds"
+        static let autoAISyncLyrics = "musicplayer.lyrics.autoAISync"
     }
 
     private static var themeAssetsDirectory: URL {
@@ -343,6 +347,10 @@ final class AppSettings {
         } else {
             self.crossfadeDurationSeconds = 4.0
         }
+        if defaults.object(forKey: Keys.autoAISyncLyrics) == nil {
+            defaults.set(true, forKey: Keys.autoAISyncLyrics)
+        }
+        self.autoAISyncLyrics = defaults.bool(forKey: Keys.autoAISyncLyrics)
 
         if FileManager.default.fileExists(atPath: Self.customIconFileURL.path),
            let img = UIImage(contentsOfFile: Self.customIconFileURL.path) {

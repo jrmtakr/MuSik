@@ -185,6 +185,15 @@ struct SettingsView: View {
                 Section("Player & Tools") {
                     Toggle("Quick access to Last Playlist", isOn: $settings.quickAccessLastPlaylist)
 
+                    Toggle(isOn: $settings.autoAISyncLyrics) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("AI Auto-Sync & Recognize Lyrics")
+                            Text("Automatically identifies and aligns mismatched lyrics while playing")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
                     Toggle(isOn: $settings.crossfadeEnabled) {
                         VStack(alignment: .leading, spacing: 2) {
                             Text("Fade Between Songs (Crossfade)")

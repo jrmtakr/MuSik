@@ -144,6 +144,7 @@ struct AppleMusicLivingBackground: View {
 struct AppleMusicLyricsView: View {
     @Environment(MediaManager.self) private var mediaManager
     @Environment(SyncedLyricsService.self) private var lyricsService
+    @Environment(AppSettings.self) private var settings
 
     let item: MediaItem
     let onOpenGeniusWeb: (String, String) -> Void
@@ -152,73 +153,91 @@ struct AppleMusicLyricsView: View {
     @State private var lastSyncPlaybackTime: Double = 0
     @State private var isUserScrolling = false
     @State private var resumeAutoScrollTask: Task<Void, Never>?
+    @State private var showQuickTimingControls = false
     @State private var showManualSearchSheet = false
     @State private var customSongTitle = ""
     @State private var customArtistName = ""
     @State private var customLyricsPasteText = ""
     @State private var copiedBannerText: String?
 
+    private var hasDurationMismatchWarning: Bool {
+        guard let lyrics = lyricsService.currentLyrics,
+              let lrcDur = lyrics.expectedDurationSeconds, lrcDur > 15,
+              let trackDur = item.durationSeconds, trackDur > 15 else {
+            return false
+        }
+        return abs(lrcDur - trackDur) > 12.0 && abs(lyrics.syncedOffsetSeconds) < 0.25 && abs(lyrics.tempoScale - 1.0) < 0.02
+    }
+
     var body: some View {
-        ZStack(alignment: .bottom) {
-            if let lyrics = lyricsService.currentLyrics, !lyrics.lines.isEmpty {
-                TimelineView(.animation(minimumInterval: mediaManager.isPlaying ? (1.0 / 30.0) : 0.25)) { timeline in
-                    let effectiveTime = interpolatedPlaybackTime(at: timeline.date, offset: lyrics.syncedOffsetSeconds)
-                    let activeIdx = lyrics.isTimeSynced ? activeLineIndex(in: lyrics.lines, at: effectiveTime) : nil
+        VStack(spacing: 0) {
+            aiSyncControlBar
 
-                    lyricsScrollContent(
-                        lyrics: lyrics,
-                        effectiveTime: effectiveTime,
-                        activeIndex: activeIdx
-                    )
-                }
-            } else if lyricsService.currentLoadingKey != nil {
-                VStack(spacing: 14) {
-                    ProgressView()
-                        .tint(.white)
-                        .controlSize(.large)
-                    Text("Finding Synced Lyrics...")
-                        .font(.headline.weight(.semibold))
-                        .foregroundStyle(.white.opacity(0.85))
-                    Text(item.displayTitle)
-                        .font(.caption)
-                        .foregroundStyle(.white.opacity(0.55))
-                        .lineLimit(1)
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else {
-                emptyOrErrorLyricsView
-            }
+            ZStack(alignment: .bottom) {
+                if let lyrics = lyricsService.currentLyrics, !lyrics.lines.isEmpty {
+                    TimelineView(.animation(minimumInterval: mediaManager.isPlaying ? (1.0 / 30.0) : 0.25)) { timeline in
+                        let effectiveTime = interpolatedPlaybackTime(
+                            at: timeline.date,
+                            offset: lyrics.syncedOffsetSeconds,
+                            tempoScale: lyrics.tempoScale
+                        )
+                        let activeIdx = lyrics.isTimeSynced ? activeLineIndex(in: lyrics.lines, at: effectiveTime) : nil
 
-            VStack(spacing: 8) {
-                if let copiedBannerText {
-                    Text(copiedBannerText)
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 7)
-                        .background(.ultraThinMaterial, in: Capsule())
-                        .transition(.opacity)
+                        lyricsScrollContent(
+                            lyrics: lyrics,
+                            effectiveTime: effectiveTime,
+                            activeIndex: activeIdx
+                        )
+                    }
+                } else if lyricsService.currentLoadingKey != nil {
+                    VStack(spacing: 14) {
+                        ProgressView()
+                            .tint(.white)
+                            .controlSize(.large)
+                        Text("Finding Synced Lyrics...")
+                            .font(.headline.weight(.semibold))
+                            .foregroundStyle(.white.opacity(0.85))
+                        Text(item.displayTitle)
+                            .font(.caption)
+                            .foregroundStyle(.white.opacity(0.55))
+                            .lineLimit(1)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    emptyOrErrorLyricsView
                 }
 
-                if isUserScrolling, lyricsService.currentLyrics?.isTimeSynced == true {
-                    Button {
-                        AppHaptics.selection()
-                        isUserScrolling = false
-                        resumeAutoScrollTask?.cancel()
-                    } label: {
-                        Label("Sync to Current Line", systemImage: "arrow.up.and.down.text.horizontal")
+                VStack(spacing: 8) {
+                    if let copiedBannerText {
+                        Text(copiedBannerText)
                             .font(.caption.weight(.semibold))
                             .foregroundStyle(.white)
                             .padding(.horizontal, 14)
-                            .padding(.vertical, 8)
+                            .padding(.vertical, 7)
                             .background(.ultraThinMaterial, in: Capsule())
-                            .overlay(Capsule().strokeBorder(.white.opacity(0.22), lineWidth: 0.8))
+                            .transition(.opacity)
                     }
-                    .buttonStyle(.plain)
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
+
+                    if isUserScrolling, lyricsService.currentLyrics?.isTimeSynced == true {
+                        Button {
+                            AppHaptics.selection()
+                            isUserScrolling = false
+                            resumeAutoScrollTask?.cancel()
+                        } label: {
+                            Label("Sync to Current Line", systemImage: "arrow.up.and.down.text.horizontal")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.white)
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 8)
+                                .background(.ultraThinMaterial, in: Capsule())
+                                .overlay(Capsule().strokeBorder(.white.opacity(0.22), lineWidth: 0.8))
+                        }
+                        .buttonStyle(.plain)
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                    }
                 }
+                .padding(.bottom, 12)
             }
-            .padding(.bottom, 12)
         }
         .onAppear {
             syncClockSnapshot()
@@ -229,6 +248,17 @@ struct AppleMusicLyricsView: View {
             syncClockSnapshot()
             lyricsService.loadLyricsIfNeeded(for: item)
         }
+        .onChange(of: lyricsService.currentLoadingKey) { oldKey, newKey in
+            if oldKey != nil, newKey == nil, settings.autoAISyncLyrics {
+                lyricsService.autoRecognizeIfAuthorizedAndNeeded(
+                    for: item,
+                    playbackTime: mediaManager.currentTime,
+                    equalizerPlayer: mediaManager.equalizerPlayer,
+                    isEQPlaying: mediaManager.equalizerPlayer.isPlaying,
+                    playbackRate: mediaManager.playbackRate
+                )
+            }
+        }
         .onChange(of: mediaManager.currentTime) { _, newTime in
             syncClockSnapshot(explicitTime: newTime)
         }
@@ -238,6 +268,177 @@ struct AppleMusicLyricsView: View {
         .sheet(isPresented: $showManualSearchSheet) {
             manualLyricsSearchSheet
         }
+    }
+
+    // MARK: - Top AI Recognition & Quick Timing Bar
+
+    private var aiSyncControlBar: some View {
+        VStack(spacing: 6) {
+            HStack(spacing: 8) {
+                Button {
+                    AppHaptics.selection()
+                    lyricsService.recognizeAndAlignWithAI(
+                        for: item,
+                        playbackTime: mediaManager.currentTime,
+                        equalizerPlayer: mediaManager.equalizerPlayer,
+                        isEQPlaying: mediaManager.equalizerPlayer.isPlaying,
+                        playbackRate: mediaManager.playbackRate,
+                        forceReidentify: false
+                    )
+                } label: {
+                    HStack(spacing: 6) {
+                        if lyricsService.isAIRecognizing {
+                            ProgressView()
+                                .controlSize(.mini)
+                                .tint(.white)
+                        } else {
+                            Image(systemName: "waveform.and.magnifyingglass")
+                                .font(.caption.weight(.bold))
+                        }
+                        Text(lyricsService.isAIRecognizing ? "Listening..." : "AI Listen & Sync")
+                            .font(.caption.weight(.semibold))
+                    }
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 11)
+                    .padding(.vertical, 6)
+                    .background(
+                        lyricsService.isAIRecognizing ? Color.accentColor.opacity(0.65) : Color.white.opacity(0.16),
+                        in: Capsule()
+                    )
+                    .overlay(Capsule().strokeBorder(.white.opacity(0.22), lineWidth: 0.7))
+                }
+                .buttonStyle(.plain)
+                .disabled(lyricsService.isAIRecognizing)
+                .contextMenu {
+                    Button {
+                        lyricsService.recognizeAndAlignWithAI(
+                            for: item,
+                            playbackTime: mediaManager.currentTime,
+                            equalizerPlayer: mediaManager.equalizerPlayer,
+                            isEQPlaying: mediaManager.equalizerPlayer.isPlaying,
+                            playbackRate: mediaManager.playbackRate,
+                            forceReidentify: true
+                        )
+                    } label: {
+                        Label("Force AI Song Re-Identification", systemImage: "sparkles")
+                    }
+                }
+
+                if lyricsService.currentLyrics?.isTimeSynced == true {
+                    Button {
+                        AppHaptics.selection()
+                        withAnimation(.spring(response: 0.3, dampingFraction: 0.85)) {
+                            showQuickTimingControls.toggle()
+                        }
+                    } label: {
+                        let off = lyricsService.currentLyrics?.syncedOffsetSeconds ?? 0
+                        HStack(spacing: 5) {
+                            Image(systemName: "slider.horizontal.3")
+                                .font(.caption2.weight(.bold))
+                            Text(abs(off) > 0.01 ? String(format: "%+.2fs", off) : "Timing")
+                                .font(.caption.monospacedDigit().weight(.semibold))
+                            if hasDurationMismatchWarning {
+                                Circle()
+                                    .fill(.orange)
+                                    .frame(width: 6, height: 6)
+                            }
+                        }
+                        .foregroundStyle(hasDurationMismatchWarning ? .orange : .white)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(showQuickTimingControls ? Color.white.opacity(0.26) : Color.white.opacity(0.13), in: Capsule())
+                    }
+                    .buttonStyle(.plain)
+                }
+
+                Spacer()
+
+                Button {
+                    lyricsService.recognizeAndAlignWithAI(
+                        for: item,
+                        playbackTime: mediaManager.currentTime,
+                        equalizerPlayer: mediaManager.equalizerPlayer,
+                        isEQPlaying: mediaManager.equalizerPlayer.isPlaying,
+                        playbackRate: mediaManager.playbackRate,
+                        forceReidentify: true
+                    )
+                } label: {
+                    Label("ID Song", systemImage: "sparkles")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.white.opacity(0.9))
+                        .padding(.horizontal, 9)
+                        .padding(.vertical, 6)
+                        .background(Color.white.opacity(0.12), in: Capsule())
+                }
+                .buttonStyle(.plain)
+                .disabled(lyricsService.isAIRecognizing)
+            }
+
+            if showQuickTimingControls, let lyrics = lyricsService.currentLyrics, lyrics.isTimeSynced {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        ForEach([-2.0, -0.5, -0.25, 0.25, 0.5, 2.0], id: \.self) { delta in
+                            Button(delta > 0 ? String(format: "+%.2gs", delta) : String(format: "%.2gs", delta)) {
+                                AppHaptics.light()
+                                lyricsService.adjustTimingOffset(by: delta)
+                            }
+                            .font(.caption2.monospacedDigit().weight(.semibold))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 9)
+                            .padding(.vertical, 5)
+                            .background(Color.white.opacity(0.16), in: Capsule())
+                            .buttonStyle(.plain)
+                        }
+
+                        if let lrcDur = lyrics.expectedDurationSeconds,
+                           let trackDur = item.durationSeconds,
+                           lrcDur > 15, trackDur > 15,
+                           abs(lrcDur - trackDur) / max(lrcDur, trackDur) > 0.08 {
+                            Button(abs(lyrics.tempoScale - 1.0) > 0.02 ? "1.0x Speed" : "Fit Speed") {
+                                AppHaptics.selection()
+                                lyricsService.toggleDurationTempoFit(for: item)
+                            }
+                            .font(.caption2.weight(.bold))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 9)
+                            .padding(.vertical, 5)
+                            .background(Color.accentColor.opacity(0.55), in: Capsule())
+                            .buttonStyle(.plain)
+                        }
+
+                        Button("Reset") {
+                            AppHaptics.selection()
+                            lyricsService.resetTimingOffset()
+                        }
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.white.opacity(0.8))
+                        .padding(.horizontal, 9)
+                        .padding(.vertical, 5)
+                        .background(Color.white.opacity(0.12), in: Capsule())
+                        .buttonStyle(.plain)
+                    }
+                }
+                .transition(.move(edge: .top).combined(with: .opacity))
+            }
+
+            if let msg = lyricsService.aiErrorMessage ?? lyricsService.aiStatusMessage, !msg.isEmpty {
+                HStack(spacing: 6) {
+                    Image(systemName: lyricsService.aiErrorMessage != nil ? "exclamationmark.triangle.fill" : "sparkles")
+                        .font(.caption2)
+                        .foregroundStyle(lyricsService.aiErrorMessage != nil ? .orange : .green)
+                    Text(msg)
+                        .font(.caption2.weight(.medium))
+                        .foregroundStyle(.white.opacity(0.88))
+                        .lineLimit(2)
+                    Spacer()
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(Color.black.opacity(0.26), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            }
+        }
+        .padding(.horizontal, 20)
+        .padding(.bottom, 6)
     }
 
     // MARK: - Main Lyrics Scroll View
@@ -268,7 +469,7 @@ struct AppleMusicLyricsView: View {
                                     effectiveTime: effectiveTime
                                 )
                                 .onTapGesture {
-                                    seekToLine(line, offset: lyrics.syncedOffsetSeconds)
+                                    seekToLine(line, offset: lyrics.syncedOffsetSeconds, tempoScale: lyrics.tempoScale)
                                 }
                             } else {
                                 lyricLineButton(
@@ -357,7 +558,7 @@ struct AppleMusicLyricsView: View {
 
         Button {
             if lyrics.isTimeSynced {
-                seekToLine(line, offset: lyrics.syncedOffsetSeconds)
+                seekToLine(line, offset: lyrics.syncedOffsetSeconds, tempoScale: lyrics.tempoScale)
             }
         } label: {
             Group {
@@ -384,7 +585,7 @@ struct AppleMusicLyricsView: View {
         .contextMenu {
             if lyrics.isTimeSynced {
                 Button {
-                    seekToLine(line, offset: lyrics.syncedOffsetSeconds)
+                    seekToLine(line, offset: lyrics.syncedOffsetSeconds, tempoScale: lyrics.tempoScale)
                 } label: {
                     Label("Play from Here", systemImage: "play.fill")
                 }
@@ -530,25 +731,47 @@ struct AppleMusicLyricsView: View {
                 .multilineTextAlignment(.center)
                 .padding(.horizontal, 28)
 
-            HStack(spacing: 12) {
+            VStack(spacing: 10) {
                 Button {
-                    customSongTitle = item.displayTitle
-                    customArtistName = item.artist ?? ""
-                    showManualSearchSheet = true
+                    lyricsService.recognizeAndAlignWithAI(
+                        for: item,
+                        playbackTime: mediaManager.currentTime,
+                        equalizerPlayer: mediaManager.equalizerPlayer,
+                        isEQPlaying: mediaManager.equalizerPlayer.isPlaying,
+                        playbackRate: mediaManager.playbackRate,
+                        forceReidentify: true
+                    )
                 } label: {
-                    Label("Search Lyrics", systemImage: "magnifyingglass")
-                        .font(.subheadline.weight(.semibold))
+                    Label(
+                        lyricsService.isAIRecognizing ? "Listening to Song..." : "AI Listen & Identify Song",
+                        systemImage: "waveform.and.magnifyingglass"
+                    )
+                    .font(.subheadline.weight(.semibold))
                 }
                 .buttonStyle(.borderedProminent)
+                .disabled(lyricsService.isAIRecognizing)
 
-                Button {
-                    onOpenGeniusWeb(item.displayTitle, item.artist ?? "")
-                } label: {
-                    Label("Open Genius", systemImage: "safari")
-                        .font(.subheadline.weight(.semibold))
+                HStack(spacing: 12) {
+                    Button {
+                        customSongTitle = item.displayTitle
+                        customArtistName = item.artist ?? ""
+                        showManualSearchSheet = true
+                    } label: {
+                        Label("Search Lyrics", systemImage: "magnifyingglass")
+                            .font(.subheadline.weight(.semibold))
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(.white)
+
+                    Button {
+                        onOpenGeniusWeb(item.displayTitle, item.artist ?? "")
+                    } label: {
+                        Label("Open Genius", systemImage: "safari")
+                            .font(.subheadline.weight(.semibold))
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(.white)
                 }
-                .buttonStyle(.bordered)
-                .tint(.white)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -615,7 +838,7 @@ struct AppleMusicLyricsView: View {
         lastSyncPlaybackTime = explicitTime ?? mediaManager.currentTime
     }
 
-    private func interpolatedPlaybackTime(at now: Date, offset: Double) -> Double {
+    private func interpolatedPlaybackTime(at now: Date, offset: Double, tempoScale: Double = 1.0) -> Double {
         let rawTime: Double
         if mediaManager.isPlaying {
             let dt = max(0, min(1.5, now.timeIntervalSince(lastSyncWallTime)))
@@ -623,7 +846,7 @@ struct AppleMusicLyricsView: View {
         } else {
             rawTime = mediaManager.currentTime
         }
-        return rawTime + offset
+        return rawTime * tempoScale + offset
     }
 
     private func activeLineIndex(in lines: [SyncedLyricLine], at effectiveTime: Double) -> Int? {
@@ -638,9 +861,9 @@ struct AppleMusicLyricsView: View {
         return bestIdx
     }
 
-    private func seekToLine(_ line: SyncedLyricLine, offset: Double) {
+    private func seekToLine(_ line: SyncedLyricLine, offset: Double, tempoScale: Double = 1.0) {
         AppHaptics.light()
-        let target = max(0, line.startTime - offset)
+        let target = max(0, (line.startTime - offset) / max(0.25, tempoScale))
         mediaManager.seek(to: target)
         if !mediaManager.isPlaying {
             mediaManager.resume()

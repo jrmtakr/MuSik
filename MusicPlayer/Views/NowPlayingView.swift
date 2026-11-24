@@ -865,6 +865,32 @@ struct NowPlayingView: View {
             } else {
                 Menu {
                     Button {
+                        lyricsService.recognizeAndAlignWithAI(
+                            for: item,
+                            playbackTime: mediaManager.currentTime,
+                            equalizerPlayer: mediaManager.equalizerPlayer,
+                            isEQPlaying: mediaManager.equalizerPlayer.isPlaying,
+                            playbackRate: mediaManager.playbackRate,
+                            forceReidentify: false
+                        )
+                    } label: {
+                        Label("AI Listen & Auto-Sync Lyrics", systemImage: "waveform.and.magnifyingglass")
+                    }
+
+                    Button {
+                        lyricsService.recognizeAndAlignWithAI(
+                            for: item,
+                            playbackTime: mediaManager.currentTime,
+                            equalizerPlayer: mediaManager.equalizerPlayer,
+                            isEQPlaying: mediaManager.equalizerPlayer.isPlaying,
+                            playbackRate: mediaManager.playbackRate,
+                            forceReidentify: true
+                        )
+                    } label: {
+                        Label("AI Re-Identify Song by Audio", systemImage: "sparkles")
+                    }
+
+                    Button {
                         lyricsService.loadLyricsIfNeeded(for: item, forceReload: true)
                     } label: {
                         Label("Reload Synced Lyrics", systemImage: "arrow.clockwise")
@@ -872,14 +898,14 @@ struct NowPlayingView: View {
 
                     if lyricsService.currentLyrics?.isTimeSynced == true {
                         Button {
-                            lyricsService.adjustTimingOffset(by: -0.25)
+                            lyricsService.adjustTimingOffset(by: -0.5)
                         } label: {
-                            Label("Timing -0.25s (Earlier)", systemImage: "minus.circle")
+                            Label("Timing -0.5s (Earlier)", systemImage: "minus.circle")
                         }
                         Button {
-                            lyricsService.adjustTimingOffset(by: 0.25)
+                            lyricsService.adjustTimingOffset(by: 0.5)
                         } label: {
-                            Label("Timing +0.25s (Later)", systemImage: "plus.circle")
+                            Label("Timing +0.5s (Later)", systemImage: "plus.circle")
                         }
                         Button {
                             lyricsService.resetTimingOffset()

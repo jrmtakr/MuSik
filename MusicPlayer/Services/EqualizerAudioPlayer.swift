@@ -390,6 +390,19 @@ final class EqualizerAudioPlayer {
         timePitchNode.rate = rate
     }
 
+    func installAudioCaptureTap(_ handler: @escaping @Sendable (AVAudioPCMBuffer, AVAudioTime) -> Void) {
+        engine.mainMixerNode.removeTap(onBus: 0)
+        let format = engine.mainMixerNode.outputFormat(forBus: 0)
+        guard format.channelCount > 0, format.sampleRate > 0 else { return }
+        engine.mainMixerNode.installTap(onBus: 0, bufferSize: 4096, format: format) { buffer, time in
+            handler(buffer, time)
+        }
+    }
+
+    func removeAudioCaptureTap() {
+        engine.mainMixerNode.removeTap(onBus: 0)
+    }
+
     // MARK: - Private Helpers
 
     private func scheduleSegment(fromSeconds seconds: Double) {
