@@ -453,6 +453,25 @@ final class WebMediaDownloader {
         headers: [String: String],
         using session: URLSession
     ) async -> URL? {
+        if let first = await performTempDownload(from: url, ext: ext, headers: headers, using: session) {
+            return first
+        }
+        let minimalHeaders: [String: String] = [
+            "User-Agent": headers["User-Agent"] ?? Self.browserUserAgent,
+            "Accept": "*/*"
+        ]
+        if minimalHeaders != headers {
+            return await performTempDownload(from: url, ext: ext, headers: minimalHeaders, using: session)
+        }
+        return nil
+    }
+
+    nonisolated private func performTempDownload(
+        from url: URL,
+        ext: String,
+        headers: [String: String],
+        using session: URLSession
+    ) async -> URL? {
         var req = URLRequest(url: url)
         headers.forEach { req.setValue($0.value, forHTTPHeaderField: $0.key) }
         req.timeoutInterval = 120
@@ -635,13 +654,29 @@ final class WebMediaDownloader {
         }
 
         if YouTubeStreamResolver.isYouTubeURL(url),
-           YouTubeStreamResolver.extractVideoID(from: url) != nil {
+           let videoID = YouTubeStreamResolver.extractVideoID(from: url) {
             MediaManager.shared.statusMessage = "Resolving YouTube stream..."
-            if let ytResult = await YouTubeStreamResolver.resolveStreams(
+            let cookieHeader: String?
+            if let explicitCookie = headers?["Cookie"], !explicitCookie.isEmpty {
+                cookieHeader = explicitCookie
+            } else {
+                cookieHeader = await BrowserYouTubeResolver.youtubeCookieHeader()
+            }
+
+            var ytResult = await YouTubeStreamResolver.resolveStreams(
                 for: url,
-                cookiesHeader: headers?["Cookie"],
-                referer: headers?["Referer"]
-            ), !ytResult.streams.isEmpty {
+                cookiesHeader: cookieHeader,
+                referer: headers?["Referer"] ?? url.absoluteString
+            )
+
+            if ytResult == nil || (ytResult?.streams.isEmpty ?? true) {
+                MediaManager.shared.statusMessage = "Resolving YouTube stream in browser..."
+                if let browserResolved = await BrowserYouTubeResolver.shared.resolveStreamsInBrowser(videoID: videoID) {
+                    ytResult = browserResolved.result
+                }
+            }
+
+            if let ytResult, !ytResult.streams.isEmpty {
                 let videoStreams = ytResult.streams.filter { !$0.isAudio }
                 let ordered = videoStreams.isEmpty ? ytResult.streams : videoStreams
                 if let primary = ordered.first {
@@ -668,6 +703,10 @@ final class WebMediaDownloader {
                     return
                 }
             }
+
+            let errMsg = ytResult?.errorReason ?? "Could not resolve YouTube stream. Try opening the video in the Browser tab."
+            recordFailedDownload(sourceURL: url, message: errMsg)
+            return
         }
 
         let mergedHeaders = enrichedHeaders(headers, for: url)
@@ -714,8 +753,7 @@ final class WebMediaDownloader {
         var getReq = URLRequest(url: url)
         mergedHeaders.forEach { getReq.setValue($0.value, forHTTPHeaderField: $0.key) }
 
-        guard let (data, resp) = try? await ephemeralDataSession.data(for: getReq),
-              let mime = resp.mimeType?.lowercased() else {
+        guard let (bytes, resp) = try? await ephemeralDataSession.bytes(for: getReq) else {
             downloadDirectMedia(
                 from: url,
                 title: title,
@@ -726,7 +764,37 @@ final class WebMediaDownloader {
             return
         }
 
-        let prefix = String(data: data.prefix(256), encoding: .utf8) ?? ""
+        let mime = resp.mimeType?.lowercased() ?? ""
+        if mime.contains("mpegurl") {
+            startHLSDownload(
+                from: url,
+                title: title,
+                headers: mergedHeaders,
+                maxDurationMinutes: maxDurationMinutes,
+                destinationFolder: destinationFolder
+            )
+            return
+        }
+
+        if !mime.isEmpty && !mime.contains("html") && !mime.contains("text/plain") && !mime.contains("json") && !mime.contains("xml") {
+            downloadDirectMedia(
+                from: url,
+                title: title,
+                headers: mergedHeaders,
+                maxDurationMinutes: maxDurationMinutes,
+                destinationFolder: destinationFolder
+            )
+            return
+        }
+
+        var buffered = Data()
+        let maxInspectBytes = 2 * 1024 * 1024
+        var iterator = bytes.makeAsyncIterator()
+        while buffered.count < maxInspectBytes, let byte = try? await iterator.next() {
+            buffered.append(byte)
+        }
+
+        let prefix = String(data: buffered.prefix(256), encoding: .utf8) ?? ""
         if mime.contains("mpegurl") || prefix.contains("#EXTM3U") {
             startHLSDownload(
                 from: url,
@@ -738,7 +806,7 @@ final class WebMediaDownloader {
             return
         }
 
-        if !mime.contains("html") {
+        if !mime.contains("html") && !mime.contains("xhtml") && !mime.contains("xml") {
             downloadDirectMedia(
                 from: url,
                 title: title,
@@ -748,6 +816,8 @@ final class WebMediaDownloader {
             )
             return
         }
+
+        let data = buffered
 
         guard let html = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1) else {
             MediaManager.shared.errorMessage = "Could not read webpage HTML."
@@ -1553,7 +1623,7 @@ final class WebMediaDownloader {
         if !isHLS {
             if !(200...299).contains(statusCode) && statusCode != 0 {
                 try? FileManager.default.removeItem(at: tempFileURL)
-                if statusCode == 403 && meta.fallbackStreams.isEmpty && !meta.didRetryHeaderless && meta.hadRefererOrCookie {
+                if statusCode == 403 && !meta.didRetryHeaderless && meta.hadRefererOrCookie {
                     let cleanID = UUID()
                     let minimalHeaders = [
                         "User-Agent": meta.userAgent,

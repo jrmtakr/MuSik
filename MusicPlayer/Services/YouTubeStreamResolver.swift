@@ -17,7 +17,7 @@ enum YouTubeStreamResolver {
     static let androidClientUserAgent =
         "com.google.android.youtube/\(androidClientVersion) (Linux; U; Android 14; en_US) gzip"
     static let androidVRUserAgent =
-        "com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip"
+        "com.google.android.apps.youtube.vr.oculus/1.62.27 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip"
 
     private enum ProbeBucket: Hashable {
         case progressive(String)
@@ -54,10 +54,18 @@ enum YouTubeStreamResolver {
         if host == "youtu.be", let first = pathParts.first, !first.isEmpty {
             return sanitizedVideoID(first)
         }
-        if let comps = URLComponents(url: url, resolvingAgainstBaseURL: false),
-           let v = comps.queryItems?.first(where: { $0.name == "v" })?.value,
-           !v.isEmpty {
-            return sanitizedVideoID(v)
+        if let comps = URLComponents(url: url, resolvingAgainstBaseURL: false) {
+            if let v = comps.queryItems?.first(where: { $0.name == "v" })?.value,
+               !v.isEmpty {
+                return sanitizedVideoID(v)
+            }
+            if let uParam = comps.queryItems?.first(where: { $0.name == "u" })?.value,
+               let innerURL = URL(string: uParam, relativeTo: url)?.absoluteURL,
+               let innerComps = URLComponents(url: innerURL, resolvingAgainstBaseURL: false),
+               let v = innerComps.queryItems?.first(where: { $0.name == "v" })?.value,
+               !v.isEmpty {
+                return sanitizedVideoID(v)
+            }
         }
         if pathParts.count >= 2, ["shorts", "embed", "live", "v"].contains(pathParts[0]) {
             return sanitizedVideoID(pathParts[1])
@@ -136,8 +144,8 @@ enum YouTubeStreamResolver {
 
         let visitorDataForRequests = resolvedVisitorData
 
-        // 1. Query IOS first (single request cuts InnerTube traffic in half and returns direct playable audio/video streams).
-        let iosResult = await fetchInnerTube(
+        // 1. Query IOS and ANDROID_VR in parallel so we always get both adaptive/HLS and progressive MP4 fallbacks.
+        async let iosTask = fetchInnerTube(
             videoID: videoID,
             sourcePageURL: url,
             clientName: "IOS",
@@ -153,8 +161,27 @@ enum YouTubeStreamResolver {
             visitorData: visitorDataForRequests,
             cookiesHeader: cookiesHeader
         )
+        async let vrTask = fetchInnerTube(
+            videoID: videoID,
+            sourcePageURL: url,
+            clientName: "ANDROID_VR",
+            clientHeaderID: "28",
+            clientVersion: "1.62.27",
+            userAgent: androidVRUserAgent,
+            extraClientFields: [
+                "deviceMake": "Oculus",
+                "deviceModel": "Quest 3",
+                "osName": "Android",
+                "osVersion": "12L",
+                "androidSdkVersion": 32
+            ],
+            visitorData: visitorDataForRequests,
+            cookiesHeader: cookiesHeader
+        )
 
-        var results = [iosResult].compactMap { $0 }.filter { !$0.streams.isEmpty }
+        let iosResult = await iosTask
+        let vrResult = await vrTask
+        var results = [iosResult, vrResult].compactMap { $0 }.filter { !$0.streams.isEmpty }
         var androidResult: YouTubeResolvedResult?
 
         if results.isEmpty {
@@ -175,28 +202,6 @@ enum YouTubeStreamResolver {
             )
             if let androidResult, !androidResult.streams.isEmpty {
                 results.append(androidResult)
-            }
-        }
-
-        if results.isEmpty {
-            if let vrResult = await fetchInnerTube(
-                videoID: videoID,
-                sourcePageURL: url,
-                clientName: "ANDROID_VR",
-                clientHeaderID: "28",
-                clientVersion: "1.62.27",
-                userAgent: "com.google.android.apps.youtube.vr.oculus/1.62.27 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip",
-                extraClientFields: [
-                    "deviceMake": "Oculus",
-                    "deviceModel": "Quest 3",
-                    "osName": "Android",
-                    "osVersion": "12L",
-                    "androidSdkVersion": 32
-                ],
-                visitorData: visitorDataForRequests,
-                cookiesHeader: cookiesHeader
-            ), !vrResult.streams.isEmpty {
-                results.append(vrResult)
             }
         }
 
@@ -318,6 +323,7 @@ enum YouTubeStreamResolver {
         req.httpMethod = "GET"
         req.timeoutInterval = 7
         headers?.forEach { req.setValue($0.value, forHTTPHeaderField: $0.key) }
+        req.setValue("bytes=0-1023", forHTTPHeaderField: "Range")
         do {
             let (bytes, resp) = try await URLSession.shared.bytes(for: req)
             guard let http = resp as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
