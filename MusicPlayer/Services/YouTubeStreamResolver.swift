@@ -359,6 +359,39 @@ enum YouTubeStreamResolver {
         visitorData: String?,
         cookiesHeader: String?
     ) async -> YouTubeResolvedResult? {
+        guard let dict = await fetchInnerTubePlayerDict(
+            videoID: videoID,
+            clientName: clientName,
+            clientHeaderID: clientHeaderID,
+            clientVersion: clientVersion,
+            userAgent: userAgent,
+            extraClientFields: extraClientFields,
+            visitorData: visitorData,
+            cookiesHeader: cookiesHeader
+        ) else {
+            return nil
+        }
+
+        let headers = ["User-Agent": userAgent]
+        return parsePlayerResponse(
+            dict: dict,
+            videoID: videoID,
+            sourcePageURL: sourcePageURL,
+            headers: headers,
+            includeReferer: false
+        )
+    }
+
+    private static func fetchInnerTubePlayerDict(
+        videoID: String,
+        clientName: String,
+        clientHeaderID: String,
+        clientVersion: String,
+        userAgent: String,
+        extraClientFields: [String: Any],
+        visitorData: String?,
+        cookiesHeader: String?
+    ) async -> [String: Any]? {
         guard let apiURL = URL(string: "https://www.youtube.com/youtubei/v1/player?prettyPrint=false") else {
             return nil
         }
@@ -406,15 +439,75 @@ enum YouTubeStreamResolver {
               let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return nil
         }
+        return dict
+    }
 
-        let headers = ["User-Agent": userAgent]
-        return parsePlayerResponse(
-            dict: dict,
-            videoID: videoID,
-            sourcePageURL: sourcePageURL,
-            headers: headers,
-            includeReferer: false
+    struct CaptionTrack {
+        let baseURL: URL
+        let languageCode: String
+        let name: String
+    }
+
+    /// Fetches creator-uploaded (non-ASR) timed subtitle tracks from YouTube player metadata.
+    static func fetchCreatorCaptionTracks(videoID: String) async -> [CaptionTrack] {
+        let trimmedID = videoID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedID.isEmpty else { return [] }
+
+        let visitorData = await visitorCache.current()
+        let iosDict = await fetchInnerTubePlayerDict(
+            videoID: trimmedID,
+            clientName: "IOS",
+            clientHeaderID: "5",
+            clientVersion: iosClientVersion,
+            userAgent: iosClientUserAgent,
+            extraClientFields: [
+                "deviceMake": "Apple",
+                "deviceModel": "iPhone16,2",
+                "osName": "iPhone",
+                "osVersion": "18.3.2"
+            ],
+            visitorData: visitorData,
+            cookiesHeader: nil
         )
+        let dict: [String: Any]?
+        if let iosDict,
+           ((iosDict["captions"] as? [String: Any])?["playerCaptionsTracklistRenderer"] as? [String: Any]) != nil {
+            dict = iosDict
+        } else {
+            dict = await fetchInnerTubePlayerDict(
+                videoID: trimmedID,
+                clientName: "ANDROID",
+                clientHeaderID: "3",
+                clientVersion: androidClientVersion,
+                userAgent: androidClientUserAgent,
+                extraClientFields: ["androidSdkVersion": 34],
+                visitorData: visitorData,
+                cookiesHeader: nil
+            )
+        }
+
+        let captions = (dict?["captions"] as? [String: Any])?["playerCaptionsTracklistRenderer"] as? [String: Any]
+        guard let rawTracks = captions?["captionTracks"] as? [[String: Any]] else {
+            return []
+        }
+
+        return rawTracks.compactMap { entry in
+            // Skip auto-generated speech recognition ("asr") to avoid misheard lyrics
+            if (entry["kind"] as? String)?.lowercased() == "asr" {
+                return nil
+            }
+            guard let urlStr = entry["baseUrl"] as? String,
+                  let url = URL(string: urlStr) else {
+                return nil
+            }
+            let lang = (entry["languageCode"] as? String) ?? ""
+            let nameDict = entry["name"] as? [String: Any]
+            let runs = nameDict?["runs"] as? [[String: Any]]
+            let name = (nameDict?["simpleText"] as? String)
+                ?? (runs?.first?["text"] as? String)
+                ?? lang
+            return CaptionTrack(baseURL: url, languageCode: lang, name: name)
+        }
     }
 
     private static func fetchMobileWebHTML(

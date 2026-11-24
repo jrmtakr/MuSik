@@ -155,6 +155,7 @@ struct AppleMusicLyricsView: View {
     @State private var showManualSearchSheet = false
     @State private var customSongTitle = ""
     @State private var customArtistName = ""
+    @State private var customLyricsPasteText = ""
     @State private var copiedBannerText: String?
 
     var body: some View {
@@ -572,6 +573,29 @@ struct AppleMusicLyricsView: View {
                     }
                     .fontWeight(.semibold)
                 }
+
+                Section {
+                    TextEditor(text: $customLyricsPasteText)
+                        .frame(minHeight: 140)
+                        .font(.subheadline)
+                    Button("Save Pasted Lyrics / .LRC") {
+                        if lyricsService.saveCustomLyrics(
+                            for: item,
+                            text: customLyricsPasteText,
+                            titleOverride: customSongTitle,
+                            artistOverride: customArtistName
+                        ) {
+                            customLyricsPasteText = ""
+                            showManualSearchSheet = false
+                        }
+                    }
+                    .fontWeight(.semibold)
+                    .disabled(customLyricsPasteText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                } header: {
+                    Text("Or Paste Lyrics / .LRC")
+                } footer: {
+                    Text("Supports time-synced [mm:ss.xx] .lrc timestamps or plain text. Saved offline for this song.")
+                }
             }
             .navigationTitle("Find Lyrics")
             .navigationBarTitleDisplayMode(.inline)
@@ -581,7 +605,7 @@ struct AppleMusicLyricsView: View {
                 }
             }
         }
-        .presentationDetents([.medium])
+        .presentationDetents([.medium, .large])
     }
 
     // MARK: - Playback Clock Interpolation & Helpers

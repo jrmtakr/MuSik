@@ -77,11 +77,26 @@ final class SyncedLyricsService {
         let rawTitle = (titleOverride?.isEmpty == false ? titleOverride! : item.displayTitle)
         let rawArtist = (artistOverride?.isEmpty == false ? artistOverride! : (item.artist ?? ""))
         let cleaned = ArtistDatabase.cleanSongTitleForSearch(rawTitle: rawTitle, rawArtistTag: rawArtist)
-        let keyBase = "\(cleaned.artistHint ?? rawArtist)|\(cleaned.songOnly)|\(item.fileName)"
-            .lowercased()
+        let rawBase = "\(cleaned.artistHint ?? rawArtist)|\(cleaned.songOnly)|\(item.fileName)".lowercased()
+        let keyBase = rawBase
             .replacingOccurrences(of: "[^a-z0-9]+", with: "_", options: .regularExpression)
             .trimmingCharacters(in: CharacterSet(charactersIn: "_"))
-        return keyBase.isEmpty ? UUID().uuidString : String(keyBase.prefix(100))
+        let hasNonASCII = rawBase.utf8.contains { $0 > 127 }
+        if keyBase.isEmpty || hasNonASCII {
+            let hash = Self.stableFNV1aHex(rawBase)
+            let prefix = keyBase.isEmpty ? "track" : String(keyBase.prefix(72))
+            return "\(prefix)_\(hash)"
+        }
+        return String(keyBase.prefix(100))
+    }
+
+    private static func stableFNV1aHex(_ input: String) -> String {
+        var hash: UInt64 = 0xcbf29ce484222325
+        for byte in input.utf8 {
+            hash ^= UInt64(byte)
+            hash &*= 0x100000001b3
+        }
+        return String(hash, radix: 16, uppercase: false)
     }
 
     func loadLyricsIfNeeded(for item: MediaItem, forceReload: Bool = false, customTitle: String? = nil, customArtist: String? = nil) {
@@ -141,6 +156,44 @@ final class SyncedLyricsService {
         adjustTimingOffset(by: 0)
     }
 
+    @discardableResult
+    func saveCustomLyrics(
+        for item: MediaItem,
+        text: String,
+        titleOverride: String? = nil,
+        artistOverride: String? = nil
+    ) -> Bool {
+        let cleanedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanedText.isEmpty else { return false }
+
+        let parsed = Self.parseLRCOrPlain(text: cleanedText, duration: item.durationSeconds)
+        guard !parsed.lines.isEmpty else { return false }
+
+        let key = cacheKey(for: item, artistOverride: artistOverride, titleOverride: titleOverride)
+        let title = (titleOverride?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
+            ? titleOverride!.trimmingCharacters(in: .whitespacesAndNewlines)
+            : item.displayTitle
+        let artist = (artistOverride?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
+            ? artistOverride!.trimmingCharacters(in: .whitespacesAndNewlines)
+            : (item.artist ?? "")
+
+        let custom = ResolvedTrackLyrics(
+            cacheKey: key,
+            trackTitle: title,
+            artistName: artist,
+            isTimeSynced: parsed.isSynced,
+            sourceLabel: parsed.isSynced ? "Custom .LRC Synced" : "Custom Lyrics",
+            attributionText: "Saved manually by you",
+            syncedOffsetSeconds: 0,
+            lines: parsed.lines
+        )
+        memoryCache[key] = custom
+        saveToDisk(custom)
+        currentLyrics = custom
+        lastError = nil
+        return true
+    }
+
     // MARK: - Multi-Source Fetching
 
     private func fetchBestLyrics(
@@ -164,7 +217,7 @@ final class SyncedLyricsService {
             }
         }
 
-        // 2. Online: LRCLIB Time-Synced LRC
+        // 2. Online: LRCLIB Time-Synced & Plain LRC
         if let lrclib = await fetchFromLRCLIB(
             cacheKey: cacheKey,
             song: song,
@@ -182,6 +235,16 @@ final class SyncedLyricsService {
             artist: artist
         ) {
             return genius
+        }
+
+        // 4. Last-Resort Fallback: Creator-Uploaded Timed Captions from Source YouTube Video (non-ASR)
+        if let ytCaptions = await fetchFromYouTubeCreatorSubtitles(
+            item: item,
+            cacheKey: cacheKey,
+            song: song,
+            artist: artist
+        ) {
+            return ytCaptions
         }
 
         return nil
@@ -252,12 +315,16 @@ final class SyncedLyricsService {
         rawTitle: String,
         duration: Double?
     ) async -> ResolvedTrackLyrics? {
+        let querySong = Self.normalizeSmartPunctuation(song)
+        let queryArtist = Self.normalizeSmartPunctuation(artist)
+        let coreSong = Self.extractCoreSongTitle(querySong)
+
         // Fast exact match endpoint first
-        if !artist.isEmpty, let dur = duration, dur > 5 {
+        if !queryArtist.isEmpty, let dur = duration, dur > 5 {
             var comps = URLComponents(string: "https://lrclib.net/api/get")
             comps?.queryItems = [
-                URLQueryItem(name: "track_name", value: song),
-                URLQueryItem(name: "artist_name", value: artist),
+                URLQueryItem(name: "track_name", value: querySong),
+                URLQueryItem(name: "artist_name", value: queryArtist),
                 URLQueryItem(name: "duration", value: String(Int(round(dur))))
             ]
             if let url = comps?.url,
@@ -267,43 +334,97 @@ final class SyncedLyricsService {
             }
         }
 
-        // Search endpoints
+        // Primary search queries
         var allCandidates: [LRCLIBCandidate] = []
-        var queries: [URL] = []
+        var primaryQueries: [URL] = []
 
-        if !artist.isEmpty {
+        if !queryArtist.isEmpty {
             var c1 = URLComponents(string: "https://lrclib.net/api/search")
             c1?.queryItems = [
-                URLQueryItem(name: "track_name", value: song),
-                URLQueryItem(name: "artist_name", value: artist)
+                URLQueryItem(name: "track_name", value: querySong),
+                URLQueryItem(name: "artist_name", value: queryArtist)
             ]
-            if let u = c1?.url { queries.append(u) }
+            if let u = c1?.url { primaryQueries.append(u) }
         }
 
-        let combined = [artist, song].filter { !$0.isEmpty }.joined(separator: " ")
+        let combined = [queryArtist, querySong].filter { !$0.isEmpty }.joined(separator: " ")
         if !combined.isEmpty {
             var c2 = URLComponents(string: "https://lrclib.net/api/search")
             c2?.queryItems = [URLQueryItem(name: "q", value: combined)]
-            if let u = c2?.url { queries.append(u) }
+            if let u = c2?.url { primaryQueries.append(u) }
         }
 
-        let cleanedRaw = Self.stripNoisyTitleTokens(rawTitle)
+        let cleanedRaw = Self.normalizeSmartPunctuation(Self.stripNoisyTitleTokens(rawTitle))
         if !cleanedRaw.isEmpty && cleanedRaw.lowercased() != combined.lowercased() {
             var c3 = URLComponents(string: "https://lrclib.net/api/search")
             c3?.queryItems = [URLQueryItem(name: "q", value: cleanedRaw)]
-            if let u = c3?.url { queries.append(u) }
+            if let u = c3?.url { primaryQueries.append(u) }
         }
 
-        for url in queries {
+        for url in primaryQueries {
             let rows = await fetchLRCLIBSearchArray(url: url)
             for row in rows {
-                let candidate = scoreLRCLIBRow(row, targetSong: song, targetArtist: artist, targetDuration: duration)
+                let candidate = scoreLRCLIBRow(
+                    row,
+                    targetSong: querySong,
+                    coreSong: coreSong,
+                    targetArtist: queryArtist,
+                    targetDuration: duration,
+                    strictArtistlessGuard: false
+                )
                 if candidate.score > 10 {
                     allCandidates.append(candidate)
                 }
             }
             if allCandidates.contains(where: { !($0.syncedLyrics?.isEmpty ?? true) && $0.score >= 70 }) {
                 break
+            }
+        }
+
+        // Obscure-track rescue ladder (only runs when primary queries did not yield a strong synced match)
+        let hasStrongMatch = allCandidates.contains(where: { !($0.syncedLyrics?.isEmpty ?? true) && $0.score >= 70 })
+        if !hasStrongMatch {
+            var fallbackQueries: [(url: URL, artistless: Bool)] = []
+
+            if !coreSong.isEmpty && coreSong.lowercased() != querySong.lowercased() {
+                var cCore = URLComponents(string: "https://lrclib.net/api/search")
+                if !queryArtist.isEmpty {
+                    cCore?.queryItems = [
+                        URLQueryItem(name: "track_name", value: coreSong),
+                        URLQueryItem(name: "artist_name", value: queryArtist)
+                    ]
+                } else {
+                    cCore?.queryItems = [URLQueryItem(name: "q", value: coreSong)]
+                }
+                if let u = cCore?.url { fallbackQueries.append((u, queryArtist.isEmpty)) }
+            }
+
+            // Title-only fallback in case artist tag was a re-upload channel or mis-tagged
+            if !queryArtist.isEmpty && !allCandidates.contains(where: { $0.score >= 45 }) {
+                let lookupTitle = coreSong.isEmpty ? querySong : coreSong
+                var cTitleOnly = URLComponents(string: "https://lrclib.net/api/search")
+                cTitleOnly?.queryItems = [URLQueryItem(name: "track_name", value: lookupTitle)]
+                if let u = cTitleOnly?.url { fallbackQueries.append((u, true)) }
+            }
+
+            for entry in fallbackQueries {
+                let rows = await fetchLRCLIBSearchArray(url: entry.url)
+                for row in rows {
+                    let candidate = scoreLRCLIBRow(
+                        row,
+                        targetSong: querySong,
+                        coreSong: coreSong,
+                        targetArtist: queryArtist,
+                        targetDuration: duration,
+                        strictArtistlessGuard: entry.artistless
+                    )
+                    if candidate.score > 15 {
+                        allCandidates.append(candidate)
+                    }
+                }
+                if allCandidates.contains(where: { !($0.syncedLyrics?.isEmpty ?? true) && $0.score >= 70 }) {
+                    break
+                }
             }
         }
 
@@ -410,8 +531,10 @@ final class SyncedLyricsService {
     private func scoreLRCLIBRow(
         _ row: [String: Any],
         targetSong: String,
+        coreSong: String,
         targetArtist: String,
-        targetDuration: Double?
+        targetDuration: Double?,
+        strictArtistlessGuard: Bool
     ) -> LRCLIBCandidate {
         let trackName = (row["trackName"] as? String) ?? ""
         let artistName = (row["artistName"] as? String) ?? ""
@@ -430,23 +553,59 @@ final class SyncedLyricsService {
         }
 
         let normTargetSong = Self.normalizeComparable(targetSong)
+        let normCoreSong = Self.normalizeComparable(coreSong)
         let normHitSong = Self.normalizeComparable(trackName)
-        if normHitSong == normTargetSong { score += 45 }
-        else if !normTargetSong.isEmpty && (normHitSong.contains(normTargetSong) || normTargetSong.contains(normHitSong)) { score += 25 }
+
+        let exactTitleMatch = !normHitSong.isEmpty && (
+            normHitSong == normTargetSong || (!normCoreSong.isEmpty && normHitSong == normCoreSong)
+        )
+        if !normHitSong.isEmpty {
+            if normHitSong == normTargetSong {
+                score += 45
+            } else if !normCoreSong.isEmpty && normHitSong == normCoreSong {
+                score += 36
+            } else if !normTargetSong.isEmpty && (normHitSong.contains(normTargetSong) || normTargetSong.contains(normHitSong)) {
+                score += 25
+            } else if !normCoreSong.isEmpty && (normHitSong.contains(normCoreSong) || normCoreSong.contains(normHitSong)) {
+                score += 18
+            }
+        }
 
         let normTargetArtist = Self.normalizeComparable(targetArtist)
         let normHitArtist = Self.normalizeComparable(artistName)
-        if !normTargetArtist.isEmpty {
-            if normHitArtist == normTargetArtist { score += 40 }
-            else if normHitArtist.contains(normTargetArtist) || normTargetArtist.contains(normHitArtist) { score += 22 }
-            else { score -= 15 }
+        var artistMatched = false
+        if !normTargetArtist.isEmpty && !normHitArtist.isEmpty {
+            if normHitArtist == normTargetArtist {
+                score += 40
+                artistMatched = true
+            } else if normHitArtist.contains(normTargetArtist) || normTargetArtist.contains(normHitArtist) {
+                score += 22
+                artistMatched = true
+            } else {
+                score -= 15
+            }
         }
 
+        var durationClose = false
         if let targetDuration, let dur, targetDuration > 5 {
             let diff = abs(targetDuration - dur)
-            if diff <= 2.5 { score += 35 }
-            else if diff <= 6.0 { score += 20 }
-            else if diff > 25.0 { score -= 25 }
+            if diff <= 2.5 {
+                score += 35
+                durationClose = true
+            } else if diff <= 8.0 {
+                score += 20
+                durationClose = true
+            } else if diff > 25.0 {
+                score -= 25
+            }
+        }
+
+        // Prevent false positives when retrying title-only or mismatched uploader channel tags
+        if strictArtistlessGuard && !artistMatched {
+            let wordCount = normTargetSong.split(separator: " ").count
+            guard exactTitleMatch, (durationClose || wordCount >= 2) else {
+                return LRCLIBCandidate(trackName: trackName, artistName: artistName, albumName: nil, duration: dur, syncedLyrics: nil, plainLyrics: nil, score: -100)
+            }
         }
 
         return LRCLIBCandidate(
@@ -467,7 +626,37 @@ final class SyncedLyricsService {
         song: String,
         artist: String
     ) async -> ResolvedTrackLyrics? {
-        let query = [artist, song].filter { !$0.isEmpty }.joined(separator: " ")
+        let querySong = Self.normalizeSmartPunctuation(song)
+        let queryArtist = Self.normalizeSmartPunctuation(artist)
+        let coreSong = Self.extractCoreSongTitle(querySong)
+
+        let combined = [queryArtist, querySong].filter { !$0.isEmpty }.joined(separator: " ")
+        if let primaryHit = await findBestGeniusHit(query: combined, targetSong: querySong, coreSong: coreSong, targetArtist: queryArtist),
+           primaryHit.score >= 35 {
+            if let fetched = await loadGeniusPage(hit: primaryHit, cacheKey: cacheKey) {
+                return fetched
+            }
+        }
+
+        // Obscure / YouTube-channel rescue query: search Genius by song title cleanly if combined query missed
+        let titleQuery = coreSong.isEmpty ? querySong : coreSong
+        if !queryArtist.isEmpty, !titleQuery.isEmpty, titleQuery.lowercased() != combined.lowercased(),
+           let rescueHit = await findBestGeniusHit(query: titleQuery, targetSong: querySong, coreSong: coreSong, targetArtist: queryArtist),
+           rescueHit.score >= 42 {
+            if let fetched = await loadGeniusPage(hit: rescueHit, cacheKey: cacheKey) {
+                return fetched
+            }
+        }
+
+        return nil
+    }
+
+    private func findBestGeniusHit(
+        query: String,
+        targetSong: String,
+        coreSong: String,
+        targetArtist: String
+    ) async -> (url: URL, title: String, artist: String, score: Int)? {
         guard !query.isEmpty,
               let encoded = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
               let searchURL = URL(string: "https://genius.com/api/search/multi?q=\(encoded)&per_page=5") else {
@@ -486,13 +675,10 @@ final class SyncedLyricsService {
             return nil
         }
 
-        var bestURL: URL?
-        var bestTitle = song
-        var bestArtist = artist
-        var bestScore = -1
-
-        let normSong = Self.normalizeComparable(song)
-        let normArtist = Self.normalizeComparable(artist)
+        var bestHit: (url: URL, title: String, artist: String, score: Int)?
+        let normSong = Self.normalizeComparable(targetSong)
+        let normCore = Self.normalizeComparable(coreSong)
+        let normArtist = Self.normalizeComparable(targetArtist)
 
         for section in sections {
             let sType = (section["type"] as? String) ?? ""
@@ -505,21 +691,34 @@ final class SyncedLyricsService {
                       let url = URL(string: urlStr) else { continue }
                 let hTitle = (result["title"] as? String) ?? ""
                 let hArtist = (result["artist_names"] as? String) ?? ""
+                let normHitSong = Self.normalizeComparable(hTitle)
+                let normHitArtist = Self.normalizeComparable(hArtist)
+
                 var s = 0
-                if Self.normalizeComparable(hTitle) == normSong { s += 50 }
-                else if Self.normalizeComparable(hTitle).contains(normSong) { s += 25 }
-                if !normArtist.isEmpty && Self.normalizeComparable(hArtist).contains(normArtist) { s += 40 }
-                if s > bestScore {
-                    bestScore = s
-                    bestURL = url
-                    bestTitle = hTitle
-                    bestArtist = hArtist
+                if !normHitSong.isEmpty {
+                    if normHitSong == normSong { s += 50 }
+                    else if !normCore.isEmpty && normHitSong == normCore { s += 42 }
+                    else if !normSong.isEmpty && (normHitSong.contains(normSong) || normSong.contains(normHitSong)) { s += 25 }
+                    else if !normCore.isEmpty && (normHitSong.contains(normCore) || normCore.contains(normHitSong)) { s += 18 }
+                }
+                if !normArtist.isEmpty && !normHitArtist.isEmpty {
+                    if normHitArtist == normArtist { s += 40 }
+                    else if normHitArtist.contains(normArtist) || normArtist.contains(normHitArtist) { s += 28 }
+                }
+                if bestHit == nil || s > bestHit!.score {
+                    bestHit = (url, hTitle, hArtist, s)
                 }
             }
         }
 
-        guard let targetURL = bestURL else { return nil }
-        var pageReq = URLRequest(url: targetURL)
+        return bestHit
+    }
+
+    private func loadGeniusPage(
+        hit: (url: URL, title: String, artist: String, score: Int),
+        cacheKey: String
+    ) async -> ResolvedTrackLyrics? {
+        var pageReq = URLRequest(url: hit.url)
         pageReq.timeoutInterval = 12
         pageReq.setValue(WebMediaDownloader.browserUserAgent, forHTTPHeaderField: "User-Agent")
 
@@ -540,13 +739,105 @@ final class SyncedLyricsService {
 
         return ResolvedTrackLyrics(
             cacheKey: cacheKey,
-            trackTitle: bestTitle,
-            artistName: bestArtist,
+            trackTitle: hit.title,
+            artistName: hit.artist,
             isTimeSynced: false,
             sourceLabel: "Plain Lyrics",
             attributionText: "Lyrics via Genius",
             syncedOffsetSeconds: 0,
             lines: parsed.lines
+        )
+    }
+
+    // MARK: - YouTube Creator-Uploaded Timed Subtitles Fallback (Non-ASR)
+
+    private func fetchFromYouTubeCreatorSubtitles(
+        item: MediaItem,
+        cacheKey: String,
+        song: String,
+        artist: String
+    ) async -> ResolvedTrackLyrics? {
+        guard let videoID = MediaManager.shared.sourceVideoID(for: item),
+              !videoID.isEmpty else {
+            return nil
+        }
+
+        let captionTracks = await YouTubeStreamResolver.fetchCreatorCaptionTracks(videoID: videoID)
+        guard !captionTracks.isEmpty else { return nil }
+
+        let preferredLang = Locale.current.language.languageCode?.identifier.lowercased() ?? "en"
+        let selectedTrack = captionTracks.first(where: { $0.languageCode.lowercased().hasPrefix(preferredLang) })
+            ?? captionTracks.first(where: { $0.languageCode.lowercased().hasPrefix("en") })
+            ?? captionTracks[0]
+
+        guard var comps = URLComponents(url: selectedTrack.baseURL, resolvingAgainstBaseURL: false) else {
+            return nil
+        }
+        var items = comps.queryItems ?? []
+        items.removeAll { $0.name.lowercased() == "fmt" }
+        items.append(URLQueryItem(name: "fmt", value: "json3"))
+        comps.queryItems = items
+        guard let jsonURL = comps.url else { return nil }
+
+        var req = URLRequest(url: jsonURL)
+        req.timeoutInterval = 10
+        req.setValue(WebMediaDownloader.browserUserAgent, forHTTPHeaderField: "User-Agent")
+
+        guard let (data, resp) = try? await URLSession.shared.data(for: req),
+              let http = resp as? HTTPURLResponse,
+              (200...299).contains(http.statusCode),
+              let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let events = dict["events"] as? [[String: Any]] else {
+            return nil
+        }
+
+        var timedLines: [(start: Double, end: Double, text: String)] = []
+        for evt in events {
+            guard let tStartMs = (evt["tStartMs"] as? NSNumber)?.doubleValue,
+                  let segs = evt["segs"] as? [[String: Any]] else { continue }
+            let joined = segs.compactMap { $0["utf8"] as? String }.joined()
+            let clean = joined
+                .replacingOccurrences(of: #"<[^>]+>"#, with: "", options: .regularExpression)
+                .replacingOccurrences(of: "\n", with: " ")
+                .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !clean.isEmpty else { continue }
+
+            let lower = clean.lowercased()
+            if lower == "[music]" || lower == "(music)" || lower == "[applause]" || lower == "♪" {
+                continue
+            }
+
+            let startSec = max(0, tStartMs / 1000.0)
+            let durMs = (evt["dDurationMs"] as? NSNumber)?.doubleValue ?? 3200.0
+            let endSec = startSec + max(0.8, durMs / 1000.0)
+            timedLines.append((startSec, endSec, Self.decodeHTMLEntities(clean)))
+        }
+
+        // Require at least a handful of lines so single title-card annotations aren't treated as full lyrics
+        guard timedLines.count >= 4 else { return nil }
+
+        var built: [SyncedLyricLine] = []
+        if let first = timedLines.first, first.start > 5.5 {
+            built.append(SyncedLyricLine(startTime: 0.4, endTime: first.start - 0.3, text: "", isInstrumentalBreak: true))
+        }
+        for i in 0..<timedLines.count {
+            let cur = timedLines[i]
+            let nextStart = (i + 1 < timedLines.count) ? timedLines[i + 1].start : cur.end
+            let boundedEnd = min(nextStart, max(cur.start + 0.6, cur.end))
+            let words = Self.synthesizeProportionalWordTimings(text: cur.text, lineStart: cur.start, lineEnd: boundedEnd)
+            built.append(SyncedLyricLine(startTime: cur.start, endTime: boundedEnd, text: cur.text, words: words))
+        }
+
+        return ResolvedTrackLyrics(
+            cacheKey: cacheKey,
+            trackTitle: song,
+            artistName: artist,
+            isTimeSynced: true,
+            sourceLabel: "YouTube Subtitles Synced",
+            attributionText: "Timed captions (\(selectedTrack.name))",
+            syncedOffsetSeconds: 0,
+            lines: built
         )
     }
 
@@ -834,35 +1125,151 @@ final class SyncedLyricsService {
         return s
     }
 
-    private static func normalizeComparable(_ text: String) -> String {
-        text.lowercased()
-            .replacingOccurrences(of: #"[\(\[].*?[\)\]]"#, with: "", options: .regularExpression)
-            .replacingOccurrences(of: #"[^a-z0-9\s]"#, with: " ", options: .regularExpression)
-            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+    private static func normalizeSmartPunctuation(_ text: String) -> String {
+        text
+            .replacingOccurrences(of: "\u{2019}", with: "'")
+            .replacingOccurrences(of: "\u{2018}", with: "'")
+            .replacingOccurrences(of: "\u{201C}", with: "\"")
+            .replacingOccurrences(of: "\u{201D}", with: "\"")
+            .replacingOccurrences(of: "\u{2013}", with: "-")
+            .replacingOccurrences(of: "\u{2014}", with: "-")
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    /// Strips remix/version/edit modifiers to uncover base song titles when an alternate upload has no dedicated entry.
+    private static func extractCoreSongTitle(_ title: String) -> String {
+        var s = normalizeSmartPunctuation(title)
+        s = s.replacingOccurrences(
+            of: #"\s*[\(\[]\s*(?:slowed(?:\s*(?:\+|&|and)?\s*reverb)?|sped\s*up|nightcore|reverb|bass\s*boosted|acoustic(?:\s*version)?|live(?:\s*at\s*[^\)\]]*)?|remix|edit|version|radio\s*edit|clean|explicit|8d(?:\s*audio)?|cover)[^\)\]]*[\)\]]"#,
+            with: "",
+            options: [.regularExpression, .caseInsensitive]
+        )
+        s = s.replacingOccurrences(
+            of: #"\s*[-–—]\s*(?:slowed(?:\s*(?:\+|&|and)?\s*reverb)?|sped\s*up|nightcore|acoustic|live|remix|radio\s*edit)\s*$"#,
+            with: "",
+            options: [.regularExpression, .caseInsensitive]
+        )
+        return s.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func normalizeComparable(_ text: String) -> String {
+        let stripped = normalizeSmartPunctuation(text)
+            .folding(options: [.diacriticInsensitive, .caseInsensitive], locale: .current)
+            .replacingOccurrences(of: #"[\(\[].*?[\)\]]"#, with: " ", options: .regularExpression)
+        var scalars: [UnicodeScalar] = []
+        scalars.reserveCapacity(stripped.unicodeScalars.count)
+        var lastWasSpace = true
+        for scalar in stripped.unicodeScalars {
+            if CharacterSet.alphanumerics.contains(scalar) {
+                scalars.append(scalar)
+                lastWasSpace = false
+            } else if !lastWasSpace {
+                scalars.append(" ")
+                lastWasSpace = true
+            }
+        }
+        return String(String.UnicodeScalarView(scalars)).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     private static func extractGeniusLyricsText(fromHTML html: String) -> String? {
-        guard let containerRegex = try? NSRegularExpression(
-            pattern: #"<div[^>]*data-lyrics-container="true"[^>]*>([\s\S]*?)</div>"#,
+        guard let openTagRegex = try? NSRegularExpression(
+            pattern: #"<div\b[^>]*data-lyrics-container\s*=\s*"true"[^>]*>"#,
             options: .caseInsensitive
-        ) else {
+        ),
+              let divTokenRegex = try? NSRegularExpression(
+                  pattern: #"<div\b[^>]*>|</div>"#,
+                  options: .caseInsensitive
+              ) else {
             return nil
         }
-        let matches = containerRegex.matches(in: html, range: NSRange(html.startIndex..., in: html))
+
+        let nsHTML = html as NSString
+        let containerMatches = openTagRegex.matches(in: html, range: NSRange(location: 0, length: nsHTML.length))
         var chunks: [String] = []
-        for match in matches {
-            guard let range = Range(match.range(at: 1), in: html) else { continue }
-            var snippet = String(html[range])
-            snippet = snippet.replacingOccurrences(of: #"<br\s*/?>"#, with: "\n", options: .regularExpression)
-            snippet = snippet.replacingOccurrences(of: #"<[^>]+>"#, with: "", options: .regularExpression)
+
+        for match in containerMatches {
+            let contentStart = match.range.upperBound
+            var depth = 1
+            var contentEnd = nsHTML.length
+
+            let tokens = divTokenRegex.matches(
+                in: html,
+                range: NSRange(location: contentStart, length: nsHTML.length - contentStart)
+            )
+            for token in tokens {
+                let tokenText = nsHTML.substring(with: token.range)
+                if tokenText.lowercased().hasPrefix("</div") {
+                    depth -= 1
+                    if depth == 0 {
+                        contentEnd = token.range.location
+                        break
+                    }
+                } else {
+                    depth += 1
+                }
+            }
+
+            guard contentEnd > contentStart else { continue }
+            var snippet = nsHTML.substring(with: NSRange(location: contentStart, length: contentEnd - contentStart))
+            // Remove nested Genius non-lyric header/contributor blocks marked data-exclude-from-selection
+            snippet = removeExcludedDivs(in: snippet)
+            snippet = snippet
+                .replacingOccurrences(of: #"<br\s*/?>"#, with: "\n", options: [.regularExpression, .caseInsensitive])
+                .replacingOccurrences(of: #"</(?:div|p|li)>"#, with: "\n", options: [.regularExpression, .caseInsensitive])
+                .replacingOccurrences(of: #"<[^>]+>"#, with: "", options: .regularExpression)
             snippet = decodeHTMLEntities(snippet)
-            chunks.append(snippet)
+            let cleaned = snippet.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !cleaned.isEmpty {
+                chunks.append(cleaned)
+            }
         }
-        let joined = chunks.joined(separator: "\n")
+
+        let joined = chunks.joined(separator: "\n\n")
+            .replacingOccurrences(of: #"[ \t]+\n"#, with: "\n", options: .regularExpression)
             .replacingOccurrences(of: #"\n{3,}"#, with: "\n\n", options: .regularExpression)
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return joined.isEmpty ? nil : joined
+    }
+
+    private static func removeExcludedDivs(in html: String) -> String {
+        guard let exclRegex = try? NSRegularExpression(
+            pattern: #"<div\b[^>]*data-exclude-from-selection\s*=\s*"true"[^>]*>"#,
+            options: .caseInsensitive
+        ),
+              let divTokenRegex = try? NSRegularExpression(
+                  pattern: #"<div\b[^>]*>|</div>"#,
+                  options: .caseInsensitive
+              ) else {
+            return html
+        }
+
+        var working = html
+        while let match = exclRegex.firstMatch(in: working, range: NSRange(location: 0, length: (working as NSString).length)) {
+            let nsWorking = working as NSString
+            var depth = 1
+            var closeEnd = nsWorking.length
+            let tokens = divTokenRegex.matches(
+                in: working,
+                range: NSRange(location: match.range.upperBound, length: nsWorking.length - match.range.upperBound)
+            )
+            for token in tokens {
+                let txt = nsWorking.substring(with: token.range)
+                if txt.lowercased().hasPrefix("</div") {
+                    depth -= 1
+                    if depth == 0 {
+                        closeEnd = token.range.upperBound
+                        break
+                    }
+                } else {
+                    depth += 1
+                }
+            }
+            working = nsWorking.replacingCharacters(
+                in: NSRange(location: match.range.location, length: closeEnd - match.range.location),
+                with: ""
+            )
+        }
+        return working
     }
 
     private static func decodeHTMLEntities(_ text: String) -> String {
