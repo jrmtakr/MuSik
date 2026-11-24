@@ -13,12 +13,21 @@ struct WrappedDashboardSheet: View {
     @State private var isPremiereMode = false
     @State private var didAutoLaunchStory = false
     @State private var editingArtist: WrappedArtistRanking?
+    @State private var verifySongItem: MediaItem?
     @State private var renameArtistInput = ""
     @State private var sharePosterURL: URL?
 
+    private var verifiedFilePaths: Set<String> {
+        Set(
+            mediaManager.customMetadataByPath.compactMap { path, meta in
+                (meta.isArtistVerified == true && !(meta.artist?.isEmpty ?? true)) ? path : nil
+            }
+        )
+    }
+
     private var report: WrappedSummaryReport {
         _ = wrapped.lastUpdatedTick
-        return wrapped.report(forYear: selectedYear)
+        return wrapped.report(forYear: selectedYear, verifiedPaths: verifiedFilePaths)
     }
 
     private var filteredArtists: [WrappedArtistRanking] {
@@ -83,6 +92,9 @@ struct WrappedDashboardSheet: View {
                     report: report
                 )
             )
+            .sheet(item: $verifySongItem) { target in
+                VerifyTrackArtistSheet(item: target)
+            }
         }
     }
 
@@ -116,6 +128,7 @@ struct WrappedDashboardSheet: View {
     }
 
     private var statsGridSection: some View {
+        @Bindable var wrapped = wrapped
         let auditCount = wrapped.auditItems(
             libraryItems: mediaManager.items,
             metadataByPath: mediaManager.customMetadataByPath
@@ -163,6 +176,26 @@ struct WrappedDashboardSheet: View {
                         .padding(.vertical, 3)
                         .background((auditCount > 0 ? Color.orange : Color.green).opacity(0.15), in: Capsule())
                         .foregroundStyle(auditCount > 0 ? .orange : .green)
+                }
+            }
+
+            Toggle(isOn: $wrapped.countConfirmedFilesOnly) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Strict Mode: Confirmed Files Only")
+                        .font(.subheadline.weight(.medium))
+                    if report.strictConfirmedOnly {
+                        Text(
+                            report.excludedUnconfirmedSeconds > 0
+                                ? "Excluding \(ListeningWrappedService.formatHoursMinutes(report.excludedUnconfirmedSeconds)) from unconfirmed files"
+                                : "Only files with a confirmed artist count toward Wrapped"
+                        )
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    } else {
+                        Text("Hide unconfirmed downloads until you confirm their artist")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
                 }
             }
 
@@ -251,6 +284,17 @@ struct WrappedDashboardSheet: View {
 
                     if let rel = song.relativePath,
                        let localItem = mediaManager.items.first(where: { $0.relativePath == rel }) {
+                        let verified = mediaManager.isArtistVerified(for: localItem)
+                        Button {
+                            verifySongItem = localItem
+                        } label: {
+                            Image(systemName: verified ? "checkmark.seal.fill" : "checkmark.seal")
+                                .font(.body)
+                                .foregroundStyle(verified ? .green : .orange)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel(verified ? "Confirmed Artist" : "Confirm Artist")
+
                         Button {
                             mediaManager.play(localItem)
                         } label: {

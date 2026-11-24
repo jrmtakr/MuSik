@@ -210,9 +210,25 @@ struct VerifyTrackArtistSheet: View {
     }
 
     private var channelAndManualSection: some View {
-        Section("Manual Override & Channel Filtering") {
+        Section("Confirm Artist & Channel Filtering") {
             let normArtist = ArtistDatabase.normalizeLookupKey(assessment.artist)
             if !assessment.isVerified && !normArtist.isEmpty && normArtist != "unknown artist" {
+                Button {
+                    let cleanTitle = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+                    mediaManager.confirmVerifiedArtist(
+                        for: liveItem,
+                        artistName: assessment.artist,
+                        updatedTitle: (applyCleanTitle && !cleanTitle.isEmpty) ? cleanTitle : nil,
+                        genre: assessment.genre
+                    )
+                    onConfirmed?(ArtistDatabase.canonicalizeSingle(assessment.artist), liveItem.displayTitle)
+                    dismiss()
+                } label: {
+                    Label("Confirm \"\(assessment.artist)\" as Real Artist", systemImage: "checkmark.seal.fill")
+                        .fontWeight(.semibold)
+                        .foregroundStyle(.green)
+                }
+
                 Button(role: .destructive) {
                     _ = wrapped.markAsUploaderChannel(
                         assessment.artist,
@@ -517,7 +533,14 @@ struct WrappedAuditQueueView: View {
                                 genre: match.genre
                             )
                             suggestedMatches.removeValue(forKey: entry.id)
-                        }
+                        },
+                        onConfirmDetectedArtist: entry.reason == .uncataloguedArtist ? {
+                            mediaManager.confirmVerifiedArtist(
+                                for: entry.item,
+                                artistName: entry.detectedArtist,
+                                genre: entry.detectedGenre
+                            )
+                        } : nil
                     )
                 }
             }
@@ -570,39 +593,49 @@ private struct AuditTrackRowView: View {
     let suggestedMatch: TrackVerificationCandidate?
     let onInspect: () -> Void
     let onApproveSuggestion: (TrackVerificationCandidate) -> Void
+    let onConfirmDetectedArtist: (() -> Void)?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Button(action: onInspect) {
-                HStack(spacing: 10) {
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text(entry.item.displayTitle)
-                            .font(.subheadline.weight(.semibold))
-                            .foregroundStyle(.primary)
-                            .lineLimit(1)
+            HStack(spacing: 8) {
+                Button(action: onInspect) {
+                    HStack(spacing: 10) {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(entry.item.displayTitle)
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundStyle(.primary)
+                                .lineLimit(1)
 
-                        HStack(spacing: 6) {
-                            Text(entry.detectedArtist)
-                                .font(.caption.weight(.medium))
-                                .foregroundStyle(.orange)
-                            Text("•")
-                            Text(entry.reason.rawValue)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                            if entry.trackedSeconds > 0 {
-                                Text("• \(ListeningWrappedService.formatHoursMinutes(entry.trackedSeconds))")
-                                    .font(.caption.weight(.semibold))
-                                    .foregroundStyle(.purple)
+                            HStack(spacing: 6) {
+                                Text(entry.detectedArtist)
+                                    .font(.caption.weight(.medium))
+                                    .foregroundStyle(.orange)
+                                Text("•")
+                                Text(entry.reason.rawValue)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                if entry.trackedSeconds > 0 {
+                                    Text("• \(ListeningWrappedService.formatHoursMinutes(entry.trackedSeconds))")
+                                        .font(.caption.weight(.semibold))
+                                        .foregroundStyle(.purple)
+                                }
                             }
                         }
+                        Spacer()
+                        Image(systemName: "chevron.right")
+                            .font(.caption)
+                            .foregroundStyle(.tertiary)
                     }
-                    Spacer()
-                    Image(systemName: "chevron.right")
-                        .font(.caption)
-                        .foregroundStyle(.tertiary)
+                }
+                .buttonStyle(.plain)
+
+                if let onConfirmDetectedArtist, suggestedMatch == nil {
+                    Button("Confirm", action: onConfirmDetectedArtist)
+                        .buttonStyle(.bordered)
+                        .tint(.green)
+                        .font(.caption2.weight(.bold))
                 }
             }
-            .buttonStyle(.plain)
 
             if let match = suggestedMatch {
                 HStack(spacing: 8) {

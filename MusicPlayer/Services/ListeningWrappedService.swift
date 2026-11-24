@@ -38,6 +38,7 @@ private struct WrappedPersistedDatabase: Codable {
     var ignoredChannelNames: [String]? = nil
     var revealedYears: Set<Int> = []
     var reminderNotificationsEnabled: Bool = true
+    var countConfirmedFilesOnly: Bool? = false
 }
 
 enum WrappedAuditReason: String, Hashable {
@@ -109,6 +110,8 @@ struct WrappedSummaryReport {
     let personaTitle: String
     let personaSubtitle: String
     let personaSystemImage: String
+    let strictConfirmedOnly: Bool
+    let excludedUnconfirmedSeconds: Double
 
     var heroTopArtist: WrappedArtistRanking? {
         namedArtists.first ?? allArtists.first
@@ -159,6 +162,15 @@ final class ListeningWrappedService {
 
     var ignoredChannels: Set<String> {
         Set(db.ignoredChannelNames ?? [])
+    }
+
+    var countConfirmedFilesOnly: Bool {
+        get { db.countConfirmedFilesOnly ?? false }
+        set {
+            db.countConfirmedFilesOnly = newValue
+            lastUpdatedTick = .now
+            scheduleDiskSave(immediate: true)
+        }
     }
 
     var notificationsEnabled: Bool {
@@ -532,7 +544,7 @@ final class ListeningWrappedService {
         for year in Array(db.years.keys) {
             guard var stats = db.years[year] else { continue }
 
-            for oldArtistKey in Array(stats.artists.keys) where oldArtistKey != newKey {
+            for oldArtistKey in Array(stats.artists.keys) {
                 guard var oldRec = stats.artists[oldArtistKey] else { continue }
                 let matchingTitles = oldRec.tracksSeconds.keys.filter { tTitle in
                     if let relativePath, oldRec.trackPaths[tTitle] == relativePath {
@@ -548,6 +560,38 @@ final class ListeningWrappedService {
                     return false
                 }
                 guard !matchingTitles.isEmpty else { continue }
+
+                if oldArtistKey == newKey {
+                    // Same canonical artist: still consolidate noisy track titles & ensure genre/path stay current
+                    var changedInsideSameArtist = false
+                    for oldT in matchingTitles {
+                        let destTitle = (preferredTitle?.isEmpty == false ? preferredTitle! : oldT)
+                        if let relativePath, oldRec.trackPaths[destTitle] != relativePath {
+                            oldRec.trackPaths[destTitle] = relativePath
+                            changedInsideSameArtist = true
+                        }
+                        if oldT != destTitle {
+                            let secs = oldRec.tracksSeconds.removeValue(forKey: oldT) ?? 0
+                            let plays = oldRec.tracksPlayCount.removeValue(forKey: oldT) ?? 0
+                            let savedPath = oldRec.trackPaths.removeValue(forKey: oldT) ?? relativePath
+                            oldRec.tracksSeconds[destTitle, default: 0] += secs
+                            oldRec.tracksPlayCount[destTitle, default: 0] += plays
+                            if let savedPath {
+                                oldRec.trackPaths[destTitle] = savedPath
+                            }
+                            changedInsideSameArtist = true
+                        }
+                    }
+                    if oldRec.genre == nil, let resolvedGenre {
+                        oldRec.genre = resolvedGenre
+                        changedInsideSameArtist = true
+                    }
+                    if changedInsideSameArtist {
+                        stats.artists[newKey] = oldRec
+                        didModify = true
+                    }
+                    continue
+                }
 
                 var target = stats.artists[newKey] ?? WrappedArtistRecord(
                     canonicalName: canonical,
@@ -585,16 +629,42 @@ final class ListeningWrappedService {
                 didModify = true
             }
 
-            for (trackKey, meta) in stats.tracksMeta {
+            // Merge/update global top songs entry when title or artist changed
+            var mergedTrackSecs = 0.0
+            var mergedTrackPlays = 0
+            var destGlobalKey: String?
+            if let preferredTitle, !preferredTitle.isEmpty {
+                let normPref = ArtistDatabase.normalizeLookupKey(preferredTitle)
+                destGlobalKey = normPref.isEmpty ? preferredTitle.lowercased() : normPref
+            }
+
+            for trackKey in Array(stats.tracksMeta.keys) {
+                guard let meta = stats.tracksMeta[trackKey] else { continue }
                 let matchesPath = relativePath != nil && meta.relativePath == relativePath
-                let matchesOld = normOldTitle != nil && ArtistDatabase.normalizeLookupKey(meta.title) == normOldTitle
-                if matchesPath || matchesOld {
+                let matchesOld = normOldTitle != nil && !normOldTitle!.isEmpty && ArtistDatabase.normalizeLookupKey(meta.title) == normOldTitle
+                guard matchesPath || matchesOld else { continue }
+
+                if let destGlobalKey, destGlobalKey != trackKey {
+                    mergedTrackSecs += stats.tracksGlobalSeconds.removeValue(forKey: trackKey) ?? 0
+                    mergedTrackPlays += stats.tracksGlobalPlays.removeValue(forKey: trackKey) ?? 0
+                    stats.tracksMeta.removeValue(forKey: trackKey)
+                } else {
                     stats.tracksMeta[trackKey]?.primaryArtist = canonical
                     if let preferredTitle, !preferredTitle.isEmpty {
                         stats.tracksMeta[trackKey]?.title = preferredTitle
                     }
-                    didModify = true
                 }
+                didModify = true
+            }
+
+            if let destGlobalKey, mergedTrackSecs > 0 || mergedTrackPlays > 0 {
+                stats.tracksGlobalSeconds[destGlobalKey, default: 0] += mergedTrackSecs
+                stats.tracksGlobalPlays[destGlobalKey, default: 0] += mergedTrackPlays
+                stats.tracksMeta[destGlobalKey] = WrappedTrackSummary(
+                    title: preferredTitle!,
+                    primaryArtist: canonical,
+                    relativePath: relativePath ?? stats.tracksMeta[destGlobalKey]?.relativePath
+                )
             }
 
             db.years[year] = stats
@@ -770,7 +840,11 @@ final class ListeningWrappedService {
         return all.sorted(by: >)
     }
 
-    func report(forYear year: Int?) -> WrappedSummaryReport {
+    func report(
+        forYear year: Int?,
+        verifiedPaths: Set<String>? = nil,
+        onlyConfirmed: Bool? = nil
+    ) -> WrappedSummaryReport {
         let scopeStats: WrappedYearStats
         let scopeLabel: String
 
@@ -802,35 +876,63 @@ final class ListeningWrappedService {
             scopeStats = combined
         }
 
-        let totalSec = max(0, scopeStats.totalSeconds)
-        let sortedArtistRecs = scopeStats.artists.sorted { lhs, rhs in
-            if lhs.value.totalSeconds != rhs.value.totalSeconds {
-                return lhs.value.totalSeconds > rhs.value.totalSeconds
-            }
-            return lhs.value.playCount > rhs.value.playCount
-        }
+        let strictMode = (onlyConfirmed ?? countConfirmedFilesOnly) && (verifiedPaths != nil)
+        let activeVerified = verifiedPaths ?? []
+        var excludedUnconfirmedSecs = 0.0
 
-        let allRankings: [WrappedArtistRanking] = sortedArtistRecs.map { key, rec in
-            let share = totalSec > 0 ? (rec.totalSeconds / totalSec) * 100.0 : 0
-            let tracks = rec.tracksSeconds.keys.map { tTitle in
-                (
-                    title: tTitle,
-                    seconds: rec.tracksSeconds[tTitle] ?? 0,
-                    plays: rec.tracksPlayCount[tTitle] ?? 0,
-                    relativePath: rec.trackPaths[tTitle]
-                )
+        var filteredArtistEntries: [(key: String, rec: WrappedArtistRecord, totalSecs: Double, totalPlays: Int, filteredTracks: [(title: String, seconds: Double, plays: Int, relativePath: String?)])] = []
+
+        for (key, rec) in scopeStats.artists {
+            let tracks = rec.tracksSeconds.keys.compactMap { tTitle -> (title: String, seconds: Double, plays: Int, relativePath: String?)? in
+                let secs = rec.tracksSeconds[tTitle] ?? 0
+                let plays = rec.tracksPlayCount[tTitle] ?? 0
+                let relPath = rec.trackPaths[tTitle]
+                if let verifiedPaths {
+                    let isConfirmed = relPath.map { verifiedPaths.contains($0) } ?? false
+                    if !isConfirmed {
+                        excludedUnconfirmedSecs += secs
+                    }
+                    if strictMode && !isConfirmed {
+                        return nil
+                    }
+                }
+                return (title: tTitle, seconds: secs, plays: plays, relativePath: relPath)
             }
             .sorted { $0.seconds > $1.seconds }
 
+            if strictMode && tracks.isEmpty {
+                continue
+            }
+            let artistSecs = strictMode ? tracks.reduce(0) { $0 + $1.seconds } : rec.totalSeconds
+            let artistPlays = strictMode ? tracks.reduce(0) { $0 + $1.plays } : rec.playCount
+            filteredArtistEntries.append((key, rec, artistSecs, artistPlays, tracks))
+        }
+
+        let totalSec = strictMode
+            ? max(0, filteredArtistEntries.reduce(0) { $0 + $1.totalSecs })
+            : max(0, scopeStats.totalSeconds)
+        let totalPlaysCount = strictMode
+            ? filteredArtistEntries.reduce(0) { $0 + $1.totalPlays }
+            : scopeStats.totalPlays
+
+        let sortedArtistEntries = filteredArtistEntries.sorted { lhs, rhs in
+            if lhs.totalSecs != rhs.totalSecs {
+                return lhs.totalSecs > rhs.totalSecs
+            }
+            return lhs.totalPlays > rhs.totalPlays
+        }
+
+        let allRankings: [WrappedArtistRanking] = sortedArtistEntries.map { entry in
+            let share = totalSec > 0 ? (entry.totalSecs / totalSec) * 100.0 : 0
             return WrappedArtistRanking(
-                normalizedKey: key,
-                canonicalName: rec.canonicalName,
-                genre: rec.genre ?? ArtistDatabase.genre(forArtist: rec.canonicalName),
-                totalSeconds: rec.totalSeconds,
-                playCount: rec.playCount,
+                normalizedKey: entry.key,
+                canonicalName: entry.rec.canonicalName,
+                genre: entry.rec.genre ?? ArtistDatabase.genre(forArtist: entry.rec.canonicalName),
+                totalSeconds: entry.totalSecs,
+                playCount: entry.totalPlays,
                 sharePercentage: share,
-                topTrackTitle: tracks.first?.title,
-                trackEntries: tracks
+                topTrackTitle: entry.filteredTracks.first?.title,
+                trackEntries: entry.filteredTracks
             )
         }
 
@@ -838,6 +940,9 @@ final class ListeningWrappedService {
 
         let topSongs: [WrappedTrackRanking] = scopeStats.tracksGlobalSeconds.compactMap { tk, secs in
             let meta = scopeStats.tracksMeta[tk]
+            if strictMode {
+                guard let rel = meta?.relativePath, activeVerified.contains(rel) else { return nil }
+            }
             return WrappedTrackRanking(
                 normalizedKey: tk,
                 title: meta?.title ?? tk,
@@ -901,7 +1006,7 @@ final class ListeningWrappedService {
             scopeLabel: scopeLabel,
             year: year,
             totalSeconds: totalSec,
-            totalPlays: scopeStats.totalPlays,
+            totalPlays: totalPlaysCount,
             namedArtists: namedArtists,
             allArtists: allRankings,
             topSongs: topSongs,
@@ -913,7 +1018,9 @@ final class ListeningWrappedService {
             longestStreakDays: streak,
             personaTitle: persona.title,
             personaSubtitle: persona.subtitle,
-            personaSystemImage: persona.icon
+            personaSystemImage: persona.icon,
+            strictConfirmedOnly: strictMode,
+            excludedUnconfirmedSeconds: excludedUnconfirmedSecs
         )
     }
 
