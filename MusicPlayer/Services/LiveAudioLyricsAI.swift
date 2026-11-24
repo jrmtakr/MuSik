@@ -574,9 +574,11 @@ enum LiveAudioLyricsAI {
                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let sections = (json["response"] as? [String: Any])?["sections"] as? [[String: Any]] else { continue }
 
-            // Prioritize `lyric` and `top_hit` sections first
-            let sortedSections = sections.sorted { lhs, _ in
-                ((lhs["type"] as? String) ?? "") == "lyric"
+            // Prioritize `lyric` sections first with strict weak ordering
+            let sortedSections = sections.sorted { lhs, rhs in
+                let lhsIsLyric = ((lhs["type"] as? String) ?? "") == "lyric"
+                let rhsIsLyric = ((rhs["type"] as? String) ?? "") == "lyric"
+                return lhsIsLyric && !rhsIsLyric
             }
 
             for section in sortedSections {
