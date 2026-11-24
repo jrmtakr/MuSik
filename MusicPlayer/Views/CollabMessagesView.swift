@@ -1,9 +1,15 @@
 import SwiftUI
 
+private enum CollabComposerMediaTab: String, CaseIterable {
+    case stickers = "TikTok Stickers"
+    case gifs = "TikTok GIFs"
+}
+
 struct CollabMessagesView: View {
     @Environment(GroupPlaylistService.self) private var groupService
     @Environment(MediaManager.self) private var mediaManager
     @Environment(WebMediaDownloader.self) private var downloader
+    @Environment(TikTokMediaService.self) private var tiktokMedia
 
     let isEmbeddedDarkGlass: Bool
     var initialGroupID: UUID? = nil
@@ -13,6 +19,10 @@ struct CollabMessagesView: View {
     @State private var selectedGroupID: UUID?
     @State private var draftNote: String = ""
     @State private var selectedSticker: String? = nil
+    @State private var selectedGifURL: String? = nil
+    @State private var mediaTab: CollabComposerMediaTab = .stickers
+    @State private var showTikTokSearch: Bool = false
+    @State private var tiktokSearchQuery: String = ""
     @State private var attachCurrentTrack: Bool = false
     @State private var showCreateSheet = false
     @State private var showJoinSheet = false
@@ -55,6 +65,7 @@ struct CollabMessagesView: View {
             if let gid = selectedGroupID {
                 groupService.startObservingGroup(id: gid)
             }
+            tiktokMedia.refreshIfDue()
         }
         .onChange(of: selectedGroupID) { _, newID in
             if let newID {
@@ -313,6 +324,16 @@ struct CollabMessagesView: View {
                 .disabled(matchedTrack == nil)
             }
 
+            if let gifStr = msg.gifURL, !gifStr.isEmpty, let gifURL = URL(string: gifStr) {
+                AnimatedTikTokImageView(url: gifURL, contentMode: .scaleAspectFill)
+                    .frame(maxWidth: 230, minHeight: 118, maxHeight: 164)
+                    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .strokeBorder(isEmbeddedDarkGlass ? Color.white.opacity(0.16) : Color.secondary.opacity(0.16), lineWidth: 1)
+                    )
+            }
+
             HStack(alignment: .center, spacing: 10) {
                 if let sticker = msg.sticker, !sticker.isEmpty {
                     TikTokStickerView(rawSticker: sticker, size: 48, showCodeBadge: true)
@@ -342,39 +363,200 @@ struct CollabMessagesView: View {
 
     private func quickMessageComposer(for group: GroupPlaylist) -> some View {
         VStack(spacing: 8) {
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 7) {
-                    ForEach(GroupPlaylistStickerPalette.presets, id: \.code) { preset in
-                        let isSelected = selectedSticker == preset.code
-                        Button {
-                            AppHaptics.selection()
-                            selectedSticker = (selectedSticker == preset.code) ? nil : preset.code
-                        } label: {
-                            VStack(spacing: 2) {
-                                TikTokStickerView(rawSticker: preset.code, size: 30)
-                                Text(preset.label)
-                                    .font(.system(size: 9, weight: .bold))
-                                    .foregroundStyle(isEmbeddedDarkGlass ? .white.opacity(isSelected ? 1 : 0.72) : .secondary)
-                            }
-                            .padding(.horizontal, 8)
+            // TikTok Stickers / GIFs switcher + live refresh bar
+            HStack(spacing: 7) {
+                ForEach(CollabComposerMediaTab.allCases, id: \.rawValue) { tab in
+                    let isTab = mediaTab == tab
+                    Button {
+                        AppHaptics.selection()
+                        mediaTab = tab
+                    } label: {
+                        Text(tab == .stickers ? "TikTok Stickers" : "TikTok GIFs")
+                            .font(.caption2.weight(.bold))
+                            .padding(.horizontal, 10)
                             .padding(.vertical, 5)
                             .background(
-                                RoundedRectangle(cornerRadius: 12, style: .continuous).fill(
-                                    isSelected
-                                        ? (isEmbeddedDarkGlass ? Color.white.opacity(0.28) : Color.accentColor.opacity(0.22))
-                                        : (isEmbeddedDarkGlass ? Color.white.opacity(0.08) : Color.secondary.opacity(0.09))
+                                Capsule().fill(
+                                    isTab
+                                        ? (isEmbeddedDarkGlass ? Color.white : Color.accentColor)
+                                        : (isEmbeddedDarkGlass ? Color.white.opacity(0.10) : Color.secondary.opacity(0.12))
                                 )
                             )
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(
-                                    isSelected
-                                        ? (isEmbeddedDarkGlass ? Color.white.opacity(0.88) : Color.accentColor)
-                                        : .clear,
-                                    lineWidth: 1.3
-                                )
+                            .foregroundStyle(
+                                isTab
+                                    ? (isEmbeddedDarkGlass ? Color.black : Color.white)
+                                    : (isEmbeddedDarkGlass ? Color.white.opacity(0.82) : Color.primary)
                             )
+                    }
+                    .buttonStyle(.plain)
+                }
+
+                Spacer()
+
+                if let status = tiktokMedia.statusText, !tiktokMedia.isRefreshing {
+                    Text(status)
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(isEmbeddedDarkGlass ? .white.opacity(0.55) : .secondary)
+                        .lineLimit(1)
+                }
+
+                Button {
+                    AppHaptics.selection()
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        showTikTokSearch.toggle()
+                    }
+                } label: {
+                    Image(systemName: "magnifyingglass")
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(isEmbeddedDarkGlass ? .white.opacity(0.85) : .primary)
+                        .padding(6)
+                        .background(
+                            Circle().fill(isEmbeddedDarkGlass ? Color.white.opacity(0.12) : Color.secondary.opacity(0.14))
+                        )
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Search TikTok Stickers and GIFs")
+
+                Button {
+                    AppHaptics.selection()
+                    tiktokMedia.refreshCatalog(query: tiktokSearchQuery, force: true)
+                } label: {
+                    Group {
+                        if tiktokMedia.isRefreshing {
+                            ProgressView()
+                                .controlSize(.mini)
+                                .tint(isEmbeddedDarkGlass ? .white : Color.accentColor)
+                        } else {
+                            Image(systemName: "arrow.clockwise")
+                                .font(.caption.weight(.bold))
                         }
-                        .buttonStyle(.plain)
+                    }
+                    .foregroundStyle(isEmbeddedDarkGlass ? .white.opacity(0.9) : Color.accentColor)
+                    .padding(6)
+                    .background(
+                        Circle().fill(isEmbeddedDarkGlass ? Color.white.opacity(0.12) : Color.secondary.opacity(0.14))
+                    )
+                }
+                .buttonStyle(.plain)
+                .disabled(tiktokMedia.isRefreshing)
+                .accessibilityLabel("Refresh TikTok Stickers and GIFs")
+            }
+
+            if showTikTokSearch {
+                HStack(spacing: 6) {
+                    TextField("Search TikTok moods (e.g. dance, vibe, hype)...", text: $tiktokSearchQuery)
+                        .font(.caption)
+                        .foregroundStyle(isEmbeddedDarkGlass ? .white : .primary)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(
+                            Capsule().fill(isEmbeddedDarkGlass ? Color.white.opacity(0.12) : Color.secondary.opacity(0.12))
+                        )
+                        .submitLabel(.search)
+                        .onSubmit {
+                            tiktokMedia.refreshCatalog(query: tiktokSearchQuery, force: true)
+                        }
+
+                    Button("Fetch") {
+                        tiktokMedia.refreshCatalog(query: tiktokSearchQuery, force: true)
+                    }
+                    .font(.caption.weight(.bold))
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.mini)
+                }
+            }
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 7) {
+                    if mediaTab == .stickers {
+                        ForEach(tiktokMedia.stickers) { asset in
+                            let isSelected = selectedSticker == asset.urlString
+                            Button {
+                                AppHaptics.selection()
+                                selectedSticker = (selectedSticker == asset.urlString) ? nil : asset.urlString
+                            } label: {
+                                ZStack {
+                                    TikTokStickerView(rawSticker: asset.urlString, size: 38)
+                                }
+                                .padding(4)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 12, style: .continuous).fill(
+                                        isSelected
+                                            ? (isEmbeddedDarkGlass ? Color.white.opacity(0.28) : Color.accentColor.opacity(0.22))
+                                            : (isEmbeddedDarkGlass ? Color.white.opacity(0.08) : Color.secondary.opacity(0.09))
+                                    )
+                                )
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(
+                                        isSelected
+                                            ? (isEmbeddedDarkGlass ? Color.white.opacity(0.88) : Color.accentColor)
+                                            : .clear,
+                                        lineWidth: 1.4
+                                    )
+                                )
+                            }
+                            .buttonStyle(.plain)
+                        }
+
+                        ForEach(GroupPlaylistStickerPalette.presets, id: \.code) { preset in
+                            let isSelected = selectedSticker == preset.code
+                            Button {
+                                AppHaptics.selection()
+                                selectedSticker = (selectedSticker == preset.code) ? nil : preset.code
+                            } label: {
+                                VStack(spacing: 2) {
+                                    TikTokStickerView(rawSticker: preset.code, size: 30)
+                                    Text(preset.label)
+                                        .font(.system(size: 9, weight: .bold))
+                                        .foregroundStyle(isEmbeddedDarkGlass ? .white.opacity(isSelected ? 1 : 0.72) : .secondary)
+                                }
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 5)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 12, style: .continuous).fill(
+                                        isSelected
+                                            ? (isEmbeddedDarkGlass ? Color.white.opacity(0.28) : Color.accentColor.opacity(0.22))
+                                            : (isEmbeddedDarkGlass ? Color.white.opacity(0.08) : Color.secondary.opacity(0.09))
+                                    )
+                                )
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(
+                                        isSelected
+                                            ? (isEmbeddedDarkGlass ? Color.white.opacity(0.88) : Color.accentColor)
+                                            : .clear,
+                                        lineWidth: 1.3
+                                    )
+                                )
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    } else {
+                        ForEach(tiktokMedia.gifs) { asset in
+                            let isSelected = selectedGifURL == asset.urlString
+                            Button {
+                                AppHaptics.selection()
+                                selectedGifURL = (selectedGifURL == asset.urlString) ? nil : asset.urlString
+                            } label: {
+                                Group {
+                                    if let url = asset.mediaURL {
+                                        AnimatedTikTokImageView(url: url, contentMode: .scaleAspectFill)
+                                    } else {
+                                        Color.secondary.opacity(0.2)
+                                    }
+                                }
+                                .frame(width: 74, height: 54)
+                                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(
+                                        isSelected
+                                            ? (isEmbeddedDarkGlass ? Color.white : Color.accentColor)
+                                            : Color.white.opacity(0.14),
+                                        lineWidth: isSelected ? 2.2 : 0.8
+                                    )
+                                )
+                            }
+                            .buttonStyle(.plain)
+                        }
                     }
                 }
             }
@@ -408,7 +590,7 @@ struct CollabMessagesView: View {
                 TextField(
                     attachCurrentTrack && mediaManager.currentItem != nil
                         ? "Note for \(mediaManager.currentItem!.displayTitle)..."
-                        : "Write a message or pick a sticker...",
+                        : "Write a message or pick TikTok sticker/GIF...",
                     text: $draftNote
                 )
                 .font(.subheadline)
@@ -423,7 +605,9 @@ struct CollabMessagesView: View {
                     submitComposerMessage(to: group)
                 }
 
-                let canSend = !draftNote.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || selectedSticker != nil
+                let canSend = !draftNote.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    || selectedSticker != nil
+                    || selectedGifURL != nil
                 Button {
                     submitComposerMessage(to: group)
                 } label: {
@@ -462,11 +646,13 @@ struct CollabMessagesView: View {
         groupService.sendMessage(
             text: draftNote,
             sticker: selectedSticker,
+            gifURL: selectedGifURL,
             attachedTrack: attached,
             to: group.id
         )
         draftNote = ""
         selectedSticker = nil
+        selectedGifURL = nil
         attachCurrentTrack = false
         AppHaptics.selection()
     }
@@ -511,6 +697,7 @@ struct CollabSongNoteTarget: Identifiable {
 
 struct CollabSongNoteComposerSheet: View {
     @Environment(GroupPlaylistService.self) private var groupService
+    @Environment(TikTokMediaService.self) private var tiktokMedia
     @Environment(\.dismiss) private var dismiss
 
     let target: CollabSongNoteTarget
@@ -519,6 +706,7 @@ struct CollabSongNoteComposerSheet: View {
     @State private var chosenGroupID: UUID?
     @State private var noteText: String = ""
     @State private var selectedSticker: String? = nil
+    @State private var selectedGifURL: String? = nil
 
     private var effectiveGroupID: UUID? {
         chosenGroupID ?? target.groupID ?? groupService.defaultMessageGroup?.id
@@ -553,32 +741,94 @@ struct CollabSongNoteComposerSheet: View {
                     }
                 }
 
-                Section("Optional TikTok Sticker") {
-                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 64), spacing: 10)], spacing: 10) {
-                        ForEach(GroupPlaylistStickerPalette.presets, id: \.code) { preset in
-                            let selected = selectedSticker == preset.code
-                            Button {
-                                AppHaptics.selection()
-                                selectedSticker = (selectedSticker == preset.code) ? nil : preset.code
-                            } label: {
-                                VStack(spacing: 4) {
-                                    TikTokStickerView(rawSticker: preset.code, size: 36)
-                                    Text(preset.label)
-                                        .font(.caption2.weight(.semibold))
-                                        .foregroundStyle(selected ? .white : .secondary)
-                                        .lineLimit(1)
+                Section {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 10) {
+                            ForEach(tiktokMedia.stickers.prefix(12)) { asset in
+                                let selected = selectedSticker == asset.urlString
+                                Button {
+                                    AppHaptics.selection()
+                                    selectedSticker = (selectedSticker == asset.urlString) ? nil : asset.urlString
+                                } label: {
+                                    TikTokStickerView(rawSticker: asset.urlString, size: 42)
+                                        .padding(6)
+                                        .background(
+                                            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                                .fill(selected ? Color.accentColor.opacity(0.22) : Color.secondary.opacity(0.10))
+                                        )
+                                        .overlay(
+                                            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                                .strokeBorder(selected ? Color.accentColor : .clear, lineWidth: 1.5)
+                                        )
                                 }
-                                .frame(maxWidth: .infinity)
-                                .padding(.vertical, 8)
-                                .background(
-                                    RoundedRectangle(cornerRadius: 12, style: .continuous)
-                                        .fill(selected ? Color.accentColor : Color.secondary.opacity(0.12))
-                                )
+                                .buttonStyle(.plain)
                             }
-                            .buttonStyle(.plain)
+
+                            ForEach(GroupPlaylistStickerPalette.presets, id: \.code) { preset in
+                                let selected = selectedSticker == preset.code
+                                Button {
+                                    AppHaptics.selection()
+                                    selectedSticker = (selectedSticker == preset.code) ? nil : preset.code
+                                } label: {
+                                    VStack(spacing: 3) {
+                                        TikTokStickerView(rawSticker: preset.code, size: 32)
+                                        Text(preset.label)
+                                            .font(.caption2.weight(.semibold))
+                                            .foregroundStyle(selected ? .white : .secondary)
+                                            .lineLimit(1)
+                                    }
+                                    .padding(.horizontal, 8)
+                                    .padding(.vertical, 6)
+                                    .background(
+                                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                            .fill(selected ? Color.accentColor : Color.secondary.opacity(0.12))
+                                    )
+                                }
+                                .buttonStyle(.plain)
+                            }
                         }
+                        .padding(.vertical, 4)
                     }
-                    .padding(.vertical, 4)
+                } header: {
+                    HStack {
+                        Text("Optional TikTok Sticker")
+                        Spacer()
+                        Button {
+                            tiktokMedia.refreshCatalog(force: true)
+                        } label: {
+                            Label(tiktokMedia.isRefreshing ? "Refreshing" : "Refresh", systemImage: "arrow.clockwise")
+                                .font(.caption2.weight(.semibold))
+                        }
+                        .disabled(tiktokMedia.isRefreshing)
+                    }
+                }
+
+                Section("Optional TikTok GIF") {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 10) {
+                            ForEach(tiktokMedia.gifs.prefix(15)) { gifAsset in
+                                let selected = selectedGifURL == gifAsset.urlString
+                                Button {
+                                    AppHaptics.selection()
+                                    selectedGifURL = (selectedGifURL == gifAsset.urlString) ? nil : gifAsset.urlString
+                                } label: {
+                                    Group {
+                                        if let url = gifAsset.mediaURL {
+                                            AnimatedTikTokImageView(url: url, contentMode: .scaleAspectFill)
+                                        }
+                                    }
+                                    .frame(width: 84, height: 60)
+                                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                            .strokeBorder(selected ? Color.accentColor : .clear, lineWidth: 2.2)
+                                    )
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                        .padding(.vertical, 4)
+                    }
                 }
 
                 Section("Optional Note / Message") {
@@ -587,13 +837,15 @@ struct CollabSongNoteComposerSheet: View {
                 }
 
                 Section {
-                    let hasExtras = !noteText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || selectedSticker != nil
+                    let hasExtras = !noteText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        || selectedSticker != nil
+                        || selectedGifURL != nil
                     Button {
                         sendAndDismiss()
                     } label: {
                         HStack {
                             Spacer()
-                            Text(hasExtras ? "Add Song with Note/Sticker" : "Add Song (No Note)")
+                            Text(hasExtras ? "Add Song with Note / Sticker / GIF" : "Add Song (No Note)")
                                 .font(.headline)
                             Spacer()
                         }
@@ -615,6 +867,7 @@ struct CollabSongNoteComposerSheet: View {
             }
             .onAppear {
                 chosenGroupID = target.groupID ?? groupService.defaultMessageGroup?.id
+                tiktokMedia.refreshIfDue()
             }
         }
         .presentationDetents([.medium, .large])
@@ -623,7 +876,7 @@ struct CollabSongNoteComposerSheet: View {
     private func sendAndDismiss() {
         guard let gid = effectiveGroupID else { return }
         if let local = target.localItem {
-            groupService.sendLocalItem(local, to: gid, note: noteText, sticker: selectedSticker)
+            groupService.sendLocalItem(local, to: gid, note: noteText, sticker: selectedSticker, gifURL: selectedGifURL)
         } else {
             groupService.sendSearchedSong(
                 title: target.songTitle,
@@ -632,7 +885,8 @@ struct CollabSongNoteComposerSheet: View {
                 durationSeconds: target.durationSeconds,
                 to: gid,
                 note: noteText,
-                sticker: selectedSticker
+                sticker: selectedSticker,
+                gifURL: selectedGifURL
             )
         }
         onCompleted?(gid)

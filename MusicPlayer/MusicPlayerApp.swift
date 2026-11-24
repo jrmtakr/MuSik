@@ -100,6 +100,7 @@ struct MusicPlayerApp: App {
     @State private var trendingService = TrendingArtistsService.shared
     @State private var actionRouter = SystemActionRouter.shared
     @State private var syncedLyricsService = SyncedLyricsService.shared
+    @State private var tiktokMediaService = TikTokMediaService.shared
 
     @State private var showPlayerSheet = false
     @State private var quickLookTarget: QuickLookTarget?
@@ -121,6 +122,7 @@ struct MusicPlayerApp: App {
                 .environment(trendingService)
                 .environment(actionRouter)
                 .environment(syncedLyricsService)
+                .environment(tiktokMediaService)
                 .task {
                     LocalMediaCacheProxy.shared.start()
                     SystemActionRouter.registerHomeQuickActions()

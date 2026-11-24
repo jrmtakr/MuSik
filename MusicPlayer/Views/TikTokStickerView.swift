@@ -11,13 +11,24 @@ struct TikTokStickerView: View {
         rawSticker.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }
 
+    private var remoteURL: URL? {
+        let trimmed = rawSticker.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.hasPrefix("https://") || trimmed.hasPrefix("http://") else { return nil }
+        return URL(string: trimmed)
+    }
+
     private var isTikTokSticker: Bool {
         GroupPlaylistStickerPalette.isTikTokCode(code)
     }
 
     var body: some View {
         VStack(spacing: 3) {
-            if isTikTokSticker {
+            if let remoteURL {
+                AnimatedTikTokImageView(url: remoteURL, contentMode: .scaleAspectFit)
+                    .frame(width: size, height: size)
+                    .clipShape(RoundedRectangle(cornerRadius: max(8, size * 0.22), style: .continuous))
+                    .shadow(color: .black.opacity(0.22), radius: max(2, size * 0.08), y: max(1, size * 0.04))
+            } else if isTikTokSticker {
                 Canvas { ctx, canvasSize in
                     drawTikTokFace(in: &ctx, size: canvasSize, code: code)
                 }

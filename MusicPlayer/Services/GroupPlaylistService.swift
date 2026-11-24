@@ -12,6 +12,7 @@ struct GroupPlaylistTrack: Identifiable, Hashable, Codable {
     var addedAt: TimeInterval
     var note: String? = nil
     var sticker: String? = nil
+    var gifURL: String? = nil
 
     var formattedDuration: String? {
         guard let durationSeconds, durationSeconds.isFinite, durationSeconds > 0 else { return nil }
@@ -21,7 +22,8 @@ struct GroupPlaylistTrack: Identifiable, Hashable, Codable {
     var hasMessageOrSticker: Bool {
         let cleanNote = note?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let cleanSticker = sticker?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        return !cleanNote.isEmpty || !cleanSticker.isEmpty
+        let cleanGif = gifURL?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return !cleanNote.isEmpty || !cleanSticker.isEmpty || !cleanGif.isEmpty
     }
 }
 
@@ -31,6 +33,7 @@ struct GroupPlaylistMessage: Identifiable, Hashable, Codable {
     var senderName: String
     var text: String?
     var sticker: String?
+    var gifURL: String? = nil
     var trackID: UUID?
     var trackTitle: String?
     var trackArtist: String?
@@ -39,7 +42,8 @@ struct GroupPlaylistMessage: Identifiable, Hashable, Codable {
     var hasContent: Bool {
         let cleanText = text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let cleanSticker = sticker?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        return !cleanText.isEmpty || !cleanSticker.isEmpty
+        let cleanGif = gifURL?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return !cleanText.isEmpty || !cleanSticker.isEmpty || !cleanGif.isEmpty
     }
 }
 
@@ -65,8 +69,15 @@ enum GroupPlaylistStickerPalette {
     ]
 
     static func displayName(for rawSticker: String) -> String {
-        let lower = rawSticker.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return presets.first(where: { $0.code == lower })?.label ?? rawSticker
+        let trimmed = rawSticker.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lower = trimmed.lowercased()
+        if let hit = presets.first(where: { $0.code == lower }) {
+            return hit.label
+        }
+        if lower.hasPrefix("http://") || lower.hasPrefix("https://") {
+            return "TikTok Sticker"
+        }
+        return trimmed
     }
 
     static func isTikTokCode(_ rawSticker: String) -> Bool {
@@ -433,13 +444,15 @@ final class GroupPlaylistService {
         _ item: MediaItem,
         to groupID: UUID,
         note: String? = nil,
-        sticker: String? = nil
+        sticker: String? = nil,
+        gifURL: String? = nil
     ) {
         guard let group = groups.first(where: { $0.id == groupID }) else { return }
         let existingVID = MediaManager.shared.sourceVideoID(for: item)
         let cleanArtist = (item.artist ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         let cleanNote = normalizedOptional(note)
         let cleanSticker = normalizedOptional(sticker)
+        let cleanGif = normalizedOptional(gifURL)
         let nowTS = Date().timeIntervalSince1970
 
         let track = GroupPlaylistTrack(
@@ -451,17 +464,19 @@ final class GroupPlaylistService {
             addedBy: normalizedSenderName,
             addedAt: nowTS,
             note: cleanNote,
-            sticker: cleanSticker
+            sticker: cleanSticker,
+            gifURL: cleanGif
         )
 
         var attachedMessage: GroupPlaylistMessage?
-        if cleanNote != nil || cleanSticker != nil {
+        if cleanNote != nil || cleanSticker != nil || cleanGif != nil {
             attachedMessage = GroupPlaylistMessage(
                 id: UUID(),
                 senderID: deviceSenderID,
                 senderName: normalizedSenderName,
                 text: cleanNote,
                 sticker: cleanSticker,
+                gifURL: cleanGif,
                 trackID: track.id,
                 trackTitle: track.title,
                 trackArtist: cleanArtist,
@@ -513,7 +528,8 @@ final class GroupPlaylistService {
         durationSeconds: Double?,
         to groupID: UUID,
         note: String? = nil,
-        sticker: String? = nil
+        sticker: String? = nil,
+        gifURL: String? = nil
     ) {
         guard let group = groups.first(where: { $0.id == groupID }) else { return }
         let cleanTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -521,6 +537,7 @@ final class GroupPlaylistService {
         let cleanArtist = artist.trimmingCharacters(in: .whitespacesAndNewlines)
         let cleanNote = normalizedOptional(note)
         let cleanSticker = normalizedOptional(sticker)
+        let cleanGif = normalizedOptional(gifURL)
         let nowTS = Date().timeIntervalSince1970
 
         let track = GroupPlaylistTrack(
@@ -532,17 +549,19 @@ final class GroupPlaylistService {
             addedBy: normalizedSenderName,
             addedAt: nowTS,
             note: cleanNote,
-            sticker: cleanSticker
+            sticker: cleanSticker,
+            gifURL: cleanGif
         )
 
         var attachedMessage: GroupPlaylistMessage?
-        if cleanNote != nil || cleanSticker != nil {
+        if cleanNote != nil || cleanSticker != nil || cleanGif != nil {
             attachedMessage = GroupPlaylistMessage(
                 id: UUID(),
                 senderID: deviceSenderID,
                 senderName: normalizedSenderName,
                 text: cleanNote,
                 sticker: cleanSticker,
+                gifURL: cleanGif,
                 trackID: track.id,
                 trackTitle: track.title,
                 trackArtist: cleanArtist,
@@ -571,13 +590,15 @@ final class GroupPlaylistService {
     func sendMessage(
         text: String?,
         sticker: String?,
+        gifURL: String? = nil,
         attachedTrack: GroupPlaylistTrack? = nil,
         to groupID: UUID
     ) {
         guard let group = groups.first(where: { $0.id == groupID }) else { return }
         let cleanText = normalizedOptional(text)
         let cleanSticker = normalizedOptional(sticker)
-        guard cleanText != nil || cleanSticker != nil else { return }
+        let cleanGif = normalizedOptional(gifURL)
+        guard cleanText != nil || cleanSticker != nil || cleanGif != nil else { return }
 
         let nowTS = Date().timeIntervalSince1970
         let msg = GroupPlaylistMessage(
@@ -586,6 +607,7 @@ final class GroupPlaylistService {
             senderName: normalizedSenderName,
             text: cleanText,
             sticker: cleanSticker,
+            gifURL: cleanGif,
             trackID: attachedTrack?.id,
             trackTitle: attachedTrack?.title,
             trackArtist: attachedTrack?.artist,

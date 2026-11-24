@@ -526,14 +526,25 @@ struct GroupPlaylistDetailView: View {
                                 if let sticker = track.sticker, !sticker.isEmpty {
                                     TikTokStickerView(rawSticker: sticker, size: 20)
                                 }
+                                if let gifStr = track.gifURL,
+                                   !gifStr.isEmpty,
+                                   let gifURL = URL(string: gifStr) {
+                                    AnimatedTikTokImageView(url: gifURL, contentMode: .scaleAspectFill)
+                                        .frame(width: 24, height: 20)
+                                        .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+                                }
                                 if let note = track.note, !note.isEmpty {
                                     Text("\"\(note)\"")
                                         .font(.caption2.weight(.medium))
                                         .foregroundStyle(Color.accentColor)
                                         .lineLimit(2)
-                                } else {
-                                    Text(GroupPlaylistStickerPalette.displayName(for: track.sticker ?? ""))
+                                } else if let sticker = track.sticker, !sticker.isEmpty {
+                                    Text(GroupPlaylistStickerPalette.displayName(for: sticker))
                                         .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                } else if track.gifURL != nil {
+                                    Text("TikTok GIF")
+                                        .font(.caption2.weight(.medium))
                                         .foregroundStyle(.secondary)
                                 }
                             }
