@@ -14,6 +14,7 @@ final class MediaManager {
     struct CustomTrackMetadata: Codable, Hashable {
         var title: String?
         var artist: String?
+        var album: String?
         var coverFileName: String?
         var sourceVideoID: String?
         var isArtistVerified: Bool?
@@ -87,6 +88,7 @@ final class MediaManager {
     private var durationsByPath: [String: Double] = [:]
     private var titlesByPath: [String: String] = [:]
     private var artistsByPath: [String: String] = [:]
+    private var albumsByPath: [String: String] = [:]
     private var metadataLoadedPaths: Set<String> = []
     private var metadataLoadTask: Task<Void, Never>?
     @ObservationIgnored private var spotlightIndexTask: Task<Void, Never>?
@@ -305,7 +307,8 @@ final class MediaManager {
                             dateAdded: dateAdded,
                             durationSeconds: durationsByPath[relPath],
                             metadataTitle: custom?.title ?? titlesByPath[relPath],
-                            artist: custom?.artist ?? artistsByPath[relPath]
+                            artist: custom?.artist ?? artistsByPath[relPath],
+                            album: custom?.album ?? albumsByPath[relPath]
                         )
                     )
                 } else {
@@ -350,7 +353,8 @@ final class MediaManager {
                         dateAdded: dateAdded,
                         durationSeconds: durationsByPath[relPath],
                         metadataTitle: custom?.title ?? titlesByPath[relPath],
-                        artist: custom?.artist ?? artistsByPath[relPath]
+                        artist: custom?.artist ?? artistsByPath[relPath],
+                        album: custom?.album ?? albumsByPath[relPath]
                     )
                 )
             } else {
@@ -614,6 +618,7 @@ final class MediaManager {
 
         if item.prefersFFmpegEngine {
             playWithFFmpegEngine(url: item.fileURL, item: item, headers: nil)
+            WholeSongAIService.shared.handlePlaybackStarted(for: item)
             return
         }
 
@@ -628,6 +633,7 @@ final class MediaManager {
                 isPlaying = true
                 updateNowPlayingInfo(for: item)
                 syncWrappedSessionStart(for: item)
+                WholeSongAIService.shared.handlePlaybackStarted(for: item)
                 return
             } catch {
                 equalizerPlayer.stop()
@@ -653,6 +659,7 @@ final class MediaManager {
         isPlaying = true
         updateNowPlayingInfo(for: item)
         syncWrappedSessionStart(for: item)
+        WholeSongAIService.shared.handlePlaybackStarted(for: item)
     }
 
     func playRemoteStream(
@@ -686,6 +693,7 @@ final class MediaManager {
             metadataTitle: title,
             artist: artist ?? url.host
         )
+        WholeSongAIService.shared.handlePlaybackStarted(for: virtualItem)
 
         let isHLS = ext == "m3u8" || url.absoluteString.lowercased().contains(".m3u8")
         if isHLS || !MediaItem.ffmpegVideoExtensions.contains(ext) {
@@ -1284,6 +1292,7 @@ final class MediaManager {
         for item: MediaItem,
         title: String,
         artist: String,
+        album: String? = nil,
         coverImage: UIImage? = nil,
         removeCustomCover: Bool = false,
         markArtistVerified: Bool = true,
@@ -1307,6 +1316,10 @@ final class MediaManager {
                 entry.isArtistVerified = true
             }
         }
+        if let album {
+            let cleanAlbum = album.trimmingCharacters(in: .whitespacesAndNewlines)
+            entry.album = cleanAlbum.isEmpty ? nil : cleanAlbum
+        }
         if let genre, !genre.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             entry.genre = genre
         }
@@ -1329,7 +1342,7 @@ final class MediaManager {
             thumbnails[item.relativePath] = coverImage
         }
 
-        if entry.title == nil && entry.artist == nil && entry.coverFileName == nil && entry.sourceVideoID == nil {
+        if entry.title == nil && entry.artist == nil && entry.album == nil && entry.coverFileName == nil && entry.sourceVideoID == nil {
             customMetadataByPath.removeValue(forKey: item.relativePath)
         } else {
             customMetadataByPath[item.relativePath] = entry
@@ -1368,14 +1381,17 @@ final class MediaManager {
         for item: MediaItem,
         artistName: String,
         updatedTitle: String? = nil,
+        albumName: String? = nil,
         genre: String? = nil
     ) {
         let cleanTitle = updatedTitle?.trimmingCharacters(in: .whitespacesAndNewlines)
         let titleToKeep = (cleanTitle?.isEmpty == false ? cleanTitle! : (customMetadataByPath[item.relativePath]?.title ?? item.displayTitle))
+        let resolvedAlbum = albumName ?? customMetadataByPath[item.relativePath]?.album ?? item.album
         updateTrackInfo(
             for: item,
             title: titleToKeep,
             artist: artistName,
+            album: resolvedAlbum,
             markArtistVerified: true,
             genre: genre
         )
@@ -1760,6 +1776,14 @@ final class MediaManager {
             summary: "Renamed to \"\(trimmed)\""
         )
         statusMessage = "Renamed playlist to \"\(trimmed)\""
+    }
+
+    func renamePlaylistSilently(id: UUID, to newName: String) {
+        let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              let index = playlists.firstIndex(where: { $0.id == id }) else { return }
+        playlists[index].name = trimmed
+        savePlaylists()
     }
 
     func playlistContains(_ item: MediaItem, in playlist: Playlist) -> Bool {
@@ -2825,6 +2849,9 @@ final class MediaManager {
         if let artist = artistsByPath.removeValue(forKey: oldPath) {
             artistsByPath[newPath] = artist
         }
+        if let album = albumsByPath.removeValue(forKey: oldPath) {
+            albumsByPath[newPath] = album
+        }
         if metadataLoadedPaths.remove(oldPath) != nil {
             metadataLoadedPaths.insert(newPath)
         }
@@ -2851,6 +2878,7 @@ final class MediaManager {
         }
         if playlistsChanged { savePlaylists() }
         PlaylistTimeMachineService.shared.updatePathReferences(from: oldPath, to: newPath)
+        WholeSongAIService.shared.rekeyPath(from: oldPath, to: newPath)
         saveLibraryState()
     }
 
@@ -2871,6 +2899,7 @@ final class MediaManager {
         for key in durationsByPath.keys where predicate(key) { durationsByPath.removeValue(forKey: key) }
         for key in titlesByPath.keys where predicate(key) { titlesByPath.removeValue(forKey: key) }
         for key in artistsByPath.keys where predicate(key) { artistsByPath.removeValue(forKey: key) }
+        for key in albumsByPath.keys where predicate(key) { albumsByPath.removeValue(forKey: key) }
         for key in thumbnails.keys where predicate(key) { thumbnails.removeValue(forKey: key) }
         metadataLoadedPaths = metadataLoadedPaths.filter { !predicate($0) }
 
@@ -2883,6 +2912,7 @@ final class MediaManager {
         likedPaths = likedPaths.filter { !predicate($0) }
         recentPaths.removeAll(where: predicate)
         upNextPaths.removeAll(where: predicate)
+        WholeSongAIService.shared.removePaths(matching: predicate)
 
         var affectedPlaylistIDs: [UUID] = []
         for idx in playlists.indices {
@@ -3072,11 +3102,13 @@ final class MediaManager {
         let custom = customMetadataByPath[item.relativePath]
         let resolvedTitle = custom?.title ?? item.metadataTitle ?? titlesByPath[item.relativePath] ?? item.name
         let resolvedArtist = custom?.artist ?? item.artist ?? artistsByPath[item.relativePath] ?? (item.isVideo ? "MuSeJRM Video" : "Unknown Artist")
+        let resolvedAlbum = custom?.album ?? item.album ?? albumsByPath[item.relativePath]
         let queue = activeQueue
         let queueIdx = queue.firstIndex(where: { $0.relativePath == item.relativePath })
         NowPlayingManager.updateNowPlayingInfo(
             title: resolvedTitle,
             artist: resolvedArtist,
+            album: resolvedAlbum,
             duration: duration,
             elapsed: currentTime,
             artworkImage: thumbnails[item.relativePath],
@@ -3177,6 +3209,7 @@ final class MediaManager {
             recordRecent(nextItem.relativePath)
             updateNowPlayingInfo(for: nextItem)
             syncWrappedSessionStart(for: nextItem)
+            WholeSongAIService.shared.handlePlaybackStarted(for: nextItem)
         } catch {
             crossfadeTriggeredForCurrentTrack = true
         }
@@ -3300,6 +3333,20 @@ final class MediaManager {
                     }
                     if currentItem?.relativePath == path {
                         currentItem?.artist = metadata.artist
+                        shouldRefreshNowPlaying = true
+                    }
+                }
+
+                if customMetadataByPath[path]?.album == nil,
+                   let metaAlbum = metadata.album,
+                   !metaAlbum.isEmpty,
+                   albumsByPath[path] == nil {
+                    albumsByPath[path] = metaAlbum
+                    if let idx = items.firstIndex(where: { $0.relativePath == path }) {
+                        items[idx].album = metaAlbum
+                    }
+                    if currentItem?.relativePath == path {
+                        currentItem?.album = metaAlbum
                         shouldRefreshNowPlaying = true
                     }
                 }

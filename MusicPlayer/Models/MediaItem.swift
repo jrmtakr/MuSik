@@ -10,6 +10,7 @@ struct MediaItem: Identifiable, Hashable, Codable {
     var durationSeconds: Double?
     var metadataTitle: String?
     var artist: String?
+    var album: String? = nil
 
     var displayTitle: String {
         if let metadataTitle, !metadataTitle.isEmpty {

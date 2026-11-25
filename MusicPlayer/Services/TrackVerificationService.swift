@@ -46,6 +46,7 @@ enum TrackVerificationService {
         var genre: String?
         var durationSeconds: Double?
         var lyricsSnippet: String?
+        var fullLyrics: String? = nil
         var artworkURL: URL?
         var source: String
         var matchedViaLyrics: Bool = false
@@ -59,6 +60,8 @@ enum TrackVerificationService {
         localDuration: Double?,
         sourceVideoID: String?,
         extraLyricSnippet: String? = nil,
+        extraLyricSnippets: [String] = [],
+        fullHeardTranscript: String? = nil,
         ignoredChannels: Set<String> = []
     ) async -> TrackVerificationResult {
         let cleanedQuery = ArtistDatabase.cleanSongTitleForSearch(
@@ -67,11 +70,13 @@ enum TrackVerificationService {
             ignoredChannels: ignoredChannels
         )
         let songQuery = cleanedQuery.songOnly.trimmingCharacters(in: .whitespacesAndNewlines)
+        let genericTitle = isGenericTitleQuery(songQuery)
 
+        let effectiveSongQuery = genericTitle ? "" : songQuery
         async let ytTask = fetchYouTubeCaptionsAndCredits(videoID: sourceVideoID)
-        async let itunesTask = fetchITunesCandidates(query: songQuery)
-        async let lrclibTask = fetchLRCLIBBySearch(query: songQuery)
-        async let geniusTask = fetchGeniusCandidates(query: songQuery, isLyricQuery: false)
+        async let itunesTask = fetchITunesCandidates(query: effectiveSongQuery)
+        async let lrclibTask = fetchLRCLIBBySearch(query: effectiveSongQuery)
+        async let geniusTask = fetchGeniusCandidates(query: effectiveSongQuery, isLyricQuery: false)
 
         let ytSignals = await ytTask
         var allHits: [RawHit] = []
@@ -95,61 +100,110 @@ enum TrackVerificationService {
             )
         }
 
-        // If we have YouTube captions or spoken audio transcript, query Genius lyric search too!
-        let lyricQueries = [extraLyricSnippet, ytSignals.caption]
+        // If we have YouTube captions or spoken audio transcript phrases, query Genius, LRCLIB, and iTunes!
+        var seenLyricQueries = Set<String>()
+        let lyricQueries = ([extraLyricSnippet] + extraLyricSnippets + [ytSignals.caption])
             .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
+            .filter { !$0.isEmpty && seenLyricQueries.insert($0.lowercased()).inserted }
 
-        for lq in lyricQueries {
-            let lyricHits = await fetchGeniusCandidates(query: lq, isLyricQuery: true)
-            allHits.append(contentsOf: lyricHits)
+        if !lyricQueries.isEmpty {
+            await withTaskGroup(of: [RawHit].self) { group in
+                for lq in lyricQueries.prefix(4) {
+                    group.addTask {
+                        await fetchGeniusCandidates(query: lq, isLyricQuery: true)
+                    }
+                    group.addTask {
+                        await fetchLRCLIBBySearch(query: lq)
+                    }
+                }
+                for await batch in group {
+                    allHits.append(contentsOf: batch)
+                }
+            }
         }
+
+        let scoringLyricClue = fullHeardTranscript?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+            ? fullHeardTranscript
+            : lyricQueries.first
 
         var merged = mergeAndScore(
             hits: allHits,
-            songQuery: songQuery,
+            songQuery: genericTitle ? "" : songQuery,
             artistHint: cleanedQuery.artistHint,
             localDuration: localDuration,
-            lyricClueText: lyricQueries.first
+            lyricClueText: scoringLyricClue
         )
 
-        // Enrich top 3 candidates with chorus lyrics from LRCLIB if still missing a snippet
+        // Enrich top 3 candidates with full lyrics & album/artwork from LRCLIB + iTunes
         let topCount = min(3, merged.count)
-        for idx in 0..<topCount where (merged[idx].lyricsSnippet?.isEmpty ?? true) {
-            let cand = merged[idx]
-            if let lrc = await fetchLRCLIBBestLyrics(
-                trackName: cand.trackTitle,
-                artistName: cand.artistName,
-                targetDuration: localDuration ?? cand.durationSeconds
-            ) {
-                var reasons = cand.matchReasons
-                var bonus = 8
-                if !reasons.contains("Lyrics Preview") {
-                    reasons.append("Lyrics Preview")
+        for idx in 0..<topCount {
+            var cand = merged[idx]
+            var reasons = cand.matchReasons
+            var sources = cand.sources
+            var bonus = 0
+            var resolvedAlbum = cand.albumName
+            var resolvedDuration = cand.durationSeconds
+            var resolvedSnippet = cand.lyricsSnippet
+            var resolvedArtwork = cand.artworkURL
+            var resolvedGenre = cand.genre
+
+            if resolvedSnippet?.isEmpty ?? true {
+                if let lrc = await fetchLRCLIBBestLyrics(
+                    trackName: cand.trackTitle,
+                    artistName: cand.artistName,
+                    targetDuration: localDuration ?? cand.durationSeconds
+                ) {
+                    bonus += 8
+                    if !reasons.contains("Lyrics Preview") {
+                        reasons.append("Lyrics Preview")
+                    }
+                    if let scoringLyricClue, lyricsShareWords(lrc.fullLyrics, clue: scoringLyricClue) {
+                        bonus += 35
+                        if !reasons.contains("Lyrics Words Matched") {
+                            reasons.append("Lyrics Words Matched")
+                        }
+                    }
+                    if !sources.contains("LRCLIB") {
+                        sources.append("LRCLIB")
+                    }
+                    if resolvedAlbum == nil { resolvedAlbum = lrc.albumName }
+                    if resolvedDuration == nil { resolvedDuration = lrc.durationSeconds }
+                    resolvedSnippet = lrc.snippet
                 }
-                if let lyricClue = lyricQueries.first, lyricsShareWords(lrc.snippet, clue: lyricClue) {
-                    bonus += 35
-                    if !reasons.contains("Lyrics Words Matched") {
-                        reasons.append("Lyrics Words Matched")
+            } else if let scoringLyricClue,
+                      let existingSnippet = resolvedSnippet,
+                      !reasons.contains("Lyrics Words Matched"),
+                      lyricsShareWords(existingSnippet, clue: scoringLyricClue) {
+                bonus += 25
+                reasons.append("Lyrics Words Matched")
+            }
+
+            if resolvedAlbum == nil || resolvedArtwork == nil {
+                if let meta = await fetchITunesAlbumAndArtwork(trackName: cand.trackTitle, artistName: cand.artistName) {
+                    if resolvedAlbum == nil { resolvedAlbum = meta.albumName }
+                    if resolvedArtwork == nil { resolvedArtwork = meta.artworkURL }
+                    if resolvedGenre == nil { resolvedGenre = meta.genre }
+                    if resolvedDuration == nil { resolvedDuration = meta.durationSeconds }
+                    if !sources.contains("iTunes") {
+                        sources.append("iTunes")
+                        bonus += 10
                     }
                 }
-                var sources = cand.sources
-                if !sources.contains("LRCLIB") {
-                    sources.append("LRCLIB")
-                }
-                merged[idx] = TrackVerificationCandidate(
-                    artistName: cand.artistName,
-                    trackTitle: cand.trackTitle,
-                    albumName: cand.albumName ?? lrc.albumName,
-                    genre: cand.genre,
-                    durationSeconds: cand.durationSeconds ?? lrc.durationSeconds,
-                    lyricsSnippet: lrc.snippet,
-                    artworkURL: cand.artworkURL,
-                    score: cand.score + bonus,
-                    matchReasons: reasons,
-                    sources: sources
-                )
             }
+
+            cand = TrackVerificationCandidate(
+                artistName: cand.artistName,
+                trackTitle: cand.trackTitle,
+                albumName: resolvedAlbum,
+                genre: resolvedGenre,
+                durationSeconds: resolvedDuration,
+                lyricsSnippet: resolvedSnippet,
+                artworkURL: resolvedArtwork,
+                score: cand.score + bonus,
+                matchReasons: reasons,
+                sources: sources
+            )
+            merged[idx] = cand
         }
 
         merged.sort { lhs, rhs in
@@ -162,6 +216,31 @@ enum TrackVerificationService {
             youtubeCaptionSnippet: ytSignals.caption,
             youtubeCreditHint: ytSignals.creditArtist
         )
+    }
+
+    static func identifyFromFullSongTranscript(
+        fullTranscript: String,
+        lyricClues: [String],
+        localDuration: Double?,
+        rawTitle: String,
+        rawArtist: String?,
+        sourceVideoID: String?,
+        ignoredChannels: Set<String> = []
+    ) async -> TrackVerificationResult {
+        await verifyTrack(
+            rawTitle: rawTitle,
+            rawArtist: rawArtist,
+            localDuration: localDuration,
+            sourceVideoID: sourceVideoID,
+            extraLyricSnippet: lyricClues.first,
+            extraLyricSnippets: Array(lyricClues.dropFirst()),
+            fullHeardTranscript: fullTranscript,
+            ignoredChannels: ignoredChannels
+        )
+    }
+
+    static func lyricsOverlapTranscript(_ lyricsText: String, transcript: String) -> Bool {
+        lyricsShareWords(lyricsText, clue: transcript)
     }
 
     // MARK: - Vocal Chorus Speech Recognition
@@ -298,6 +377,43 @@ enum TrackVerificationService {
 
     // MARK: - Network Sources
 
+    private static func fetchITunesAlbumAndArtwork(
+        trackName: String,
+        artistName: String
+    ) async -> (albumName: String?, artworkURL: URL?, genre: String?, durationSeconds: Double?)? {
+        let query = [trackName, artistName]
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+        let hits = await fetchITunesCandidates(query: query)
+        let normTrack = ArtistDatabase.normalizeLookupKey(trackName)
+        let normArtist = ArtistDatabase.normalizeLookupKey(artistName)
+        let best = hits.first(where: {
+            ArtistDatabase.normalizeLookupKey($0.trackTitle) == normTrack &&
+                ArtistDatabase.normalizeLookupKey($0.artistName) == normArtist
+        }) ?? hits.first(where: {
+            ArtistDatabase.normalizeLookupKey($0.artistName).contains(normArtist) ||
+                normArtist.contains(ArtistDatabase.normalizeLookupKey($0.artistName))
+        }) ?? hits.first
+        guard let best else { return nil }
+        return (best.albumName, best.artworkURL, best.genre, best.durationSeconds)
+    }
+
+    private static func isGenericTitleQuery(_ title: String) -> Bool {
+        let norm = ArtistDatabase.normalizeLookupKey(title)
+        if norm.isEmpty || norm.count < 2 { return true }
+        let genericPrefixes = [
+            "track", "song", "audio", "recording", "voice memo", "untitled",
+            "unknown", "video", "media", "download", "new recording", "memo", "vid", "aud", "img"
+        ]
+        for prefix in genericPrefixes {
+            if norm == prefix || norm.hasPrefix("\(prefix) ") {
+                return true
+            }
+        }
+        return norm.allSatisfy { $0.isNumber || $0 == " " }
+    }
+
     private static func fetchITunesCandidates(query: String) async -> [RawHit] {
         guard !query.isEmpty,
               let encoded = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
@@ -358,7 +474,7 @@ enum TrackVerificationService {
         trackName: String,
         artistName: String,
         targetDuration: Double?
-    ) async -> (snippet: String, albumName: String?, durationSeconds: Double?)? {
+    ) async -> (snippet: String, fullLyrics: String, albumName: String?, durationSeconds: Double?)? {
         let cleanTrack = ArtistDatabase.cleanSongTitleForSearch(rawTitle: trackName).songOnly
         let primaryArtist = ArtistDatabase.extractArtists(
             rawArtistTag: artistName,
@@ -387,11 +503,11 @@ enum TrackVerificationService {
                         abs((rhs.durationSeconds ?? targetDuration) - targetDuration)
                 }
                 if let best, let snippet = best.lyricsSnippet {
-                    return (snippet, best.albumName, best.durationSeconds)
+                    return (snippet, best.fullLyrics ?? snippet, best.albumName, best.durationSeconds)
                 }
             }
             if let first = withLyrics.first, let snippet = first.lyricsSnippet {
-                return (snippet, first.albumName, first.durationSeconds)
+                return (snippet, first.fullLyrics ?? snippet, first.albumName, first.durationSeconds)
             }
         }
         return nil
@@ -440,6 +556,7 @@ enum TrackVerificationService {
                     genre: ArtistDatabase.genre(forArtist: resolvedArtist),
                     durationSeconds: dur,
                     lyricsSnippet: snippet,
+                    fullLyrics: plain.isEmpty ? nil : plain,
                     artworkURL: nil,
                     source: "LRCLIB"
                 )
@@ -794,8 +911,9 @@ enum TrackVerificationService {
             .map(String.init)
             .filter { $0.count >= 3 && !stopWords.contains($0) }
         guard clueWords.count >= 2 else { return false }
-        let hitCount = clueWords.filter { lyricWords.contains($0) }.count
-        return hitCount >= max(2, clueWords.count / 2)
+        let hitCount = Set(clueWords).filter { lyricWords.contains($0) }.count
+        let needed = clueWords.count > 24 ? max(4, min(10, lyricWords.count / 6)) : max(2, Set(clueWords).count / 2)
+        return hitCount >= needed
     }
 
     private final class ContinuationStateBox: @unchecked Sendable {

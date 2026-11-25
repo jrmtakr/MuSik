@@ -355,6 +355,20 @@ final class TikTokMediaService {
         TikTokMediaAsset(id: "tenor_jm1-sKpAykQ", kind: .gif, title: "Bruh Really", urlString: "https://media.tenor.com/jm1-sKpAykQAAAAM/bruh-really.gif", sourceName: "Tenor TikTok", discoveredAt: 0),
         TikTokMediaAsset(id: "tenor_Y_LH4fKgpqA", kind: .gif, title: "TikTok Dance Meme", urlString: "https://media.tenor.com/Y_LH4fKgpqAAAAAM/tiktok-meme-tiktok.gif", sourceName: "Tenor TikTok", discoveredAt: 0)
     ]
+
+    static var fallbackGifURLs: [URL] {
+        seededGifs.compactMap(\.mediaURL)
+    }
+
+    func randomGifURL(excluding previousURL: URL? = nil) -> URL? {
+        let candidates = (gifs.isEmpty ? Self.seededGifs : gifs).compactMap(\.mediaURL)
+        guard !candidates.isEmpty else { return nil }
+        if candidates.count > 1, let previousURL {
+            let filtered = candidates.filter { $0 != previousURL }
+            if let pick = filtered.randomElement() { return pick }
+        }
+        return candidates.randomElement()
+    }
 }
 
 // MARK: - Native 60fps Animated GIF/WebP Disk + Memory Cache View
@@ -421,11 +435,23 @@ struct AnimatedTikTokImageView: View {
     var contentMode: UIView.ContentMode = .scaleAspectFit
 
     @State private var animatedImage: UIImage?
+    @State private var loadFailed = false
 
     var body: some View {
         Group {
             if let animatedImage {
                 UIKitAnimatedImageRepresentable(image: animatedImage, contentMode: contentMode)
+            } else if loadFailed {
+                VStack(spacing: 8) {
+                    Image(systemName: "music.note.tv.fill")
+                        .font(.system(size: 32, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.75))
+                    Text("TikTok GIF")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.white.opacity(0.6))
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(.white.opacity(0.08))
             } else {
                 ProgressView()
                     .controlSize(.small)
@@ -438,27 +464,44 @@ struct AnimatedTikTokImageView: View {
     }
 
     private func loadIfNeeded() async {
-        let key = url.absoluteString as NSString
-        if let cached = AnimatedImageCache.shared.memory.object(forKey: key) {
-            animatedImage = cached
-            return
+        animatedImage = nil
+        loadFailed = false
+
+        var candidateURLs: [URL] = [url]
+        for fallback in TikTokMediaService.fallbackGifURLs where fallback != url {
+            candidateURLs.append(fallback)
         }
 
-        let diskURL = AnimatedImageCache.shared.diskFileURL(for: url.absoluteString)
+        for candidate in candidateURLs.prefix(4) {
+            if Task.isCancelled { return }
+            if let img = await fetchOrDecodeGIF(from: candidate) {
+                animatedImage = img
+                return
+            }
+        }
+        loadFailed = true
+    }
+
+    private func fetchOrDecodeGIF(from targetURL: URL) async -> UIImage? {
+        let key = targetURL.absoluteString as NSString
+        if let cached = AnimatedImageCache.shared.memory.object(forKey: key) {
+            return cached
+        }
+
+        let diskURL = AnimatedImageCache.shared.diskFileURL(for: targetURL.absoluteString)
         if let diskData = try? Data(contentsOf: diskURL),
            let decoded = AnimatedImageCache.shared.decodeAnimatedImage(from: diskData) {
             AnimatedImageCache.shared.memory.setObject(decoded, forKey: key)
-            animatedImage = decoded
-            return
+            return decoded
         }
 
-        var req = URLRequest(url: url)
-        req.timeoutInterval = 15
+        var req = URLRequest(url: targetURL)
+        req.timeoutInterval = 12
         req.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 18_3 like Mac OS X)", forHTTPHeaderField: "User-Agent")
         guard let (data, resp) = try? await URLSession.shared.data(for: req),
               let http = resp as? HTTPURLResponse,
               (200...299).contains(http.statusCode) else {
-            return
+            return nil
         }
         try? data.write(to: diskURL, options: [.atomic])
         let decoded = await Task.detached(priority: .userInitiated) {
@@ -466,8 +509,9 @@ struct AnimatedTikTokImageView: View {
         }.value
         if let decoded {
             AnimatedImageCache.shared.memory.setObject(decoded, forKey: key)
-            animatedImage = decoded
+            return decoded
         }
+        return nil
     }
 }
 

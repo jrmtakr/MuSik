@@ -406,6 +406,13 @@ struct NowPlayingView: View {
                     .lineLimit(1)
             }
 
+            if let album = item.album, !album.isEmpty {
+                Text(album)
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.secondary.opacity(0.85))
+                    .lineLimit(1)
+            }
+
             HStack(spacing: 8) {
                 Text(item.isHLS ? "HLS" : item.fileExtension.uppercased())
                     .font(.caption.weight(.bold))
@@ -833,7 +840,11 @@ struct NowPlayingView: View {
                     .font(.headline.weight(.bold))
                     .foregroundStyle(.white)
                     .lineLimit(1)
-                Text(item.artist ?? "Unknown Artist")
+                let subtitle = [item.artist ?? "Unknown Artist", item.album]
+                    .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+                    .filter { !$0.isEmpty }
+                    .joined(separator: " • ")
+                Text(subtitle)
                     .font(.subheadline)
                     .foregroundStyle(.white.opacity(0.72))
                     .lineLimit(1)

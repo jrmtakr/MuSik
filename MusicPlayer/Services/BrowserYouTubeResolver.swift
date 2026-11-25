@@ -205,30 +205,121 @@ final class BrowserYouTubeResolver: NSObject, WKNavigationDelegate, WKScriptMess
         defer { releaseLock() }
 
         guard let wv = ensureWebView() else { return nil }
-        await loadAndWait(url: url, in: wv, timeoutSeconds: 10)
-        try? await Task.sleep(nanoseconds: 900_000_000)
+        await loadAndWait(url: url, in: wv, timeoutSeconds: 12)
 
-        let js = """
+        let pollJS = """
         (function() {
             try {
-                if (window.ytInitialData && typeof window.ytInitialData === 'object') {
-                    return JSON.stringify(window.ytInitialData);
+                var docTitle = (document.title || '')
+                    .replace(/\\s*-\\s*YouTube Music\\s*$/i, '')
+                    .replace(/\\s*-\\s*YouTube\\s*$/i, '')
+                    .trim();
+
+                var data = (window.ytInitialData && typeof window.ytInitialData === 'object')
+                    ? window.ytInitialData : null;
+                if (data) {
+                    var serialized = JSON.stringify(data);
+                    if (serialized.indexOf('playlistVideoRenderer') !== -1 ||
+                        serialized.indexOf('playlistPanelVideoRenderer') !== -1 ||
+                        serialized.indexOf('musicResponsiveListItemRenderer') !== -1 ||
+                        serialized.indexOf('lockupViewModel') !== -1) {
+                        return serialized;
+                    }
+                }
+
+                var items = [];
+                var seen = {};
+                var selectors = [
+                    'ytm-playlist-video-renderer',
+                    'ytd-playlist-video-renderer',
+                    'ytm-compact-video-renderer',
+                    'ytmusic-responsive-list-item-renderer',
+                    'yt-lockup-view-model'
+                ];
+                var nodes = document.querySelectorAll(selectors.join(','));
+                for (var i = 0; i < nodes.length; i++) {
+                    var node = nodes[i];
+                    var link = node.querySelector('a[href*="watch?v="], a[href*="v="]');
+                    if (!link) continue;
+                    var href = link.getAttribute('href') || '';
+                    var m = href.match(/[?&]v=([A-Za-z0-9_-]{11})/);
+                    if (!m) continue;
+                    var vid = m[1];
+                    if (seen[vid]) continue;
+                    seen[vid] = true;
+
+                    var titleEl = node.querySelector('#video-title, h3, h4, .media-item-headline, .title, yt-formatted-string');
+                    var title = (titleEl ? titleEl.textContent : link.textContent) || '';
+                    title = title.replace(/\\s+/g, ' ').trim();
+                    if (!title || title === '[Deleted video]' || title === '[Private video]') continue;
+
+                    var bylineEl = node.querySelector('#byline, .media-item-byline, .secondary-flex-columns, ytd-channel-name, .subtitle');
+                    var artist = bylineEl ? (bylineEl.textContent || '').replace(/\\s+/g, ' ').trim() : '';
+
+                    var durEl = node.querySelector('ytd-thumbnail-overlay-time-status-renderer, ytm-thumbnail-overlay-time-status-renderer, .badge-shape-wiz__text');
+                    var duration = durEl ? (durEl.textContent || '').trim() : '';
+
+                    items.push({ videoId: vid, title: title, artist: artist, duration: duration });
+                }
+
+                if (items.length === 0) {
+                    var listMatch = (window.location.href || '').match(/[?&]list=([^&]+)/);
+                    var links = document.querySelectorAll('a[href*="/watch?v="]');
+                    for (var j = 0; j < links.length; j++) {
+                        var a = links[j];
+                        var h = a.getAttribute('href') || '';
+                        if (listMatch && h.indexOf('list=') === -1 &&
+                            !a.closest('ytm-playlist-video-list-renderer, ytd-playlist-video-list-renderer, ytm-section-list-renderer, ytmusic-playlist-shelf-renderer')) {
+                            continue;
+                        }
+                        var vm = h.match(/[?&]v=([A-Za-z0-9_-]{11})/);
+                        if (!vm || seen[vm[1]]) continue;
+                        var label = (a.getAttribute('aria-label') || a.textContent || '').replace(/\\s+/g, ' ').trim();
+                        if (!label || label.length < 2) continue;
+                        seen[vm[1]] = true;
+                        items.push({ videoId: vm[1], title: label, artist: '', duration: '' });
+                    }
+                }
+
+                if (items.length > 0) {
+                    return JSON.stringify({
+                        '__domFallback': items,
+                        '__domTitle': docTitle
+                    });
                 }
             } catch (e) {}
             return '';
         })();
         """
-        let raw = try? await wv.evaluateJavaScript(js) as? String
+
+        var capturedJSON: [String: Any]?
+        var domCandidate: [String: Any]?
+        for attempt in 0..<18 {
+            if attempt == 3 || attempt == 8 {
+                _ = try? await wv.evaluateJavaScript("window.scrollBy(0, 600);")
+            }
+            if let raw = try? await wv.evaluateJavaScript(pollJS) as? String,
+               !raw.isEmpty,
+               let data = raw.data(using: .utf8),
+               let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                if dict["__domFallback"] != nil {
+                    domCandidate = dict
+                    if attempt >= 5 { break }
+                } else {
+                    capturedJSON = dict
+                    break
+                }
+            }
+            try? await Task.sleep(nanoseconds: 350_000_000)
+        }
+
+        let finalJSON = capturedJSON ?? domCandidate
         let cookies = await Self.youtubeCookieHeader(forceRefresh: true)
         wv.stopLoading()
         wv.loadHTMLString("", baseURL: nil)
 
-        guard let raw, !raw.isEmpty,
-              let data = raw.data(using: .utf8),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return nil
-        }
-        return (json, cookies)
+        guard let finalJSON else { return nil }
+        return (finalJSON, cookies)
     }
 
     // MARK: - Lock & WebView Setup
@@ -272,7 +363,7 @@ final class BrowserYouTubeResolver: NSObject, WKNavigationDelegate, WKScriptMess
         config.userContentController = ucc
         config.websiteDataStore = .default()
         config.allowsInlineMediaPlayback = true
-        config.mediaTypesRequiringUserActionForPlayback = [.all]
+        config.mediaTypesRequiringUserActionForPlayback = []
 
         let wv = WKWebView(frame: CGRect(x: -400, y: -400, width: 320, height: 180), configuration: config)
         wv.customUserAgent = WebMediaDownloader.browserUserAgent
@@ -317,6 +408,21 @@ final class BrowserYouTubeResolver: NSObject, WKNavigationDelegate, WKScriptMess
         let js = """
         (function() {
             try {
+                var v = document.querySelector('video');
+                if (v && v.paused) {
+                    v.muted = true;
+                    v.volume = 0;
+                    var pPromise = v.play();
+                    if (pPromise && typeof pPromise.catch === 'function') pPromise.catch(function(){});
+                }
+                if (v && (v.currentSrc || v.src)) {
+                    var src = v.currentSrc || v.src;
+                    if (src.indexOf('googlevideo.com/videoplayback') !== -1 || src.indexOf('.m3u8') !== -1) {
+                        if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.ytResolverMediaURL) {
+                            window.webkit.messageHandlers.ytResolverMediaURL.postMessage({ url: src });
+                        }
+                    }
+                }
                 var p = document.getElementById('movie_player') || document.querySelector('#movie_player');
                 if (p && typeof p.getPlayerResponse === 'function') {
                     var pr = p.getPlayerResponse();
@@ -373,12 +479,34 @@ final class BrowserYouTubeResolver: NSObject, WKNavigationDelegate, WKScriptMess
         await pollPlayerResponseFromDOM()
         guard activeResolveContinuation != nil else { return }
         if !fallbackStreamURLs.isEmpty, let vid = activeVideoID {
+            var enriched = fallbackStreamURLs
+            if let audioCandidate = fallbackStreamURLs.first(where: { $0.isAudio && !$0.isHLS }),
+               let videoCandidate = fallbackStreamURLs.first(where: { !$0.isAudio && !$0.isHLS }) {
+                let paired = DetectedBrowserMedia(
+                    url: videoCandidate.url,
+                    pairedAudioURL: audioCandidate.url,
+                    isHLS: false,
+                    isAudio: false,
+                    title: videoCandidate.title,
+                    author: videoCandidate.author,
+                    qualityLabel: videoCandidate.qualityLabel,
+                    referer: videoCandidate.referer,
+                    customHeaders: videoCandidate.customHeaders,
+                    durationSeconds: videoCandidate.durationSeconds,
+                    isActivelyPlaying: false
+                )
+                enriched.insert(paired, at: 0)
+            }
+            let rawTitle = webView?.title?
+                .replacingOccurrences(of: " - YouTube", with: "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let title = (rawTitle?.isEmpty == false) ? rawTitle! : "YouTube Video"
             let fallback = YouTubeResolvedResult(
                 videoID: vid,
-                title: webView?.title?.replacingOccurrences(of: " - YouTube", with: "") ?? "YouTube Video",
+                title: title,
                 author: nil,
                 durationSeconds: nil,
-                streams: fallbackStreamURLs,
+                streams: enriched,
                 errorReason: nil
             )
             resumeActiveResolve(with: fallback)
@@ -420,11 +548,12 @@ final class BrowserYouTubeResolver: NSObject, WKNavigationDelegate, WKScriptMess
             }
         } else if message.name == "ytResolverMediaURL" {
             guard let urlStr = body["url"] as? String,
-                  let streamURL = URL(string: urlStr),
+                  let rawStreamURL = URL(string: urlStr),
                   let watchURL = self.activeWatchURL else { return }
             let lower = urlStr.lowercased()
             let isHLS = lower.contains(".m3u8") || lower.contains("/manifest/hls")
             let isAudio = lower.contains("mime=audio") || lower.contains("mime%3daudio")
+            let streamURL = isHLS ? rawStreamURL : YouTubeStreamResolver.cleanGooglevideoURL(rawStreamURL)
             let media = DetectedBrowserMedia(
                 url: streamURL,
                 isHLS: isHLS,
@@ -478,17 +607,51 @@ final class BrowserYouTubeResolver: NSObject, WKNavigationDelegate, WKScriptMess
         HTMLMediaElement.prototype.play = function() {
             try {
                 this.muted = true;
-                this.pause();
+                this.volume = 0;
                 if (this.currentSrc || this.src) postMediaURL(this.currentSrc || this.src);
             } catch (e) {}
-            return Promise.resolve();
+            try {
+                return origPlay.apply(this, arguments);
+            } catch (e) {
+                return Promise.resolve();
+            }
         };
+
+        try {
+            var srcDesc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'src');
+            if (srcDesc && srcDesc.set) {
+                Object.defineProperty(HTMLMediaElement.prototype, 'src', {
+                    configurable: true,
+                    enumerable: srcDesc.enumerable,
+                    get: srcDesc.get,
+                    set: function(val) {
+                        this.muted = true;
+                        this.volume = 0;
+                        if (val) postMediaURL(String(val));
+                        return srcDesc.set.call(this, val);
+                    }
+                });
+            }
+        } catch (e) {}
+
+        if (window.PerformanceObserver) {
+            try {
+                var perfObs = new PerformanceObserver(function(list) {
+                    var entries = list.getEntries();
+                    for (var i = 0; i < entries.length; i++) {
+                        if (entries[i] && entries[i].name) postMediaURL(entries[i].name);
+                    }
+                });
+                perfObs.observe({ entryTypes: ['resource'] });
+            } catch (e) {}
+        }
 
         if (window.fetch) {
             var origFetch = window.fetch;
             window.fetch = function(input) {
                 var urlStr = '';
                 try { urlStr = typeof input === 'string' ? input : (input && input.url ? input.url : ''); } catch (e) {}
+                if (urlStr) postMediaURL(urlStr);
                 return origFetch.apply(this, arguments).then(function(resp) {
                     try {
                         if (urlStr.indexOf('/youtubei/v1/player') !== -1 && resp && resp.clone) {
@@ -507,6 +670,7 @@ final class BrowserYouTubeResolver: NSObject, WKNavigationDelegate, WKScriptMess
             var origSend = XMLHttpRequest.prototype.send;
             XMLHttpRequest.prototype.open = function(method, url) {
                 this.__mpUrl = url ? String(url) : '';
+                if (this.__mpUrl) postMediaURL(this.__mpUrl);
                 return origOpen.apply(this, arguments);
             };
             XMLHttpRequest.prototype.send = function() {

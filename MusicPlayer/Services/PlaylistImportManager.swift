@@ -383,7 +383,20 @@ final class PlaylistImportManager {
     func resumeJob(id: UUID) {
         guard let idx = jobs.firstIndex(where: { $0.id == id }), !jobs[idx].isCancelled else { return }
         jobs[idx].isPaused = false
+        jobs[idx].discoveryError = nil
         jobs[idx].updatedAt = .now
+        if jobs[idx].isDiscoveringPages && discoveryTasksByJobID[id] == nil {
+            let sourceURL = jobs[idx].sourceURLString
+            let parsedListID = PlaylistURLImporter.parsePlaylistURL(sourceURL)?.playlistID
+            discoveryTasksByJobID[id] = Task { [weak self] in
+                await self?.runDiscoveryStream(
+                    jobID: id,
+                    urlString: sourceURL,
+                    initialJSON: nil,
+                    listID: parsedListID
+                )
+            }
+        }
         refreshCachedVideoMap()
         persistJobsNow()
         ensurePumping()
@@ -458,13 +471,21 @@ final class PlaylistImportManager {
             let cookies = await BrowserYouTubeResolver.youtubeCookieHeader()
 
             if let initialJSON, let listID, !listID.isEmpty {
-                _ = try await PlaylistURLImporter.continueYouTubePlaylist(
-                    fromInitialJSON: initialJSON,
-                    listID: listID,
-                    cookiesHeader: cookies
-                ) { page in
-                    await MainActor.run {
-                        self.handleDiscoveryPage(jobID: jobID, page: page)
+                do {
+                    _ = try await PlaylistURLImporter.continueYouTubePlaylist(
+                        fromInitialJSON: initialJSON,
+                        listID: listID,
+                        cookiesHeader: cookies
+                    ) { page in
+                        await MainActor.run {
+                            self.handleDiscoveryPage(jobID: jobID, page: page)
+                        }
+                    }
+                } catch {
+                    _ = try await PlaylistURLImporter.streamPlaylist(from: urlString, cookiesHeader: cookies) { page in
+                        await MainActor.run {
+                            self.handleDiscoveryPage(jobID: jobID, page: page)
+                        }
                     }
                 }
             } else {
@@ -514,8 +535,17 @@ final class PlaylistImportManager {
         page: PlaylistURLImporter.PlaylistStreamPage
     ) {
         guard let idx = jobs.firstIndex(where: { $0.id == jobID }), !jobs[idx].isCancelled else { return }
-        if jobs[idx].playlistName.isEmpty || jobs[idx].playlistName == "YouTube Playlist" {
+        let currentName = jobs[idx].playlistName
+        let isPlaceholderName = currentName.isEmpty
+            || currentName == "YouTube Playlist"
+            || currentName == "YouTube Music Playlist"
+            || currentName == "Spotify Playlist"
+            || currentName == "Apple Music Playlist"
+        if isPlaceholderName,
+           !page.playlistTitle.isEmpty,
+           page.playlistTitle != "YouTube Playlist" {
             jobs[idx].playlistName = page.playlistTitle
+            MediaManager.shared.renamePlaylistSilently(id: jobs[idx].targetPlaylistID, to: page.playlistTitle)
         }
         if !page.newTracks.isEmpty {
             appendTracks(page.newTracks, toJobID: jobID)
@@ -715,19 +745,19 @@ final class PlaylistImportManager {
             return
         }
 
-        // Step 3: Resolve streams (fast InnerTube with browser cookies -> Built-in Browser WKWebView fallback)
+        // Step 3: Resolve streams (fast InnerTube with reachability check -> Built-in Browser WKWebView fallback)
         var resolvedResult: YouTubeResolvedResult?
         var cookiesHeader = await BrowserYouTubeResolver.youtubeCookieHeader()
 
         if !job.alwaysUseBrowserResolver,
-           track.retryCount == 0,
+           (track.retryCount == 0 || track.retryCount >= 2),
            let watchURL = URL(string: "https://www.youtube.com/watch?v=\(resolvedVideoID)") {
             resolvedResult = await YouTubeStreamResolver.resolveStreams(
                 for: watchURL,
                 cookiesHeader: cookiesHeader,
                 referer: watchURL.absoluteString,
                 visitorData: nil,
-                skipReachabilityProbe: true
+                skipReachabilityProbe: false
             )
         }
 
@@ -744,7 +774,7 @@ final class PlaylistImportManager {
                 jobID: jobID,
                 trackID: trackID,
                 error: resolvedResult?.errorReason ?? "Could not find playable stream in browser",
-                retryable: track.retryCount == 0
+                retryable: track.retryCount < 2
             )
             return
         }
@@ -761,20 +791,37 @@ final class PlaylistImportManager {
         // Step 4: Select best stream & enqueue into background URLSession
         guard let picked = selectBestStream(from: resolvedResult.streams, format: job.preferredFormat) else {
             // HLS-only fallback via foreground WebMediaDownloader if available
-            if let hlsStream = resolvedResult.streams.first(where: { $0.isHLS }) {
+            if let rawHLS = resolvedResult.streams.first(where: { $0.isHLS }) {
                 setTrackStatus(jobID: jobID, trackID: trackID, status: .downloading)
+                let fallbackTitle = track.title.isEmpty ? resolvedResult.title : track.title
+                let fallbackArtist = track.artist.isEmpty ? resolvedResult.author : track.artist
+                let labeledHLS = DetectedBrowserMedia(
+                    url: rawHLS.url,
+                    pairedAudioURL: rawHLS.pairedAudioURL,
+                    isHLS: rawHLS.isHLS,
+                    isAudio: rawHLS.isAudio,
+                    title: rawHLS.title ?? fallbackTitle,
+                    author: rawHLS.author ?? fallbackArtist,
+                    qualityLabel: rawHLS.qualityLabel,
+                    referer: rawHLS.referer,
+                    customHeaders: rawHLS.customHeaders,
+                    durationSeconds: rawHLS.durationSeconds ?? resolvedResult.durationSeconds,
+                    isActivelyPlaying: false
+                )
                 if let downloaded = await WebMediaDownloader.shared.downloadTrackIntoPlaylist(
-                    hlsStream,
+                    labeledHLS,
+                    fallbackStreams: resolvedResult.streams,
                     targetPlaylistID: job.targetPlaylistID,
                     maxDurationMinutes: 0,
-                    sourceVideoID: resolvedVideoID
+                    sourceVideoID: resolvedVideoID,
+                    preferAudioOnly: job.preferredFormat == .audioOnly
                 ) {
                     cachedMediaByVideoID[resolvedVideoID] = downloaded
                     markTrackCompleted(jobID: jobID, trackID: trackID, viaBrowser: usedBrowser)
                     return
                 }
             }
-            markTrackFailed(jobID: jobID, trackID: trackID, error: "No downloadable stream available", retryable: track.retryCount == 0)
+            markTrackFailed(jobID: jobID, trackID: trackID, error: "No downloadable stream available", retryable: track.retryCount < 2)
             return
         }
 
@@ -803,6 +850,11 @@ final class PlaylistImportManager {
             if let audio = streams.first(where: { $0.isAudio && !$0.isHLS && $0.pairedAudioURL == nil }) {
                 let ext = validExtension(for: audio.url, fallback: "m4a")
                 return (audio.url, nil, audio.customHeaders, .singleDirect, ext)
+            }
+            if let paired = streams.first(where: { !$0.isHLS && $0.pairedAudioURL != nil }),
+               let audioURL = paired.pairedAudioURL {
+                let ext = validExtension(for: audioURL, fallback: "m4a")
+                return (audioURL, nil, paired.customHeaders, .singleDirect, ext)
             }
             if let mp4 = streams.first(where: { !$0.isHLS && $0.pairedAudioURL == nil }) {
                 return (mp4.url, nil, mp4.customHeaders, .audioExtractFromMP4, "mp4")
@@ -1037,7 +1089,7 @@ final class PlaylistImportManager {
             try? FileManager.default.removeItem(at: Self.stagingDirectoryURL.appendingPathComponent(audioName))
         }
         if let pair = lookup(jobID: metadata.jobID, trackID: metadata.trackID),
-           pair.track.retryCount < 1,
+           pair.track.retryCount < 2,
            !pair.job.isPaused, !pair.job.isCancelled {
             incrementRetryAndRequeue(jobID: metadata.jobID, trackID: metadata.trackID)
             ensurePumping()
@@ -1076,11 +1128,18 @@ final class PlaylistImportManager {
 
         var changed = false
         for jIdx in jobs.indices {
-            if jobs[jIdx].isDiscoveringPages && discoveryTasksByJobID[jobs[jIdx].id] == nil && !jobs[jIdx].isCancelled {
-                // Resume interrupted discovery seamlessly from the URL
-                jobs[jIdx].isPaused = true
-                jobs[jIdx].isDiscoveringPages = false
-                changed = true
+            if jobs[jIdx].isDiscoveringPages && discoveryTasksByJobID[jobs[jIdx].id] == nil && !jobs[jIdx].isCancelled && !jobs[jIdx].isPaused {
+                let jobID = jobs[jIdx].id
+                let sourceURL = jobs[jIdx].sourceURLString
+                let parsedListID = PlaylistURLImporter.parsePlaylistURL(sourceURL)?.playlistID
+                discoveryTasksByJobID[jobID] = Task { [weak self] in
+                    await self?.runDiscoveryStream(
+                        jobID: jobID,
+                        urlString: sourceURL,
+                        initialJSON: nil,
+                        listID: parsedListID
+                    )
+                }
             }
             for tIdx in jobs[jIdx].tracks.indices {
                 let track = jobs[jIdx].tracks[tIdx]
@@ -1231,7 +1290,7 @@ final class PlaylistImportManager {
     private func markTrackFailed(jobID: UUID, trackID: UUID, error: String, retryable: Bool) {
         guard let jIdx = jobs.firstIndex(where: { $0.id == jobID }),
               let tIdx = jobs[jIdx].tracks.firstIndex(where: { $0.id == trackID }) else { return }
-        if retryable && jobs[jIdx].tracks[tIdx].retryCount < 1 && !jobs[jIdx].isPaused && !jobs[jIdx].isCancelled {
+        if retryable && jobs[jIdx].tracks[tIdx].retryCount < 2 && !jobs[jIdx].isPaused && !jobs[jIdx].isCancelled {
             jobs[jIdx].tracks[tIdx].retryCount += 1
             jobs[jIdx].tracks[tIdx].status = .pending
             scheduleDebouncedSave()
@@ -1286,7 +1345,13 @@ final class PlaylistImportManager {
         if headers["User-Agent"] == nil {
             headers["User-Agent"] = WebMediaDownloader.browserUserAgent
         }
-        if let cookiesHeader, !cookiesHeader.isEmpty, headers["Cookie"] == nil {
+        let ua = headers["User-Agent"] ?? ""
+        let isNativeYouTubeClient = ua.hasPrefix("com.google.")
+        if isNativeYouTubeClient {
+            headers.removeValue(forKey: "Cookie")
+            headers.removeValue(forKey: "Referer")
+            headers.removeValue(forKey: "Origin")
+        } else if let cookiesHeader, !cookiesHeader.isEmpty, headers["Cookie"] == nil {
             headers["Cookie"] = cookiesHeader
         }
         return headers

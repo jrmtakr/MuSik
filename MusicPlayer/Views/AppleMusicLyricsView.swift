@@ -148,6 +148,8 @@ struct AppleMusicLyricsView: View {
     let item: MediaItem
     let onOpenGeniusWeb: (String, String) -> Void
 
+    @State private var tiktokMedia = TikTokMediaService.shared
+    @State private var wholeSongAI = WholeSongAIService.shared
     @State private var lastSyncWallTime: Date = .now
     @State private var lastSyncPlaybackTime: Double = 0
     @State private var isUserScrolling = false
@@ -157,6 +159,7 @@ struct AppleMusicLyricsView: View {
     @State private var customArtistName = ""
     @State private var customLyricsPasteText = ""
     @State private var copiedBannerText: String?
+    @State private var randomGifURL: URL?
 
     var body: some View {
         ZStack(alignment: .bottom) {
@@ -222,11 +225,14 @@ struct AppleMusicLyricsView: View {
         }
         .onAppear {
             syncClockSnapshot()
+            tiktokMedia.refreshIfDue()
+            pickRandomTikTokGif()
             lyricsService.loadLyricsIfNeeded(for: item)
         }
         .onChange(of: item.relativePath) { _, _ in
             isUserScrolling = false
             syncClockSnapshot()
+            pickRandomTikTokGif()
             lyricsService.loadLyricsIfNeeded(for: item)
         }
         .onChange(of: mediaManager.currentTime) { _, newTime in
@@ -514,21 +520,55 @@ struct AppleMusicLyricsView: View {
         }
     }
 
+    private func pickRandomTikTokGif() {
+        randomGifURL = tiktokMedia.randomGifURL(excluding: randomGifURL)
+    }
+
     private var emptyOrErrorLyricsView: some View {
         VStack(spacing: 16) {
-            Image(systemName: "quote.bubble")
-                .font(.system(size: 46))
-                .foregroundStyle(.white.opacity(0.55))
-
-            Text("Lyrics Unavailable")
+            Text("No lyrics for first time listen")
                 .font(.title3.weight(.bold))
                 .foregroundStyle(.white)
-
-            Text(lyricsService.lastError ?? "Tap Search Manually to fix song/artist title or view on Genius.")
-                .font(.subheadline)
-                .foregroundStyle(.white.opacity(0.68))
                 .multilineTextAlignment(.center)
-                .padding(.horizontal, 28)
+                .padding(.horizontal, 24)
+
+            if let gifURL = randomGifURL ?? tiktokMedia.randomGifURL() {
+                AnimatedTikTokImageView(url: gifURL, contentMode: .scaleAspectFit)
+                    .frame(width: 220, height: 170)
+                    .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 16, style: .continuous)
+                            .strokeBorder(.white.opacity(0.18), lineWidth: 1)
+                    )
+                    .shadow(color: .black.opacity(0.35), radius: 12, y: 6)
+                    .onTapGesture {
+                        AppHaptics.light()
+                        pickRandomTikTokGif()
+                    }
+            }
+
+            if wholeSongAI.isListening(to: item) {
+                VStack(spacing: 6) {
+                    ProgressView(value: max(0.02, wholeSongAI.progressFraction))
+                        .tint(.white)
+                        .frame(maxWidth: 220)
+                    Text(wholeSongAI.statusMessage ?? "AI listening to whole song...")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.white.opacity(0.75))
+                        .multilineTextAlignment(.center)
+                }
+                .padding(.top, 2)
+            } else if !item.relativePath.hasPrefix("__remote__/") {
+                Button {
+                    AppHaptics.light()
+                    wholeSongAI.startWholeSongListen(for: item, force: true)
+                } label: {
+                    Label("AI Listen Whole Song", systemImage: "waveform.and.magnifyingglass")
+                        .font(.caption.weight(.semibold))
+                }
+                .buttonStyle(.bordered)
+                .tint(.white.opacity(0.85))
+            }
 
             HStack(spacing: 12) {
                 Button {

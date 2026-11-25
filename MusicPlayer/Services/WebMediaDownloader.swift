@@ -802,8 +802,49 @@ final class WebMediaDownloader {
         maxDurationSeconds: Double?,
         destinationFolder: String
     ) async -> Bool {
-        guard let initialText = await fetchText(from: playlistURL, headers: headers) else {
+        guard let output = await downloadHLSToTempFile(
+            downloadID: downloadID,
+            playlistURL: playlistURL,
+            cleanTitle: cleanTitle,
+            minimumBitrate: minimumBitrate,
+            headers: headers,
+            maxDurationSeconds: maxDurationSeconds,
+            audioOnly: false
+        ) else {
+            return Task.isCancelled
+        }
+        if output.tooLong {
+            return true
+        }
+        guard let tempURL = output.tempURL else { return false }
+
+        activeDownloads.removeAll { $0.id == downloadID }
+        if let saved = MediaManager.shared.importTemporaryFile(
+            from: tempURL,
+            preferredFileName: "\(cleanTitle).\(output.ext)",
+            inFolder: destinationFolder
+        ) {
+            let updated = MediaManager.shared.applyDownloadedMetadataAndPlaylist(for: saved, title: cleanTitle, artist: artist)
+            recordCompletedDownload(updated, sourceURL: playlistURL)
+        } else {
+            try? FileManager.default.removeItem(at: tempURL)
             return false
+        }
+        LocalMediaCacheProxy.shared.refreshCacheSize()
+        return true
+    }
+
+    private func downloadHLSToTempFile(
+        downloadID: UUID,
+        playlistURL: URL,
+        cleanTitle: String,
+        minimumBitrate: Double?,
+        headers: [String: String],
+        maxDurationSeconds: Double?,
+        audioOnly: Bool
+    ) async -> (tempURL: URL?, ext: String, tooLong: Bool)? {
+        guard let initialText = await fetchText(from: playlistURL, headers: headers) else {
+            return nil
         }
 
         let initialParsed = parseM3U8(text: initialText, baseURL: playlistURL)
@@ -811,7 +852,7 @@ final class WebMediaDownloader {
         var separateAudioURL: URL?
 
         if initialParsed.isMaster {
-            guard !initialParsed.variants.isEmpty else { return false }
+            guard !initialParsed.variants.isEmpty else { return nil }
             let chosenVariant: HLSQualityVariant?
             if let minimumBitrate, minimumBitrate > 0 {
                 chosenVariant = initialParsed.variants.min { abs($0.peakBitrate - minimumBitrate) < abs($1.peakBitrate - minimumBitrate) }
@@ -819,8 +860,8 @@ final class WebMediaDownloader {
                 let capped = initialParsed.variants.filter { $0.height == 0 || $0.height <= 1080 }
                 chosenVariant = capped.max { $0.peakBitrate < $1.peakBitrate } ?? initialParsed.variants.last
             }
-            guard let chosenURL = chosenVariant?.variantURL else { return false }
-            guard let subText = await fetchText(from: chosenURL, headers: headers) else { return false }
+            guard let chosenURL = chosenVariant?.variantURL else { return nil }
+            guard let subText = await fetchText(from: chosenURL, headers: headers) else { return nil }
             parsedVideo = parseM3U8(text: subText, baseURL: chosenURL)
             if let groupID = chosenVariant?.audioGroupID {
                 separateAudioURL = initialParsed.audioGroupURLs[groupID]
@@ -830,7 +871,7 @@ final class WebMediaDownloader {
         }
 
         if parsedVideo.hasUnsupportedEncryption || parsedVideo.isLiveWithoutEndList || parsedVideo.segments.isEmpty {
-            return false
+            return nil
         }
 
         if let maxDurationSeconds, parsedVideo.totalDuration > maxDurationSeconds {
@@ -839,7 +880,7 @@ final class WebMediaDownloader {
                 sourceURL: playlistURL,
                 message: "Skipped \"\(cleanTitle)\" (exceeds \(Int(maxDurationSeconds / 60)) min limit)."
             )
-            return true
+            return (nil, "mp4", true)
         }
 
         var parsedAudio: ParsedHLSMedia?
@@ -855,6 +896,29 @@ final class WebMediaDownloader {
         try? FileManager.default.createDirectory(at: workDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: workDir) }
 
+        if audioOnly, let parsedAudio,
+           let audioJoined = await downloadHLSSegmentSet(
+               parsed: parsedAudio,
+               workDir: workDir,
+               filePrefix: "audio",
+               headers: headers,
+               downloadID: downloadID,
+               progressBase: 0,
+               progressSpan: 0.9
+           ) {
+            let m4aOut = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString).m4a")
+            let remuxed = await Task.detached(priority: .userInitiated) {
+                FFmpegMediaService.remuxAudioTrackToM4A(inputURL: audioJoined.url, outputURL: m4aOut)
+            }.value
+            if remuxed {
+                return (m4aOut, "m4a", false)
+            }
+            try? FileManager.default.removeItem(at: m4aOut)
+            let movedAudio = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString).\(audioJoined.ext)")
+            try? FileManager.default.moveItem(at: audioJoined.url, to: movedAudio)
+            return (movedAudio, audioJoined.ext, false)
+        }
+
         let hasSeparateAudio = parsedAudio != nil
         guard let videoJoined = await downloadHLSSegmentSet(
             parsed: parsedVideo,
@@ -865,7 +929,18 @@ final class WebMediaDownloader {
             progressBase: 0,
             progressSpan: hasSeparateAudio ? 0.72 : 0.95
         ) else {
-            return Task.isCancelled
+            return nil
+        }
+
+        if audioOnly {
+            let m4aOut = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString).m4a")
+            let remuxed = await Task.detached(priority: .userInitiated) {
+                FFmpegMediaService.remuxAudioTrackToM4A(inputURL: videoJoined.url, outputURL: m4aOut)
+            }.value
+            if remuxed {
+                return (m4aOut, "m4a", false)
+            }
+            try? FileManager.default.removeItem(at: m4aOut)
         }
 
         var audioJoined: (url: URL, ext: String)?
@@ -880,7 +955,7 @@ final class WebMediaDownloader {
                 progressSpan: 0.23
             )
             if audioJoined == nil && Task.isCancelled {
-                return true
+                return nil
             }
         }
 
@@ -904,32 +979,13 @@ final class WebMediaDownloader {
             }.value
         }
 
-        activeDownloads.removeAll { $0.id == downloadID }
-
-        let finalTempURL: URL
-        let finalExt: String
         if finalOK {
-            finalTempURL = finalMP4URL
-            finalExt = "mp4"
-        } else {
-            try? FileManager.default.removeItem(at: finalMP4URL)
-            finalTempURL = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString).\(videoJoined.ext)")
-            try? FileManager.default.moveItem(at: videoJoined.url, to: finalTempURL)
-            finalExt = videoJoined.ext
+            return (finalMP4URL, "mp4", false)
         }
-
-        if let saved = MediaManager.shared.importTemporaryFile(
-            from: finalTempURL,
-            preferredFileName: "\(cleanTitle).\(finalExt)",
-            inFolder: destinationFolder
-        ) {
-            let updated = MediaManager.shared.applyDownloadedMetadataAndPlaylist(for: saved, title: cleanTitle, artist: artist)
-            recordCompletedDownload(updated, sourceURL: playlistURL)
-        } else {
-            return false
-        }
-        LocalMediaCacheProxy.shared.refreshCacheSize()
-        return true
+        try? FileManager.default.removeItem(at: finalMP4URL)
+        let moved = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString).\(videoJoined.ext)")
+        try? FileManager.default.moveItem(at: videoJoined.url, to: moved)
+        return (moved, videoJoined.ext, false)
     }
 
     private func downloadHLSSegmentSet(
@@ -1682,28 +1738,32 @@ final class WebMediaDownloader {
         fallbackStreams: [DetectedBrowserMedia] = [],
         targetPlaylistID: UUID,
         maxDurationMinutes: Int = 0,
-        sourceVideoID: String? = nil
+        sourceVideoID: String? = nil,
+        preferAudioOnly: Bool = false
     ) async -> MediaItem? {
         await downloadResolvedToLibrary(
             media,
             fallbackStreams: fallbackStreams,
             targetPlaylistID: targetPlaylistID,
             maxDurationMinutes: maxDurationMinutes,
-            sourceVideoID: sourceVideoID
+            sourceVideoID: sourceVideoID,
+            preferAudioOnly: preferAudioOnly
         )
     }
 
     func downloadGroupTrackOffline(
         _ media: DetectedBrowserMedia,
         fallbackStreams: [DetectedBrowserMedia] = [],
-        sourceVideoID: String? = nil
+        sourceVideoID: String? = nil,
+        preferAudioOnly: Bool = false
     ) async -> MediaItem? {
         await downloadResolvedToLibrary(
             media,
             fallbackStreams: fallbackStreams,
             targetPlaylistID: nil,
             maxDurationMinutes: 0,
-            sourceVideoID: sourceVideoID
+            sourceVideoID: sourceVideoID,
+            preferAudioOnly: preferAudioOnly
         )
     }
 
@@ -1712,9 +1772,17 @@ final class WebMediaDownloader {
         fallbackStreams: [DetectedBrowserMedia],
         targetPlaylistID: UUID?,
         maxDurationMinutes: Int,
-        sourceVideoID: String?
+        sourceVideoID: String?,
+        preferAudioOnly: Bool
     ) async -> MediaItem? {
-        let candidates = ([media] + fallbackStreams).filter { !$0.isHLS }
+        var seenCandidateKeys = Set<String>()
+        var candidates: [DetectedBrowserMedia] = []
+        for s in ([media] + fallbackStreams) {
+            let key = "\(s.url.absoluteString)|\(s.pairedAudioURL?.absoluteString ?? "")|\(s.isHLS)"
+            if seenCandidateKeys.insert(key).inserted {
+                candidates.append(s)
+            }
+        }
         let maxSec = maxDurationMinutes > 0 ? Double(maxDurationMinutes * 60) : nil
         let cleanTitle = sanitizedTitle(media.title, fallbackURL: media.url, defaultTitle: "Track")
 
@@ -1727,7 +1795,7 @@ final class WebMediaDownloader {
 
         let downloadID = UUID()
         activeDownloads.append(
-            BrowserDownloadItem(id: downloadID, title: cleanTitle, sourceURL: media.url, progress: 0.05, isHLS: false)
+            BrowserDownloadItem(id: downloadID, title: cleanTitle, sourceURL: media.url, progress: 0.05, isHLS: media.isHLS)
         )
         defer {
             activeDownloads.removeAll { $0.id == downloadID }
@@ -1741,7 +1809,60 @@ final class WebMediaDownloader {
                 "Accept": "*/*"
             ]
 
+            if candidate.isHLS {
+                if let hlsOut = await downloadHLSToTempFile(
+                    downloadID: downloadID,
+                    playlistURL: candidate.url,
+                    cleanTitle: cleanTitle,
+                    minimumBitrate: nil,
+                    headers: primaryHeaders,
+                    maxDurationSeconds: maxSec,
+                    audioOnly: preferAudioOnly
+                ), !hlsOut.tooLong, let tempURL = hlsOut.tempURL {
+                    if let saved = MediaManager.shared.importTemporaryFile(
+                        from: tempURL,
+                        preferredFileName: "\(cleanTitle).\(hlsOut.ext)"
+                    ) {
+                        LocalMediaCacheProxy.shared.refreshCacheSize()
+                        return MediaManager.shared.applyDownloadedMetadataAndPlaylist(
+                            for: saved,
+                            title: candidate.title ?? cleanTitle,
+                            artist: candidate.author,
+                            explicitPlaylistID: targetPlaylistID,
+                            appendOrder: true,
+                            sourceVideoID: sourceVideoID
+                        )
+                    }
+                    try? FileManager.default.removeItem(at: tempURL)
+                }
+                continue
+            }
+
             if let pairedAudio = candidate.pairedAudioURL {
+                if preferAudioOnly {
+                    let cleanAudio = cleanedStreamURLIfRangeFragment(pairedAudio)
+                    guard let aURL = await fetchTempFile(from: cleanAudio, ext: "m4a", headers: primaryHeaders, using: ephemeralDataSession)
+                            ?? (await fetchTempFile(from: cleanAudio, ext: "m4a", headers: minimalHeaders, using: ephemeralDataSession)) else {
+                        continue
+                    }
+                    if let maxSec, let dur = await resolveLocalDuration(at: aURL), dur > maxSec {
+                        try? FileManager.default.removeItem(at: aURL)
+                        return nil
+                    }
+                    if let saved = MediaManager.shared.importTemporaryFile(from: aURL, preferredFileName: "\(cleanTitle).m4a") {
+                        LocalMediaCacheProxy.shared.refreshCacheSize()
+                        return MediaManager.shared.applyDownloadedMetadataAndPlaylist(
+                            for: saved,
+                            title: candidate.title ?? cleanTitle,
+                            artist: candidate.author,
+                            explicitPlaylistID: targetPlaylistID,
+                            appendOrder: true,
+                            sourceVideoID: sourceVideoID
+                        )
+                    }
+                    continue
+                }
+
                 let cleanVideo = cleanedStreamURLIfRangeFragment(candidate.url)
                 let cleanAudio = cleanedStreamURLIfRangeFragment(pairedAudio)
                 async let videoTemp = fetchTempFile(from: cleanVideo, ext: "mp4", headers: primaryHeaders, using: ephemeralDataSession)
@@ -1800,10 +1921,27 @@ final class WebMediaDownloader {
                     try? FileManager.default.removeItem(at: downloadedURL)
                     return nil
                 }
+
+                var finalTemp = downloadedURL
+                var finalExt = ext
+                if preferAudioOnly && !candidate.isAudio {
+                    let m4aURL = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString).m4a")
+                    let remuxed = await Task.detached(priority: .userInitiated) {
+                        FFmpegMediaService.remuxAudioTrackToM4A(inputURL: downloadedURL, outputURL: m4aURL)
+                    }.value
+                    if remuxed {
+                        try? FileManager.default.removeItem(at: downloadedURL)
+                        finalTemp = m4aURL
+                        finalExt = "m4a"
+                    } else {
+                        try? FileManager.default.removeItem(at: m4aURL)
+                    }
+                }
+
                 updateProgress(downloadID: downloadID, fraction: 0.92)
                 if let saved = MediaManager.shared.importTemporaryFile(
-                    from: downloadedURL,
-                    preferredFileName: "\(cleanTitle).\(ext)"
+                    from: finalTemp,
+                    preferredFileName: "\(cleanTitle).\(finalExt)"
                 ) {
                     LocalMediaCacheProxy.shared.refreshCacheSize()
                     return MediaManager.shared.applyDownloadedMetadataAndPlaylist(

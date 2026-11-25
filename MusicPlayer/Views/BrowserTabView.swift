@@ -1116,6 +1116,7 @@ struct BrowserTabView: View {
     @State private var showingStreamsSheet = false
     @State private var showingPlaylistImportSheet = false
     @State private var playlistImportSheetURL = ""
+    @State private var playlistBannerFormat: PlaylistImportPreferredFormat = .audioOnly
 
     private var detectedBrowserYouTubePlaylist: ParsedExternalPlaylistURL? {
         guard let url = browser.currentURL,
@@ -1846,35 +1847,22 @@ struct BrowserTabView: View {
         HStack(spacing: 8) {
             Image(systemName: "music.note.list")
                 .foregroundStyle(.red)
-            VStack(alignment: .leading, spacing: 1) {
-                Text("YouTube Playlist Detected")
-                    .font(.caption.weight(.semibold))
-                Text("Cache all videos in background (no cap)")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
+
+            Picker("Format", selection: $playlistBannerFormat) {
+                Text("Audio").tag(PlaylistImportPreferredFormat.audioOnly)
+                Text("Video").tag(PlaylistImportPreferredFormat.videoWithAudio)
             }
+            .pickerStyle(.segmented)
+            .frame(maxWidth: 130)
+
             Spacer()
-            Button("Audio") {
-                enqueueCurrentBrowserPlaylist(parsed: parsed, format: .audioOnly)
+
+            Button(playlistBannerFormat == .audioOnly ? "Download All Songs" : "Download All Videos") {
+                enqueueCurrentBrowserPlaylist(parsed: parsed, format: playlistBannerFormat)
             }
             .font(.caption.weight(.semibold))
             .buttonStyle(.borderedProminent)
             .controlSize(.small)
-
-            Button("Video") {
-                enqueueCurrentBrowserPlaylist(parsed: parsed, format: .videoWithAudio)
-            }
-            .font(.caption.weight(.semibold))
-            .buttonStyle(.bordered)
-            .controlSize(.small)
-
-            Button("More") {
-                playlistImportSheetURL = (browser.currentURL ?? parsed.originalURL)?.absoluteString ?? ""
-                showingPlaylistImportSheet = true
-            }
-            .font(.caption.weight(.medium))
-            .buttonStyle(.borderless)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 7)
@@ -1925,15 +1913,21 @@ struct BrowserTabView: View {
                    "(window.ytInitialData && typeof window.ytInitialData === 'object') ? JSON.stringify(window.ytInitialData) : ''"
                ) as? String,
                !rawJSON.isEmpty,
+               (rawJSON.contains("playlistVideoRenderer")
+                || rawJSON.contains("playlistPanelVideoRenderer")
+                || rawJSON.contains("musicResponsiveListItemRenderer")
+                || rawJSON.contains("lockupViewModel")),
                let data = rawJSON.data(using: .utf8),
                let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
                 capturedInitialJSON = dict
             }
 
             let rawTitle = browser.pageTitle
+                .replacingOccurrences(of: " - YouTube Music", with: "")
                 .replacingOccurrences(of: " - YouTube", with: "")
                 .trimmingCharacters(in: .whitespacesAndNewlines)
-            let playlistName = rawTitle.isEmpty ? "YouTube Playlist" : rawTitle
+            let isGenericTitle = rawTitle.isEmpty || rawTitle == "YouTube" || rawTitle == "YouTube Music"
+            let playlistName = isGenericTitle ? "YouTube Playlist" : rawTitle
             let created = mediaManager.createPlaylist(name: playlistName)
             guard let targetPlaylistID = created?.id ?? mediaManager.playlists.first?.id else { return }
 

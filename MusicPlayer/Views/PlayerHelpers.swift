@@ -140,6 +140,7 @@ struct EditTrackInfoSheet: View {
 
     @State private var titleText: String
     @State private var artistText: String
+    @State private var albumText: String
     @State private var selectedPhoto: PhotosPickerItem?
     @State private var pickedCover: UIImage?
     @State private var removeCustomCover = false
@@ -149,6 +150,7 @@ struct EditTrackInfoSheet: View {
         self.item = item
         self._titleText = State(initialValue: item.metadataTitle ?? item.name)
         self._artistText = State(initialValue: item.artist ?? "")
+        self._albumText = State(initialValue: item.album ?? "")
     }
 
     private var previewImage: UIImage? {
@@ -192,6 +194,7 @@ struct EditTrackInfoSheet: View {
                 Section("Track Info") {
                     TextField("Title", text: $titleText)
                     TextField("Artist", text: $artistText)
+                    TextField("Album", text: $albumText)
 
                     Button {
                         showVerifySheet = true
@@ -220,6 +223,7 @@ struct EditTrackInfoSheet: View {
                             for: item,
                             title: titleText,
                             artist: artistText,
+                            album: albumText,
                             coverImage: pickedCover,
                             removeCustomCover: removeCustomCover
                         )

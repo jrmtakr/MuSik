@@ -8,6 +8,7 @@ struct VerifyTrackArtistSheet: View {
     let item: MediaItem
     var onConfirmed: ((String, String) -> Void)? = nil
 
+    @State private var wholeSongAI = WholeSongAIService.shared
     @State private var searchQuery: String
     @State private var customArtistInput: String = ""
     @State private var isSearching = false
@@ -164,6 +165,25 @@ struct VerifyTrackArtistSheet: View {
             }
             .disabled(isListeningVocals)
 
+            Button {
+                wholeSongAI.startWholeSongListen(for: liveItem, force: true)
+            } label: {
+                VStack(alignment: .leading, spacing: 6) {
+                    if wholeSongAI.isListening(to: liveItem) {
+                        HStack {
+                            ProgressView()
+                                .padding(.trailing, 4)
+                            Text(wholeSongAI.statusMessage ?? "AI listening to whole song...")
+                        }
+                        ProgressView(value: max(0.02, wholeSongAI.progressFraction))
+                    } else {
+                        Label("AI Listen Whole Song & Identify", systemImage: "waveform.and.magnifyingglass")
+                    }
+                }
+                .font(.subheadline.weight(.semibold))
+            }
+            .disabled(wholeSongAI.isListening(to: liveItem))
+
             Toggle("Also clean up Song Title when confirming", isOn: $applyCleanTitle)
             if mediaManager.thumbnails[liveItem.relativePath] == nil {
                 Toggle("Save Album Art if missing", isOn: $saveCoverArtIfMissing)
@@ -171,13 +191,27 @@ struct VerifyTrackArtistSheet: View {
         } header: {
             Text("Lookup & Lyrics Match")
         } footer: {
-            if let transcript = vocalTranscript, !transcript.isEmpty {
-                Text("Heard vocals: \"\(transcript)\"")
-            } else if let vocalErrorMessage {
-                Text(vocalErrorMessage)
-                    .foregroundStyle(.orange)
-            } else if let ytCap = verificationResult?.youtubeCaptionSnippet {
-                Text("Found YouTube lyrics caption: \"\(ytCap)\"")
+            VStack(alignment: .leading, spacing: 4) {
+                if let aiRes = wholeSongAI.result(for: liveItem), aiRes.completedFullListen {
+                    let summaryParts = [aiRes.identifiedTitle, aiRes.identifiedAlbum, aiRes.identifiedArtist]
+                        .compactMap { $0 }
+                        .filter { !$0.isEmpty }
+                    if !summaryParts.isEmpty {
+                        Text("AI Full Listen: \(summaryParts.joined(separator: " • ")) (\(aiRes.heardWordCount) words)")
+                    }
+                }
+                if let aiErr = wholeSongAI.lastError, !aiErr.isEmpty {
+                    Text(aiErr)
+                        .foregroundStyle(.orange)
+                }
+                if let transcript = vocalTranscript, !transcript.isEmpty {
+                    Text("Heard vocals: \"\(transcript)\"")
+                } else if let vocalErrorMessage {
+                    Text(vocalErrorMessage)
+                        .foregroundStyle(.orange)
+                } else if let ytCap = verificationResult?.youtubeCaptionSnippet {
+                    Text("Found YouTube lyrics caption: \"\(ytCap)\"")
+                }
             }
         }
     }
@@ -310,6 +344,7 @@ struct VerifyTrackArtistSheet: View {
             for: liveItem,
             artistName: cand.artistName,
             updatedTitle: applyCleanTitle ? cand.trackTitle : nil,
+            albumName: cand.albumName,
             genre: cand.genre
         )
 
@@ -325,6 +360,7 @@ struct VerifyTrackArtistSheet: View {
                             for: capturedItem,
                             title: finalTitle,
                             artist: cand.artistName,
+                            album: cand.albumName,
                             coverImage: image,
                             markArtistVerified: true,
                             genre: cand.genre
@@ -368,6 +404,13 @@ private struct CandidateVerificationCardRow: View {
                         .font(.caption.weight(.medium))
                         .foregroundStyle(.secondary)
                         .lineLimit(2)
+
+                    if let album = candidate.albumName, !album.isEmpty {
+                        Text(album)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary.opacity(0.85))
+                            .lineLimit(1)
+                    }
 
                     HStack(spacing: 6) {
                         Text(candidate.confidenceLabel)
@@ -500,6 +543,7 @@ struct WrappedAuditQueueView: View {
                                 for: pair.item,
                                 artistName: pair.match.artistName,
                                 updatedTitle: pair.match.trackTitle,
+                                albumName: pair.match.albumName,
                                 genre: pair.match.genre
                             )
                             suggestedMatches.removeValue(forKey: pair.item.relativePath)
@@ -530,6 +574,7 @@ struct WrappedAuditQueueView: View {
                                 for: entry.item,
                                 artistName: match.artistName,
                                 updatedTitle: match.trackTitle,
+                                albumName: match.albumName,
                                 genre: match.genre
                             )
                             suggestedMatches.removeValue(forKey: entry.id)

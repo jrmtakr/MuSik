@@ -75,11 +75,21 @@ enum PlaylistImportError: LocalizedError {
 }
 
 enum PlaylistURLImporter {
-    private static let webClientVersion = "2.20250220.01.00"
-    private static let remixClientVersion = "1.20250220.01.00"
+    private static let webClientVersion = "2.20260301.01.00"
+    private static let remixClientVersion = "1.20260301.01.00"
+    private static let consentCookies = "CONSENT=YES+cb.20210328-17-p0.en+FX+299; SOCS=CAESEwgDEgk0ODE3Nzk3MjQaAmVuIAEaBgiA_LyaBg"
+
+    private static func extractFirstHTTPURL(in raw: String) -> String {
+        if let regex = try? NSRegularExpression(pattern: #"https?://[^\s<>"'\)\]]+"#, options: [.caseInsensitive]),
+           let match = regex.firstMatch(in: raw, range: NSRange(location: 0, length: (raw as NSString).length)) {
+            let matched = (raw as NSString).substring(with: match.range)
+            return matched.trimmingCharacters(in: CharacterSet(charactersIn: ".,;!?"))
+        }
+        return raw
+    }
 
     static func parsePlaylistURL(_ rawString: String) -> ParsedExternalPlaylistURL? {
-        var trimmed = rawString.trimmingCharacters(in: .whitespacesAndNewlines)
+        var trimmed = extractFirstHTTPURL(in: rawString.trimmingCharacters(in: .whitespacesAndNewlines))
         guard !trimmed.isEmpty else { return nil }
 
         if trimmed.lowercased().hasPrefix("spotify:playlist:") {
@@ -127,10 +137,36 @@ enum PlaylistURLImporter {
         }
 
         if host.contains("youtube.com") || host.contains("youtu.be") {
+            if url.path == "/attribution_link",
+               let comps = URLComponents(url: url, resolvingAgainstBaseURL: false),
+               let innerPath = comps.queryItems?.first(where: { $0.name == "u" })?.value {
+                let innerFull = innerPath.hasPrefix("http") ? innerPath : "https://www.youtube.com\(innerPath.hasPrefix("/") ? innerPath : "/\(innerPath)")"
+                if let unwrapped = parsePlaylistURL(innerFull) {
+                    return unwrapped
+                }
+            }
+
             if let comps = URLComponents(url: url, resolvingAgainstBaseURL: false),
                let listID = comps.queryItems?.first(where: { $0.name == "list" })?.value,
                !listID.isEmpty {
                 return ParsedExternalPlaylistURL(platform: .youtubeMusic, playlistID: listID, originalURL: url)
+            }
+
+            let parts = url.pathComponents.filter { $0 != "/" }
+            if let idx = parts.firstIndex(of: "browse"), idx + 1 < parts.count {
+                let rawBrowse = parts[idx + 1]
+                if rawBrowse.hasPrefix("VL") || rawBrowse.hasPrefix("PL") || rawBrowse.hasPrefix("OLAK") || rawBrowse.hasPrefix("RDCLAK") || rawBrowse.hasPrefix("MPREb_") {
+                    return ParsedExternalPlaylistURL(platform: .youtubeMusic, playlistID: rawBrowse, originalURL: url)
+                }
+            }
+
+            if let regex = try? NSRegularExpression(pattern: #"[?&#]list=([A-Za-z0-9_-]+)"#),
+               let m = regex.firstMatch(in: trimmed, range: NSRange(location: 0, length: (trimmed as NSString).length)),
+               m.numberOfRanges >= 2 {
+                let listID = (trimmed as NSString).substring(with: m.range(at: 1))
+                if !listID.isEmpty {
+                    return ParsedExternalPlaylistURL(platform: .youtubeMusic, playlistID: listID, originalURL: url)
+                }
             }
         }
 
@@ -208,62 +244,164 @@ enum PlaylistURLImporter {
         try await streamYouTubePlaylist(listID: listID, seedVideoID: nil, cookiesHeader: nil) { _ in }
     }
 
+    private static func mergedYouTubeCookies(_ cookiesHeader: String?) async -> String {
+        var parts: [String] = []
+        if let cookiesHeader, !cookiesHeader.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            parts.append(cookiesHeader)
+        } else if let browserCookies = await BrowserYouTubeResolver.youtubeCookieHeader(), !browserCookies.isEmpty {
+            parts.append(browserCookies)
+        }
+        let joined = parts.joined(separator: "; ")
+        var extras: [String] = []
+        if !joined.contains("CONSENT=") {
+            extras.append("CONSENT=YES+cb.20210328-17-p0.en+FX+299")
+        }
+        if !joined.contains("SOCS=") {
+            extras.append("SOCS=CAESEwgDEgk0ODE3Nzk3MjQaAmVuIAEaBgiA_LyaBg")
+        }
+        if extras.isEmpty { return joined }
+        if joined.isEmpty { return extras.joined(separator: "; ") }
+        return "\(joined); \(extras.joined(separator: "; "))"
+    }
+
     private static func streamYouTubePlaylist(
         listID: String,
         seedVideoID: String?,
         cookiesHeader: String?,
         onPage: @escaping @Sendable (PlaylistStreamPage) async -> Void
     ) async throws -> LoadedExternalPlaylist {
-        let browseID = listID.hasPrefix("VL") ? listID : "VL\(listID)"
-        let preferRemix = listID.hasPrefix("OLAK") || listID.hasPrefix("RDCLAK")
+        let browseID: String
+        if listID.hasPrefix("VL") || listID.hasPrefix("MPREb_") {
+            browseID = listID
+        } else {
+            browseID = "VL\(listID)"
+        }
+        let queryPlaylistID = listID.hasPrefix("VL") ? String(listID.dropFirst(2)) : listID
+        let preferRemix = listID.hasPrefix("OLAK") || listID.hasPrefix("RDCLAK") || listID.hasPrefix("MPREb_") || listID.hasPrefix("VLOLAK") || listID.hasPrefix("VLRDCLAK")
+        var effectiveCookies = await mergedYouTubeCookies(cookiesHeader)
+
         var playlistTitle = "YouTube Playlist"
         var tracks: [ExternalPlaylistTrack] = []
         var seenVideoIDs = Set<String>()
         var pendingTokens: [String] = []
         var usedRemixForPagination = preferRemix
         var paginationUsesNext = false
+        var liveAPIKey: String?
+        var liveClientVersion: String?
+        var liveVisitorData: String?
 
-        var initialJSON = await fetchYouTubeBrowse(
+        func absorbPage(from json: [String: Any]) -> Bool {
+            if let parsedTitle = extractYouTubePlaylistTitle(from: json),
+               !parsedTitle.isEmpty,
+               (playlistTitle == "YouTube Playlist" || parsedTitle != "YouTube") {
+                playlistTitle = parsedTitle
+            }
+            let page = extractYouTubePlaylistPage(from: json, seenIDs: &seenVideoIDs)
+            tracks.append(contentsOf: page.tracks)
+            for token in page.continuations where !pendingTokens.contains(token) {
+                pendingTokens.append(token)
+            }
+            return !page.tracks.isEmpty
+        }
+
+        // Stage 1: Primary InnerTube browse (WEB_REMIX for albums/music, WEB for standard playlists)
+        if let json1 = await fetchYouTubeBrowse(
             browseID: browseID,
             continuation: nil,
             useMusicRemix: preferRemix,
-            cookiesHeader: cookiesHeader
-        )
-        if initialJSON == nil && preferRemix {
-            usedRemixForPagination = false
-            initialJSON = await fetchYouTubeBrowse(
+            cookiesHeader: effectiveCookies
+        ) {
+            _ = absorbPage(from: json1)
+        }
+
+        // Stage 2: Alternate InnerTube client whenever tracks are still empty (even if JSON wasn't nil)
+        if tracks.isEmpty {
+            if let json2 = await fetchYouTubeBrowse(
+                browseID: browseID,
+                continuation: nil,
+                useMusicRemix: !preferRemix,
+                cookiesHeader: effectiveCookies
+            ), absorbPage(from: json2) {
+                usedRemixForPagination = !preferRemix
+            }
+        }
+
+        // Stage 3: Desktop / Music / Mobile HTML scraping (+ extracting live InnerTube key/version/visitorData)
+        if tracks.isEmpty, let encoded = queryPlaylistID.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) {
+            let htmlTargets: [(url: String, ua: String, isRemix: Bool)] = listID.hasPrefix("MPREb_")
+                ? [("https://music.youtube.com/browse/\(encoded)", desktopYouTubeUserAgent, true)]
+                : [
+                    ("https://www.youtube.com/playlist?list=\(encoded)&hl=en", desktopYouTubeUserAgent, false),
+                    ("https://music.youtube.com/playlist?list=\(encoded)&hl=en", desktopYouTubeUserAgent, true),
+                    ("https://m.youtube.com/playlist?list=\(encoded)&hl=en", WebMediaDownloader.browserUserAgent, false)
+                ]
+            for target in htmlTargets where tracks.isEmpty {
+                let bootstrap = await fetchYouTubePlaylistHTMLBootstrap(
+                    urlString: target.url,
+                    cookiesHeader: effectiveCookies,
+                    userAgent: target.ua
+                )
+                if liveAPIKey == nil { liveAPIKey = bootstrap.apiKey }
+                if liveClientVersion == nil, !target.isRemix { liveClientVersion = bootstrap.clientVersion }
+                if liveVisitorData == nil { liveVisitorData = bootstrap.visitorData }
+                if let initialData = bootstrap.initialData, absorbPage(from: initialData) {
+                    usedRemixForPagination = target.isRemix
+                    break
+                }
+            }
+        }
+
+        // Retry InnerTube browse with freshly scraped live API key & visitorData if HTML yielded metadata without rows
+        if tracks.isEmpty && (liveAPIKey != nil || liveVisitorData != nil) {
+            if let jsonKeyed = await fetchYouTubeBrowse(
                 browseID: browseID,
                 continuation: nil,
                 useMusicRemix: false,
-                cookiesHeader: cookiesHeader
-            )
-        }
-        if initialJSON == nil {
-            initialJSON = await fetchYouTubePlaylistHTMLInitialData(listID: listID, cookiesHeader: cookiesHeader)
-            if initialJSON != nil {
+                cookiesHeader: effectiveCookies,
+                apiKey: liveAPIKey,
+                clientVersionOverride: liveClientVersion,
+                visitorData: liveVisitorData
+            ), absorbPage(from: jsonKeyed) {
                 usedRemixForPagination = false
             }
         }
-        if let initialJSON {
-            if let parsedTitle = extractYouTubePlaylistTitle(from: initialJSON), !parsedTitle.isEmpty {
-                playlistTitle = parsedTitle
-            }
-            let firstPage = extractYouTubePlaylistPage(from: initialJSON, seenIDs: &seenVideoIDs)
-            tracks.append(contentsOf: firstPage.tracks)
-            pendingTokens = firstPage.continuations
+
+        // Stage 4: InnerTube `next` endpoint (Mixes RD*, watch?v=...&list=..., Watch Later, Radio)
+        if tracks.isEmpty && !listID.hasPrefix("MPREb_"),
+           let nextJSON = await fetchYouTubeNext(
+               videoID: seedVideoID,
+               playlistID: queryPlaylistID,
+               continuation: nil,
+               cookiesHeader: effectiveCookies,
+               apiKey: liveAPIKey,
+               clientVersionOverride: liveClientVersion,
+               visitorData: liveVisitorData
+           ),
+           absorbPage(from: nextJSON) {
+            paginationUsesNext = true
         }
 
-        // Handle YouTube Auto-Mix / Radio lists (RD..., RDMM...) or watch?v=...&list=... when browse returns 0 items.
-        if tracks.isEmpty, (listID.hasPrefix("RD") || seedVideoID != nil),
-           let nextJSON = await fetchYouTubeNext(videoID: seedVideoID, playlistID: listID, continuation: nil, cookiesHeader: cookiesHeader) {
-            if let parsedTitle = extractYouTubePlaylistTitle(from: nextJSON), !parsedTitle.isEmpty {
-                playlistTitle = parsedTitle
+        // Stage 5: Built-in WKWebView browser fallback (executes YouTube JS, uses logged-in cookies, scrapes DOM)
+        if tracks.isEmpty, let encoded = queryPlaylistID.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) {
+            let browserCandidates: [String]
+            if listID.hasPrefix("MPREb_") {
+                browserCandidates = ["https://music.youtube.com/browse/\(encoded)"]
+            } else if preferRemix {
+                browserCandidates = ["https://music.youtube.com/playlist?list=\(encoded)", "https://www.youtube.com/playlist?list=\(encoded)"]
+            } else {
+                browserCandidates = ["https://www.youtube.com/playlist?list=\(encoded)"]
             }
-            let nextPage = extractYouTubePlaylistPage(from: nextJSON, seenIDs: &seenVideoIDs)
-            if !nextPage.tracks.isEmpty {
-                tracks.append(contentsOf: nextPage.tracks)
-                pendingTokens = nextPage.continuations
-                paginationUsesNext = true
+            for candidate in browserCandidates where tracks.isEmpty {
+                guard let url = URL(string: candidate) else { continue }
+                if let browserRes = await BrowserYouTubeResolver.shared.extractPlaylistInitialDataInBrowser(url: url) {
+                    if let updatedCookies = browserRes.cookiesHeader, !updatedCookies.isEmpty {
+                        effectiveCookies = await mergedYouTubeCookies(updatedCookies)
+                    }
+                    if absorbPage(from: browserRes.json) {
+                        usedRemixForPagination = candidate.contains("music.youtube.com")
+                        break
+                    }
+                }
             }
         }
 
@@ -298,21 +436,29 @@ enum PlaylistURLImporter {
                         videoID: seedVideoID,
                         playlistID: listID,
                         continuation: token,
-                        cookiesHeader: cookiesHeader
+                        cookiesHeader: effectiveCookies,
+                        apiKey: liveAPIKey,
+                        clientVersionOverride: liveClientVersion,
+                        visitorData: liveVisitorData
                     )
                 } else {
                     pageJSON = await fetchYouTubeBrowse(
                         browseID: nil,
                         continuation: token,
                         useMusicRemix: usedRemixForPagination,
-                        cookiesHeader: cookiesHeader
+                        cookiesHeader: effectiveCookies,
+                        apiKey: liveAPIKey,
+                        clientVersionOverride: usedRemixForPagination ? nil : liveClientVersion,
+                        visitorData: liveVisitorData
                     )
                     if pageJSON == nil && attempt == 0 {
                         pageJSON = await fetchYouTubeBrowse(
                             browseID: nil,
                             continuation: token,
                             useMusicRemix: !usedRemixForPagination,
-                            cookiesHeader: cookiesHeader
+                            cookiesHeader: effectiveCookies,
+                            apiKey: liveAPIKey,
+                            visitorData: liveVisitorData
                         )
                     }
                 }
@@ -322,16 +468,15 @@ enum PlaylistURLImporter {
 
             guard let pageJSON else { continue }
             let nextPage = extractYouTubePlaylistPage(from: pageJSON, seenIDs: &seenVideoIDs)
+            for newTok in nextPage.continuations where !visitedTokens.contains(newTok) && !pendingTokens.contains(newTok) {
+                pendingTokens.append(newTok)
+            }
             if nextPage.tracks.isEmpty {
-                // If an auxiliary continuation token yielded 0 tracks (e.g. recommendations shelf),
-                // advance cursor to try remaining candidate continuation tokens.
                 continue
             }
 
             pageCount += 1
             tracks.append(contentsOf: nextPage.tracks)
-            pendingTokens = nextPage.continuations.filter { !visitedTokens.contains($0) }
-            cursor = 0
 
             await onPage(PlaylistStreamPage(
                 playlistTitle: playlistTitle,
@@ -340,7 +485,7 @@ enum PlaylistURLImporter {
                 newTracks: nextPage.tracks,
                 totalFetchedCount: tracks.count,
                 pageNumber: pageCount,
-                isComplete: pendingTokens.isEmpty
+                isComplete: cursor >= pendingTokens.count
             ))
         }
 
@@ -376,6 +521,7 @@ enum PlaylistURLImporter {
         cookiesHeader: String?,
         onPage: @escaping @Sendable (PlaylistStreamPage) async -> Void
     ) async throws -> LoadedExternalPlaylist {
+        let effectiveCookies = await mergedYouTubeCookies(cookiesHeader)
         let playlistTitle = extractYouTubePlaylistTitle(from: initialJSON) ?? "YouTube Playlist"
         var seenVideoIDs = Set<String>()
         var tracks: [ExternalPlaylistTrack] = []
@@ -411,20 +557,29 @@ enum PlaylistURLImporter {
                 pageJSON = await fetchYouTubeBrowse(
                     browseID: nil,
                     continuation: token,
-                    useMusicRemix: false,
-                    cookiesHeader: cookiesHeader
+                    useMusicRemix: listID.hasPrefix("OLAK") || listID.hasPrefix("RDCLAK"),
+                    cookiesHeader: effectiveCookies
                 )
+                if pageJSON == nil && attempt == 0 {
+                    pageJSON = await fetchYouTubeBrowse(
+                        browseID: nil,
+                        continuation: token,
+                        useMusicRemix: !(listID.hasPrefix("OLAK") || listID.hasPrefix("RDCLAK")),
+                        cookiesHeader: effectiveCookies
+                    )
+                }
                 if pageJSON != nil { break }
                 try? await Task.sleep(nanoseconds: UInt64(350_000_000 * (attempt + 1)))
             }
             guard let pageJSON else { continue }
             let nextPage = extractYouTubePlaylistPage(from: pageJSON, seenIDs: &seenVideoIDs)
+            for newTok in nextPage.continuations where !visitedTokens.contains(newTok) && !pendingTokens.contains(newTok) {
+                pendingTokens.append(newTok)
+            }
             if nextPage.tracks.isEmpty { continue }
 
             pageCount += 1
             tracks.append(contentsOf: nextPage.tracks)
-            pendingTokens = nextPage.continuations.filter { !visitedTokens.contains($0) }
-            cursor = 0
 
             await onPage(PlaylistStreamPage(
                 playlistTitle: playlistTitle,
@@ -433,7 +588,7 @@ enum PlaylistURLImporter {
                 newTracks: nextPage.tracks,
                 totalFetchedCount: tracks.count,
                 pageNumber: pageCount,
-                isComplete: pendingTokens.isEmpty
+                isComplete: cursor >= pendingTokens.count
             ))
         }
 
@@ -463,17 +618,22 @@ enum PlaylistURLImporter {
         browseID: String?,
         continuation: String?,
         useMusicRemix: Bool,
-        cookiesHeader: String? = nil
+        cookiesHeader: String? = nil,
+        apiKey: String? = nil,
+        clientVersionOverride: String? = nil,
+        visitorData: String? = nil
     ) async -> [String: Any]? {
-        guard let apiURL = URL(string: useMusicRemix
-            ? "https://music.youtube.com/youtubei/v1/browse?prettyPrint=false"
-            : "https://www.youtube.com/youtubei/v1/browse?prettyPrint=false") else {
+        let baseEndpoint = useMusicRemix
+            ? "https://music.youtube.com/youtubei/v1/browse"
+            : "https://www.youtube.com/youtubei/v1/browse"
+        let query = (apiKey?.isEmpty == false) ? "?key=\(apiKey!)&prettyPrint=false" : "?prettyPrint=false"
+        guard let apiURL = URL(string: "\(baseEndpoint)\(query)") else {
             return nil
         }
 
         let origin = useMusicRemix ? "https://music.youtube.com" : "https://www.youtube.com"
         let clientName = useMusicRemix ? "WEB_REMIX" : "WEB"
-        let clientVersion = useMusicRemix ? remixClientVersion : webClientVersion
+        let clientVersion = clientVersionOverride ?? (useMusicRemix ? remixClientVersion : webClientVersion)
         let clientHeaderID = useMusicRemix ? "67" : "1"
 
         var body: [String: Any] = [
@@ -504,6 +664,9 @@ enum PlaylistURLImporter {
         req.setValue("\(origin)/", forHTTPHeaderField: "Referer")
         req.setValue(clientHeaderID, forHTTPHeaderField: "X-YouTube-Client-Name")
         req.setValue(clientVersion, forHTTPHeaderField: "X-YouTube-Client-Version")
+        if let visitorData, !visitorData.isEmpty {
+            req.setValue(visitorData, forHTTPHeaderField: "X-Goog-Visitor-Id")
+        }
         if let cookiesHeader, !cookiesHeader.isEmpty {
             req.setValue(cookiesHeader, forHTTPHeaderField: "Cookie")
         }
@@ -521,17 +684,22 @@ enum PlaylistURLImporter {
         videoID: String?,
         playlistID: String,
         continuation: String?,
-        cookiesHeader: String? = nil
+        cookiesHeader: String? = nil,
+        apiKey: String? = nil,
+        clientVersionOverride: String? = nil,
+        visitorData: String? = nil
     ) async -> [String: Any]? {
-        guard let apiURL = URL(string: "https://www.youtube.com/youtubei/v1/next?prettyPrint=false") else {
+        let query = (apiKey?.isEmpty == false) ? "?key=\(apiKey!)&prettyPrint=false" : "?prettyPrint=false"
+        guard let apiURL = URL(string: "https://www.youtube.com/youtubei/v1/next\(query)") else {
             return nil
         }
 
+        let clientVersion = clientVersionOverride ?? webClientVersion
         var body: [String: Any] = [
             "context": [
                 "client": [
                     "clientName": "WEB",
-                    "clientVersion": webClientVersion,
+                    "clientVersion": clientVersion,
                     "hl": "en",
                     "gl": "US"
                 ]
@@ -557,7 +725,10 @@ enum PlaylistURLImporter {
         req.setValue("https://www.youtube.com", forHTTPHeaderField: "Origin")
         req.setValue("https://www.youtube.com/", forHTTPHeaderField: "Referer")
         req.setValue("1", forHTTPHeaderField: "X-YouTube-Client-Name")
-        req.setValue(webClientVersion, forHTTPHeaderField: "X-YouTube-Client-Version")
+        req.setValue(clientVersion, forHTTPHeaderField: "X-YouTube-Client-Version")
+        if let visitorData, !visitorData.isEmpty {
+            req.setValue(visitorData, forHTTPHeaderField: "X-Goog-Visitor-Id")
+        }
         if let cookiesHeader, !cookiesHeader.isEmpty {
             req.setValue(cookiesHeader, forHTTPHeaderField: "Cookie")
         }
@@ -571,17 +742,24 @@ enum PlaylistURLImporter {
         return json
     }
 
-    private static func fetchYouTubePlaylistHTMLInitialData(
-        listID: String,
-        cookiesHeader: String? = nil
-    ) async -> [String: Any]? {
-        guard let encoded = listID.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
-              let url = URL(string: "https://www.youtube.com/playlist?list=\(encoded)") else {
-            return nil
+    private struct YouTubeHTMLBootstrap {
+        let initialData: [String: Any]?
+        let apiKey: String?
+        let clientVersion: String?
+        let visitorData: String?
+    }
+
+    private static func fetchYouTubePlaylistHTMLBootstrap(
+        urlString: String,
+        cookiesHeader: String?,
+        userAgent: String
+    ) async -> YouTubeHTMLBootstrap {
+        guard let url = URL(string: urlString) else {
+            return YouTubeHTMLBootstrap(initialData: nil, apiKey: nil, clientVersion: nil, visitorData: nil)
         }
         var req = URLRequest(url: url)
         req.timeoutInterval = 20
-        req.setValue(desktopYouTubeUserAgent, forHTTPHeaderField: "User-Agent")
+        req.setValue(userAgent, forHTTPHeaderField: "User-Agent")
         req.setValue("en-US,en;q=0.9", forHTTPHeaderField: "Accept-Language")
         if let cookiesHeader, !cookiesHeader.isEmpty {
             req.setValue(cookiesHeader, forHTTPHeaderField: "Cookie")
@@ -590,21 +768,141 @@ enum PlaylistURLImporter {
               let http = resp as? HTTPURLResponse,
               (200...299).contains(http.statusCode),
               let html = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .ascii) else {
-            return nil
+            return YouTubeHTMLBootstrap(initialData: nil, apiKey: nil, clientVersion: nil, visitorData: nil)
         }
-        for marker in ["var ytInitialData = ", "ytInitialData = "] {
-            if let range = html.range(of: marker),
-               let jsonStart = html[range.upperBound...].firstIndex(of: "{"),
-               let slice = balancedJSONObject(in: html, startingAt: jsonStart),
-               let sliceData = slice.data(using: .utf8),
-               let dict = try? JSONSerialization.jsonObject(with: sliceData) as? [String: Any] {
-                return dict
+
+        let apiKey = extractFirstRegexGroup(in: html, pattern: #""INNERTUBE_API_KEY"\s*:\s*"([^"]+)""#)
+        let clientVersion = extractFirstRegexGroup(in: html, pattern: #""INNERTUBE_CLIENT_VERSION"\s*:\s*"([^"]+)""#)
+        let visitorData = extractFirstRegexGroup(in: html, pattern: #""VISITOR_DATA"\s*:\s*"([^"]+)""#)
+
+        var parsedDict: [String: Any]?
+        for marker in ["var ytInitialData = ", "window[\"ytInitialData\"] = ", "ytInitialData = "] {
+            if let range = html.range(of: marker) {
+                let tail = html[range.upperBound...].drop(while: { $0.isWhitespace })
+                if tail.first == "{",
+                   let slice = balancedJSONObject(in: html, startingAt: tail.startIndex),
+                   let sliceData = slice.data(using: .utf8),
+                   let dict = try? JSONSerialization.jsonObject(with: sliceData) as? [String: Any] {
+                    parsedDict = dict
+                    break
+                } else if tail.hasPrefix("JSON.parse(") || tail.first == "'" || tail.first == "\"",
+                          let decoded = decodeQuotedJSStringJSON(in: String(tail.prefix(2_500_000))) {
+                    parsedDict = decoded
+                    break
+                }
             }
         }
-        return nil
+
+        // YouTube Music sometimes embeds initialData via `initialData.push({path: '/browse', data: '...'});`
+        if parsedDict == nil,
+           let pushRegex = try? NSRegularExpression(
+               pattern: #"initialData\.push\(\{[^}]*?data\s*:\s*'((?:\\'|[^'])+)'"#,
+               options: [.dotMatchesLineSeparators]
+           ) {
+            let nsHTML = html as NSString
+            for match in pushRegex.matches(in: html, range: NSRange(location: 0, length: nsHTML.length)) where match.numberOfRanges >= 2 {
+                let escaped = nsHTML.substring(with: match.range(at: 1))
+                if let dict = unescapeJSStringToJSON(escaped),
+                   dict["contents"] != nil || dict["header"] != nil {
+                    parsedDict = dict
+                    break
+                }
+            }
+        }
+
+        return YouTubeHTMLBootstrap(
+            initialData: parsedDict,
+            apiKey: apiKey,
+            clientVersion: clientVersion,
+            visitorData: visitorData
+        )
+    }
+
+    private static func extractFirstRegexGroup(in text: String, pattern: String) -> String? {
+        guard let regex = try? NSRegularExpression(pattern: pattern),
+              let m = regex.firstMatch(in: text, range: NSRange(location: 0, length: (text as NSString).length)),
+              m.numberOfRanges >= 2 else {
+            return nil
+        }
+        return (text as NSString).substring(with: m.range(at: 1))
+    }
+
+    private static func decodeQuotedJSStringJSON(in tail: String) -> [String: Any]? {
+        guard let quoteIdx = tail.firstIndex(where: { $0 == "'" || $0 == "\"" }) else { return nil }
+        let quoteChar = tail[quoteIdx]
+        var idx = tail.index(after: quoteIdx)
+        var escaped = ""
+        var isEscaped = false
+        while idx < tail.endIndex {
+            let ch = tail[idx]
+            if isEscaped {
+                escaped.append(ch)
+                isEscaped = false
+            } else if ch == "\\" {
+                escaped.append(ch)
+                isEscaped = true
+            } else if ch == quoteChar {
+                break
+            } else {
+                escaped.append(ch)
+            }
+            idx = tail.index(after: idx)
+        }
+        return unescapeJSStringToJSON(escaped)
+    }
+
+    private static func unescapeJSStringToJSON(_ escaped: String) -> [String: Any]? {
+        var result = ""
+        result.reserveCapacity(escaped.count)
+        var i = escaped.startIndex
+        while i < escaped.endIndex {
+            let ch = escaped[i]
+            if ch == "\\" {
+                let next = escaped.index(after: i)
+                guard next < escaped.endIndex else { break }
+                let esc = escaped[next]
+                if esc == "x", let end = escaped.index(next, offsetBy: 3, limitedBy: escaped.endIndex) {
+                    let hex = String(escaped[escaped.index(after: next)..<end])
+                    if let byte = UInt8(hex, radix: 16) {
+                        result.append(Character(UnicodeScalar(byte)))
+                        i = end
+                        continue
+                    }
+                } else if esc == "u", let end = escaped.index(next, offsetBy: 5, limitedBy: escaped.endIndex) {
+                    let hex = String(escaped[escaped.index(after: next)..<end])
+                    if let code = UInt32(hex, radix: 16), let scalar = UnicodeScalar(code) {
+                        result.append(Character(scalar))
+                        i = end
+                        continue
+                    }
+                } else if esc == "'" {
+                    result.append("'")
+                    i = escaped.index(after: next)
+                    continue
+                } else if esc == "\"" {
+                    result.append("\"")
+                    i = escaped.index(after: next)
+                    continue
+                } else if esc == "\\" {
+                    result.append("\\")
+                    i = escaped.index(after: next)
+                    continue
+                }
+            }
+            result.append(ch)
+            i = escaped.index(after: i)
+        }
+        guard let data = result.data(using: .utf8),
+              let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        return dict
     }
 
     private static func extractYouTubePlaylistTitle(from json: [String: Any]) -> String? {
+        if let domTitle = json["__domTitle"] as? String, !domTitle.isEmpty {
+            return cleanTitle(domTitle)
+        }
         if let metadata = json["metadata"] as? [String: Any],
            let metaRenderer = metadata["playlistMetadataRenderer"] as? [String: Any],
            let title = metaRenderer["title"] as? String {
@@ -641,11 +939,18 @@ enum PlaylistURLImporter {
             return nil
         }
 
-        let watchEndpoint = (((lockup["rendererContext"] as? [String: Any])?["commandContext"] as? [String: Any])?["onTap"] as? [String: Any])?["innertubeCommand"] as? [String: Any]
-        let watchVideoID = (watchEndpoint?["watchEndpoint"] as? [String: Any])?["videoId"] as? String
+        let onTap = ((lockup["rendererContext"] as? [String: Any])?["commandContext"] as? [String: Any])?["onTap"] as? [String: Any]
+        let watchEndpoint = (onTap?["innertubeCommand"] as? [String: Any])?["watchEndpoint"] as? [String: Any]
+            ?? (onTap?["watchEndpoint"] as? [String: Any])
+        let watchVideoID = watchEndpoint?["videoId"] as? String
         let contentID = lockup["contentId"] as? String
+        let looksLikeVideoID = contentID.map { id in
+            id.count == 11 && id.range(of: #"^[A-Za-z0-9_-]{11}$"#, options: .regularExpression) != nil
+        } ?? false
 
-        guard contentType == "LOCKUP_CONTENT_TYPE_VIDEO" || (watchVideoID != nil && !(watchVideoID?.isEmpty ?? true)),
+        guard contentType == "LOCKUP_CONTENT_TYPE_VIDEO"
+                || (watchVideoID != nil && !(watchVideoID?.isEmpty ?? true))
+                || (contentType.isEmpty && looksLikeVideoID),
               let vid = (watchVideoID?.isEmpty == false ? watchVideoID : contentID),
               !vid.isEmpty else {
             return nil
@@ -739,6 +1044,31 @@ enum PlaylistURLImporter {
         var secondaryContinuations: [String] = []
         var seenTokens = Set<String>()
 
+        if let rootDict = root as? [String: Any],
+           let domItems = rootDict["__domFallback"] as? [[String: Any]] {
+            for item in domItems {
+                guard let vid = item["videoId"] as? String,
+                      !vid.isEmpty,
+                      let rawTitle = item["title"] as? String,
+                      !rawTitle.isEmpty,
+                      rawTitle != "[Deleted video]",
+                      rawTitle != "[Private video]",
+                      seenIDs.insert(vid).inserted else {
+                    continue
+                }
+                let rawArtist = ((item["artist"] as? String) ?? "")
+                    .replacingOccurrences(of: " - Topic", with: "")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                let duration = (item["duration"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+                tracks.append(ExternalPlaylistTrack(
+                    title: cleanTitle(rawTitle),
+                    artist: rawArtist,
+                    youtubeVideoID: vid,
+                    durationText: (duration?.isEmpty == false) ? duration : nil
+                ))
+            }
+        }
+
         func appendToken(_ token: String?, inPrimaryPlaylistSection: Bool) {
             guard let token, !token.isEmpty, seenTokens.insert(token).inserted else { return }
             if inPrimaryPlaylistSection {
@@ -748,17 +1078,17 @@ enum PlaylistURLImporter {
             }
         }
 
-        func walk(_ node: Any, depth: Int, inPlaylistSection: Bool) {
-            guard depth < 42 else { return }
+        func walk(_ node: Any, depth: Int, inPlaylistSection: Bool, inRecommendations: Bool) {
+            guard depth < 44 else { return }
             if let arr = node as? [Any] {
                 for item in arr {
-                    walk(item, depth: depth + 1, inPlaylistSection: inPlaylistSection)
+                    walk(item, depth: depth + 1, inPlaylistSection: inPlaylistSection, inRecommendations: inRecommendations)
                 }
                 return
             }
             guard let dict = node as? [String: Any] else { return }
 
-            if let lockup = dict["lockupViewModel"] as? [String: Any] {
+            if !inRecommendations, let lockup = dict["lockupViewModel"] as? [String: Any] {
                 if let track = extractLockupVideoTrack(from: lockup),
                    let vid = track.youtubeVideoID,
                    seenIDs.insert(vid).inserted {
@@ -814,6 +1144,8 @@ enum PlaylistURLImporter {
                 let overlay = mli["overlay"] as? [String: Any]
                 let overlayVid = ((overlay?["musicItemThumbnailOverlayRenderer"] as? [String: Any])?["content"] as? [String: Any])?["musicPlayButtonRenderer"] as? [String: Any]
                 let navVid = ((overlayVid?["playNavigationEndpoint"] as? [String: Any])?["watchEndpoint"] as? [String: Any])?["videoId"] as? String
+                    ?? ((mli["navigationEndpoint"] as? [String: Any])?["watchEndpoint"] as? [String: Any])?["videoId"] as? String
+                    ?? (((mli["doubleTapCommand"] as? [String: Any])?["watchEndpoint"] as? [String: Any])?["videoId"] as? String)
                 if let vid = (playlistData?["videoId"] as? String) ?? navVid,
                    !vid.isEmpty,
                    let flexColumns = mli["flexColumns"] as? [[String: Any]],
@@ -826,12 +1158,60 @@ enum PlaylistURLImporter {
                         let col1 = (flexColumns[1]["musicResponsiveListItemFlexColumnRenderer"] as? [String: Any])?["text"]
                         rawArtist = ytArtistFromRuns(col1)
                     }
+                    var duration: String?
+                    if let fixedColumns = mli["fixedColumns"] as? [[String: Any]],
+                       let fixed0 = (fixedColumns.first?["musicResponsiveListItemFixedColumnRenderer"] as? [String: Any])?["text"] {
+                        duration = ytText(fixed0)
+                    }
                     tracks.append(
                         ExternalPlaylistTrack(
                             title: cleanTitle(rawTitle),
                             artist: rawArtist,
                             youtubeVideoID: vid,
-                            durationText: nil
+                            durationText: duration
+                        )
+                    )
+                    return
+                }
+            }
+
+            if !inRecommendations,
+               let mtri = dict["musicTwoRowItemRenderer"] as? [String: Any],
+               let vid = ((mtri["navigationEndpoint"] as? [String: Any])?["watchEndpoint"] as? [String: Any])?["videoId"] as? String,
+               !vid.isEmpty,
+               let rawTitle = ytText(mtri["title"]),
+               seenIDs.insert(vid).inserted {
+                let rawArtist = ytArtistFromRuns(mtri["subtitle"])
+                tracks.append(
+                    ExternalPlaylistTrack(
+                        title: cleanTitle(rawTitle),
+                        artist: rawArtist,
+                        youtubeVideoID: vid,
+                        durationText: nil
+                    )
+                )
+                return
+            }
+
+            if inPlaylistSection && !inRecommendations {
+                if let vr = (dict["gridVideoRenderer"] as? [String: Any])
+                    ?? (dict["compactVideoRenderer"] as? [String: Any])
+                    ?? (dict["videoRenderer"] as? [String: Any]),
+                   let vid = vr["videoId"] as? String,
+                   !vid.isEmpty,
+                   let rawTitle = ytText(vr["title"]),
+                   rawTitle != "[Deleted video]",
+                   rawTitle != "[Private video]",
+                   seenIDs.insert(vid).inserted {
+                    let rawArtist = (ytText(vr["shortBylineText"]) ?? ytText(vr["longBylineText"]) ?? ytText(vr["ownerText"]) ?? "")
+                        .replacingOccurrences(of: " - Topic", with: "")
+                    let duration = ytText(vr["lengthText"])
+                    tracks.append(
+                        ExternalPlaylistTrack(
+                            title: cleanTitle(rawTitle),
+                            artist: rawArtist.trimmingCharacters(in: .whitespacesAndNewlines),
+                            youtubeVideoID: vid,
+                            durationText: duration
                         )
                     )
                     return
@@ -841,36 +1221,53 @@ enum PlaylistURLImporter {
             if let contVM = dict["continuationItemViewModel"] as? [String: Any],
                let contCmd = contVM["continuationCommand"] as? [String: Any],
                let ep = contCmd["innertubeCommand"] as? [String: Any] {
-                appendToken(extractContinuationToken(fromEndpoint: ep), inPrimaryPlaylistSection: inPlaylistSection)
+                appendToken(extractContinuationToken(fromEndpoint: ep), inPrimaryPlaylistSection: inPlaylistSection && !inRecommendations)
                 return
             }
 
             if let contRenderer = dict["continuationItemRenderer"] as? [String: Any],
                let ep = contRenderer["continuationEndpoint"] as? [String: Any] {
-                appendToken(extractContinuationToken(fromEndpoint: ep), inPrimaryPlaylistSection: inPlaylistSection)
+                appendToken(extractContinuationToken(fromEndpoint: ep), inPrimaryPlaylistSection: inPlaylistSection && !inRecommendations)
                 return
             }
 
             if let nextCont = dict["nextContinuationData"] as? [String: Any],
                let tok = nextCont["continuation"] as? String {
-                appendToken(tok, inPrimaryPlaylistSection: inPlaylistSection)
+                appendToken(tok, inPrimaryPlaylistSection: inPlaylistSection && !inRecommendations)
             }
 
             for (key, val) in dict {
                 if val is [String: Any] || val is [Any] {
-                    let enteringPrimary = inPlaylistSection
+                    let nextRecommendations = inRecommendations
+                        || key == "secondaryResults"
+                        || key == "watchNextSecondaryResultsRenderer"
+                        || key == "relatedItems"
+                        || key == "sidebar"
+                        || key == "musicCarouselShelfRenderer"
+                        || key == "horizontalCardListRenderer"
+                    let enteringPrimary = !nextRecommendations && (
+                        inPlaylistSection
                         || key == "itemSectionRenderer"
                         || key == "playlistVideoListRenderer"
+                        || key == "playlistVideoListContinuation"
                         || key == "musicPlaylistShelfRenderer"
+                        || key == "musicPlaylistShelfContinuation"
+                        || key == "musicShelfContinuation"
+                        || key == "sectionListContinuation"
                         || key == "appendContinuationItemsAction"
+                        || key == "reloadContinuationItemsCommand"
                         || key == "playlist"
-                    walk(val, depth: depth + 1, inPlaylistSection: enteringPrimary)
+                    )
+                    walk(val, depth: depth + 1, inPlaylistSection: enteringPrimary, inRecommendations: nextRecommendations)
                 }
             }
         }
 
-        walk(root, depth: 0, inPlaylistSection: false)
-        return (tracks, primaryContinuations + secondaryContinuations)
+        walk(root, depth: 0, inPlaylistSection: false, inRecommendations: false)
+        let selectedContinuations = primaryContinuations.isEmpty && tracks.isEmpty
+            ? secondaryContinuations
+            : primaryContinuations
+        return (tracks, selectedContinuations)
     }
 
     // MARK: - Spotify Playlist (Public Embed JSON, no API token needed)

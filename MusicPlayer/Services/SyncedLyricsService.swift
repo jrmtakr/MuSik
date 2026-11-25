@@ -125,6 +125,31 @@ final class SyncedLyricsService {
         }
 
         activeFetchTask = Task {
+            if !forceReload,
+               customTitle == nil,
+               customArtist == nil,
+               !item.relativePath.hasPrefix("__remote__/"),
+               WholeSongAIService.shared.shouldDeferOnlineLyricsForFirstListen(item) {
+                let offline = await loadOfflineEmbeddedOrSidecarLyrics(
+                    item: item,
+                    cacheKey: key,
+                    title: item.displayTitle,
+                    artist: item.artist ?? ""
+                )
+                guard !Task.isCancelled else { return }
+                currentLoadingKey = nil
+                if let offline {
+                    memoryCache[key] = offline
+                    saveToDisk(offline)
+                    currentLyrics = offline
+                    lastError = nil
+                } else {
+                    WholeSongAIService.shared.triggerIfFirstTimeUnknown(item: item)
+                    lastError = "No lyrics for first time listen"
+                }
+                return
+            }
+
             let resolved = await fetchBestLyrics(
                 item: item,
                 cacheKey: key,
@@ -139,9 +164,51 @@ final class SyncedLyricsService {
                 currentLyrics = resolved
                 lastError = nil
             } else {
-                lastError = "No synced or plain lyrics found for this track."
+                lastError = "No lyrics for first time listen"
+                if customTitle == nil && customArtist == nil && !item.relativePath.hasPrefix("__remote__/") {
+                    WholeSongAIService.shared.triggerIfFirstTimeUnknown(item: item)
+                }
             }
         }
+    }
+
+    func installLyrics(_ lyrics: ResolvedTrackLyrics, for item: MediaItem) {
+        let key = cacheKey(for: item)
+        let normalized = ResolvedTrackLyrics(
+            cacheKey: key,
+            trackTitle: lyrics.trackTitle,
+            artistName: lyrics.artistName,
+            isTimeSynced: lyrics.isTimeSynced,
+            sourceLabel: lyrics.sourceLabel,
+            attributionText: lyrics.attributionText,
+            syncedOffsetSeconds: lyrics.syncedOffsetSeconds,
+            lines: lyrics.lines
+        )
+        memoryCache[key] = normalized
+        saveToDisk(normalized)
+        if MediaManager.shared.currentItem?.relativePath == item.relativePath {
+            currentLoadingKey = nil
+            currentLyrics = normalized
+            lastError = nil
+        }
+    }
+
+    func fetchOfficialLyricsCandidate(
+        cacheKey: String,
+        song: String,
+        artist: String,
+        duration: Double?
+    ) async -> ResolvedTrackLyrics? {
+        if let lrclib = await fetchFromLRCLIB(
+            cacheKey: cacheKey,
+            song: song,
+            artist: artist,
+            rawTitle: song,
+            duration: duration
+        ) {
+            return lrclib
+        }
+        return await fetchFromGenius(cacheKey: cacheKey, song: song, artist: artist)
     }
 
     func adjustTimingOffset(by delta: Double) {

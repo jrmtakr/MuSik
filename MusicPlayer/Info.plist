@@ -70,7 +70,7 @@
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Run a local Wi-Fi transfer web server so you can upload and download media between your computer and iPhone.</string>
 	<key>NSSpeechRecognitionUsageDescription</key>
-	<string>MuSeJRM uses Speech Recognition locally on your device to hear a short vocal clip from untagged songs and match lyrics to the real artist.</string>
+	<string>MuSeJRM uses Speech Recognition to listen to songs, generate lyrics, and identify the song, album, and artist.</string>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsArbitraryLoads</key>

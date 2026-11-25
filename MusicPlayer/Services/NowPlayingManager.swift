@@ -98,6 +98,7 @@ final class NowPlayingManager {
     static func updateNowPlayingInfo(
         title: String,
         artist: String,
+        album: String? = nil,
         duration: TimeInterval,
         elapsed: TimeInterval,
         artworkImage: UIImage?,
@@ -115,6 +116,10 @@ final class NowPlayingManager {
             MPNowPlayingInfoPropertyPlaybackRate: playbackRate,
             MPNowPlayingInfoPropertyDefaultPlaybackRate: 1.0
         ]
+
+        if let album, !album.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            info[MPMediaItemPropertyAlbumTitle] = album
+        }
 
         if duration > 0 {
             info[MPMediaItemPropertyPlaybackDuration] = duration

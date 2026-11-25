@@ -4,6 +4,7 @@ import UIKit
 struct TrackMetadata {
     let title: String
     let artist: String
+    let album: String?
     let artwork: UIImage?
 }
 
@@ -11,6 +12,7 @@ func extractMetadata(from url: URL) async -> TrackMetadata {
     let asset = AVURLAsset(url: url)
     var title = url.deletingPathExtension().lastPathComponent
     var artist = "Unknown Artist"
+    var album: String?
     var artwork: UIImage?
 
     if let metadata = try? await asset.load(.commonMetadata) {
@@ -24,6 +26,11 @@ func extractMetadata(from url: URL) async -> TrackMetadata {
                 let trimmed = val.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !trimmed.isEmpty {
                     artist = trimmed
+                }
+            } else if item.commonKey == .commonKeyAlbumName, let val = try? await item.load(.stringValue) {
+                let trimmed = val.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty {
+                    album = trimmed
                 }
             } else if item.commonKey == .commonKeyArtwork, let data = try? await item.load(.dataValue) {
                 artwork = UIImage(data: data)
@@ -44,7 +51,7 @@ func extractMetadata(from url: URL) async -> TrackMetadata {
         }
     }
 
-    if artwork == nil || title == url.deletingPathExtension().lastPathComponent || artist == "Unknown Artist" {
+    if artwork == nil || title == url.deletingPathExtension().lastPathComponent || artist == "Unknown Artist" || album == nil {
         let info = await Task.detached(priority: .utility) {
             let meta = FFmpegMediaService.probeMetadata(for: url)
             let img = artwork == nil ? FFmpegMediaService.extractArtworkOrFrame(from: url, at: 1.0, maxDimension: 480) : nil
@@ -57,11 +64,14 @@ func extractMetadata(from url: URL) async -> TrackMetadata {
             if let metaArtist = meta.artist, !metaArtist.isEmpty, artist == "Unknown Artist" {
                 artist = metaArtist
             }
+            if let metaAlbum = meta.album, !metaAlbum.isEmpty, album == nil {
+                album = metaAlbum
+            }
         }
         if artwork == nil {
             artwork = info.1
         }
     }
 
-    return TrackMetadata(title: title, artist: artist, artwork: artwork)
+    return TrackMetadata(title: title, artist: artist, album: album, artwork: artwork)
 }

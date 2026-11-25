@@ -11,6 +11,7 @@ struct FFmpegMediaInfo {
     let durationSeconds: Double?
     let title: String?
     let artist: String?
+    let album: String?
     let hasVideo: Bool
     let hasAudio: Bool
     let videoWidth: Int
@@ -66,6 +67,7 @@ enum FFmpegMediaService {
         let tags = readDictionary(ctx.pointee.metadata)
         let title = tags["title"]?.trimmingCharacters(in: .whitespacesAndNewlines)
         let artist = (tags["artist"] ?? tags["album_artist"])?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let album = tags["album"]?.trimmingCharacters(in: .whitespacesAndNewlines)
 
         var hasVideo = false
         var hasAudio = false
@@ -91,6 +93,7 @@ enum FFmpegMediaService {
             durationSeconds: duration,
             title: title?.isEmpty == false ? title : nil,
             artist: artist?.isEmpty == false ? artist : nil,
+            album: album?.isEmpty == false ? album : nil,
             hasVideo: hasVideo,
             hasAudio: hasAudio,
             videoWidth: width,
