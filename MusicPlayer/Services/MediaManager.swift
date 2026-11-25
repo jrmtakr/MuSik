@@ -618,7 +618,7 @@ final class MediaManager {
 
         if item.prefersFFmpegEngine {
             playWithFFmpegEngine(url: item.fileURL, item: item, headers: nil)
-            WholeSongAIService.shared.handlePlaybackStarted(for: item)
+            Task { @MainActor in WholeSongAIService.shared.handlePlaybackStarted(for: item) }
             return
         }
 
@@ -633,7 +633,7 @@ final class MediaManager {
                 isPlaying = true
                 updateNowPlayingInfo(for: item)
                 syncWrappedSessionStart(for: item)
-                WholeSongAIService.shared.handlePlaybackStarted(for: item)
+                Task { @MainActor in WholeSongAIService.shared.handlePlaybackStarted(for: item) }
                 return
             } catch {
                 equalizerPlayer.stop()
@@ -659,7 +659,7 @@ final class MediaManager {
         isPlaying = true
         updateNowPlayingInfo(for: item)
         syncWrappedSessionStart(for: item)
-        WholeSongAIService.shared.handlePlaybackStarted(for: item)
+        Task { @MainActor in WholeSongAIService.shared.handlePlaybackStarted(for: item) }
     }
 
     func playRemoteStream(
@@ -693,7 +693,7 @@ final class MediaManager {
             metadataTitle: title,
             artist: artist ?? url.host
         )
-        WholeSongAIService.shared.handlePlaybackStarted(for: virtualItem)
+        Task { @MainActor in WholeSongAIService.shared.handlePlaybackStarted(for: virtualItem) }
 
         let isHLS = ext == "m3u8" || url.absoluteString.lowercased().contains(".m3u8")
         if isHLS || !MediaItem.ffmpegVideoExtensions.contains(ext) {
@@ -2878,7 +2878,7 @@ final class MediaManager {
         }
         if playlistsChanged { savePlaylists() }
         PlaylistTimeMachineService.shared.updatePathReferences(from: oldPath, to: newPath)
-        WholeSongAIService.shared.rekeyPath(from: oldPath, to: newPath)
+        Task { @MainActor in WholeSongAIService.shared.rekeyPath(from: oldPath, to: newPath) }
         saveLibraryState()
     }
 
@@ -2909,10 +2909,13 @@ final class MediaManager {
             }
         }
 
+        let matchedPaths = Set(items.map(\.relativePath).filter(predicate))
         likedPaths = likedPaths.filter { !predicate($0) }
         recentPaths.removeAll(where: predicate)
         upNextPaths.removeAll(where: predicate)
-        WholeSongAIService.shared.removePaths(matching: predicate)
+        if !matchedPaths.isEmpty {
+            Task { @MainActor in WholeSongAIService.shared.removePaths(matching: { matchedPaths.contains($0) }) }
+        }
 
         var affectedPlaylistIDs: [UUID] = []
         for idx in playlists.indices {
@@ -3209,7 +3212,7 @@ final class MediaManager {
             recordRecent(nextItem.relativePath)
             updateNowPlayingInfo(for: nextItem)
             syncWrappedSessionStart(for: nextItem)
-            WholeSongAIService.shared.handlePlaybackStarted(for: nextItem)
+            Task { @MainActor in WholeSongAIService.shared.handlePlaybackStarted(for: nextItem) }
         } catch {
             crossfadeTriggeredForCurrentTrack = true
         }

@@ -1841,8 +1841,11 @@ final class WebMediaDownloader {
             if let pairedAudio = candidate.pairedAudioURL {
                 if preferAudioOnly {
                     let cleanAudio = cleanedStreamURLIfRangeFragment(pairedAudio)
-                    guard let aURL = await fetchTempFile(from: cleanAudio, ext: "m4a", headers: primaryHeaders, using: ephemeralDataSession)
-                            ?? (await fetchTempFile(from: cleanAudio, ext: "m4a", headers: minimalHeaders, using: ephemeralDataSession)) else {
+                    var tempAudio = await fetchTempFile(from: cleanAudio, ext: "m4a", headers: primaryHeaders, using: ephemeralDataSession)
+                    if tempAudio == nil && !Task.isCancelled {
+                        tempAudio = await fetchTempFile(from: cleanAudio, ext: "m4a", headers: minimalHeaders, using: ephemeralDataSession)
+                    }
+                    guard let aURL = tempAudio else {
                         continue
                     }
                     if let maxSec, let dur = await resolveLocalDuration(at: aURL), dur > maxSec {
