@@ -284,6 +284,31 @@ struct VerifyTrackArtistSheet: View {
     private func runVocalClipScan() async {
         isListeningVocals = true
         vocalErrorMessage = nil
+
+        if mediaManager.currentItem?.relativePath == liveItem.relativePath {
+            let liveCapture = await LiveAudioLyricsAI.capturePlaybackTranscript(
+                for: liveItem,
+                playbackTime: mediaManager.currentTime,
+                equalizerPlayer: mediaManager.equalizerPlayer,
+                isEQPlaying: mediaManager.equalizerPlayer.isPlaying,
+                playbackRate: mediaManager.playbackRate
+            )
+            if !liveCapture.transcript.isEmpty {
+                vocalTranscript = liveCapture.transcript
+                let result = await TrackVerificationService.verifyTrack(
+                    rawTitle: searchQuery,
+                    rawArtist: liveItem.artist,
+                    localDuration: liveItem.durationSeconds,
+                    sourceVideoID: mediaManager.sourceVideoID(for: liveItem),
+                    extraLyricSnippet: liveCapture.transcript,
+                    ignoredChannels: wrapped.ignoredChannels
+                )
+                verificationResult = result
+                isListeningVocals = false
+                return
+            }
+        }
+
         let scan = await TrackVerificationService.identifyFromVocalClip(
             audioURL: liveItem.fileURL,
             durationSeconds: liveItem.durationSeconds,

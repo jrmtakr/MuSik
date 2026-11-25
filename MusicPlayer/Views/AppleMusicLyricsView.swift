@@ -436,6 +436,49 @@ struct AppleMusicLyricsView: View {
                 .padding(.vertical, 5)
                 .background(Color.black.opacity(0.26), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
             }
+
+            if let info = lyricsService.lastRecognizedTrackInfo,
+               info.relativePath == item.relativePath {
+                if info.wasAutoSaved {
+                    HStack(spacing: 6) {
+                        Image(systemName: "checkmark.seal.fill")
+                            .font(.caption2)
+                            .foregroundStyle(.green)
+                        Text("Artist DB & Wrapped Confirmed: \(info.artistName) — \(info.songTitle)")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(.white.opacity(0.9))
+                            .lineLimit(1)
+                        Spacer()
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .background(Color.green.opacity(0.18), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                } else {
+                    Button {
+                        AppHaptics.selection()
+                        lyricsService.applyRecognizedMetadata(info, to: item)
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: "checkmark.circle.badge.plus")
+                                .font(.caption2.weight(.bold))
+                            Text("Save to Artist DB: \(info.artistName) — \(info.songTitle)")
+                                .font(.caption2.weight(.semibold))
+                                .lineLimit(1)
+                            Spacer()
+                            Text("Save")
+                                .font(.caption2.weight(.bold))
+                                .padding(.horizontal, 7)
+                                .padding(.vertical, 2)
+                                .background(.white.opacity(0.2), in: Capsule())
+                        }
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 5)
+                        .background(Color.accentColor.opacity(0.45), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
         }
         .padding(.horizontal, 20)
         .padding(.bottom, 6)

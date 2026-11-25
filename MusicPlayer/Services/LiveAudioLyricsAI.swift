@@ -12,6 +12,8 @@ struct SpokenLyricWord: Hashable, Sendable {
 struct LiveLyricsSyncOutcome: Sendable {
     let identifiedTitle: String?
     let identifiedArtist: String?
+    let identifiedGenre: String?
+    let isHighConfidence: Bool
     let transcriptSnippet: String
     let alignedLyrics: ResolvedTrackLyrics?
     let computedOffsetSeconds: Double?
@@ -23,10 +25,12 @@ struct LiveLyricsSyncOutcome: Sendable {
 private struct RecognizedLyricsCandidate {
     let trackName: String
     let artistName: String
+    let genre: String?
     let durationSeconds: Double?
     let syncedLyrics: String?
     let plainLyrics: String?
     let source: String
+    let isInCatalog: Bool
     let textOverlapCount: Int
     let score: Int
 }
@@ -85,6 +89,8 @@ enum LiveAudioLyricsAI {
             return LiveLyricsSyncOutcome(
                 identifiedTitle: nil,
                 identifiedArtist: nil,
+                identifiedGenre: nil,
+                isHighConfidence: false,
                 transcriptSnippet: "",
                 alignedLyrics: nil,
                 computedOffsetSeconds: nil,
@@ -100,6 +106,8 @@ enum LiveAudioLyricsAI {
             return LiveLyricsSyncOutcome(
                 identifiedTitle: nil,
                 identifiedArtist: nil,
+                identifiedGenre: nil,
+                isHighConfidence: false,
                 transcriptSnippet: "",
                 alignedLyrics: nil,
                 computedOffsetSeconds: nil,
@@ -143,6 +151,8 @@ enum LiveAudioLyricsAI {
             return LiveLyricsSyncOutcome(
                 identifiedTitle: nil,
                 identifiedArtist: nil,
+                identifiedGenre: nil,
+                isHighConfidence: false,
                 transcriptSnippet: cleanSnippet,
                 alignedLyrics: nil,
                 computedOffsetSeconds: nil,
@@ -164,10 +174,15 @@ enum LiveAudioLyricsAI {
            anchor.matchedCount >= 3 && anchor.score >= 0.42 {
             var updated = currentLyrics
             updated.syncedOffsetSeconds = anchor.offsetSeconds
+            let canonicalArtist = ArtistDatabase.canonicalizeSingle(currentLyrics.artistName)
+            let genre = ArtistDatabase.genre(forArtist: canonicalArtist)
+            let isStrongCatalogArtist = ArtistDatabase.lookup(canonicalArtist) != nil
             let signStr = String(format: "%+.1fs", anchor.offsetSeconds)
             return LiveLyricsSyncOutcome(
                 identifiedTitle: currentLyrics.trackTitle,
-                identifiedArtist: currentLyrics.artistName,
+                identifiedArtist: canonicalArtist.isEmpty ? currentLyrics.artistName : canonicalArtist,
+                identifiedGenre: genre,
+                isHighConfidence: anchor.matchedCount >= 4 && (!canonicalArtist.isEmpty && isStrongCatalogArtist),
                 transcriptSnippet: cleanSnippet,
                 alignedLyrics: updated,
                 computedOffsetSeconds: anchor.offsetSeconds,
@@ -177,8 +192,8 @@ enum LiveAudioLyricsAI {
             )
         }
 
-        // 2. Lyrics are missing, plain, or didn't match the playing vocals — identify the real song via lyric search!
-        await onProgress("Heard \"\(heardWords.prefix(6).map(\.rawWord).joined(separator: " "))\" — identifying song...")
+        // 2. Lyrics are missing, plain, or didn't match the playing vocals — identify the real song & canonical artist!
+        await onProgress("Heard \"\(heardWords.prefix(6).map(\.rawWord).joined(separator: " "))\" — identifying song & artist...")
 
         if let recognized = await identifyBestSong(
             heardWords: heardWords,
@@ -186,6 +201,8 @@ enum LiveAudioLyricsAI {
             rawTitleHint: item.displayTitle,
             rawArtistHint: item.artist
         ) {
+            let highConfidence = recognized.textOverlapCount >= 3 && recognized.score >= 70
+
             if let synced = recognized.syncedLyrics, !synced.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 let parsed = SyncedLyricsService.parseLRCOrPlain(text: synced, duration: item.durationSeconds ?? recognized.durationSeconds)
                 if !parsed.lines.isEmpty {
@@ -211,11 +228,13 @@ enum LiveAudioLyricsAI {
                     return LiveLyricsSyncOutcome(
                         identifiedTitle: recognized.trackName,
                         identifiedArtist: recognized.artistName,
+                        identifiedGenre: recognized.genre,
+                        isHighConfidence: highConfidence,
                         transcriptSnippet: cleanSnippet,
                         alignedLyrics: built,
                         computedOffsetSeconds: anchor?.offsetSeconds,
                         alignedLineText: anchor?.lineText,
-                        statusMessage: "AI Matched \"\(recognized.trackName)\"\(offsetSummary)",
+                        statusMessage: "AI Identified \"\(recognized.trackName)\" by \(recognized.artistName)\(offsetSummary)",
                         errorMessage: nil
                     )
                 }
@@ -239,11 +258,13 @@ enum LiveAudioLyricsAI {
                     return LiveLyricsSyncOutcome(
                         identifiedTitle: recognized.trackName,
                         identifiedArtist: recognized.artistName,
+                        identifiedGenre: recognized.genre,
+                        isHighConfidence: highConfidence,
                         transcriptSnippet: cleanSnippet,
                         alignedLyrics: built,
                         computedOffsetSeconds: nil,
                         alignedLineText: nil,
-                        statusMessage: "AI Matched \"\(recognized.trackName)\" (plain lyrics)",
+                        statusMessage: "AI Identified \"\(recognized.trackName)\" by \(recognized.artistName)",
                         errorMessage: nil
                     )
                 }
@@ -265,6 +286,8 @@ enum LiveAudioLyricsAI {
             return LiveLyricsSyncOutcome(
                 identifiedTitle: currentLyrics.trackTitle,
                 identifiedArtist: currentLyrics.artistName,
+                identifiedGenre: ArtistDatabase.genre(forArtist: currentLyrics.artistName),
+                isHighConfidence: false,
                 transcriptSnippet: cleanSnippet,
                 alignedLyrics: updated,
                 computedOffsetSeconds: anchor.offsetSeconds,
@@ -277,6 +300,8 @@ enum LiveAudioLyricsAI {
         return LiveLyricsSyncOutcome(
             identifiedTitle: nil,
             identifiedArtist: nil,
+            identifiedGenre: nil,
+            isHighConfidence: false,
             transcriptSnippet: cleanSnippet,
             alignedLyrics: nil,
             computedOffsetSeconds: nil,
@@ -284,6 +309,53 @@ enum LiveAudioLyricsAI {
             statusMessage: "No matching song found",
             errorMessage: "Heard \"\(cleanSnippet)\" — couldn't find a synced match automatically. Try searching by title."
         )
+    }
+
+    static func capturePlaybackTranscript(
+        for item: MediaItem,
+        playbackTime: Double,
+        equalizerPlayer: EqualizerAudioPlayer,
+        isEQPlaying: Bool,
+        playbackRate: Float
+    ) async -> (transcript: String, errorMessage: String?) {
+        let authStatus = await requestSpeechPermission()
+        guard authStatus == .authorized else {
+            return ("", "Enable Speech Recognition in iPhone Settings -> MuseJRM -> Speech Recognition.")
+        }
+        let recognizer = SFSpeechRecognizer(locale: .current)
+            ?? SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
+        guard let recognizer, recognizer.isAvailable else {
+            return ("", "On-device Speech Recognition is currently unavailable.")
+        }
+
+        var capture = await captureSpokenWords(
+            item: item,
+            playbackTime: playbackTime,
+            recognizer: recognizer,
+            equalizerPlayer: equalizerPlayer,
+            isEQPlaying: isEQPlaying,
+            playbackRate: playbackRate
+        )
+
+        let totalDur = item.durationSeconds ?? 0
+        if capture.words.count < 4, playbackTime < 12.0, totalDur > 36.0 {
+            let fallbackStart = min(max(18.0, totalDur * 0.28), max(18.0, totalDur - 20.0))
+            let secondTry = await captureAudioClipWords(
+                at: item.fileURL,
+                clipStart: fallbackStart,
+                clipDuration: min(20.0, max(6.0, totalDur - fallbackStart)),
+                recognizer: recognizer
+            )
+            if secondTry.words.count > capture.words.count {
+                capture = secondTry
+            }
+        }
+
+        let words = capture.words.prefix(16).map(\.rawWord).joined(separator: " ")
+        guard capture.words.count >= 3 else {
+            return ("", "Couldn't catch clear vocals around this position. Scrub to singing and retry.")
+        }
+        return (words, nil)
     }
 
     // MARK: - Audio Clip & Live Graph Capture
@@ -504,30 +576,65 @@ enum LiveAudioLyricsAI {
             lrclibCandidates.append(contentsOf: fetched)
         }
 
+        // Cross-check the top identified song name against iTunes/Apple Music catalog for canonical artist, title & genre.
+        let topSeed = lrclibCandidates.max(by: { $0.score < $1.score })
+        let itunesTitle = topSeed?.trackName ?? geniusHits.first?.title ?? ""
+        let itunesArtist = topSeed?.artistName ?? geniusHits.first?.artist ?? ""
+        let itunesMatch = await fetchITunesVerification(title: itunesTitle, artist: itunesArtist, localDuration: duration)
+
         let cleanTitle = (rawTitleHint ?? "").lowercased()
         let cleanArtist = (rawArtistHint ?? "").lowercased()
 
         let rescored = lrclibCandidates.map { cand -> RecognizedLyricsCandidate in
             var s = cand.score
+            var finalTitle = cand.trackName
+            var finalArtist = cand.artistName
+            var resolvedGenre = cand.genre
+
+            if cand.isInCatalog {
+                s += 18
+            }
+
             if let dur = cand.durationSeconds, let localDur = duration, localDur > 10 {
                 let diff = abs(localDur - dur)
                 if diff <= 4.0 { s += 28 }
                 else if diff <= 12.0 { s += 14 }
                 else if diff > 35.0 { s -= 15 }
             }
-            if !cleanTitle.isEmpty && cand.trackName.lowercased().contains(cleanTitle) {
-                s += 12
+
+            if let itunes = itunesMatch {
+                let normCandA = ArtistDatabase.normalizeLookupKey(finalArtist)
+                let normItunesA = ArtistDatabase.normalizeLookupKey(itunes.artistName)
+                let normCandT = ArtistDatabase.normalizeLookupKey(finalTitle)
+                let normItunesT = ArtistDatabase.normalizeLookupKey(itunes.trackName)
+                if !normItunesA.isEmpty && !normItunesT.isEmpty &&
+                    (normCandA == normItunesA || normCandA.contains(normItunesA) || normItunesA.contains(normCandA)) &&
+                    (normCandT == normItunesT || normCandT.contains(normItunesT) || normItunesT.contains(normCandT)) {
+                    s += 25
+                    finalTitle = itunes.trackName
+                    finalArtist = ArtistDatabase.canonicalizeSingle(itunes.artistName)
+                    if let g = itunes.genre, !g.isEmpty {
+                        resolvedGenre = g
+                    }
+                }
             }
-            if !cleanArtist.isEmpty && cand.artistName.lowercased().contains(cleanArtist) {
-                s += 12
+
+            if !cleanTitle.isEmpty && finalTitle.lowercased().contains(cleanTitle) {
+                s += 10
             }
+            if !cleanArtist.isEmpty && finalArtist.lowercased().contains(cleanArtist) {
+                s += 10
+            }
+
             return RecognizedLyricsCandidate(
-                trackName: cand.trackName,
-                artistName: cand.artistName,
+                trackName: finalTitle,
+                artistName: finalArtist,
+                genre: resolvedGenre ?? ArtistDatabase.genre(forArtist: finalArtist),
                 durationSeconds: cand.durationSeconds,
                 syncedLyrics: cand.syncedLyrics,
                 plainLyrics: cand.plainLyrics,
-                source: cand.source,
+                source: itunesMatch != nil ? "\(cand.source) + Apple Catalog" : cand.source,
+                isInCatalog: cand.isInCatalog || ArtistDatabase.lookup(finalArtist) != nil,
                 textOverlapCount: cand.textOverlapCount,
                 score: s
             )
@@ -541,13 +648,17 @@ enum LiveAudioLyricsAI {
         // Fallback: fetch Genius plain lyrics for top Genius lyric hit if LRCLIB had no entry at all
         if let topGenius = geniusHits.first {
             if let plain = await fetchGeniusPlainLyrics(url: topGenius.url) {
+                let extracted = ArtistDatabase.extractArtists(rawArtistTag: topGenius.artist, rawTitle: topGenius.title, isArtistVerified: true)
+                let canonicalArtist = ArtistDatabase.canonicalizeSingle(extracted.primaryArtist.isEmpty ? topGenius.artist : extracted.primaryArtist)
                 return RecognizedLyricsCandidate(
-                    trackName: topGenius.title,
-                    artistName: topGenius.artist,
-                    durationSeconds: duration,
+                    trackName: itunesMatch?.trackName ?? topGenius.title,
+                    artistName: itunesMatch?.artistName ?? canonicalArtist,
+                    genre: itunesMatch?.genre ?? ArtistDatabase.genre(forArtist: canonicalArtist) ?? extracted.genre,
+                    durationSeconds: duration ?? itunesMatch?.durationSeconds,
                     syncedLyrics: nil,
                     plainLyrics: plain,
                     source: "Genius",
+                    isInCatalog: ArtistDatabase.lookup(canonicalArtist) != nil,
                     textOverlapCount: 3,
                     score: 50
                 )
@@ -555,6 +666,61 @@ enum LiveAudioLyricsAI {
         }
 
         return nil
+    }
+
+    private static func fetchITunesVerification(
+        title: String,
+        artist: String,
+        localDuration: Double?
+    ) async -> (trackName: String, artistName: String, genre: String?, durationSeconds: Double?)? {
+        let query = [artist, title]
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+        guard !query.isEmpty,
+              let encoded = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+              let url = URL(string: "https://itunes.apple.com/search?media=music&entity=song&limit=5&term=\(encoded)") else {
+            return nil
+        }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 8
+        req.setValue(WebMediaDownloader.browserUserAgent, forHTTPHeaderField: "User-Agent")
+
+        guard let (data, resp) = try? await URLSession.shared.data(for: req),
+              let http = resp as? HTTPURLResponse,
+              (200...299).contains(http.statusCode),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let rows = json["results"] as? [[String: Any]], !rows.isEmpty else {
+            return nil
+        }
+
+        let normTitle = ArtistDatabase.normalizeLookupKey(title)
+        let normArtist = ArtistDatabase.normalizeLookupKey(artist)
+
+        let best = rows.max { lhs, rhs in
+            let lT = ArtistDatabase.normalizeLookupKey((lhs["trackName"] as? String) ?? "")
+            let rT = ArtistDatabase.normalizeLookupKey((rhs["trackName"] as? String) ?? "")
+            let lA = ArtistDatabase.normalizeLookupKey((lhs["artistName"] as? String) ?? "")
+            let rA = ArtistDatabase.normalizeLookupKey((rhs["artistName"] as? String) ?? "")
+
+            var lScore = (lT == normTitle ? 20 : 0) + (lA.contains(normArtist) ? 15 : 0)
+            var rScore = (rT == normTitle ? 20 : 0) + (rA.contains(normArtist) ? 15 : 0)
+            if let localDuration, localDuration > 10 {
+                if let lm = (lhs["trackTimeMillis"] as? Double).map({ $0 / 1000 }), abs(lm - localDuration) <= 5 { lScore += 15 }
+                if let rm = (rhs["trackTimeMillis"] as? Double).map({ $0 / 1000 }), abs(rm - localDuration) <= 5 { rScore += 15 }
+            }
+            return lScore < rScore
+        }
+
+        guard let best,
+              let track = best["trackName"] as? String,
+              let rawArt = best["artistName"] as? String else {
+            return nil
+        }
+        let canonical = ArtistDatabase.canonicalizeSingle(rawArt)
+        let genre = best["primaryGenreName"] as? String
+        let dur = (best["trackTimeMillis"] as? Double).map { $0 / 1000.0 }
+        return (track, canonical, genre, dur)
     }
 
     private static func searchGeniusByLyrics(queries: [String]) async -> [(title: String, artist: String, url: URL)] {
@@ -683,13 +849,30 @@ enum LiveAudioLyricsAI {
             score += 12
         }
 
+        let extracted = ArtistDatabase.extractArtists(
+            rawArtistTag: artist,
+            rawTitle: track,
+            isArtistVerified: true
+        )
+        let canonicalArtist = ArtistDatabase.canonicalizeSingle(
+            extracted.primaryArtist.isEmpty ? artist : extracted.primaryArtist
+        )
+        let cleanTitle = ArtistDatabase.cleanSongTitleForSearch(
+            rawTitle: track,
+            rawArtistTag: canonicalArtist
+        ).songOnly
+        let resolvedTitle = cleanTitle.isEmpty ? track : cleanTitle
+        let catalogHit = ArtistDatabase.lookup(canonicalArtist)
+
         return RecognizedLyricsCandidate(
-            trackName: track,
-            artistName: artist,
+            trackName: resolvedTitle,
+            artistName: canonicalArtist,
+            genre: catalogHit?.genre ?? extracted.genre,
             durationSeconds: dur,
             syncedLyrics: synced,
             plainLyrics: plain,
             source: source,
+            isInCatalog: catalogHit != nil,
             textOverlapCount: overlap,
             score: score
         )
