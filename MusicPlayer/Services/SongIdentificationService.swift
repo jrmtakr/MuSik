@@ -80,6 +80,64 @@ final class SongIdentificationService {
     @ObservationIgnored private var worker: Task<Void, Never>?
     @ObservationIgnored private var lastMusicBrainzRequestAt = Date.distantPast
 
+    private final class SyncStateBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var pendingPaths = Set<String>()
+        private var stepLabels: [String: String] = [:]
+
+        func setPending(_ path: String, pending: Bool) {
+            lock.lock()
+            if pending {
+                pendingPaths.insert(path)
+            } else {
+                pendingPaths.remove(path)
+                stepLabels.removeValue(forKey: path)
+            }
+            lock.unlock()
+        }
+
+        func setLabel(_ path: String, label: String) {
+            lock.lock()
+            stepLabels[path] = label
+            lock.unlock()
+        }
+
+        func isPending(_ path: String) -> Bool {
+            lock.lock()
+            let result = pendingPaths.contains(path)
+            lock.unlock()
+            return result
+        }
+
+        func label(for path: String) -> String? {
+            lock.lock()
+            let val = stepLabels[path]
+            lock.unlock()
+            return val
+        }
+
+        func rekey(from oldPath: String, to newPath: String) {
+            lock.lock()
+            if pendingPaths.remove(oldPath) != nil {
+                pendingPaths.insert(newPath)
+            }
+            if let oldLabel = stepLabels.removeValue(forKey: oldPath) {
+                stepLabels[newPath] = oldLabel
+            }
+            lock.unlock()
+        }
+    }
+
+    nonisolated private static let syncStateBox = SyncStateBox()
+
+    nonisolated static func isIdentifyingSync(relativePath: String) -> Bool {
+        syncStateBox.isPending(relativePath)
+    }
+
+    nonisolated static func stepLabelSync(forRelativePath path: String) -> String? {
+        syncStateBox.label(for: path)
+    }
+
     private struct Request {
         let relativePath: String
         let fileURL: URL
@@ -152,7 +210,10 @@ final class SongIdentificationService {
         guard !queuedPaths.contains(item.relativePath) else { return }
         queuedPaths.insert(item.relativePath)
         progressByPath[item.relativePath] = 0.02
-        stepLabelByPath[item.relativePath] = "Queued for AI whole-song analysis..."
+        let queuedLabel = "Queued for AI whole-song analysis..."
+        stepLabelByPath[item.relativePath] = queuedLabel
+        Self.syncStateBox.setPending(item.relativePath, pending: true)
+        Self.syncStateBox.setLabel(item.relativePath, label: queuedLabel)
         queue.append(Request(
             relativePath: item.relativePath,
             fileURL: item.fileURL,
@@ -165,6 +226,16 @@ final class SongIdentificationService {
         ))
         pendingCount = queue.count
         startWorkerIfNeeded()
+    }
+
+    private func updateTrackStep(path: String, progress: Double? = nil, label: String? = nil) {
+        if let progress {
+            progressByPath[path] = progress
+        }
+        if let label {
+            stepLabelByPath[path] = label
+            Self.syncStateBox.setLabel(path, label: label)
+        }
     }
 
     private func startWorkerIfNeeded() {
@@ -180,9 +251,11 @@ final class SongIdentificationService {
                 let request = self.queue.removeFirst()
                 self.pendingCount = self.queue.count
                 self.activePath = request.relativePath
+                Self.syncStateBox.setPending(request.relativePath, pending: true)
                 await self.process(request)
                 self.progressByPath.removeValue(forKey: request.relativePath)
                 self.stepLabelByPath.removeValue(forKey: request.relativePath)
+                Self.syncStateBox.setPending(request.relativePath, pending: false)
                 self.activePath = nil
                 self.queuedPaths.remove(request.relativePath)
                 self.completedRevision &+= 1
@@ -219,7 +292,7 @@ final class SongIdentificationService {
         if let idx = queue.firstIndex(where: { $0.relativePath == item.relativePath }), idx > 0 {
             let target = queue.remove(at: idx)
             queue.insert(target, at: 0)
-            stepLabelByPath[item.relativePath] = "Prioritized for AI whole-song analysis..."
+            updateTrackStep(path: item.relativePath, label: "Prioritized for AI whole-song analysis...")
         } else if activePath != item.relativePath && !queuedPaths.contains(item.relativePath)
                     && MediaManager.shared.customMetadata(forRelativePath: item.relativePath)?.aiAnalysisCompleted == false {
             enqueue(
@@ -234,6 +307,7 @@ final class SongIdentificationService {
     }
 
     func rekeyPath(from oldPath: String, to newPath: String) {
+        Self.syncStateBox.rekey(from: oldPath, to: newPath)
         if let prog = progressByPath.removeValue(forKey: oldPath) {
             progressByPath[newPath] = prog
         }
@@ -322,8 +396,8 @@ final class SongIdentificationService {
                 let frac = 0.15 + 0.52 * (Double(chunkIdx) / Double(max(1, totalChunks)))
                 let mins = Int(totalSeconds) / 60
                 let secs = Int(totalSeconds) % 60
-                self?.progressByPath[capturedPath] = frac
-                self?.stepLabelByPath[capturedPath] = "AI listening to song (\(chunkIdx)/\(totalChunks) • \(mins):\(String(format: "%02d", secs)))..."
+                let label = "AI listening to song (\(chunkIdx)/\(totalChunks) • \(mins):\(String(format: "%02d", secs)))..."
+                self?.updateTrackStep(path: capturedPath, progress: frac, label: label)
                 self?.lastStatus = "Listening to whole song (\(chunkIdx)/\(totalChunks)): \"\(capturedLabelTitle)\""
             }
         }

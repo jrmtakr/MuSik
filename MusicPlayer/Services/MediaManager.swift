@@ -678,7 +678,7 @@ final class MediaManager {
 
     func isAIAnalysisPending(for item: MediaItem) -> Bool {
         guard !item.relativePath.hasPrefix("__remote__/"), !item.isHLS else { return false }
-        if SongIdentificationService.shared.isIdentifying(item) {
+        if SongIdentificationService.isIdentifyingSync(relativePath: item.relativePath) {
             return true
         }
         return customMetadataByPath[item.relativePath]?.aiAnalysisCompleted == false
@@ -742,8 +742,11 @@ final class MediaManager {
         }
 
         if isAIAnalysisPending(for: item) {
-            SongIdentificationService.shared.prioritize(item)
-            let detail = SongIdentificationService.shared.analysisStatusText(for: item)
+            let capturedItem = item
+            Task { @MainActor in
+                SongIdentificationService.shared.prioritize(capturedItem)
+            }
+            let detail = SongIdentificationService.stepLabelSync(forRelativePath: item.relativePath)
                 ?? "AI is listening to whole song..."
             statusMessage = "Waiting for AI analysis before playback: \(detail)"
             return false
