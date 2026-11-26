@@ -615,12 +615,13 @@ final class ShazamFingerprintEngine: SongRecognitionEngine, @unchecked Sendable 
             )
             if status == noErr, let ptr = pointer, length >= 2 {
                 let count = min(length / MemoryLayout<Int16>.size, maxSamples - samples.count)
-                let startIdx = samples.count
-                samples.append(contentsOf: repeatElement(0, count: count))
+                var rawFloats = [Float](repeating: 0, count: count)
+                var scaledFloats = [Float](repeating: 0, count: count)
                 ptr.withMemoryRebound(to: Int16.self, capacity: count) { int16Ptr in
-                    vDSP_vflt16(int16Ptr, 1, &samples[startIdx], 1, vDSP_Length(count))
+                    vDSP_vflt16(int16Ptr, 1, &rawFloats, 1, vDSP_Length(count))
                 }
-                vDSP_vsmul(&samples[startIdx], 1, &scale, &samples[startIdx], 1, vDSP_Length(count))
+                vDSP_vsmul(rawFloats, 1, &scale, &scaledFloats, 1, vDSP_Length(count))
+                samples.append(contentsOf: scaledFloats)
             }
             CMSampleBufferInvalidate(sampleBuffer)
         }
