@@ -3,6 +3,13 @@ workflows:
     name: Build MuseJRM IPA
     max_build_duration: 60
     instance_type: mac_mini_m2
+    triggering:
+      events:
+        - push
+      branch_patterns:
+        - pattern: main
+          include: true
+          source: true
     environment:
       xcode: latest
     scripts:
@@ -15,8 +22,8 @@ workflows:
       - name: Archive unsigned iOS app
         script: |
           xcodebuild \
-            -project MuseJRM.xcodeproj \
-            -scheme MuseJRM \
+            -project MusicPlayer.xcodeproj \
+            -scheme MusicPlayer \
             -configuration Release \
             -sdk iphoneos \
             -destination 'generic/platform=iOS' \
@@ -24,11 +31,11 @@ workflows:
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
             archive \
-            -archivePath build/MuseJRM.xcarchive
+            -archivePath build/MusicPlayer.xcarchive
       - name: Package MuseJRM.ipa
         script: |
           mkdir -p artifacts build/Payload
-          cp -R build/MuseJRM.xcarchive/Products/Applications/MuseJRM.app build/Payload/
+          cp -R build/MusicPlayer.xcarchive/Products/Applications/MuseJRM.app build/Payload/
           codesign --force --deep --sign - --timestamp=none build/Payload/MuseJRM.app
           (cd build && zip -qry ../artifacts/MuseJRM.ipa Payload)
     artifacts:
