@@ -185,6 +185,18 @@ struct SettingsView: View {
                 Section("Player & Tools") {
                     Toggle("Quick access to Last Playlist", isOn: $settings.quickAccessLastPlaylist)
 
+                    Toggle(isOn: $settings.keepImportingWhenLocked) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Keep Importing When Locked")
+                            Text("Plays silence while a playlist import runs and nothing else is playing, so iOS doesn't pause it. Never interrupts your music.")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .onChange(of: settings.keepImportingWhenLocked) { _, enabled in
+                        if !enabled { ImportKeepAlive.shared.stop() }
+                    }
+
                     Toggle(isOn: $settings.autoIdentifyImportedSongs) {
                         VStack(alignment: .leading, spacing: 2) {
                             Text("Auto-Identify Imported Songs")
