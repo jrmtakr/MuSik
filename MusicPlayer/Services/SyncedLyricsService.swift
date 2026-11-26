@@ -230,8 +230,8 @@ final class SyncedLyricsService {
             )
             guard !Task.isCancelled else { return }
             if var resolved {
-                // Automatically line synced lyrics up to the actual local audio file with zero user input.
-                if resolved.isTimeSynced && !item.relativePath.hasPrefix("__remote__/") && !item.isHLS {
+                // Automatically line synced or plain lyrics up into real-time word-timed lyrics against local audio.
+                if !item.relativePath.hasPrefix("__remote__/") && !item.isHLS {
                     resolved = await SongAudioListener.autoAlign(lyrics: resolved, heard: nil, fileURL: item.fileURL)
                     guard !Task.isCancelled else { return }
                 }
@@ -508,8 +508,9 @@ final class SyncedLyricsService {
         await fetchFromLRCLIB(cacheKey: "verify", song: title, artist: artist, rawTitle: title, duration: duration)
     }
 
-    /// Pre-fetches best lyrics during upload/import and aligns them against the local audio file
-    /// using speech anchors + acoustic vocal-energy cross-correlation so lyrics are ready & synced before play.
+    /// Checks all candidate lyric sources during upload/import against the actual audio (heard words +
+    /// acoustic vocal energy), selects the verified matching lyrics, converts even plain lyrics into
+    /// real-time synced line & word timings, and saves them offline ready before playback starts.
     func fetchAndAlignDuringImport(
         item: MediaItem,
         title: String,
@@ -518,21 +519,61 @@ final class SyncedLyricsService {
         heard: [HeardWord]?
     ) async {
         let key = cacheKey(for: item, artistOverride: artist, titleOverride: title)
-        guard loadFromDisk(key: key) == nil else { return }
+        let split = splitArtistAndSong(rawTitle: title, rawArtist: artist)
 
-        guard var lyrics = await fetchBestLyrics(
+        var candidates: [ResolvedTrackLyrics] = []
+        if let lrclib = await fetchFromLRCLIB(
+            cacheKey: key,
+            song: split.song,
+            artist: split.artist,
+            rawTitle: title,
+            duration: duration
+        ) {
+            candidates.append(lrclib)
+        }
+        if let genius = await fetchFromGenius(
+            cacheKey: key,
+            song: split.song,
+            artist: split.artist
+        ) {
+            candidates.append(genius)
+        }
+        if let ytCaptions = await fetchFromYouTubeCreatorSubtitles(
             item: item,
             cacheKey: key,
-            customTitle: title,
-            customArtist: artist
-        ) else {
-            return
+            song: split.song,
+            artist: split.artist
+        ) {
+            candidates.append(ytCaptions)
         }
 
-        if lyrics.isTimeSynced && !item.isHLS {
-            lyrics = await SongAudioListener.autoAlign(lyrics: lyrics, heard: heard, fileURL: item.fileURL)
+        // Verify candidate lyrics directly against what the AI heard in the actual audio file.
+        var bestCandidate: ResolvedTrackLyrics?
+        var bestScore = -Double.infinity
+        for cand in candidates {
+            var score = cand.isTimeSynced ? 0.25 : 0.0
+            if let heard, !heard.isEmpty {
+                switch SongAudioListener.verdict(heard: heard, lyrics: cand) {
+                case .confirmed(let ratio):
+                    score += 2.0 + ratio
+                case .inconclusive:
+                    score += 0.1
+                case .contradicted:
+                    score -= 2.0
+                }
+            }
+            if score > bestScore {
+                bestScore = score
+                bestCandidate = cand
+            }
         }
-        storeAlignedLyrics(lyrics, for: item)
+
+        // Don't lock in clearly wrong lyrics if the audio contradicted the candidate.
+        guard var selected = bestCandidate, bestScore > -0.5 else { return }
+        if !item.isHLS {
+            selected = await SongAudioListener.autoAlign(lyrics: selected, heard: heard, fileURL: item.fileURL)
+        }
+        storeAlignedLyrics(selected, for: item)
     }
 
     /// Saves lyrics that were already re-timed against this exact file, so playback uses them as-is

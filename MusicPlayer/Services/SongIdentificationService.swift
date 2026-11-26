@@ -113,12 +113,30 @@ final class SongIdentificationService {
         sourcePlatform: ExternalPlaylistPlatform? = nil,
         jobID: UUID?
     ) {
-        guard isEnabled, !item.isHLS, !queuedPaths.contains(item.relativePath) else { return }
+        guard isEnabled, !item.isHLS else { return }
         // Never fight metadata the user confirmed or edited by hand.
         if let meta = MediaManager.shared.customMetadata(forRelativePath: item.relativePath),
            meta.isArtistVerified == true, meta.autoIdentifiedSource == nil {
             return
         }
+
+        // If still waiting in the queue, merge any richer hints (e.g. sourceVideoID/title applied right after import).
+        if let qIdx = queue.firstIndex(where: { $0.relativePath == item.relativePath }) {
+            let prev = queue[qIdx]
+            queue[qIdx] = Request(
+                relativePath: item.relativePath,
+                fileURL: item.fileURL,
+                hintTitle: (!hintTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && hintTitle != item.fileName) ? hintTitle : prev.hintTitle,
+                hintArtist: !hintArtist.isEmpty ? hintArtist : prev.hintArtist,
+                durationSeconds: item.durationSeconds ?? prev.durationSeconds,
+                sourceVideoID: sourceVideoID ?? prev.sourceVideoID,
+                sourcePlatform: sourcePlatform ?? prev.sourcePlatform,
+                jobID: jobID ?? prev.jobID
+            )
+            return
+        }
+
+        guard !queuedPaths.contains(item.relativePath) else { return }
         queuedPaths.insert(item.relativePath)
         queue.append(Request(
             relativePath: item.relativePath,
@@ -245,7 +263,19 @@ final class SongIdentificationService {
         }
 
         guard let finalSong = song else {
-            lastStatus = "Not sure what \"\(request.hintTitle)\" is — kept the original title"
+            // Even when metadata doesn't warrant renaming the track, still check the audio & align
+            // real-time lyrics if a real title/hint is known and matches what was heard.
+            if let item = MediaManager.shared.items.first(where: { $0.relativePath == request.relativePath }),
+               !request.hintTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                await SyncedLyricsService.shared.fetchAndAlignDuringImport(
+                    item: item,
+                    title: request.hintTitle,
+                    artist: request.hintArtist,
+                    duration: request.durationSeconds,
+                    heard: heard
+                )
+            }
+            lastStatus = "Kept \"\(request.hintTitle)\" and checked audio lyrics"
             return nil
         }
 

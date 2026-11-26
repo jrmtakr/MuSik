@@ -225,19 +225,229 @@ enum SongAudioListener {
         )
     }
 
-    // MARK: - Hybrid Automatic Whole-Song Aligner (STT + Acoustic Vocal-Band Cross-Correlation)
+    // MARK: - Hybrid Automatic Whole-Song Aligner (STT + Acoustic Vocal-Band Cross-Correlation + Real-Time Word Timings)
 
-    /// Automatically lines up `lyrics` against `fileURL` with zero user input:
-    ///   1. First tries word-level speech anchors (`align(lyrics:heard:)`) across the whole song.
-    ///   2. If speech heard too few words (heavy beat, reverb, non-English, or no permission),
-    ///      extracts a 10 Hz vocal-presence envelope (300 Hz - 3.4 kHz FFT energy) across the whole
-    ///      track and slides offset/tempo to lock `.lrc` lines to where vocals actually enter & pause.
+    /// Automatically lines up ANY `lyrics` (both synced `.lrc` and plain/Genius text) against `fileURL`
+    /// into real-time synced line + word timings with zero user input:
+    ///   1. If `lyrics` are already time-synced: re-times them via whole-song STT word anchors, or falls back to
+    ///      10 Hz vocal-band (300 Hz - 3.4 kHz) energy cross-correlation to remove intro/outro/tempo drift.
+    ///   2. If `lyrics` are plain/untimed text: converts them into real-time synced lines (`isTimeSynced = true`)
+    ///      using STT heard-word anchors across the song or the 10 Hz acoustic vocal-onset span.
+    ///   3. Populates real-time word-by-word `LyricWordTiming` highlights anchored to heard words when available.
     static func autoAlign(lyrics: ResolvedTrackLyrics, heard: [HeardWord]?, fileURL: URL) async -> ResolvedTrackLyrics {
-        guard lyrics.isTimeSynced, !lyrics.lines.isEmpty else { return lyrics }
-        if let heard, let sttAligned = align(lyrics: lyrics, heard: heard) {
-            return sttAligned
+        guard !lyrics.lines.isEmpty else { return lyrics }
+
+        var working = lyrics
+        if working.isTimeSynced {
+            if let heard, let sttAligned = align(lyrics: working, heard: heard) {
+                working = sttAligned
+            } else {
+                working = await alignAcousticallyIfNeeded(lyrics: working, fileURL: fileURL)
+            }
+        } else {
+            working = await alignPlainLyricsIntoRealTimeSync(lyrics: working, heard: heard, fileURL: fileURL)
         }
-        return await alignAcousticallyIfNeeded(lyrics: lyrics, fileURL: fileURL)
+        return withRealTimeWordTimings(in: working, heard: heard)
+    }
+
+    private static func alignPlainLyricsIntoRealTimeSync(
+        lyrics: ResolvedTrackLyrics,
+        heard: [HeardWord]?,
+        fileURL: URL
+    ) async -> ResolvedTrackLyrics {
+        let nonEmptyLines = lyrics.lines.filter { !$0.isInstrumentalBreak && !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        guard !nonEmptyLines.isEmpty else { return lyrics }
+
+        let curve = await Task.detached(priority: .utility) {
+            Self.extractVocalActivityCurve(from: fileURL)
+        }.value
+        let totalDuration = curve.map { Double($0.envelope.count) * $0.frameDurationSeconds } ?? lyrics.expectedDurationSeconds ?? 180.0
+        guard totalDuration > 10 else { return lyrics }
+
+        // Detect first & last true vocal entry from acoustic envelope to skip silent intros/outros.
+        var firstVocalSec: Double = min(4.0, totalDuration * 0.08)
+        var lastVocalSec: Double = max(firstVocalSec + 6.0, totalDuration - min(5.0, totalDuration * 0.05))
+        if let curve, curve.envelope.count >= 40 {
+            let dt = curve.frameDurationSeconds
+            if let firstIdx = curve.envelope.firstIndex(where: { $0 > 0.12 }) {
+                firstVocalSec = max(0, Double(firstIdx) * dt - 0.3)
+            }
+            if let lastIdx = curve.envelope.lastIndex(where: { $0 > 0.12 }) {
+                lastVocalSec = min(totalDuration, max(firstVocalSec + 6.0, Double(lastIdx) * dt + 0.8))
+            }
+        }
+
+        // Find monotonic anchors between line indices and actual heard vocal timestamps.
+        var indexAnchors: [(lineIdx: Int, fileTime: Double)] = []
+        if let heard, heard.count >= 6 {
+            var rawHits: [(lineIdx: Int, fileTime: Double)] = []
+            for (lIdx, line) in nonEmptyLines.enumerated() {
+                let lineTokens = tokens(line.text)
+                guard lineTokens.count >= 3 else { continue }
+                let needed = Set(lineTokens)
+                let window = lineTokens.count + 3
+                var bestScore = 0.0
+                var bestStart: Int?
+                var i = 0
+                while i < heard.count {
+                    let end = min(heard.count, i + window)
+                    var hits = Set<String>()
+                    var firstHit: Int?
+                    for j in i..<end where needed.contains(heard[j].token) {
+                        if firstHit == nil { firstHit = j }
+                        hits.insert(heard[j].token)
+                    }
+                    let sc = Double(hits.count) / Double(needed.count)
+                    if sc > bestScore, let firstHit {
+                        bestScore = sc
+                        bestStart = firstHit
+                    }
+                    i += 1
+                }
+                if bestScore >= 0.55, let bestStart {
+                    rawHits.append((lIdx, max(0, heard[bestStart].time - 0.15)))
+                }
+            }
+
+            if !rawHits.isEmpty {
+                var len = Array(repeating: 1, count: rawHits.count)
+                var prev = Array(repeating: -1, count: rawHits.count)
+                for i in 0..<rawHits.count {
+                    for j in 0..<i where rawHits[j].lineIdx < rawHits[i].lineIdx && rawHits[j].fileTime < rawHits[i].fileTime {
+                        if len[j] + 1 > len[i] {
+                            len[i] = len[j] + 1
+                            prev[i] = j
+                        }
+                    }
+                }
+                if var cursor = len.indices.max(by: { len[$0] < len[$1] }) {
+                    while cursor >= 0 {
+                        indexAnchors.append(rawHits[cursor])
+                        cursor = prev[cursor]
+                    }
+                    indexAnchors.reverse()
+                }
+            }
+        }
+
+        // Word-weight per line so longer lines get proportionally longer time slots.
+        let weights: [Double] = nonEmptyLines.map { Double(max(2, tokens($0.text).count)) }
+        var cumWeights = [Double](repeating: 0, count: nonEmptyLines.count + 1)
+        for i in 0..<nonEmptyLines.count {
+            cumWeights[i + 1] = cumWeights[i] + weights[i]
+        }
+
+        func timeForLine(_ idx: Int) -> Double {
+            if let exact = indexAnchors.first(where: { $0.lineIdx == idx }) {
+                return exact.fileTime
+            }
+            let prevAnchor = indexAnchors.last(where: { $0.lineIdx < idx })
+            let nextAnchor = indexAnchors.first(where: { $0.lineIdx > idx })
+
+            let startLine = prevAnchor?.lineIdx ?? 0
+            let endLine = nextAnchor?.lineIdx ?? nonEmptyLines.count
+            let startTime = prevAnchor?.fileTime ?? firstVocalSec
+            let endTime = nextAnchor?.fileTime ?? lastVocalSec
+
+            let spanWeight = max(1.0, cumWeights[endLine] - cumWeights[startLine])
+            let relWeight = max(0, cumWeights[idx] - cumWeights[startLine])
+            return startTime + (endTime - startTime) * (relWeight / spanWeight)
+        }
+
+        var syncedLines: [SyncedLyricLine] = []
+        syncedLines.reserveCapacity(nonEmptyLines.count)
+        for idx in 0..<nonEmptyLines.count {
+            let line = nonEmptyLines[idx]
+            let prevEnd = idx > 0 ? syncedLines[idx - 1].startTime + 0.4 : 0
+            let rawStart = max(prevEnd, timeForLine(idx))
+            let nextStart = (idx + 1 < nonEmptyLines.count) ? max(rawStart + 0.6, timeForLine(idx + 1)) : min(totalDuration, rawStart + 4.5)
+            let lineEnd = min(totalDuration, max(rawStart + 0.6, nextStart - 0.08))
+            syncedLines.append(SyncedLyricLine(
+                id: line.id,
+                startTime: rawStart,
+                endTime: lineEnd,
+                text: line.text,
+                words: [],
+                isInstrumentalBreak: false
+            ))
+        }
+
+        let note = indexAnchors.isEmpty
+            ? "AI vocal-span real-time sync"
+            : "AI audio-synced (\(indexAnchors.count) vocal anchors)"
+        return ResolvedTrackLyrics(
+            cacheKey: lyrics.cacheKey,
+            trackTitle: lyrics.trackTitle,
+            artistName: lyrics.artistName,
+            isTimeSynced: true,
+            sourceLabel: "Real-Time Synced Lyrics · AI",
+            attributionText: (lyrics.attributionText ?? "AI Sync") + " · \(note)",
+            syncedOffsetSeconds: 0,
+            tempoScale: 1.0,
+            expectedDurationSeconds: totalDuration,
+            lines: syncedLines
+        )
+    }
+
+    private static func withRealTimeWordTimings(in lyrics: ResolvedTrackLyrics, heard: [HeardWord]?) -> ResolvedTrackLyrics {
+        guard lyrics.isTimeSynced, !lyrics.lines.isEmpty else { return lyrics }
+
+        let updatedLines: [SyncedLyricLine] = lyrics.lines.enumerated().map { idx, line in
+            guard !line.isInstrumentalBreak, line.words.isEmpty else { return line }
+            let rawWords = line.text.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+            guard !rawWords.isEmpty else { return line }
+
+            let fallbackNextStart = (idx + 1 < lyrics.lines.count)
+                ? max(line.startTime + 0.6, lyrics.lines[idx + 1].startTime - 0.08)
+                : max(line.startTime + 3.2, line.endTime)
+            let lineEnd = max(line.startTime + 0.5, line.endTime > line.startTime + 0.25 ? line.endTime : fallbackNextStart)
+            let span = lineEnd - line.startTime
+
+            // Anchor any recognized words from STT near this line window; distribute others smoothly by character length.
+            let localHeard: [HeardWord] = (heard ?? []).filter {
+                $0.time >= line.startTime - 0.6 && $0.time <= lineEnd + 0.6
+            }
+            let totalChars = Double(rawWords.reduce(0) { $0 + max(1, $1.count) })
+            var cursorTime = line.startTime
+            var generatedWords: [LyricWordTiming] = []
+            generatedWords.reserveCapacity(rawWords.count)
+
+            for (wIdx, wordText) in rawWords.enumerated() {
+                let normWord = normalizeToken(wordText)
+                var wStart = cursorTime
+                if !normWord.isEmpty,
+                   let heardMatch = localHeard.first(where: { $0.token == normWord && $0.time >= cursorTime - 0.25 && $0.time <= lineEnd }) {
+                    wStart = max(cursorTime, min(lineEnd - 0.08, heardMatch.time))
+                }
+                let share = Double(max(1, wordText.count)) / max(1.0, totalChars)
+                let estDur = max(0.08, span * share)
+                let wEnd = (wIdx == rawWords.count - 1) ? lineEnd : min(lineEnd, wStart + estDur)
+                generatedWords.append(LyricWordTiming(text: wordText, startTime: wStart, endTime: max(wStart + 0.05, wEnd)))
+                cursorTime = max(cursorTime, wEnd)
+            }
+
+            return SyncedLyricLine(
+                id: line.id,
+                startTime: line.startTime,
+                endTime: lineEnd,
+                text: line.text,
+                words: generatedWords,
+                isInstrumentalBreak: false
+            )
+        }
+
+        return ResolvedTrackLyrics(
+            cacheKey: lyrics.cacheKey,
+            trackTitle: lyrics.trackTitle,
+            artistName: lyrics.artistName,
+            isTimeSynced: lyrics.isTimeSynced,
+            sourceLabel: lyrics.sourceLabel,
+            attributionText: lyrics.attributionText,
+            syncedOffsetSeconds: lyrics.syncedOffsetSeconds,
+            tempoScale: lyrics.tempoScale,
+            expectedDurationSeconds: lyrics.expectedDurationSeconds,
+            lines: updatedLines
+        )
     }
 
     static func alignAcousticallyIfNeeded(lyrics: ResolvedTrackLyrics, fileURL: URL) async -> ResolvedTrackLyrics {
