@@ -223,6 +223,8 @@ struct ImportPlaylistSheetView: View {
                             .foregroundStyle(.secondary)
                     }
 
+                    ImportJobActiveTracksView(job: job)
+
                     ImportJobIssuesBar(job: job) {
                         issuesJobID = IdentifiedUUID(id: job.id)
                     }

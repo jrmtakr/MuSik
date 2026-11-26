@@ -390,3 +390,81 @@ struct ImportJobIssuesBar: View {
             : "\(failed) failed (mostly \(top.key.title.lowercased()))"
     }
 }
+
+/// Live "Now caching" list under an import: exactly which songs are being found / downloaded right
+/// now, with a progress bar for each, plus the next songs in line.
+struct ImportJobActiveTracksView: View {
+    @Environment(PlaylistImportManager.self) private var playlistImportManager
+    let job: PlaylistImportJob
+
+    var body: some View {
+        let active = playlistImportManager.inFlightTracks(in: job)
+        let upNext = playlistImportManager.upNextTracks(in: job)
+        if !job.isFinished && !job.isPaused && (!active.isEmpty || !upNext.isEmpty) {
+            VStack(alignment: .leading, spacing: 6) {
+                if !active.isEmpty {
+                    Text("Now caching")
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(.secondary)
+                    ForEach(active.prefix(6)) { track in
+                        activeRow(track)
+                    }
+                }
+                if !upNext.isEmpty {
+                    Text("Up next: " + upNext.map { $0.title.isEmpty ? "Untitled" : $0.title }.joined(separator: " • "))
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
+            }
+            .padding(8)
+            .background(Color.secondary.opacity(0.07), in: RoundedRectangle(cornerRadius: 8))
+        }
+    }
+
+    private func activeRow(_ track: PlaylistImportTrackJob) -> some View {
+        let progress = playlistImportManager.activeDownloadProgressByTrackID[track.id]
+        let isDownloading = track.status == .downloading
+        return VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 6) {
+                Image(systemName: isDownloading ? "arrow.down.circle.fill" : "magnifyingglass.circle.fill")
+                    .foregroundStyle(isDownloading ? Color.accentColor : Color.orange)
+                    .font(.caption)
+                VStack(alignment: .leading, spacing: 0) {
+                    Text(track.title.isEmpty ? "Untitled" : track.title)
+                        .font(.caption.weight(.semibold))
+                        .lineLimit(1)
+                    Text(track.artist.isEmpty ? "Unknown Artist" : track.artist)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                Spacer(minLength: 4)
+                Text(statusText(track, progress: progress))
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+            if isDownloading {
+                if let progress {
+                    ProgressView(value: progress)
+                        .progressViewStyle(.linear)
+                } else {
+                    ProgressView()
+                        .progressViewStyle(.linear)
+                }
+            }
+        }
+    }
+
+    private func statusText(_ track: PlaylistImportTrackJob, progress: Double?) -> String {
+        switch track.status {
+        case .resolving:
+            return track.retryCount > 0 ? "Retrying…" : "Finding…"
+        case .downloading:
+            if let progress { return "\(Int((progress * 100).rounded()))%" }
+            return "Downloading…"
+        default:
+            return ""
+        }
+    }
+}

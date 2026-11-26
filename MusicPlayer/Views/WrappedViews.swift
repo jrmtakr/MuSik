@@ -1155,7 +1155,7 @@ private struct WrappedPosterRenderCard: View {
                     .tracking(1.5)
                     .foregroundStyle(.yellow)
                 Spacer()
-                Text("MuSeJRM")
+                Text("MuseJRM")
                     .font(.caption2.weight(.heavy))
                     .foregroundStyle(.white.opacity(0.75))
             }
@@ -1261,7 +1261,7 @@ private enum WrappedPosterExporter {
               let data = image.pngData() else {
             return nil
         }
-        let fileName = report.year.map { "MuSeJRM-Wrapped-\($0).png" } ?? "MuSeJRM-AllTime-Wrapped.png"
+        let fileName = report.year.map { "MuseJRM-Wrapped-\($0).png" } ?? "MuseJRM-AllTime-Wrapped.png"
         let url = FileManager.default.temporaryDirectory.appendingPathComponent(fileName)
         try? data.write(to: url, options: [.atomic])
         return url

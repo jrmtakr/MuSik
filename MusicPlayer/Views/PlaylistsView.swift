@@ -165,6 +165,8 @@ struct PlaylistsView: View {
                                         .foregroundStyle(.secondary)
                                 }
 
+                                ImportJobActiveTracksView(job: job)
+
                                 ImportJobIssuesBar(job: job) {
                                     importIssuesJobID = IdentifiedUUID(id: job.id)
                                 }
