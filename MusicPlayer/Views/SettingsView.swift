@@ -185,6 +185,41 @@ struct SettingsView: View {
                 Section("Player & Tools") {
                     Toggle("Quick access to Last Playlist", isOn: $settings.quickAccessLastPlaylist)
 
+                    Toggle(isOn: $settings.keepImportingWhenLocked) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Keep Importing When Locked")
+                            Text("Plays silence while a playlist import runs and nothing else is playing, so iOS doesn't pause it. Never interrupts your music.")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .onChange(of: settings.keepImportingWhenLocked) { _, enabled in
+                        if !enabled { ImportKeepAlive.shared.stop() }
+                    }
+
+                    Toggle(isOn: $settings.autoIdentifyImportedSongs) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Auto-Identify Imported Songs")
+                            Text("Fixes each imported song's title, artist, album and cover art so lyrics match. Uses the playlist, YouTube's Music info and music catalogs; only renames when two sources agree")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                            if let reason = SongIdentificationService.shared.engineUnavailableReason {
+                                Text(reason)
+                                    .font(.caption2)
+                                    .foregroundStyle(.orange)
+                            }
+                        }
+                    }
+
+                    Toggle(isOn: $settings.autoAISyncLyrics) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("AI Auto-Sync & Recognize Lyrics")
+                            Text("Automatically identifies and aligns mismatched lyrics while playing")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
                     Toggle(isOn: $settings.crossfadeEnabled) {
                         VStack(alignment: .leading, spacing: 2) {
                             Text("Fade Between Songs (Crossfade)")

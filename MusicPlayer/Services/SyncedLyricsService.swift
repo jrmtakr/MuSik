@@ -1,6 +1,7 @@
 import AVFoundation
 import Foundation
 import Observation
+@preconcurrency import Speech
 
 struct LyricWordTiming: Identifiable, Codable, Hashable, Sendable {
     let id: UUID
@@ -49,7 +50,64 @@ struct ResolvedTrackLyrics: Codable, Sendable {
     let sourceLabel: String
     let attributionText: String?
     var syncedOffsetSeconds: Double
+    var tempoScale: Double = 1.0
+    var expectedDurationSeconds: Double? = nil
     let lines: [SyncedLyricLine]
+
+    enum CodingKeys: String, CodingKey {
+        case cacheKey, trackTitle, artistName, isTimeSynced, sourceLabel, attributionText
+        case syncedOffsetSeconds, tempoScale, expectedDurationSeconds, lines
+    }
+
+    init(
+        cacheKey: String,
+        trackTitle: String,
+        artistName: String,
+        isTimeSynced: Bool,
+        sourceLabel: String,
+        attributionText: String?,
+        syncedOffsetSeconds: Double,
+        tempoScale: Double = 1.0,
+        expectedDurationSeconds: Double? = nil,
+        lines: [SyncedLyricLine]
+    ) {
+        self.cacheKey = cacheKey
+        self.trackTitle = trackTitle
+        self.artistName = artistName
+        self.isTimeSynced = isTimeSynced
+        self.sourceLabel = sourceLabel
+        self.attributionText = attributionText
+        self.syncedOffsetSeconds = syncedOffsetSeconds
+        self.tempoScale = tempoScale
+        self.expectedDurationSeconds = expectedDurationSeconds
+        self.lines = lines
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        cacheKey = try c.decode(String.self, forKey: .cacheKey)
+        trackTitle = try c.decode(String.self, forKey: .trackTitle)
+        artistName = try c.decode(String.self, forKey: .artistName)
+        isTimeSynced = try c.decode(Bool.self, forKey: .isTimeSynced)
+        sourceLabel = try c.decode(String.self, forKey: .sourceLabel)
+        attributionText = try c.decodeIfPresent(String.self, forKey: .attributionText)
+        syncedOffsetSeconds = try c.decode(Double.self, forKey: .syncedOffsetSeconds)
+        tempoScale = try c.decodeIfPresent(Double.self, forKey: .tempoScale) ?? 1.0
+        expectedDurationSeconds = try c.decodeIfPresent(Double.self, forKey: .expectedDurationSeconds)
+        lines = try c.decode([SyncedLyricLine].self, forKey: .lines)
+    }
+}
+
+struct AIRecognizedTrackInfo: Equatable, Sendable {
+    let cacheKey: String
+    let relativePath: String
+    let songTitle: String
+    let artistName: String
+    let genre: String?
+    let isHighConfidence: Bool
+    let isInArtistDatabase: Bool
+    let transcriptSnippet: String
+    let wasAutoSaved: Bool
 }
 
 @MainActor
@@ -60,9 +118,15 @@ final class SyncedLyricsService {
     var currentLyrics: ResolvedTrackLyrics?
     var currentLoadingKey: String?
     var lastError: String?
+    var isAIRecognizing: Bool = false
+    var aiStatusMessage: String?
+    var aiErrorMessage: String?
+    var lastRecognizedTrackInfo: AIRecognizedTrackInfo?
 
     @ObservationIgnored private var memoryCache: [String: ResolvedTrackLyrics] = [:]
     @ObservationIgnored private var activeFetchTask: Task<Void, Never>?
+    @ObservationIgnored private var activeAITask: Task<Void, Never>?
+    @ObservationIgnored private var autoAttemptedKeys: Set<String> = []
 
     private static var cacheDirectoryURL: URL {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -104,6 +168,9 @@ final class SyncedLyricsService {
 
         if !forceReload {
             if currentLyrics?.cacheKey == key { return }
+            aiStatusMessage = nil
+            aiErrorMessage = nil
+            lastRecognizedTrackInfo = nil
             if let inMem = memoryCache[key] {
                 currentLyrics = inMem
                 lastError = nil
@@ -118,6 +185,11 @@ final class SyncedLyricsService {
         }
 
         activeFetchTask?.cancel()
+        activeAITask?.cancel()
+        isAIRecognizing = false
+        aiStatusMessage = nil
+        aiErrorMessage = nil
+        lastRecognizedTrackInfo = nil
         currentLoadingKey = key
         lastError = nil
         if forceReload || currentLyrics?.cacheKey != key {
@@ -220,7 +292,238 @@ final class SyncedLyricsService {
     }
 
     func resetTimingOffset() {
-        adjustTimingOffset(by: 0)
+        guard var lyrics = currentLyrics, lyrics.isTimeSynced else { return }
+        lyrics.syncedOffsetSeconds = 0
+        lyrics.tempoScale = 1.0
+        currentLyrics = lyrics
+        memoryCache[lyrics.cacheKey] = lyrics
+        saveToDisk(lyrics)
+        aiStatusMessage = "Timing reset to default"
+    }
+
+    func toggleDurationTempoFit(for item: MediaItem) {
+        guard var lyrics = currentLyrics, lyrics.isTimeSynced,
+              let trackDur = item.durationSeconds, trackDur > 15,
+              let lrcDur = lyrics.expectedDurationSeconds, lrcDur > 15 else {
+            return
+        }
+        if abs(lyrics.tempoScale - 1.0) > 0.02 {
+            lyrics.tempoScale = 1.0
+            lyrics.syncedOffsetSeconds = 0
+            aiStatusMessage = "Reset tempo speed fit (1.0x)"
+        } else {
+            let ratio = lrcDur / trackDur
+            let clampedRatio = min(1.45, max(0.65, ratio))
+            lyrics.tempoScale = clampedRatio
+            aiStatusMessage = String(format: "Matched speed (%.2fx)", clampedRatio)
+        }
+        currentLyrics = lyrics
+        memoryCache[lyrics.cacheKey] = lyrics
+        saveToDisk(lyrics)
+    }
+
+    func recognizeAndAlignWithAI(
+        for item: MediaItem,
+        playbackTime: Double,
+        equalizerPlayer: EqualizerAudioPlayer,
+        isEQPlaying: Bool,
+        playbackRate: Float,
+        forceReidentify: Bool = false
+    ) {
+        guard !isAIRecognizing else { return }
+        let key = cacheKey(for: item)
+        activeAITask?.cancel()
+        isAIRecognizing = true
+        aiErrorMessage = nil
+        aiStatusMessage = "Listening to playing song..."
+
+        let existingLyrics = (currentLyrics?.cacheKey == key) ? currentLyrics : nil
+
+        activeAITask = Task {
+            let outcome = await LiveAudioLyricsAI.recognizeAndAlign(
+                item: item,
+                cacheKey: key,
+                playbackTime: playbackTime,
+                currentLyrics: existingLyrics,
+                equalizerPlayer: equalizerPlayer,
+                isEQPlaying: isEQPlaying,
+                playbackRate: playbackRate,
+                forceReidentify: forceReidentify
+            ) { [weak self] stepText in
+                self?.aiStatusMessage = stepText
+            }
+            guard !Task.isCancelled else { return }
+            isAIRecognizing = false
+            aiStatusMessage = outcome.statusMessage
+            aiErrorMessage = outcome.errorMessage
+
+            if let updated = outcome.alignedLyrics {
+                memoryCache[key] = updated
+                saveToDisk(updated)
+                currentLyrics = updated
+                lastError = nil
+            }
+
+            if let rawTitle = outcome.identifiedTitle?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !rawTitle.isEmpty,
+               let rawArtist = outcome.identifiedArtist?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !rawArtist.isEmpty {
+                let extracted = ArtistDatabase.extractArtists(
+                    rawArtistTag: rawArtist,
+                    rawTitle: rawTitle,
+                    isArtistVerified: true
+                )
+                let canonicalArtist = ArtistDatabase.canonicalizeSingle(
+                    extracted.primaryArtist.isEmpty ? rawArtist : extracted.primaryArtist
+                )
+                let cleanTitle = ArtistDatabase.cleanSongTitleForSearch(
+                    rawTitle: rawTitle,
+                    rawArtistTag: canonicalArtist
+                ).songOnly
+                let finalTitle = cleanTitle.isEmpty ? rawTitle : cleanTitle
+                let inCatalogBefore = ArtistDatabase.lookup(canonicalArtist) != nil
+                let resolvedGenre = outcome.identifiedGenre
+                    ?? ArtistDatabase.genre(forArtist: canonicalArtist)
+                    ?? extracted.genre
+
+                if outcome.isHighConfidence && !inCatalogBefore && !canonicalArtist.isEmpty {
+                    ArtistDatabase.registerDynamicArtists([
+                        ArtistCatalogEntry(
+                            canonicalName: canonicalArtist,
+                            genre: resolvedGenre ?? "Pop",
+                            aliases: canonicalArtist != rawArtist ? [rawArtist] : [],
+                            requiresSeparatedContext: false
+                        )
+                    ])
+                }
+
+                var autoSaved = false
+                if outcome.isHighConfidence && !MediaManager.shared.isArtistVerified(for: item) {
+                    MediaManager.shared.confirmVerifiedArtist(
+                        for: item,
+                        artistName: canonicalArtist,
+                        updatedTitle: finalTitle,
+                        genre: resolvedGenre
+                    )
+                    autoSaved = true
+                }
+
+                lastRecognizedTrackInfo = AIRecognizedTrackInfo(
+                    cacheKey: key,
+                    relativePath: item.relativePath,
+                    songTitle: finalTitle,
+                    artistName: canonicalArtist,
+                    genre: resolvedGenre,
+                    isHighConfidence: outcome.isHighConfidence,
+                    isInArtistDatabase: ArtistDatabase.lookup(canonicalArtist) != nil,
+                    transcriptSnippet: outcome.transcriptSnippet,
+                    wasAutoSaved: autoSaved
+                )
+            }
+        }
+    }
+
+    func applyRecognizedMetadata(_ info: AIRecognizedTrackInfo, to item: MediaItem) {
+        let canonical = ArtistDatabase.canonicalizeSingle(info.artistName)
+        if ArtistDatabase.lookup(canonical) == nil && !canonical.isEmpty {
+            ArtistDatabase.registerDynamicArtists([
+                ArtistCatalogEntry(
+                    canonicalName: canonical,
+                    genre: info.genre ?? "Pop",
+                    aliases: [],
+                    requiresSeparatedContext: false
+                )
+            ])
+        }
+        MediaManager.shared.confirmVerifiedArtist(
+            for: item,
+            artistName: canonical,
+            updatedTitle: info.songTitle,
+            genre: info.genre
+        )
+        lastRecognizedTrackInfo = AIRecognizedTrackInfo(
+            cacheKey: info.cacheKey,
+            relativePath: info.relativePath,
+            songTitle: info.songTitle,
+            artistName: canonical,
+            genre: info.genre,
+            isHighConfidence: info.isHighConfidence,
+            isInArtistDatabase: true,
+            transcriptSnippet: info.transcriptSnippet,
+            wasAutoSaved: true
+        )
+        aiStatusMessage = "Saved to Library & Artist Database: \(canonical) — \(info.songTitle)"
+    }
+
+    func autoRecognizeIfAuthorizedAndNeeded(
+        for item: MediaItem,
+        playbackTime: Double,
+        equalizerPlayer: EqualizerAudioPlayer,
+        isEQPlaying: Bool,
+        playbackRate: Float
+    ) {
+        guard SFSpeechRecognizer.authorizationStatus() == .authorized,
+              !isAIRecognizing,
+              currentLoadingKey == nil else {
+            return
+        }
+        let key = cacheKey(for: item)
+        guard !autoAttemptedKeys.contains(key) else { return }
+
+        let shouldAutoRun: Bool = {
+            guard let cur = currentLyrics, cur.cacheKey == key else {
+                return true // No lyrics found for current track
+            }
+            if !cur.isTimeSynced { return true }
+            if abs(cur.syncedOffsetSeconds) > 0.01 { return false } // Already synced
+            if let lrcDur = cur.expectedDurationSeconds,
+               let fileDur = item.durationSeconds,
+               abs(lrcDur - fileDur) > 15.0 {
+                return true // Duration differs strongly (intro skit / wrong edit / remux)
+            }
+            return false
+        }()
+
+        guard shouldAutoRun else { return }
+        autoAttemptedKeys.insert(key)
+        recognizeAndAlignWithAI(
+            for: item,
+            playbackTime: playbackTime,
+            equalizerPlayer: equalizerPlayer,
+            isEQPlaying: isEQPlaying,
+            playbackRate: playbackRate,
+            forceReidentify: false
+        )
+    }
+
+    /// Exact lyrics for a known song, used by import-time song ID to confirm the name by listening.
+    /// Doesn't touch what's on screen.
+    func fetchLyricsForVerification(title: String, artist: String, duration: Double?) async -> ResolvedTrackLyrics? {
+        await fetchFromLRCLIB(cacheKey: "verify", song: title, artist: artist, rawTitle: title, duration: duration)
+    }
+
+    /// Saves lyrics that were already re-timed against this exact file, so playback uses them as-is
+    /// (and the play-time auto-sync doesn't shift them a second time).
+    func storeAlignedLyrics(_ lyrics: ResolvedTrackLyrics, for item: MediaItem) {
+        let key = cacheKey(for: item)
+        let stored = ResolvedTrackLyrics(
+            cacheKey: key,
+            trackTitle: lyrics.trackTitle,
+            artistName: lyrics.artistName,
+            isTimeSynced: lyrics.isTimeSynced,
+            sourceLabel: lyrics.sourceLabel,
+            attributionText: lyrics.attributionText,
+            syncedOffsetSeconds: 0,
+            tempoScale: 1.0,
+            expectedDurationSeconds: item.durationSeconds,
+            lines: lyrics.lines
+        )
+        memoryCache[key] = stored
+        saveToDisk(stored)
+        autoAttemptedKeys.insert(key)
+        if currentLyrics?.cacheKey == key {
+            currentLyrics = stored
+        }
     }
 
     @discardableResult
@@ -508,6 +811,8 @@ final class SyncedLyricsService {
                     sourceLabel: parsed.isSynced ? "Synced Lyrics" : "Lyrics",
                     attributionText: "Time-synced via LRCLIB",
                     syncedOffsetSeconds: 0,
+                    tempoScale: 1.0,
+                    expectedDurationSeconds: best.duration,
                     lines: parsed.lines
                 )
             }
@@ -524,6 +829,8 @@ final class SyncedLyricsService {
                     sourceLabel: "Plain Lyrics",
                     attributionText: "Lyrics via LRCLIB",
                     syncedOffsetSeconds: 0,
+                    tempoScale: 1.0,
+                    expectedDurationSeconds: best.duration,
                     lines: parsed.lines
                 )
             }
@@ -535,7 +842,7 @@ final class SyncedLyricsService {
     private func fetchSingleLRCLIBObject(url: URL) async -> [String: Any]? {
         var req = URLRequest(url: url)
         req.timeoutInterval = 8
-        req.setValue("MuSeJRM/2.0 (iOS)", forHTTPHeaderField: "User-Agent")
+        req.setValue("MuseJRM/2.0 (iOS)", forHTTPHeaderField: "User-Agent")
         guard let (data, resp) = try? await URLSession.shared.data(for: req),
               let http = resp as? HTTPURLResponse,
               (200...299).contains(http.statusCode),
@@ -548,7 +855,7 @@ final class SyncedLyricsService {
     private func fetchLRCLIBSearchArray(url: URL) async -> [[String: Any]] {
         var req = URLRequest(url: url)
         req.timeoutInterval = 10
-        req.setValue("MuSeJRM/2.0 (iOS)", forHTTPHeaderField: "User-Agent")
+        req.setValue("MuseJRM/2.0 (iOS)", forHTTPHeaderField: "User-Agent")
         guard let (data, resp) = try? await URLSession.shared.data(for: req),
               let http = resp as? HTTPURLResponse,
               (200...299).contains(http.statusCode),
@@ -573,6 +880,8 @@ final class SyncedLyricsService {
                     sourceLabel: parsed.isSynced ? "Synced Lyrics" : "Lyrics",
                     attributionText: "Time-synced via LRCLIB",
                     syncedOffsetSeconds: 0,
+                    tempoScale: 1.0,
+                    expectedDurationSeconds: dur,
                     lines: parsed.lines
                 )
             }
@@ -588,6 +897,8 @@ final class SyncedLyricsService {
                     sourceLabel: "Plain Lyrics",
                     attributionText: "Lyrics via LRCLIB",
                     syncedOffsetSeconds: 0,
+                    tempoScale: 1.0,
+                    expectedDurationSeconds: dur,
                     lines: parsed.lines
                 )
             }
@@ -657,13 +968,27 @@ final class SyncedLyricsService {
         if let targetDuration, let dur, targetDuration > 5 {
             let diff = abs(targetDuration - dur)
             if diff <= 2.5 {
-                score += 35
+                score += 50
                 durationClose = true
-            } else if diff <= 8.0 {
-                score += 20
+            } else if diff <= 7.0 {
+                score += 25
                 durationClose = true
-            } else if diff > 25.0 {
-                score -= 25
+            } else if diff > 15.0 {
+                score -= diff > 30.0 ? 50 : 30
+            }
+        }
+
+        // Penalize alternate edits/versions (remix, slowed, sped up, live, cover, karaoke) when the track isn't one.
+        let versionKeywords = [
+            "slowed", "sped up", "speed up", "nightcore", "remix",
+            "acoustic", "live", "instrumental", "karaoke", "8d", "cover"
+        ]
+        let hitCombined = (trackName + " " + ((row["albumName"] as? String) ?? "")).lowercased()
+        let targetCombined = (targetSong + " " + coreSong).lowercased()
+        for kw in versionKeywords {
+            if hitCombined.contains(kw) && !targetCombined.contains(kw) {
+                score -= 50
+                break
             }
         }
 
@@ -910,7 +1235,7 @@ final class SyncedLyricsService {
 
     // MARK: - LRC + Word Timing Parser
 
-    static func parseLRCOrPlain(text: String, duration: Double?) -> (isSynced: Bool, lines: [SyncedLyricLine]) {
+    nonisolated static func parseLRCOrPlain(text: String, duration: Double?) -> (isSynced: Bool, lines: [SyncedLyricLine]) {
         let normalizedText = text
             .replacingOccurrences(of: "\r\n", with: "\n")
             .replacingOccurrences(of: "\r", with: "\n")
@@ -1064,7 +1389,7 @@ final class SyncedLyricsService {
         return (false, plainLines)
     }
 
-    private static func parseTimestampMatch(_ match: NSTextCheckingResult, in text: String) -> Double? {
+    nonisolated private static func parseTimestampMatch(_ match: NSTextCheckingResult, in text: String) -> Double? {
         guard let minRange = Range(match.range(at: 1), in: text),
               let secRange = Range(match.range(at: 2), in: text),
               let mins = Double(text[minRange]),
@@ -1082,7 +1407,7 @@ final class SyncedLyricsService {
         return mins * 60.0 + secs + frac
     }
 
-    private static func stripEnhancedTimestamps(_ raw: String) -> String {
+    nonisolated private static func stripEnhancedTimestamps(_ raw: String) -> String {
         raw.replacingOccurrences(
             of: #"<\d{1,3}:\d{2}(?:[\.:]\d{1,3})?>"#,
             with: "",
@@ -1092,7 +1417,7 @@ final class SyncedLyricsService {
         .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    private static func parseEnhancedWords(
+    nonisolated private static func parseEnhancedWords(
         in raw: String,
         lineStart: Double,
         lineEnd: Double,
@@ -1121,7 +1446,7 @@ final class SyncedLyricsService {
         return words
     }
 
-    private static func synthesizeProportionalWordTimings(
+    nonisolated private static func synthesizeProportionalWordTimings(
         text: String,
         lineStart: Double,
         lineEnd: Double
@@ -1238,7 +1563,7 @@ final class SyncedLyricsService {
         return String(String.UnicodeScalarView(scalars)).trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    private static func extractGeniusLyricsText(fromHTML html: String) -> String? {
+    nonisolated static func extractGeniusLyricsText(fromHTML html: String) -> String? {
         guard let openTagRegex = try? NSRegularExpression(
             pattern: #"<div\b[^>]*data-lyrics-container\s*=\s*"true"[^>]*>"#,
             options: .caseInsensitive
@@ -1298,7 +1623,7 @@ final class SyncedLyricsService {
         return joined.isEmpty ? nil : joined
     }
 
-    private static func removeExcludedDivs(in html: String) -> String {
+    nonisolated private static func removeExcludedDivs(in html: String) -> String {
         guard let exclRegex = try? NSRegularExpression(
             pattern: #"<div\b[^>]*data-exclude-from-selection\s*=\s*"true"[^>]*>"#,
             options: .caseInsensitive
@@ -1339,7 +1664,7 @@ final class SyncedLyricsService {
         return working
     }
 
-    private static func decodeHTMLEntities(_ text: String) -> String {
+    nonisolated private static func decodeHTMLEntities(_ text: String) -> String {
         text
             .replacingOccurrences(of: "&amp;", with: "&")
             .replacingOccurrences(of: "&quot;", with: "\"")

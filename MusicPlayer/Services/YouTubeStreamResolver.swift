@@ -55,10 +55,18 @@ enum YouTubeStreamResolver {
         if host == "youtu.be", let first = pathParts.first, !first.isEmpty {
             return sanitizedVideoID(first)
         }
-        if let comps = URLComponents(url: url, resolvingAgainstBaseURL: false),
-           let v = comps.queryItems?.first(where: { $0.name == "v" })?.value,
-           !v.isEmpty {
-            return sanitizedVideoID(v)
+        if let comps = URLComponents(url: url, resolvingAgainstBaseURL: false) {
+            if let v = comps.queryItems?.first(where: { $0.name == "v" })?.value,
+               !v.isEmpty {
+                return sanitizedVideoID(v)
+            }
+            if let uParam = comps.queryItems?.first(where: { $0.name == "u" })?.value,
+               let innerURL = URL(string: uParam, relativeTo: url)?.absoluteURL,
+               let innerComps = URLComponents(url: innerURL, resolvingAgainstBaseURL: false),
+               let v = innerComps.queryItems?.first(where: { $0.name == "v" })?.value,
+               !v.isEmpty {
+                return sanitizedVideoID(v)
+            }
         }
         if pathParts.count >= 2, ["shorts", "embed", "live", "v"].contains(pathParts[0]) {
             return sanitizedVideoID(pathParts[1])
@@ -347,6 +355,7 @@ enum YouTubeStreamResolver {
         req.httpMethod = "GET"
         req.timeoutInterval = 7
         headers?.forEach { req.setValue($0.value, forHTTPHeaderField: $0.key) }
+        req.setValue("bytes=0-1023", forHTTPHeaderField: "Range")
         do {
             let (bytes, resp) = try await URLSession.shared.bytes(for: req)
             guard let http = resp as? HTTPURLResponse, (200...299).contains(http.statusCode) else {

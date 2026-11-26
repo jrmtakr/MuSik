@@ -66,7 +66,7 @@ enum EqualizerPresetAppOption: String, AppEnum {
 
 struct PlayPlaylistIntent: AppIntent {
     static var title: LocalizedStringResource = "Play Offline Playlist"
-    static var description = IntentDescription("Loads and plays a saved offline playlist in MuSeJRM.")
+    static var description = IntentDescription("Loads and plays a saved offline playlist in MuseJRM.")
     static var openAppWhenRun: Bool = false
 
     @Parameter(title: "Playlist Name", optionsProvider: PlaylistNameOptionsProvider())
@@ -78,7 +78,7 @@ struct PlayPlaylistIntent: AppIntent {
         case .playing(let resolvedName, let count):
             return .result(dialog: "Playing \(resolvedName) (\(count) \(count == 1 ? "item" : "items")).")
         case .empty(let resolvedName):
-            return .result(dialog: "Playlist \"\(resolvedName)\" is empty. Add media in MuSeJRM first.")
+            return .result(dialog: "Playlist \"\(resolvedName)\" is empty. Add media in MuseJRM first.")
         case .notFound:
             return .result(dialog: "No playlist named \"\(playlistName)\" was found.")
         }
@@ -87,7 +87,7 @@ struct PlayPlaylistIntent: AppIntent {
 
 struct PlaySongIntent: AppIntent {
     static var title: LocalizedStringResource = "Play Offline Song"
-    static var description = IntentDescription("Plays a matching offline song or video in MuSeJRM.")
+    static var description = IntentDescription("Plays a matching offline song or video in MuseJRM.")
     static var openAppWhenRun: Bool = false
 
     @Parameter(title: "Song or Video Name", optionsProvider: SongTitleOptionsProvider())
@@ -145,7 +145,7 @@ struct ResumeLastPlayedIntent: AppIntent {
 
 struct LikeCurrentSongIntent: AppIntent {
     static var title: LocalizedStringResource = "Favorite Current Song"
-    static var description = IntentDescription("Toggles favorite on the currently playing track in MuSeJRM.")
+    static var description = IntentDescription("Toggles favorite on the currently playing track in MuseJRM.")
     static var openAppWhenRun: Bool = false
 
     func perform() async throws -> some IntentResult & ProvidesDialog {
@@ -164,7 +164,7 @@ struct LikeCurrentSongIntent: AppIntent {
 
 struct SkipTrackIntent: AppIntent {
     static var title: LocalizedStringResource = "Skip Track"
-    static var description = IntentDescription("Skips to the next or previous track in MuSeJRM.")
+    static var description = IntentDescription("Skips to the next or previous track in MuseJRM.")
     static var openAppWhenRun: Bool = false
 
     @Parameter(title: "Direction", default: .next)
@@ -189,7 +189,7 @@ struct SkipTrackIntent: AppIntent {
 
 struct SetSleepTimerIntent: AppIntent {
     static var title: LocalizedStringResource = "Set Sleep Timer"
-    static var description = IntentDescription("Pauses MuSeJRM automatically after the chosen number of minutes (0 turns it off).")
+    static var description = IntentDescription("Pauses MuseJRM automatically after the chosen number of minutes (0 turns it off).")
     static var openAppWhenRun: Bool = false
 
     @Parameter(title: "Minutes", default: 30)
@@ -214,7 +214,7 @@ struct SetSleepTimerIntent: AppIntent {
 
 struct SetEqualizerPresetIntent: AppIntent {
     static var title: LocalizedStringResource = "Set Equalizer Preset"
-    static var description = IntentDescription("Applies an audio equalizer preset in MuSeJRM.")
+    static var description = IntentDescription("Applies an audio equalizer preset in MuseJRM.")
     static var openAppWhenRun: Bool = false
 
     @Parameter(title: "Preset", default: .bassBoost)
@@ -230,7 +230,7 @@ struct SetEqualizerPresetIntent: AppIntent {
 }
 
 struct SaveMediaLinkIntent: AppIntent {
-    static var title: LocalizedStringResource = "Save URL in MuSeJRM"
+    static var title: LocalizedStringResource = "Save URL in MuseJRM"
     static var description = IntentDescription("Downloads a direct video/audio/YouTube URL or opens the Playlist Importer for Spotify/Apple Music links.")
     static var openAppWhenRun: Bool = true
 
@@ -251,7 +251,7 @@ struct SaveMediaLinkIntent: AppIntent {
                 SystemActionRouter.shared.requestedTab = .files
             }
         }
-        return .result(dialog: "Opening link in MuSeJRM.")
+        return .result(dialog: "Opening link in MuseJRM.")
     }
 }
 

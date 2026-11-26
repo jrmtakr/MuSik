@@ -21,8 +21,8 @@ jobs:
       - name: Archive unsigned iOS app
         run: |
           xcodebuild \
-            -project MuseJRM.xcodeproj \
-            -scheme MuseJRM \
+            -project MusicPlayer.xcodeproj \
+            -scheme MusicPlayer \
             -configuration Release \
             -sdk iphoneos \
             -destination 'generic/platform=iOS' \
@@ -30,12 +30,12 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
             archive \
-            -archivePath build/MuseJRM.xcarchive
+            -archivePath build/MusicPlayer.xcarchive
 
       - name: Package MuseJRM.ipa
         run: |
           mkdir -p build/Payload
-          cp -R build/MuseJRM.xcarchive/Products/Applications/MuseJRM.app build/Payload/
+          cp -R build/MusicPlayer.xcarchive/Products/Applications/MuseJRM.app build/Payload/
           codesign --force --deep --sign - --timestamp=none build/Payload/MuseJRM.app
           cd build
           zip -qry MuseJRM.ipa Payload

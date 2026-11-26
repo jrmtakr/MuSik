@@ -258,7 +258,7 @@ enum TrackVerificationService {
             return (
                 nil,
                 nil,
-                "Speech Recognition is disabled. Enable it in iPhone Settings -> MuSeJRM -> Speech Recognition."
+                "Speech Recognition is disabled. Enable it in iPhone Settings -> MuseJRM -> Speech Recognition."
             )
         }
 

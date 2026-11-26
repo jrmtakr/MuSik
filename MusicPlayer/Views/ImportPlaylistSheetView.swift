@@ -12,6 +12,7 @@ struct ImportPlaylistSheetView: View {
     @State private var playlistURL = ""
     @State private var preferredFormat: PlaylistImportPreferredFormat = .audioOnly
     @State private var inputError: String?
+    @State private var issuesJobID: IdentifiedUUID?
 
     init(initialURL: String? = nil, onPlaylistImported: ((UUID) -> Void)? = nil) {
         self.initialURL = initialURL
@@ -100,6 +101,9 @@ struct ImportPlaylistSheetView: View {
                     }
                 }
             }
+            .sheet(item: $issuesJobID) { wrapped in
+                ImportIssuesView(jobID: wrapped.id)
+            }
             .task {
                 if let initialURL, !initialURL.isEmpty, playlistURL.isEmpty {
                     playlistURL = initialURL
@@ -147,8 +151,8 @@ struct ImportPlaylistSheetView: View {
                             }
                             .buttonStyle(.plain)
                         } else {
-                            if job.failedCount > 0 {
-                                Button("Retry (\(job.failedCount))") {
+                            if job.canRetry {
+                                Button(job.failedCount > 0 ? "Retry (\(job.failedCount))" : "Restart") {
                                     playlistImportManager.retryFailedTracks(inJobID: job.id)
                                 }
                                 .font(.caption.weight(.semibold))
@@ -185,6 +189,12 @@ struct ImportPlaylistSheetView: View {
                         Text("\(job.completedCount) saved • \(job.skippedCount) cached\(job.failedCount > 0 ? " • \(job.failedCount) failed" : "")")
                             .font(.caption2)
                             .foregroundStyle(.secondary)
+                    }
+
+                    ImportJobActiveTracksView(job: job)
+
+                    ImportJobIssuesBar(job: job) {
+                        issuesJobID = IdentifiedUUID(id: job.id)
                     }
                 }
                 .padding(.vertical, 4)
@@ -224,7 +234,7 @@ struct ImportPlaylistSheetView: View {
     }
 
     private func jobStatusSubtitle(_ job: PlaylistImportJob) -> String {
-        if job.isCancelled { return "Cancelled" }
+        if job.isCancelled { return "Stopped • \(job.cancelledCount) not downloaded" }
         if job.isFinished { return "Completed • \(job.preferredFormat == .audioOnly ? "Audio" : "Video")" }
         if job.isPaused { return "Paused • \(job.remainingCount) remaining" }
         return "Downloading \(job.preferredFormat == .audioOnly ? "Audio" : "Video")"

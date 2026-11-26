@@ -173,7 +173,7 @@ struct GroupPlaylist: Identifiable, Hashable, Codable {
     }
 
     var shareMessage: String {
-        "Join my live Group Playlist \"\(name)\"!\n\nCode: \(formattedCode)\nLink: \(inviteLinkString)\n\nIn MuSeJRM: Playlists -> Group Playlists -> Join with Code or Link."
+        "Join my live Group Playlist \"\(name)\"!\n\nCode: \(formattedCode)\nLink: \(inviteLinkString)\n\nIn MuseJRM: Playlists -> Group Playlists -> Join with Code or Link."
     }
 }
 

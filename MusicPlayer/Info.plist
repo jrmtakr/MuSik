@@ -68,9 +68,13 @@
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>Import videos from your Photos library and choose custom cover images for tracks and playlists.</string>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>Run a local Wi-Fi transfer web server so you can upload and download media between your computer and iPhone.</string>
+	<string>Run a local Wi-Fi transfer server and discover nearby MuseJRM Jam sessions.</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_musejrm-jam._tcp</string>
+	</array>
 	<key>NSSpeechRecognitionUsageDescription</key>
-	<string>MuSeJRM uses Speech Recognition to listen to songs, generate lyrics, and identify the song, album, and artist.</string>
+	<string>MuseJRM uses Speech Recognition on your device to listen to songs, generate lyrics, and identify the song, album, and artist.</string>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsArbitraryLoads</key>

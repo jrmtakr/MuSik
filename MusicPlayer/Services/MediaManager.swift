@@ -20,6 +20,10 @@ final class MediaManager {
         var isArtistVerified: Bool?
         var verifiedArtist: String?
         var genre: String?
+        var album: String?
+        /// Set when the song-ID AI filled in the metadata, e.g. "Shazam" or "iTunes match".
+        var autoIdentifiedSource: String?
+        var isrc: String?
     }
 
     private struct LibraryPersistedState: Codable {
@@ -52,7 +56,27 @@ final class MediaManager {
     var duration: Double = 0
     var playbackRate: Float = 1.0
     var repeatMode: RepeatMode = .off
-    var isShuffleEnabled = false
+    var isShuffleEnabled = false {
+        // Turning shuffle on (or tapping "Shuffle Play" again) starts a brand-new no-repeat cycle.
+        didSet { if isShuffleEnabled || isShuffleEnabled != oldValue { shuffleBag.reset() } }
+    }
+    @ObservationIgnored private var shuffleBag = ShuffleBag()
+
+    private var shuffleContextKey: String {
+        activePlaylistID?.uuidString ?? "library"
+    }
+
+    /// Next song from the no-repeat shuffle bag. `consume: false` only peeks.
+    private func nextShuffledItem(from queue: [MediaItem], consume: Bool) -> MediaItem? {
+        let path = shuffleBag.next(
+            queue: queue.map(\.relativePath),
+            current: currentItem?.relativePath,
+            contextKey: shuffleContextKey,
+            consume: consume
+        )
+        guard let path else { return nil }
+        return queue.first(where: { $0.relativePath == path })
+    }
 
     var convertingItemID: UUID?
     var conversionProgress: Double = 0
@@ -1084,7 +1108,13 @@ final class MediaManager {
         let queue = activeQueue
         guard !queue.isEmpty else { return [] }
         if isShuffleEnabled {
-            return queue.filter { $0.id != currentItem?.id }
+            let order = shuffleBag.upcomingPreview(
+                queue: queue.map(\.relativePath),
+                current: currentItem?.relativePath,
+                contextKey: shuffleContextKey
+            )
+            let byPath = Dictionary(queue.map { ($0.relativePath, $0) }, uniquingKeysWith: { first, _ in first })
+            return order.compactMap { byPath[$0] }
         }
         guard let currentItem,
               let index = queue.firstIndex(where: { $0.id == currentItem.id }) else {
@@ -1241,9 +1271,9 @@ final class MediaManager {
         guard !queue.isEmpty else { return }
 
         if isShuffleEnabled, queue.count > 1 {
-            let candidates = queue.filter { $0.id != currentItem?.id }
-            if let randomNext = candidates.randomElement() {
-                play(randomNext, inPlaylist: activePlaylistID)
+            // No-repeat shuffle: every song plays once before any song repeats.
+            if let shuffledNext = nextShuffledItem(from: queue, consume: true) {
+                play(shuffledNext, inPlaylist: activePlaylistID)
             }
             return
         }
@@ -1276,6 +1306,21 @@ final class MediaManager {
 
         let queue = activeQueue
         guard !queue.isEmpty else { return }
+
+        if isShuffleEnabled, queue.count > 1 {
+            // Go back to what actually played before, not the neighbour in playlist order.
+            if let previousPath = shuffleBag.previous(
+                queue: queue.map(\.relativePath),
+                current: currentItem?.relativePath,
+                contextKey: shuffleContextKey
+            ), let previousItem = queue.first(where: { $0.relativePath == previousPath }) {
+                play(previousItem, inPlaylist: activePlaylistID)
+            } else {
+                seek(to: 0)
+            }
+            return
+        }
+
         guard let currentItem,
               let index = queue.firstIndex(where: { $0.id == currentItem.id }) else {
             if let first = queue.first { play(first, inPlaylist: activePlaylistID) }
@@ -1302,6 +1347,8 @@ final class MediaManager {
         let cleanTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
         let cleanArtist = artist.trimmingCharacters(in: .whitespacesAndNewlines)
         var entry = customMetadataByPath[item.relativePath] ?? CustomTrackMetadata()
+        // A manual edit wins over AI song ID from now on.
+        entry.autoIdentifiedSource = nil
 
         entry.title = cleanTitle.isEmpty ? nil : cleanTitle
         if cleanArtist.isEmpty {
@@ -1397,6 +1444,64 @@ final class MediaManager {
         )
         let canonical = ArtistDatabase.canonicalizeSingle(artistName)
         statusMessage = "Verified \"\(titleToKeep)\" by \(canonical)"
+    }
+
+    /// Applies metadata found by `SongIdentificationService` without a full library reload, so it is
+    /// cheap enough to run after every imported song. Never overwrites an artist the user verified by hand.
+    @discardableResult
+    func applyAutoIdentifiedMetadata(
+        relativePath: String,
+        title: String,
+        artist: String,
+        album: String?,
+        genre: String?,
+        isrc: String?,
+        coverImage: UIImage?,
+        source: String
+    ) -> Bool {
+        var entry = customMetadataByPath[relativePath] ?? CustomTrackMetadata()
+        if entry.isArtistVerified == true && entry.autoIdentifiedSource == nil {
+            return false
+        }
+        let cleanTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanArtist = ArtistDatabase.canonicalizeSingle(artist.trimmingCharacters(in: .whitespacesAndNewlines))
+        guard !cleanTitle.isEmpty, !cleanArtist.isEmpty else { return false }
+
+        entry.title = cleanTitle
+        entry.artist = cleanArtist
+        entry.verifiedArtist = cleanArtist
+        entry.isArtistVerified = true
+        if let album, !album.isEmpty { entry.album = album }
+        if let genre, !genre.isEmpty { entry.genre = genre }
+        if let isrc, !isrc.isEmpty { entry.isrc = isrc }
+        entry.autoIdentifiedSource = source
+
+        if let coverImage, let jpeg = coverImage.jpegData(compressionQuality: 0.85) {
+            if let oldCover = entry.coverFileName {
+                try? FileManager.default.removeItem(at: coversDirectoryURL.appendingPathComponent(oldCover))
+            }
+            let coverName = "\(UUID().uuidString).jpg"
+            try? FileManager.default.createDirectory(at: coversDirectoryURL, withIntermediateDirectories: true)
+            try? jpeg.write(to: coversDirectoryURL.appendingPathComponent(coverName), options: [.atomic])
+            entry.coverFileName = coverName
+            thumbnails[relativePath] = coverImage
+        }
+        customMetadataByPath[relativePath] = entry
+
+        if let idx = items.firstIndex(where: { $0.relativePath == relativePath }) {
+            items[idx].metadataTitle = cleanTitle
+            items[idx].artist = cleanArtist
+            if currentItem?.relativePath == relativePath {
+                currentItem = items[idx]
+                updateNowPlayingInfo(for: items[idx])
+            }
+        }
+        saveLibraryState()
+        return true
+    }
+
+    func customMetadata(forRelativePath path: String) -> CustomTrackMetadata? {
+        customMetadataByPath[path]
     }
 
     func setSourceVideoID(_ videoID: String?, for item: MediaItem) {
@@ -2313,6 +2418,9 @@ final class MediaManager {
 
     func playPlaylist(_ playlist: Playlist, startingAt startItem: MediaItem? = nil) {
         let playlistItems = items(in: playlist)
+        if isShuffleEnabled && startItem == nil {
+            shuffleBag.reset()
+        }
         guard let first = startItem ?? (isShuffleEnabled ? playlistItems.randomElement() : playlistItems.first) else {
             errorMessage = "Playlist \"\(playlist.name)\" has no playable files."
             return
@@ -3104,7 +3212,7 @@ final class MediaManager {
     private func updateNowPlayingInfo(for item: MediaItem) {
         let custom = customMetadataByPath[item.relativePath]
         let resolvedTitle = custom?.title ?? item.metadataTitle ?? titlesByPath[item.relativePath] ?? item.name
-        let resolvedArtist = custom?.artist ?? item.artist ?? artistsByPath[item.relativePath] ?? (item.isVideo ? "MuSeJRM Video" : "Unknown Artist")
+        let resolvedArtist = custom?.artist ?? item.artist ?? artistsByPath[item.relativePath] ?? (item.isVideo ? "MuseJRM Video" : "Unknown Artist")
         let resolvedAlbum = custom?.album ?? item.album ?? albumsByPath[item.relativePath]
         let queue = activeQueue
         let queueIdx = queue.firstIndex(where: { $0.relativePath == item.relativePath })
@@ -3165,8 +3273,9 @@ final class MediaManager {
         let queue = activeQueue
         guard !queue.isEmpty else { return nil }
         if isShuffleEnabled, queue.count > 1 {
-            if let randomNext = queue.filter({ $0.id != currentItem?.id }).randomElement() {
-                return (randomNext, false)
+            // Peek only: the bag syncs once the crossfaded song becomes current, so the choice stays consistent.
+            if let shuffledNext = nextShuffledItem(from: queue, consume: false) {
+                return (shuffledNext, false)
             }
             return nil
         }
