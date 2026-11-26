@@ -74,6 +74,15 @@ final class BrowserYouTubeResolver: NSObject, WKNavigationDelegate, WKScriptMess
         hostContainerView = nil
     }
 
+    /// Cancels any currently running browser resolve/page load so Stop -> Retry starts immediately.
+    func cancelPendingOperations() {
+        activeTimeoutTask?.cancel()
+        activeTimeoutTask = nil
+        resumePageFinishIfPending()
+        resumeActiveResolve(with: nil)
+        webView?.stopLoading()
+    }
+
     /// Finds an exact YouTube video ID inside the built-in browser search page when InnerTube search fails.
     func findVideoIDInBrowser(title: String, artist: String) async -> String? {
         let query = [artist, title]

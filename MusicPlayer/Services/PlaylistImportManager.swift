@@ -583,6 +583,10 @@ final class PlaylistImportManager {
             summary: "Paused \"\(jobs[idx].playlistName)\" (\(jobs[idx].completedCount + jobs[idx].skippedCount) saved)",
             reloadLibrary: true
         )
+        if !activeJobs.contains(where: { !$0.isPaused && !$0.isCancelled }) {
+            BrowserYouTubeResolver.shared.cancelPendingOperations()
+            BrowserYouTubeResolver.shared.releaseIdleWebView()
+        }
         persistJobsNow()
         if let wakeup = pumpWakeupContinuation {
             pumpWakeupContinuation = nil
@@ -709,6 +713,9 @@ final class PlaylistImportManager {
             summary: "Stopped import \"\(jobs[idx].playlistName)\"",
             reloadLibrary: true
         )
+        if !activeJobs.contains(where: { !$0.isPaused && !$0.isCancelled }) {
+            BrowserYouTubeResolver.shared.cancelPendingOperations()
+        }
         BrowserYouTubeResolver.shared.releaseIdleWebView()
         persistJobsNow()
         if let wakeup = pumpWakeupContinuation {

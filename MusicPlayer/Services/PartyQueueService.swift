@@ -1,4 +1,5 @@
 import Foundation
+import Network
 import Observation
 import UIKit
 
@@ -23,6 +24,51 @@ struct PartyQueueEntry: Identifiable, Hashable, Codable {
     }
 }
 
+struct JamParticipant: Identifiable, Hashable, Codable, Sendable {
+    let id: String // senderID
+    var name: String
+    var isHost: Bool
+    var lastSeenAt: TimeInterval
+}
+
+struct JamPlaybackState: Hashable, Codable, Sendable {
+    var entryID: UUID?
+    var title: String
+    var artist: String
+    var youtubeVideoID: String?
+    var durationSeconds: Double?
+    var isPlaying: Bool
+    var positionSeconds: Double
+    var playbackRate: Float
+    var updatedAt: TimeInterval
+    var updatedBy: String
+
+    func estimatedPosition(at now: Date = .now) -> Double {
+        guard isPlaying else { return max(0, positionSeconds) }
+        let elapsed = max(0, now.timeIntervalSince1970 - updatedAt)
+        let raw = positionSeconds + elapsed * Double(max(0.5, playbackRate))
+        if let durationSeconds, durationSeconds > 0 {
+            return min(durationSeconds, max(0, raw))
+        }
+        return max(0, raw)
+    }
+}
+
+struct NearbyJamSession: Identifiable, Hashable, Sendable {
+    let id: String
+    let code: String
+    let name: String
+    let hostName: String
+
+    var formattedCode: String {
+        let clean = GroupPlaylistService.normalizeCode(code)
+        if clean.count == 8 {
+            return "\(clean.prefix(4))-\(clean.suffix(4))"
+        }
+        return clean
+    }
+}
+
 struct PartyQueueSession: Identifiable, Hashable, Codable {
     let id: UUID
     let code: String
@@ -37,6 +83,30 @@ struct PartyQueueSession: Identifiable, Hashable, Codable {
     var createdAt: Date = .now
     var lastSyncedAt: Date?
 
+    // 1-to-1 Spotify Jam fields (all optional so older saved sessions still decode cleanly)
+    var hostSenderID: String?
+    var hostName: String?
+    var guestsCanControlPlayback: Bool?
+    var participants: [JamParticipant]?
+    var kickedSenderIDs: [String]?
+    var livePlayback: JamPlaybackState?
+    var isEnded: Bool?
+
+    var allowsGuestControls: Bool {
+        guestsCanControlPlayback ?? true
+    }
+
+    var activeParticipantsList: [JamParticipant] {
+        let now = Date().timeIntervalSince1970
+        let list = (participants ?? []).filter { p in
+            !(kickedSenderIDs ?? []).contains(p.id) && (now - p.lastSeenAt < 180 || p.isHost)
+        }
+        return list.sorted { lhs, rhs in
+            if lhs.isHost != rhs.isHost { return lhs.isHost }
+            return lhs.lastSeenAt > rhs.lastSeenAt
+        }
+    }
+
     var formattedCode: String {
         let clean = GroupPlaylistService.normalizeCode(code)
         if clean.count == 8 {
@@ -48,22 +118,24 @@ struct PartyQueueSession: Identifiable, Hashable, Codable {
     var inviteLinkString: String {
         var comps = URLComponents()
         comps.scheme = "musicplayer"
-        comps.host = "party"
+        comps.host = "jam"
         comps.queryItems = [
             URLQueryItem(name: "code", value: formattedCode),
             URLQueryItem(name: "name", value: name)
         ]
-        return comps.string ?? "musicplayer://party?code=\(formattedCode)"
+        return comps.string ?? "musicplayer://jam?code=\(formattedCode)"
     }
 
     var shareMessage: String {
-        "Join my live Party Queue / Blend \"\(name)\"!\n\nCode: \(formattedCode)\nLink: \(inviteLinkString)\n\nIn MuseJRM: Playlists -> Party Queue -> Join Code or Link."
+        "Join my live Spotify-style Jam \"\(name)\"!\n\nJam Code: \(formattedCode)\nLink: \(inviteLinkString)\n\nIn MuseJRM: Playlists -> Jam -> Join Jam."
     }
 }
 
 private enum PartyQueueEventKind: String, Codable {
     case createParty
     case joinPresence
+    case heartbeat
+    case leaveParty
     case renameParty
     case enqueueTrack
     case updateEntryVideoID
@@ -71,7 +143,19 @@ private enum PartyQueueEventKind: String, Codable {
     case startPlaybackEntry
     case clearPlayedHistory
     case reorderBlendEntries
+    case playbackSync
+    case remoteCommand
+    case setGuestControl
+    case kickMember
+    case endJam
     case snapshot
+}
+
+private enum JamRemoteAction: String, Codable {
+    case play
+    case pause
+    case next
+    case seek
 }
 
 private struct PartyQueueEventPayload: Codable {
@@ -92,6 +176,13 @@ private struct PartyQueueEventPayload: Codable {
     var removedTimestamps: [UUID: TimeInterval]?
     var consumedEntryIDs: [UUID: TimeInterval]?
     var members: [String]?
+    var hostSenderID: String?
+    var hostName: String?
+    var guestsCanControlPlayback: Bool?
+    var playbackState: JamPlaybackState?
+    var remoteAction: JamRemoteAction?
+    var seekPosition: Double?
+    var targetSenderID: String?
 }
 
 @MainActor
@@ -105,21 +196,48 @@ final class PartyQueueService {
     var resolvingEntryID: UUID?
     var activePartyID: UUID?
     var lastSyncError: String?
+    var nearbyJams: [NearbyJamSession] = []
+
     var autoSavePartyTracks: Bool {
         didSet {
             UserDefaults.standard.set(autoSavePartyTracks, forKey: Self.autoSaveDefaultsKey)
         }
     }
 
+    /// True = Spotify "Listen together" on your own phone/earbuds; false = "Control host's speaker only".
+    var listenOnThisDevice: Bool {
+        didSet {
+            UserDefaults.standard.set(listenOnThisDevice, forKey: Self.listenTogetherDefaultsKey)
+            if !listenOnThisDevice, let activePartyID, !isHost(of: activePartyID) {
+                if MediaManager.shared.isPlaying {
+                    MediaManager.shared.pause()
+                }
+            } else if listenOnThisDevice, let activePartyID,
+                      let party = parties.first(where: { $0.id == activePartyID }),
+                      let state = party.livePlayback {
+                Task { await applyRemotePlaybackToGuestDevice(state, in: party) }
+            }
+        }
+    }
+
+    var localSenderID: String { deviceSenderID }
+
     @ObservationIgnored private let deviceSenderID: String
     @ObservationIgnored private var observedPartyID: UUID?
     @ObservationIgnored private var wsTask: URLSessionWebSocketTask?
     @ObservationIgnored private var liveListenTask: Task<Void, Never>?
     @ObservationIgnored private var pollLoopTask: Task<Void, Never>?
+    @ObservationIgnored private var hostSyncLoopTask: Task<Void, Never>?
+    @ObservationIgnored private var participantHeartbeatTask: Task<Void, Never>?
     @ObservationIgnored private var lastSnapshotBroadcastByParty: [UUID: Date] = [:]
+    @ObservationIgnored private var lastGuestSyncedSignature: String?
+    @ObservationIgnored private var lastGuestSyncedTrackID: UUID?
+    @ObservationIgnored private var bonjourListener: NWListener?
+    @ObservationIgnored private var bonjourBrowser: NWBrowser?
 
     private static let senderIDDefaultsKey = "musicplayer.party.senderID"
     private static let autoSaveDefaultsKey = "musicplayer.party.autoSave"
+    private static let listenTogetherDefaultsKey = "musicplayer.party.listenTogether"
 
     private init() {
         let d = UserDefaults.standard
@@ -131,6 +249,10 @@ final class PartyQueueService {
             self.deviceSenderID = fresh
         }
         self.autoSavePartyTracks = d.bool(forKey: Self.autoSaveDefaultsKey)
+        if d.object(forKey: Self.listenTogetherDefaultsKey) == nil {
+            d.set(true, forKey: Self.listenTogetherDefaultsKey)
+        }
+        self.listenOnThisDevice = d.bool(forKey: Self.listenTogetherDefaultsKey)
         loadParties()
     }
 
@@ -138,42 +260,112 @@ final class PartyQueueService {
         "mppty_\(GroupPlaylistService.normalizeCode(code).lowercased())"
     }
 
+    func isHost(of partyID: UUID) -> Bool {
+        guard let party = parties.first(where: { $0.id == partyID }) else { return false }
+        return party.hostSenderID == nil || party.hostSenderID == deviceSenderID
+    }
+
+    func canControlPlayback(in partyID: UUID) -> Bool {
+        guard let party = parties.first(where: { $0.id == partyID }) else { return false }
+        return isHost(of: partyID) || party.allowsGuestControls
+    }
+
+    func currentJamTitle(for partyID: UUID) -> String {
+        parties.first(where: { $0.id == partyID })?.name ?? "Jam"
+    }
+
+    var activeJamSession: PartyQueueSession? {
+        guard let activePartyID else { return nil }
+        return parties.first(where: { $0.id == activePartyID && $0.isEnded != true })
+    }
+
     // MARK: - Create / Join / Leave
 
     @discardableResult
-    func createParty(name: String) async -> PartyQueueSession {
+    func createParty(name: String, guestsCanControl: Bool = true) async -> PartyQueueSession {
         let cleanName = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        let finalName = cleanName.isEmpty ? "Party Queue" : cleanName
+        let finalName = cleanName.isEmpty ? "\(currentMemberName)'s Jam" : cleanName
         let code = GroupPlaylistService.normalizeCode(GroupPlaylistService.generateRoomCode())
         let member = currentMemberName
+        let now = Date().timeIntervalSince1970
+
+        var seededUpNext: [PartyQueueEntry] = []
+        var initialPlayback: JamPlaybackState?
+        var seededNowPlaying: PartyQueueEntry?
+
+        // Seed currently playing song into the Jam automatically, just like Spotify Jam!
+        if let current = MediaManager.shared.currentItem {
+            let currentEntry = PartyQueueEntry(
+                id: UUID(),
+                title: current.displayTitle,
+                artist: (current.artist ?? "").trimmingCharacters(in: .whitespacesAndNewlines),
+                youtubeVideoID: MediaManager.shared.sourceVideoID(for: current),
+                durationSeconds: MediaManager.shared.duration > 0 ? MediaManager.shared.duration : current.durationSeconds,
+                queuedBy: member,
+                queuedBySenderID: deviceSenderID,
+                localQueuedAt: now,
+                serverQueuedAt: nil
+            )
+            seededNowPlaying = currentEntry
+            initialPlayback = JamPlaybackState(
+                entryID: currentEntry.id,
+                title: currentEntry.title,
+                artist: currentEntry.artist,
+                youtubeVideoID: currentEntry.youtubeVideoID,
+                durationSeconds: currentEntry.durationSeconds,
+                isPlaying: MediaManager.shared.isPlaying,
+                positionSeconds: MediaManager.shared.currentTime,
+                playbackRate: MediaManager.shared.playbackRate,
+                updatedAt: now,
+                updatedBy: member
+            )
+        } else {
+            seededUpNext = []
+        }
 
         let party = PartyQueueSession(
             id: UUID(),
             code: code,
             name: finalName,
-            upNext: [],
-            nowPlayingEntry: nil,
+            upNext: seededUpNext,
+            nowPlayingEntry: seededNowPlaying,
             playedHistory: [],
             removedTimestamps: [:],
             consumedEntryIDs: [:],
             appliedEventIDs: [],
             knownMembers: [member],
             createdAt: .now,
-            lastSyncedAt: .now
+            lastSyncedAt: .now,
+            hostSenderID: deviceSenderID,
+            hostName: member,
+            guestsCanControlPlayback: guestsCanControl,
+            participants: [JamParticipant(id: deviceSenderID, name: member, isHost: true, lastSeenAt: now)],
+            kickedSenderIDs: [],
+            livePlayback: initialPlayback,
+            isEnded: false
         )
         parties.insert(party, at: 0)
+        activePartyID = party.id
+        installJamExternalQueueHandlers(for: party.id)
         saveParties()
 
         let evt = PartyQueueEventPayload(
             id: UUID(),
             senderID: deviceSenderID,
             senderName: member,
-            timestamp: Date().timeIntervalSince1970,
+            timestamp: now,
             kind: .createParty,
             partyName: finalName,
-            members: [member]
+            nowPlayingEntry: seededNowPlaying,
+            members: [member],
+            hostSenderID: deviceSenderID,
+            hostName: member,
+            guestsCanControlPlayback: guestsCanControl,
+            playbackState: initialPlayback
         )
         applyEvent(evt, serverTime: nil, toPartyID: party.id)
+        startBonjourAdvertising(for: party)
+        startHostSyncLoopIfNeeded(for: party.id)
         await publishEvent(evt, topic: Self.topicName(forCode: code))
         return parties.first(where: { $0.id == party.id }) ?? party
     }
@@ -182,18 +374,20 @@ final class PartyQueueService {
     func joinParty(input: String) async -> PartyQueueSession? {
         lastSyncError = nil
         guard let parsed = GroupPlaylistService.parseInviteInput(input) else {
-            lastSyncError = "Enter a valid 8-character Party Code or Invite Link."
+            lastSyncError = "Enter a valid 8-character Jam Code or Invite Link."
             return nil
         }
 
         if let existing = parties.first(where: { GroupPlaylistService.normalizeCode($0.code) == parsed.code }) {
             pendingOpenPartyID = existing.id
+            activePartyID = existing.id
             await refreshParty(id: existing.id)
             return parties.first(where: { $0.id == existing.id }) ?? existing
         }
 
-        let initialName = parsed.name?.isEmpty == false ? parsed.name! : "Party \(String(parsed.code.prefix(4)))"
+        let initialName = parsed.name?.isEmpty == false ? parsed.name! : "Jam \(String(parsed.code.prefix(4)))"
         let member = currentMemberName
+        let now = Date().timeIntervalSince1970
         let party = PartyQueueSession(
             id: UUID(),
             code: parsed.code,
@@ -206,13 +400,30 @@ final class PartyQueueService {
             appliedEventIDs: [],
             knownMembers: [member],
             createdAt: .now,
-            lastSyncedAt: nil
+            lastSyncedAt: nil,
+            hostSenderID: nil,
+            hostName: nil,
+            guestsCanControlPlayback: true,
+            participants: [JamParticipant(id: deviceSenderID, name: member, isHost: false, lastSeenAt: now)],
+            kickedSenderIDs: [],
+            livePlayback: nil,
+            isEnded: false
         )
         parties.insert(party, at: 0)
         saveParties()
         pendingOpenPartyID = party.id
+        activePartyID = party.id
 
         await refreshParty(id: party.id)
+
+        if let fresh = parties.first(where: { $0.id == party.id }), fresh.kickedSenderIDs?.contains(deviceSenderID) == true {
+            parties.removeAll { $0.id == party.id }
+            saveParties()
+            pendingOpenPartyID = nil
+            activePartyID = nil
+            lastSyncError = "You were removed from this Jam by the host."
+            return nil
+        }
 
         let updated = parties.first(where: { $0.id == party.id })
         let isEmptyRoom = (updated?.upNext.isEmpty ?? true) && (updated?.nowPlayingEntry == nil)
@@ -220,7 +431,7 @@ final class PartyQueueService {
             id: UUID(),
             senderID: deviceSenderID,
             senderName: member,
-            timestamp: Date().timeIntervalSince1970,
+            timestamp: now,
             kind: .joinPresence,
             needsSnapshot: isEmptyRoom
         )
@@ -230,14 +441,79 @@ final class PartyQueueService {
     }
 
     func leaveParty(id: UUID) {
+        if let party = parties.first(where: { $0.id == id }) {
+            let evt = PartyQueueEventPayload(
+                id: UUID(),
+                senderID: deviceSenderID,
+                senderName: currentMemberName,
+                timestamp: Date().timeIntervalSince1970,
+                kind: .leaveParty,
+                targetSenderID: deviceSenderID
+            )
+            let topic = Self.topicName(forCode: party.code)
+            Task { await self.publishEvent(evt, topic: topic) }
+        }
         if observedPartyID == id {
             stopObservingParty()
+        }
+        if isHost(of: id) {
+            stopBonjourAdvertising()
         }
         parties.removeAll { $0.id == id }
         saveParties()
         if activePartyID == id {
             activePartyID = nil
+            hostSyncLoopTask?.cancel()
+            hostSyncLoopTask = nil
+            MediaManager.shared.externalQueueNextHandler = nil
+            MediaManager.shared.externalQueuePreviousHandler = nil
         }
+    }
+
+    func endJamForEveryone(id: UUID) {
+        guard isHost(of: id), let party = parties.first(where: { $0.id == id }) else {
+            leaveParty(id: id)
+            return
+        }
+        let evt = PartyQueueEventPayload(
+            id: UUID(),
+            senderID: deviceSenderID,
+            senderName: currentMemberName,
+            timestamp: Date().timeIntervalSince1970,
+            kind: .endJam
+        )
+        let topic = Self.topicName(forCode: party.code)
+        Task { await self.publishEvent(evt, topic: topic) }
+        leaveParty(id: id)
+    }
+
+    func kickParticipant(_ participantID: String, from partyID: UUID) {
+        guard isHost(of: partyID), participantID != deviceSenderID,
+              let party = parties.first(where: { $0.id == partyID }) else { return }
+        let evt = PartyQueueEventPayload(
+            id: UUID(),
+            senderID: deviceSenderID,
+            senderName: currentMemberName,
+            timestamp: Date().timeIntervalSince1970,
+            kind: .kickMember,
+            targetSenderID: participantID
+        )
+        applyEvent(evt, serverTime: nil, toPartyID: partyID)
+        Task { await publishEvent(evt, topic: Self.topicName(forCode: party.code)) }
+    }
+
+    func setGuestsCanControl(_ enabled: Bool, in partyID: UUID) {
+        guard isHost(of: partyID), let party = parties.first(where: { $0.id == partyID }) else { return }
+        let evt = PartyQueueEventPayload(
+            id: UUID(),
+            senderID: deviceSenderID,
+            senderName: currentMemberName,
+            timestamp: Date().timeIntervalSince1970,
+            kind: .setGuestControl,
+            guestsCanControlPlayback: enabled
+        )
+        applyEvent(evt, serverTime: nil, toPartyID: partyID)
+        Task { await publishEvent(evt, topic: Self.topicName(forCode: party.code)) }
     }
 
     func renameParty(id: UUID, to newName: String) {
@@ -254,12 +530,15 @@ final class PartyQueueService {
             partyName: trimmed
         )
         applyEvent(evt, serverTime: nil, toPartyID: id)
+        if isHost(of: id), let updated = parties.first(where: { $0.id == id }) {
+            startBonjourAdvertising(for: updated)
+        }
         Task {
             await publishEvent(evt, topic: Self.topicName(forCode: party.code))
         }
     }
 
-    // MARK: - First-Come First-Serve Queuing & Blend Actions
+    // MARK: - Queueing, Reordering & Blend Actions
 
     func queueLocalItem(_ item: MediaItem, to partyID: UUID, silent: Bool = false) {
         guard let party = parties.first(where: { $0.id == partyID }) else { return }
@@ -289,7 +568,7 @@ final class PartyQueueService {
         applyEvent(evt, serverTime: nil, toPartyID: partyID)
         if !silent {
             AppHaptics.light()
-            MediaManager.shared.statusMessage = "Queued \"\(entry.title)\" in \(party.name)"
+            MediaManager.shared.statusMessage = "Added \"\(entry.title)\" to \(party.name)"
         }
 
         let topic = Self.topicName(forCode: party.code)
@@ -347,7 +626,7 @@ final class PartyQueueService {
         )
         applyEvent(evt, serverTime: nil, toPartyID: partyID)
         AppHaptics.light()
-        MediaManager.shared.statusMessage = "Queued \"\(cleanTitle)\" in \(party.name)"
+        MediaManager.shared.statusMessage = "Added \"\(cleanTitle)\" to \(party.name)"
 
         let topic = Self.topicName(forCode: party.code)
         Task {
@@ -365,6 +644,25 @@ final class PartyQueueService {
         )
     }
 
+    func moveUpNext(from source: IndexSet, to destination: Int, in partyID: UUID) {
+        guard canControlPlayback(in: partyID),
+              let idx = parties.firstIndex(where: { $0.id == partyID }) else { return }
+        var reordered = parties[idx].upNext
+        reordered.move(fromOffsets: source, toOffset: destination)
+        let orderedIDs = reordered.map(\.id)
+        let evt = PartyQueueEventPayload(
+            id: UUID(),
+            senderID: deviceSenderID,
+            senderName: currentMemberName,
+            timestamp: Date().timeIntervalSince1970,
+            kind: .reorderBlendEntries,
+            orderedEntryIDs: orderedIDs
+        )
+        applyEvent(evt, serverTime: nil, toPartyID: partyID)
+        let topic = Self.topicName(forCode: parties[idx].code)
+        Task { await publishEvent(evt, topic: topic) }
+    }
+
     func blendMyFavorites(into partyID: UUID, maxCount: Int = 5) {
         let favs = MediaManager.shared.favoriteItems
         let pool = favs.isEmpty ? Array(MediaManager.shared.audioItems.shuffled().prefix(maxCount)) : Array(favs.shuffled().prefix(maxCount))
@@ -376,13 +674,13 @@ final class PartyQueueService {
             queueLocalItem(item, to: partyID, silent: true)
         }
         AppHaptics.success()
-        MediaManager.shared.statusMessage = "Added \(pool.count) songs to Party Blend"
+        MediaManager.shared.statusMessage = "Added \(pool.count) songs to Jam Blend"
     }
 
     func interleaveBlendOrder(in partyID: UUID) {
-        guard let party = parties.first(where: { $0.id == partyID }), party.upNext.count > 1 else { return }
+        guard canControlPlayback(in: partyID),
+              let party = parties.first(where: { $0.id == partyID }), party.upNext.count > 1 else { return }
 
-        // Group currently queued items by sender, then round-robin interleave for a balanced Blend
         var buckets: [String: [PartyQueueEntry]] = [:]
         var senderOrder: [String] = []
         for entry in party.upNext {
@@ -423,6 +721,10 @@ final class PartyQueueService {
 
     func removeEntry(_ entryID: UUID, from partyID: UUID) {
         guard let party = parties.first(where: { $0.id == partyID }) else { return }
+        // Guests can always remove tracks they queued themselves, or any track if guest control is enabled.
+        let isOwn = party.upNext.first(where: { $0.id == entryID })?.queuedBySenderID == deviceSenderID
+        guard isOwn || canControlPlayback(in: partyID) else { return }
+
         let evt = PartyQueueEventPayload(
             id: UUID(),
             senderID: deviceSenderID,
@@ -437,7 +739,55 @@ final class PartyQueueService {
         }
     }
 
-    // MARK: - FIFO Playback
+    // MARK: - 1-to-1 Spotify Jam Playback & Live Sync
+
+    func toggleJamPlayPause(in partyID: UUID, downloader: WebMediaDownloader) async {
+        guard canControlPlayback(in: partyID),
+              let party = parties.first(where: { $0.id == partyID }) else { return }
+
+        if isHost(of: partyID) {
+            if MediaManager.shared.currentItem != nil {
+                MediaManager.shared.togglePlayPause()
+                await broadcastHostPlaybackState(for: partyID)
+            } else {
+                _ = await startOrAdvanceFIFOPlayback(in: partyID, downloader: downloader)
+            }
+            return
+        }
+
+        let currentlyPlaying = party.livePlayback?.isPlaying ?? false
+        let action: JamRemoteAction = currentlyPlaying ? .pause : .play
+        let evt = PartyQueueEventPayload(
+            id: UUID(),
+            senderID: deviceSenderID,
+            senderName: currentMemberName,
+            timestamp: Date().timeIntervalSince1970,
+            kind: .remoteCommand,
+            remoteAction: action
+        )
+        await publishEvent(evt, topic: Self.topicName(forCode: party.code))
+    }
+
+    func seekJam(to position: Double, in partyID: UUID) async {
+        guard canControlPlayback(in: partyID),
+              let party = parties.first(where: { $0.id == partyID }) else { return }
+        let clamped = max(0, position)
+        if isHost(of: partyID) {
+            MediaManager.shared.seek(to: clamped)
+            await broadcastHostPlaybackState(for: partyID)
+            return
+        }
+        let evt = PartyQueueEventPayload(
+            id: UUID(),
+            senderID: deviceSenderID,
+            senderName: currentMemberName,
+            timestamp: Date().timeIntervalSince1970,
+            kind: .remoteCommand,
+            remoteAction: .seek,
+            seekPosition: clamped
+        )
+        await publishEvent(evt, topic: Self.topicName(forCode: party.code))
+    }
 
     func startOrAdvanceFIFOPlayback(
         in partyID: UUID,
@@ -445,43 +795,103 @@ final class PartyQueueService {
         specificEntry: PartyQueueEntry? = nil
     ) async -> Bool {
         guard let party = parties.first(where: { $0.id == partyID }) else { return false }
+
+        // If a guest with permission taps a specific song or Next while controlling the Jam:
+        // update & broadcast so the Host jumps to it too!
         guard let targetEntry = specificEntry ?? party.upNext.first ?? party.nowPlayingEntry else {
-            MediaManager.shared.errorMessage = "Party queue is empty. Queue a song first!"
+            MediaManager.shared.errorMessage = "Jam queue is empty. Add a song first!"
             return false
         }
 
         activePartyID = partyID
+        installJamExternalQueueHandlers(for: partyID)
+
+        if isHost(of: partyID) {
+            startBonjourAdvertising(for: party)
+            startHostSyncLoopIfNeeded(for: partyID)
+        }
+
+        let now = Date().timeIntervalSince1970
+        let newState = JamPlaybackState(
+            entryID: targetEntry.id,
+            title: targetEntry.title,
+            artist: targetEntry.artist,
+            youtubeVideoID: targetEntry.youtubeVideoID,
+            durationSeconds: targetEntry.durationSeconds,
+            isPlaying: true,
+            positionSeconds: 0,
+            playbackRate: MediaManager.shared.playbackRate,
+            updatedAt: now,
+            updatedBy: currentMemberName
+        )
+
+        if party.upNext.contains(where: { $0.id == targetEntry.id }) || isHost(of: partyID) {
+            let startEvt = PartyQueueEventPayload(
+                id: UUID(),
+                senderID: deviceSenderID,
+                senderName: currentMemberName,
+                timestamp: now,
+                kind: .startPlaybackEntry,
+                entryID: targetEntry.id,
+                playbackState: newState
+            )
+            applyEvent(startEvt, serverTime: nil, toPartyID: partyID)
+            let topic = Self.topicName(forCode: party.code)
+            Task { await publishEvent(startEvt, topic: topic) }
+        } else if canControlPlayback(in: partyID) {
+            let startEvt = PartyQueueEventPayload(
+                id: UUID(),
+                senderID: deviceSenderID,
+                senderName: currentMemberName,
+                timestamp: now,
+                kind: .startPlaybackEntry,
+                entryID: targetEntry.id,
+                playbackState: newState
+            )
+            applyEvent(startEvt, serverTime: nil, toPartyID: partyID)
+            let topic = Self.topicName(forCode: party.code)
+            Task { await publishEvent(startEvt, topic: topic) }
+            if !listenOnThisDevice {
+                return true
+            }
+        }
+
+        if !isHost(of: partyID) && !listenOnThisDevice {
+            return true
+        }
+
+        let ok = await loadAndPlayEntryLocally(targetEntry, in: partyID, downloader: downloader)
+        if ok && isHost(of: partyID) {
+            await broadcastHostPlaybackState(for: partyID)
+        }
+        return ok
+    }
+
+    private func installJamExternalQueueHandlers(for partyID: UUID) {
         MediaManager.shared.externalQueueNextHandler = { [weak self] in
             guard let self else { return false }
             Task { @MainActor in
-                _ = await self.startOrAdvanceFIFOPlayback(in: partyID, downloader: downloader)
+                _ = await self.startOrAdvanceFIFOPlayback(in: partyID, downloader: WebMediaDownloader.shared)
             }
             return true
         }
         MediaManager.shared.externalQueuePreviousHandler = {
             MediaManager.shared.seek(to: 0)
+            Task { @MainActor in
+                await PartyQueueService.shared.broadcastHostPlaybackState(for: partyID)
+            }
             return true
         }
+    }
 
-        // Only advance/consume queue when starting an item in upNext
-        if party.upNext.contains(where: { $0.id == targetEntry.id }) {
-            let startEvt = PartyQueueEventPayload(
-                id: UUID(),
-                senderID: deviceSenderID,
-                senderName: currentMemberName,
-                timestamp: Date().timeIntervalSince1970,
-                kind: .startPlaybackEntry,
-                entryID: targetEntry.id
-            )
-            applyEvent(startEvt, serverTime: nil, toPartyID: partyID)
-            let topic = Self.topicName(forCode: party.code)
-            Task {
-                await publishEvent(startEvt, topic: topic)
-            }
-        }
-
+    private func loadAndPlayEntryLocally(
+        _ targetEntry: PartyQueueEntry,
+        in partyID: UUID,
+        downloader: WebMediaDownloader
+    ) async -> Bool {
         if let localMatch = matchingLocalItem(for: targetEntry) {
             MediaManager.shared.play(localMatch, inPlaylist: nil, keepExternalQueue: true)
+            lastGuestSyncedTrackID = targetEntry.id
             return true
         }
 
@@ -516,7 +926,7 @@ final class PartyQueueService {
               let watchURL = URL(string: "https://www.youtube.com/watch?v=\(vid)"),
               let resolved = await YouTubeStreamResolver.resolveStreams(for: watchURL),
               !resolved.streams.isEmpty else {
-            MediaManager.shared.errorMessage = "Could not load \"\(targetEntry.title)\". Advancing queue..."
+            MediaManager.shared.errorMessage = "Could not load \"\(targetEntry.title)\"."
             return false
         }
 
@@ -546,6 +956,7 @@ final class PartyQueueService {
                sourceVideoID: vid
            ) {
             MediaManager.shared.play(saved, inPlaylist: nil, keepExternalQueue: true)
+            lastGuestSyncedTrackID = targetEntry.id
             return true
         }
 
@@ -557,6 +968,7 @@ final class PartyQueueService {
             isVideo: !taggedPrimary.isAudio,
             keepExternalQueue: true
         )
+        lastGuestSyncedTrackID = targetEntry.id
         return true
     }
 
@@ -571,12 +983,211 @@ final class PartyQueueService {
         return items.first { normalizedComparable($0.displayTitle) == target }
     }
 
+    // MARK: - Host Sync Heartbeat & Guest Playback Alignment
+
+    private func startHostSyncLoopIfNeeded(for partyID: UUID) {
+        hostSyncLoopTask?.cancel()
+        guard isHost(of: partyID) else { return }
+        hostSyncLoopTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(2.5))
+                guard let self, !Task.isCancelled else { break }
+                guard self.activePartyID == partyID, self.isHost(of: partyID) else { break }
+                await self.broadcastHostPlaybackState(for: partyID)
+            }
+        }
+    }
+
+    func broadcastHostPlaybackState(for partyID: UUID) async {
+        guard isHost(of: partyID), let idx = parties.firstIndex(where: { $0.id == partyID }) else { return }
+        guard let item = MediaManager.shared.currentItem else { return }
+
+        let now = Date().timeIntervalSince1970
+        let existingEntry = parties[idx].nowPlayingEntry
+        let entryID: UUID
+        if let existingEntry, normalizedComparable(existingEntry.title) == normalizedComparable(item.displayTitle) {
+            entryID = existingEntry.id
+        } else {
+            let freshEntry = PartyQueueEntry(
+                id: UUID(),
+                title: item.displayTitle,
+                artist: (item.artist ?? "").trimmingCharacters(in: .whitespacesAndNewlines),
+                youtubeVideoID: MediaManager.shared.sourceVideoID(for: item),
+                durationSeconds: MediaManager.shared.duration > 0 ? MediaManager.shared.duration : item.durationSeconds,
+                queuedBy: currentMemberName,
+                queuedBySenderID: deviceSenderID,
+                localQueuedAt: now,
+                serverQueuedAt: nil
+            )
+            parties[idx].nowPlayingEntry = freshEntry
+            entryID = freshEntry.id
+        }
+
+        let state = JamPlaybackState(
+            entryID: entryID,
+            title: item.displayTitle,
+            artist: (item.artist ?? "").trimmingCharacters(in: .whitespacesAndNewlines),
+            youtubeVideoID: MediaManager.shared.sourceVideoID(for: item),
+            durationSeconds: MediaManager.shared.duration > 0 ? MediaManager.shared.duration : item.durationSeconds,
+            isPlaying: MediaManager.shared.isPlaying,
+            positionSeconds: MediaManager.shared.currentTime,
+            playbackRate: MediaManager.shared.playbackRate,
+            updatedAt: now,
+            updatedBy: currentMemberName
+        )
+
+        // Only broadcast when track/playState changes OR >4s since last network push to keep bandwidth light.
+        let prev = parties[idx].livePlayback
+        let trackChanged = prev?.title != state.title || prev?.isPlaying != state.isPlaying
+        let driftFromExpected = prev.map { abs($0.estimatedPosition() - state.positionSeconds) > 2.2 } ?? true
+        let age = now - (prev?.updatedAt ?? 0)
+        guard trackChanged || driftFromExpected || age >= 4.0 else { return }
+
+        parties[idx].livePlayback = state
+        saveParties()
+
+        let evt = PartyQueueEventPayload(
+            id: UUID(),
+            senderID: deviceSenderID,
+            senderName: currentMemberName,
+            timestamp: now,
+            kind: .playbackSync,
+            nowPlayingEntry: parties[idx].nowPlayingEntry,
+            playbackState: state
+        )
+        await publishEvent(evt, topic: Self.topicName(forCode: parties[idx].code))
+    }
+
+    private func applyRemotePlaybackToGuestDevice(_ state: JamPlaybackState, in party: PartyQueueSession) async {
+        guard !isHost(of: party.id), listenOnThisDevice, party.isEnded != true else { return }
+
+        let sig = "\(state.entryID?.uuidString ?? state.title)|\(state.isPlaying)|\(Int(state.updatedAt))"
+        if sig == lastGuestSyncedSignature { return }
+        lastGuestSyncedSignature = sig
+
+        let desiredPos = state.estimatedPosition()
+        let isSameTrack: Bool = {
+            if let eid = state.entryID, eid == lastGuestSyncedTrackID, MediaManager.shared.currentItem != nil {
+                return true
+            }
+            if let cur = MediaManager.shared.currentItem,
+               normalizedComparable(cur.displayTitle) == normalizedComparable(state.title) {
+                return true
+            }
+            return false
+        }()
+
+        if !isSameTrack {
+            let entry = party.nowPlayingEntry ?? PartyQueueEntry(
+                id: state.entryID ?? UUID(),
+                title: state.title,
+                artist: state.artist,
+                youtubeVideoID: state.youtubeVideoID,
+                durationSeconds: state.durationSeconds,
+                queuedBy: party.hostName ?? "Host",
+                queuedBySenderID: party.hostSenderID ?? "",
+                localQueuedAt: state.updatedAt,
+                serverQueuedAt: nil
+            )
+            let ok = await loadAndPlayEntryLocally(entry, in: party.id, downloader: WebMediaDownloader.shared)
+            if ok {
+                if desiredPos > 1.5 {
+                    MediaManager.shared.seek(to: desiredPos)
+                }
+                if !state.isPlaying {
+                    MediaManager.shared.pause()
+                }
+            }
+            return
+        }
+
+        if state.isPlaying && !MediaManager.shared.isPlaying {
+            MediaManager.shared.resume()
+        } else if !state.isPlaying && MediaManager.shared.isPlaying {
+            MediaManager.shared.pause()
+        }
+
+        let localPos = MediaManager.shared.currentTime
+        if abs(localPos - desiredPos) > 2.0 {
+            MediaManager.shared.seek(to: desiredPos)
+        }
+    }
+
+    // MARK: - Nearby Wi-Fi Jam Discovery (Bonjour _musejrm-jam._tcp)
+
+    func startBonjourDiscovery() {
+        guard bonjourBrowser == nil else { return }
+        let params = NWParameters.tcp
+        params.includePeerToPeer = true
+        let browser = NWBrowser(for: .bonjour(type: "_musejrm-jam._tcp", domain: nil), using: params)
+        browser.browseResultsChangedHandler = { [weak self] results, _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                var found: [NearbyJamSession] = []
+                for res in results {
+                    if case .bonjour(let txt) = res.metadata,
+                       let code = txt["code"], !code.isEmpty {
+                        let norm = GroupPlaylistService.normalizeCode(code)
+                        if self.parties.contains(where: { GroupPlaylistService.normalizeCode($0.code) == norm && self.isHost(of: $0.id) }) {
+                            continue
+                        }
+                        let name = txt["name"] ?? "Nearby Jam"
+                        let host = txt["host"] ?? "Friend"
+                        if !found.contains(where: { $0.code == norm }) {
+                            found.append(NearbyJamSession(id: norm, code: norm, name: name, hostName: host))
+                        }
+                    }
+                }
+                self.nearbyJams = found
+            }
+        }
+        browser.start(queue: .main)
+        bonjourBrowser = browser
+    }
+
+    func stopBonjourDiscovery() {
+        bonjourBrowser?.cancel()
+        bonjourBrowser = nil
+        nearbyJams = []
+    }
+
+    private func startBonjourAdvertising(for party: PartyQueueSession) {
+        stopBonjourAdvertising()
+        guard let listener = try? NWListener(using: .tcp) else { return }
+        var txt = NWTXTRecord()
+        txt["code"] = party.code
+        txt["name"] = party.name
+        txt["host"] = currentMemberName
+        listener.service = NWListener.Service(
+            name: "MuseJRM-\(String(party.code.prefix(4)))",
+            type: "_musejrm-jam._tcp",
+            domain: nil,
+            txtRecord: txt
+        )
+        listener.newConnectionHandler = { conn in
+            conn.cancel()
+        }
+        listener.start(queue: .main)
+        bonjourListener = listener
+    }
+
+    private func stopBonjourAdvertising() {
+        bonjourListener?.cancel()
+        bonjourListener = nil
+    }
+
     // MARK: - Live Relay (ntfy.sh WebSocket + Poll)
 
     func startObservingParty(id: UUID) {
         if observedPartyID == id, wsTask != nil { return }
         stopObservingParty()
         observedPartyID = id
+        if isHost(of: id), let party = parties.first(where: { $0.id == id }) {
+            startBonjourAdvertising(for: party)
+            if activePartyID == id {
+                startHostSyncLoopIfNeeded(for: id)
+            }
+        }
 
         liveListenTask = Task { [weak self] in
             guard let self else { return }
@@ -598,6 +1209,23 @@ final class PartyQueueService {
                 await self.refreshParty(id: id)
             }
         }
+
+        participantHeartbeatTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(25.0))
+                guard let self, !Task.isCancelled, self.observedPartyID == id,
+                      let party = self.parties.first(where: { $0.id == id }) else { break }
+                let hb = PartyQueueEventPayload(
+                    id: UUID(),
+                    senderID: self.deviceSenderID,
+                    senderName: self.currentMemberName,
+                    timestamp: Date().timeIntervalSince1970,
+                    kind: .heartbeat
+                )
+                self.applyEvent(hb, serverTime: nil, toPartyID: id)
+                await self.publishEvent(hb, topic: Self.topicName(forCode: party.code))
+            }
+        }
     }
 
     func stopObservingParty() {
@@ -607,6 +1235,8 @@ final class PartyQueueService {
         liveListenTask = nil
         pollLoopTask?.cancel()
         pollLoopTask = nil
+        participantHeartbeatTask?.cancel()
+        participantHeartbeatTask = nil
         wsTask?.cancel(with: .goingAway, reason: nil)
         wsTask = nil
     }
@@ -688,9 +1318,9 @@ final class PartyQueueService {
 
         if payload.kind == .joinPresence && payload.needsSnapshot == true && payload.senderID != deviceSenderID {
             if let party = parties.first(where: { $0.id == partyID }),
-               !party.upNext.isEmpty || party.nowPlayingEntry != nil {
+               !party.upNext.isEmpty || party.nowPlayingEntry != nil || party.livePlayback != nil {
                 let last = lastSnapshotBroadcastByParty[partyID] ?? .distantPast
-                if Date().timeIntervalSince(last) > 5 {
+                if Date().timeIntervalSince(last) > 4 {
                     lastSnapshotBroadcastByParty[partyID] = .now
                     let snapshot = PartyQueueEventPayload(
                         id: UUID(),
@@ -704,7 +1334,11 @@ final class PartyQueueService {
                         playedHistory: Array(party.playedHistory.prefix(30)),
                         removedTimestamps: party.removedTimestamps,
                         consumedEntryIDs: party.consumedEntryIDs,
-                        members: party.knownMembers
+                        members: party.knownMembers,
+                        hostSenderID: party.hostSenderID,
+                        hostName: party.hostName,
+                        guestsCanControlPlayback: party.allowsGuestControls,
+                        playbackState: party.livePlayback
                     )
                     let topic = Self.topicName(forCode: party.code)
                     Task { await self.publishEvent(snapshot, topic: topic) }
@@ -732,7 +1366,11 @@ final class PartyQueueService {
             playedHistory: Array(party.playedHistory.prefix(30)),
             removedTimestamps: party.removedTimestamps,
             consumedEntryIDs: party.consumedEntryIDs,
-            members: party.knownMembers
+            members: party.knownMembers,
+            hostSenderID: party.hostSenderID,
+            hostName: party.hostName,
+            guestsCanControlPlayback: party.allowsGuestControls,
+            playbackState: party.livePlayback
         )
         await publishEvent(snapshot, topic: Self.topicName(forCode: party.code))
     }
@@ -757,7 +1395,6 @@ final class PartyQueueService {
     ) {
         guard let idx = parties.firstIndex(where: { $0.id == partyID }) else { return }
 
-        // Allow serverTime backfill for own queued track echoed back by ntfy
         if event.kind == .enqueueTrack,
            let entry = event.entry,
            let serverTime,
@@ -781,14 +1418,75 @@ final class PartyQueueService {
             parties[idx].knownMembers.append(cleanMember)
         }
 
+        // Update participant presence list
+        if !event.senderID.isEmpty, event.kind != .leaveParty {
+            var plist = parties[idx].participants ?? []
+            let isEventHost = (event.hostSenderID ?? parties[idx].hostSenderID) == event.senderID
+            if let pIdx = plist.firstIndex(where: { $0.id == event.senderID }) {
+                if !cleanMember.isEmpty { plist[pIdx].name = cleanMember }
+                plist[pIdx].lastSeenAt = max(plist[pIdx].lastSeenAt, event.timestamp)
+                plist[pIdx].isHost = plist[pIdx].isHost || isEventHost
+            } else if !cleanMember.isEmpty {
+                plist.append(JamParticipant(id: event.senderID, name: cleanMember, isHost: isEventHost, lastSeenAt: event.timestamp))
+            }
+            parties[idx].participants = plist
+        }
+
         switch event.kind {
-        case .createParty, .renameParty:
+        case .createParty:
+            if let hostID = event.hostSenderID, !hostID.isEmpty {
+                parties[idx].hostSenderID = hostID
+                parties[idx].hostName = event.hostName
+            }
+            if let newName = event.partyName?.trimmingCharacters(in: .whitespacesAndNewlines), !newName.isEmpty {
+                parties[idx].name = newName
+            }
+            if let allow = event.guestsCanControlPlayback {
+                parties[idx].guestsCanControlPlayback = allow
+            }
+            if let nowPlaying = event.nowPlayingEntry {
+                parties[idx].nowPlayingEntry = nowPlaying
+            }
+            if let state = event.playbackState {
+                parties[idx].livePlayback = state
+            }
+
+        case .renameParty:
             if let newName = event.partyName?.trimmingCharacters(in: .whitespacesAndNewlines), !newName.isEmpty {
                 parties[idx].name = newName
             }
 
-        case .joinPresence:
+        case .joinPresence, .heartbeat:
             break
+
+        case .leaveParty:
+            if let leaver = event.targetSenderID ?? (event.senderID.isEmpty ? nil : event.senderID) {
+                parties[idx].participants?.removeAll { $0.id == leaver }
+            }
+
+        case .setGuestControl:
+            if let allow = event.guestsCanControlPlayback {
+                parties[idx].guestsCanControlPlayback = allow
+            }
+
+        case .kickMember:
+            if let victim = event.targetSenderID {
+                var kicked = parties[idx].kickedSenderIDs ?? []
+                if !kicked.contains(victim) { kicked.append(victim) }
+                parties[idx].kickedSenderIDs = kicked
+                parties[idx].participants?.removeAll { $0.id == victim }
+                if victim == deviceSenderID {
+                    parties[idx].isEnded = true
+                    if observedPartyID == partyID { stopObservingParty() }
+                    if activePartyID == partyID { activePartyID = nil }
+                    lastSyncError = "Removed from \"\(parties[idx].name)\" by the host."
+                }
+            }
+
+        case .endJam:
+            parties[idx].isEnded = true
+            if observedPartyID == partyID { stopObservingParty() }
+            if activePartyID == partyID { activePartyID = nil }
 
         case .enqueueTrack:
             guard var entry = event.entry else { break }
@@ -842,6 +1540,60 @@ final class PartyQueueService {
                 let target = parties[idx].upNext.remove(at: foundIdx)
                 parties[idx].nowPlayingEntry = target
             }
+            if let state = event.playbackState {
+                parties[idx].livePlayback = state
+                let updatedParty = parties[idx]
+                if event.senderID != deviceSenderID {
+                    if isHost(of: partyID) {
+                        if let entry = parties[idx].nowPlayingEntry {
+                            Task {
+                                _ = await self.loadAndPlayEntryLocally(entry, in: partyID, downloader: WebMediaDownloader.shared)
+                                await self.broadcastHostPlaybackState(for: partyID)
+                            }
+                        }
+                    } else if activePartyID == partyID {
+                        Task { await self.applyRemotePlaybackToGuestDevice(state, in: updatedParty) }
+                    }
+                }
+            }
+
+        case .playbackSync:
+            if let nowEntry = event.nowPlayingEntry {
+                parties[idx].nowPlayingEntry = nowEntry
+            }
+            if let state = event.playbackState {
+                let currentUpdated = parties[idx].livePlayback?.updatedAt ?? 0
+                if state.updatedAt >= currentUpdated - 0.5 {
+                    parties[idx].livePlayback = state
+                    let updatedParty = parties[idx]
+                    if event.senderID != deviceSenderID && activePartyID == partyID && !isHost(of: partyID) {
+                        Task { await self.applyRemotePlaybackToGuestDevice(state, in: updatedParty) }
+                    }
+                }
+            }
+
+        case .remoteCommand:
+            guard event.senderID != deviceSenderID,
+                  isHost(of: partyID),
+                  parties[idx].allowsGuestControls,
+                  let action = event.remoteAction else { break }
+            Task {
+                switch action {
+                case .play:
+                    MediaManager.shared.resume()
+                    await self.broadcastHostPlaybackState(for: partyID)
+                case .pause:
+                    MediaManager.shared.pause()
+                    await self.broadcastHostPlaybackState(for: partyID)
+                case .next:
+                    _ = await self.startOrAdvanceFIFOPlayback(in: partyID, downloader: WebMediaDownloader.shared)
+                case .seek:
+                    if let pos = event.seekPosition {
+                        MediaManager.shared.seek(to: pos)
+                        await self.broadcastHostPlaybackState(for: partyID)
+                    }
+                }
+            }
 
         case .clearPlayedHistory:
             parties[idx].playedHistory.removeAll()
@@ -858,6 +1610,13 @@ final class PartyQueueService {
             }
 
         case .snapshot:
+            if let hostID = event.hostSenderID, !hostID.isEmpty, parties[idx].hostSenderID == nil {
+                parties[idx].hostSenderID = hostID
+                parties[idx].hostName = event.hostName
+            }
+            if let allow = event.guestsCanControlPlayback {
+                parties[idx].guestsCanControlPlayback = allow
+            }
             if let title = event.partyName?.trimmingCharacters(in: .whitespacesAndNewlines),
                !title.isEmpty,
                parties[idx].upNext.isEmpty && parties[idx].nowPlayingEntry == nil {
@@ -882,6 +1641,9 @@ final class PartyQueueService {
                parties[idx].removedTimestamps[remoteNow.id] == nil {
                 parties[idx].nowPlayingEntry = remoteNow
             }
+            if let remoteState = event.playbackState, parties[idx].livePlayback == nil {
+                parties[idx].livePlayback = remoteState
+            }
             if let remoteUpNext = event.upNext {
                 for e in remoteUpNext {
                     if parties[idx].removedTimestamps[e.id] != nil || parties[idx].consumedEntryIDs[e.id] != nil {
@@ -900,7 +1662,6 @@ final class PartyQueueService {
             }
         }
 
-        // Consistently strip removed or already-consumed tracks after any merge
         parties[idx].upNext.removeAll { entry in
             parties[idx].removedTimestamps[entry.id] != nil || parties[idx].consumedEntryIDs[entry.id] != nil
         }

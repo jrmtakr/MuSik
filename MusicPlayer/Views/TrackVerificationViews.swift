@@ -9,6 +9,9 @@ struct VerifyTrackArtistSheet: View {
     var onConfirmed: ((String, String) -> Void)? = nil
 
     @State private var wholeSongAI = WholeSongAIService.shared
+    @State private var songIDService = SongIdentificationService.shared
+    @State private var isRunningShazamAI = false
+    @State private var shazamStatusNote: String?
     @State private var searchQuery: String
     @State private var customArtistInput: String = ""
     @State private var isSearching = false
@@ -183,6 +186,40 @@ struct VerifyTrackArtistSheet: View {
                 .font(.subheadline.weight(.semibold))
             }
             .disabled(wholeSongAI.isListening(to: liveItem))
+
+            Button {
+                Task {
+                    isRunningShazamAI = true
+                    shazamStatusNote = nil
+                    let found = await songIDService.identifyNow(liveItem)
+                    isRunningShazamAI = false
+                    if let found {
+                        searchQuery = "\(found.artist) \(found.title)"
+                        shazamStatusNote = "Shazam AI: \(found.title) — \(found.artist)" + (found.album.map { " (\($0))" } ?? "")
+                        await runVerificationLookup()
+                    } else {
+                        shazamStatusNote = songIDService.lastStatus ?? "Could not match acoustically — try lyrics search above."
+                    }
+                }
+            } label: {
+                HStack {
+                    if isRunningShazamAI || songIDService.isIdentifying(liveItem) {
+                        ProgressView()
+                            .padding(.trailing, 4)
+                        Text(songIDService.lastStatus ?? "Shazam AI fingerprinting full song...")
+                    } else {
+                        Label("Identify with Shazam AI", systemImage: "shazam.logo.fill")
+                    }
+                }
+                .font(.subheadline.weight(.semibold))
+            }
+            .disabled(isRunningShazamAI)
+
+            if let shazamStatusNote {
+                Text(shazamStatusNote)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
 
             Toggle("Also clean up Song Title when confirming", isOn: $applyCleanTitle)
             if mediaManager.thumbnails[liveItem.relativePath] == nil {

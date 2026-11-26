@@ -37,6 +37,8 @@ struct NowPlayingView: View {
     @State private var collabAddSongsGroupID: IdentifiableUUID?
     @State private var showNewPlaylistAlert = false
     @State private var newPlaylistName = ""
+    @State private var partyService = PartyQueueService.shared
+    @State private var showJamSheet = false
 
     private let speedOptions: [Float] = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
     private let sleepPresets = [5, 10, 15, 30, 45, 60]
@@ -174,6 +176,15 @@ struct NowPlayingView: View {
                     }
                     .accessibilityLabel("Playing Next Queue")
 
+                    Button {
+                        AppHaptics.selection()
+                        showJamSheet = true
+                    } label: {
+                        Image(systemName: "dot.radiowaves.left.and.right")
+                            .foregroundStyle(partyService.activeJamSession != nil ? Color.green : .primary)
+                    }
+                    .accessibilityLabel("Live Jam")
+
                     sleepTimerMenu
 
                     if let item = mediaManager.currentItem {
@@ -184,6 +195,9 @@ struct NowPlayingView: View {
             }
             .sheet(isPresented: $showEqualizerSheet) {
                 EqualizerView()
+            }
+            .sheet(isPresented: $showJamSheet) {
+                JamSessionSheet(showPlayerSheet: .constant(true))
             }
             .sheet(isPresented: $showQueueSheet) {
                 UserQueueSheetView()
@@ -1043,6 +1057,29 @@ struct NowPlayingView: View {
             }
             .buttonStyle(.plain)
             .accessibilityLabel("Synced Lyrics")
+
+            Spacer()
+
+            Button {
+                AppHaptics.selection()
+                showJamSheet = true
+            } label: {
+                let jamActive = partyService.activeJamSession != nil
+                let listenerCount = partyService.activeJamSession?.activeParticipantsList.count ?? 0
+                HStack(spacing: 4) {
+                    Image(systemName: "dot.radiowaves.left.and.right")
+                        .font(.subheadline.weight(.semibold))
+                    Text(jamActive ? (listenerCount > 1 ? "\(listenerCount)" : "Jam") : "Jam")
+                        .font(.caption.weight(.bold))
+                        .monospacedDigit()
+                }
+                .foregroundStyle(jamActive ? .white : inactiveText)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(Capsule().fill(jamActive ? Color.green : inactiveFill))
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Start or Open Jam")
 
             Spacer()
 

@@ -279,21 +279,22 @@ struct PlaylistsView: View {
                         }
                     }
 
-                    Section("Party Queue & Blend (Live FIFO)") {
+                    Section("Spotify-Style Jam (Live Sync)") {
                         HStack(spacing: 10) {
                             Button {
                                 showCreatePartySheet = true
                             } label: {
-                                Label("Start Party", systemImage: "radio.fill")
+                                Label("Start a Jam", systemImage: "dot.radiowaves.left.and.right")
                                     .font(.caption.weight(.semibold))
                                     .frame(maxWidth: .infinity)
                             }
                             .buttonStyle(.borderedProminent)
+                            .tint(.green)
 
                             Button {
                                 showJoinPartySheet = true
                             } label: {
-                                Label("Join Party Link", systemImage: "person.badge.plus")
+                                Label("Join a Jam", systemImage: "person.badge.plus")
                                     .font(.caption.weight(.semibold))
                                     .frame(maxWidth: .infinity)
                             }
@@ -302,7 +303,7 @@ struct PlaylistsView: View {
                         .padding(.vertical, 2)
 
                         if partyService.parties.isEmpty {
-                            Text("Queue songs together with friends in real time. First come, first served: whoever queues first plays first!")
+                            Text("Listen and queue songs together with friends in real time. Share a QR code, link, or join nearby over Wi-Fi.")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         } else {

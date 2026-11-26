@@ -480,7 +480,20 @@ final class MediaManager {
             }
             loadLocalFiles()
             statusMessage = "Saved \(destURL.lastPathComponent)"
-            return outcomeForRelativePath(rel)
+            let outcome = outcomeForRelativePath(rel)
+            if case .media(let importedMedia) = outcome {
+                Task { @MainActor in
+                    SongIdentificationService.shared.enqueue(
+                        importedMedia,
+                        hintTitle: importedMedia.displayTitle,
+                        hintArtist: importedMedia.artist ?? "",
+                        sourceVideoID: customMetadataByPath[importedMedia.relativePath]?.sourceVideoID,
+                        sourcePlatform: nil,
+                        jobID: nil
+                    )
+                }
+            }
+            return outcome
         } catch {
             errorMessage = "Import failed: \(error.localizedDescription)"
             return nil
@@ -592,7 +605,20 @@ final class MediaManager {
             }
             loadLocalFiles()
             statusMessage = "Saved \(destURL.lastPathComponent)"
-            return items.first(where: { $0.relativePath == rel })
+            let saved = items.first(where: { $0.relativePath == rel })
+            if let saved {
+                Task { @MainActor in
+                    SongIdentificationService.shared.enqueue(
+                        saved,
+                        hintTitle: saved.displayTitle,
+                        hintArtist: saved.artist ?? "",
+                        sourceVideoID: customMetadataByPath[saved.relativePath]?.sourceVideoID,
+                        sourcePlatform: nil,
+                        jobID: nil
+                    )
+                }
+            }
+            return saved
         } catch {
             try? FileManager.default.removeItem(at: tempURL)
             errorMessage = "Import failed: \(error.localizedDescription)"
@@ -2418,12 +2444,30 @@ final class MediaManager {
 
     func playPlaylist(_ playlist: Playlist, startingAt startItem: MediaItem? = nil) {
         let playlistItems = items(in: playlist)
-        if isShuffleEnabled && startItem == nil {
-            shuffleBag.reset()
-        }
-        guard let first = startItem ?? (isShuffleEnabled ? playlistItems.randomElement() : playlistItems.first) else {
+        guard !playlistItems.isEmpty else {
             errorMessage = "Playlist \"\(playlist.name)\" has no playable files."
             return
+        }
+        let first: MediaItem
+        if let startItem {
+            first = startItem
+        } else if isShuffleEnabled {
+            let excludedPath = currentItem?.relativePath
+            shuffleBag.reset()
+            let pickedPath = shuffleBag.next(
+                queue: playlistItems.map(\.relativePath),
+                current: excludedPath,
+                contextKey: playlist.id.uuidString,
+                consume: true
+            )
+            let nonRepeatingPool = playlistItems.count > 1
+                ? playlistItems.filter { $0.relativePath != excludedPath }
+                : playlistItems
+            first = playlistItems.first(where: { $0.relativePath == pickedPath })
+                ?? nonRepeatingPool.randomElement()
+                ?? playlistItems[0]
+        } else {
+            first = playlistItems[0]
         }
         play(first, inPlaylist: playlist.id)
     }
@@ -2470,11 +2514,26 @@ final class MediaManager {
 
     func shuffleAllOfflineMusic() {
         let pool = audioItems.isEmpty ? items : audioItems
-        guard let pick = pool.randomElement() else {
+        let excludedPath = currentItem?.relativePath
+        let nonRepeatingPool = pool.count > 1
+            ? pool.filter { $0.relativePath != excludedPath }
+            : pool
+        guard !pool.isEmpty else {
             errorMessage = "No offline tracks available to shuffle."
             return
         }
         isShuffleEnabled = true
+        shuffleBag.reset()
+        let pickedPath = shuffleBag.next(
+            queue: pool.map(\.relativePath),
+            current: excludedPath,
+            contextKey: "library",
+            consume: true
+        )
+        guard let pick = pool.first(where: { $0.relativePath == pickedPath }) ?? nonRepeatingPool.randomElement() else {
+            errorMessage = "No offline tracks available to shuffle."
+            return
+        }
         play(pick)
         statusMessage = "Shuffling: \(pick.displayTitle)"
     }
@@ -3314,6 +3373,13 @@ final class MediaManager {
             isUsingEqualizerBackend = true
             remoteStreamSourceURL = nil
             currentItem = nextItem
+            if isShuffleEnabled && !candidate.fromUserQueue {
+                shuffleBag.sync(
+                    queue: activeQueue.map(\.relativePath),
+                    current: nextItem.relativePath,
+                    contextKey: shuffleContextKey
+                )
+            }
             currentTime = 0
             duration = equalizerPlayer.duration > 0 ? equalizerPlayer.duration : (nextItem.durationSeconds ?? 0)
             isPlaying = true

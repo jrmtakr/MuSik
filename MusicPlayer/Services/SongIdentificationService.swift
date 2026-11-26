@@ -63,11 +63,12 @@ final class SongIdentificationService {
 
     private(set) var pendingCount = 0
     private(set) var identifiedThisSession = 0
+    private(set) var activePath: String?
     private(set) var lastStatus: String?
     /// Set when an optional audio engine can't run; shown in Settings.
     private(set) var engineUnavailableReason: String?
 
-    @ObservationIgnored var engines: [any SongRecognitionEngine] = []
+    @ObservationIgnored var engines: [any SongRecognitionEngine] = [ShazamFingerprintEngine.shared]
     @ObservationIgnored private var disabledEngineNames = Set<String>()
     @ObservationIgnored private var queue: [Request] = []
     @ObservationIgnored private var queuedPaths = Set<String>()
@@ -145,17 +146,48 @@ final class SongIdentificationService {
                 }
                 let request = self.queue.removeFirst()
                 self.pendingCount = self.queue.count
+                self.activePath = request.relativePath
                 await self.process(request)
+                self.activePath = nil
                 self.queuedPaths.remove(request.relativePath)
             }
         }
     }
 
+    func isIdentifying(_ item: MediaItem) -> Bool {
+        activePath == item.relativePath || queuedPaths.contains(item.relativePath)
+    }
+
+    /// Runs whole-song Shazam AI + vocal lyric identification immediately on demand for an item.
+    @discardableResult
+    func identifyNow(_ item: MediaItem) async -> IdentifiedSong? {
+        guard !item.isHLS, FileManager.default.fileExists(atPath: item.fileURL.path) else { return nil }
+        activePath = item.relativePath
+        defer { if activePath == item.relativePath { activePath = nil } }
+
+        let req = Request(
+            relativePath: item.relativePath,
+            fileURL: item.fileURL,
+            hintTitle: item.displayTitle,
+            hintArtist: item.artist ?? "",
+            durationSeconds: item.durationSeconds,
+            sourceVideoID: MediaManager.shared.customMetadata(forRelativePath: item.relativePath)?.sourceVideoID,
+            sourcePlatform: nil,
+            jobID: nil
+        )
+        return await runFullIdentification(req, allowOverwriteVerified: true)
+    }
+
     // MARK: Processing
 
     private func process(_ request: Request) async {
-        guard FileManager.default.fileExists(atPath: request.fileURL.path) else { return }
-        lastStatus = "Identifying \"\(request.hintTitle)\"..."
+        _ = await runFullIdentification(request, allowOverwriteVerified: false)
+    }
+
+    @discardableResult
+    private func runFullIdentification(_ request: Request, allowOverwriteVerified: Bool) async -> IdentifiedSong? {
+        guard FileManager.default.fileExists(atPath: request.fileURL.path) else { return nil }
+        lastStatus = "Shazam AI analyzing \"\(request.hintTitle)\"..."
 
         var song = await identify(
             fileURL: request.fileURL,
@@ -166,10 +198,10 @@ final class SongIdentificationService {
             sourcePlatform: request.sourcePlatform
         )
 
-        // Listen to the whole song: confirm the name from the sung lyrics, and get word timings to
-        // line the lyrics up with this exact file (music videos drift from album-timed lyrics).
+        // Listen to the whole song: confirm the name from the sung lyrics, identify unknown uploads
+        // with Shazam acoustic matching, and align lyrics with this exact recording.
         await Self.ensureSpeechPermissionIfPossible()
-        lastStatus = "Listening to \"\(song?.title ?? request.hintTitle)\"..."
+        lastStatus = "Listening to whole song: \"\(song?.title ?? request.hintTitle)\"..."
         let heard = await SongAudioListener.listen(to: request.fileURL)
         var lyricsToAlign: ResolvedTrackLyrics?
 
@@ -180,16 +212,12 @@ final class SongIdentificationService {
                 duration: candidate.durationSeconds ?? request.durationSeconds
             ), Self.similarity(Self.stripVersionNoise(lyrics.trackTitle, keepVersionTags: false),
                                 Self.stripVersionNoise(candidate.title, keepVersionTags: false)) >= 0.8 {
-                // (Only judge against lyrics that really belong to this title — a fuzzy lyrics-search hit
-                // for some other song must never be used to reject a correct name.)
                 switch SongAudioListener.verdict(heard: heard, lyrics: lyrics) {
                 case .confirmed:
                     candidate.source += " + heard lyrics match"
                     lyricsToAlign = lyrics
                     song = candidate
                 case .contradicted:
-                    // Clear vocals that don't match that song at all: the name is wrong (or the download
-                    // is a different song). Don't rename on a guess; try to identify from the lyrics instead.
                     song = nil
                 case .inconclusive:
                     lyricsToAlign = lyrics
@@ -202,9 +230,23 @@ final class SongIdentificationService {
             lyricsToAlign = byLyrics.lyrics
         }
 
+        // Shazam acoustic constellation + heard-lyric + iTunes official preview matcher across the whole song.
+        if song == nil {
+            lastStatus = "Running Shazam AI acoustic fingerprint..."
+            if case .match(let shazamSong) = await ShazamFingerprintEngine.shared.recognize(
+                fileURL: request.fileURL,
+                durationHint: request.durationSeconds,
+                seedHintTitle: request.hintTitle,
+                seedHintArtist: request.hintArtist,
+                heardWords: heard
+            ) {
+                song = shazamSong
+            }
+        }
+
         guard let finalSong = song else {
             lastStatus = "Not sure what \"\(request.hintTitle)\" is — kept the original title"
-            return
+            return nil
         }
 
         var cover: UIImage?
@@ -212,21 +254,46 @@ final class SongIdentificationService {
             cover = await Self.downloadImage(artURL)
         }
 
-        let applied = MediaManager.shared.applyAutoIdentifiedMetadata(
-            relativePath: request.relativePath,
-            title: finalSong.title,
-            artist: finalSong.artist,
-            album: finalSong.album,
-            genre: finalSong.genre,
-            isrc: finalSong.isrc,
-            coverImage: cover,
-            source: finalSong.source
-        )
-        guard applied else { return }
+        let applied: Bool
+        if allowOverwriteVerified,
+           let item = MediaManager.shared.items.first(where: { $0.relativePath == request.relativePath }) {
+            MediaManager.shared.verifyArtist(
+                finalSong.artist,
+                for: item,
+                cleanTitle: finalSong.title,
+                album: finalSong.album,
+                genre: finalSong.genre,
+                artworkImage: cover
+            )
+            applied = true
+        } else {
+            applied = MediaManager.shared.applyAutoIdentifiedMetadata(
+                relativePath: request.relativePath,
+                title: finalSong.title,
+                artist: finalSong.artist,
+                album: finalSong.album,
+                genre: finalSong.genre,
+                isrc: finalSong.isrc,
+                coverImage: cover,
+                source: finalSong.source
+            )
+        }
+        guard applied else { return nil }
         identifiedThisSession += 1
         lastStatus = "Identified \"\(finalSong.title)\" by \(finalSong.artist) (\(finalSong.source))"
         if let jobID = request.jobID {
             PlaylistImportManager.shared.noteTrackIdentified(jobID: jobID)
+        }
+
+        // Index this confirmed track into our local Shazam acoustic fingerprint DB.
+        let indexFileURL = request.fileURL
+        let indexPath = request.relativePath
+        Task.detached(priority: .background) {
+            await ShazamFingerprintEngine.shared.indexConfirmedTrack(
+                fileURL: indexFileURL,
+                trackKey: indexPath,
+                song: finalSong
+            )
         }
 
         // Save lyrics re-timed to this file so they line up even for music videos.
@@ -235,6 +302,7 @@ final class SongIdentificationService {
            let item = MediaManager.shared.items.first(where: { $0.relativePath == request.relativePath }) {
             SyncedLyricsService.shared.storeAlignedLyrics(aligned, for: item)
         }
+        return finalSong
     }
 
     private static func ensureSpeechPermissionIfPossible() async {

@@ -127,7 +127,7 @@ final class SystemActionRouter {
             }
             return true
 
-        case "party":
+        case "party", "jam":
             Task { @MainActor in
                 await PartyQueueService.shared.joinParty(input: url.absoluteString)
             }
