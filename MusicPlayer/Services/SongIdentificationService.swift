@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+@preconcurrency import Speech
 import UIKit
 
 // MARK: - Public model
@@ -156,40 +157,148 @@ final class SongIdentificationService {
         guard FileManager.default.fileExists(atPath: request.fileURL.path) else { return }
         lastStatus = "Identifying \"\(request.hintTitle)\"..."
 
-        guard let song = await identify(
+        var song = await identify(
             fileURL: request.fileURL,
             hintTitle: request.hintTitle,
             hintArtist: request.hintArtist,
             durationSeconds: request.durationSeconds,
             sourceVideoID: request.sourceVideoID,
             sourcePlatform: request.sourcePlatform
-        ) else {
+        )
+
+        // Listen to the whole song: confirm the name from the sung lyrics, and get word timings to
+        // line the lyrics up with this exact file (music videos drift from album-timed lyrics).
+        await Self.ensureSpeechPermissionIfPossible()
+        lastStatus = "Listening to \"\(song?.title ?? request.hintTitle)\"..."
+        let heard = await SongAudioListener.listen(to: request.fileURL)
+        var lyricsToAlign: ResolvedTrackLyrics?
+
+        if var candidate = song, let heard {
+            if let lyrics = await SyncedLyricsService.shared.fetchLyricsForVerification(
+                title: candidate.title,
+                artist: candidate.artist,
+                duration: candidate.durationSeconds ?? request.durationSeconds
+            ), Self.similarity(Self.stripVersionNoise(lyrics.trackTitle, keepVersionTags: false),
+                                Self.stripVersionNoise(candidate.title, keepVersionTags: false)) >= 0.8 {
+                // (Only judge against lyrics that really belong to this title — a fuzzy lyrics-search hit
+                // for some other song must never be used to reject a correct name.)
+                switch SongAudioListener.verdict(heard: heard, lyrics: lyrics) {
+                case .confirmed:
+                    candidate.source += " + heard lyrics match"
+                    lyricsToAlign = lyrics
+                    song = candidate
+                case .contradicted:
+                    // Clear vocals that don't match that song at all: the name is wrong (or the download
+                    // is a different song). Don't rename on a guess; try to identify from the lyrics instead.
+                    song = nil
+                case .inconclusive:
+                    lyricsToAlign = lyrics
+                }
+            }
+        }
+
+        if song == nil, let heard, let byLyrics = await identifyFromHeardLyrics(heard, localDuration: request.durationSeconds) {
+            song = byLyrics.song
+            lyricsToAlign = byLyrics.lyrics
+        }
+
+        guard let finalSong = song else {
             lastStatus = "Not sure what \"\(request.hintTitle)\" is — kept the original title"
             return
         }
 
         var cover: UIImage?
-        if let artURL = song.artworkURL {
+        if let artURL = finalSong.artworkURL {
             cover = await Self.downloadImage(artURL)
         }
 
         let applied = MediaManager.shared.applyAutoIdentifiedMetadata(
             relativePath: request.relativePath,
-            title: song.title,
-            artist: song.artist,
-            album: song.album,
-            genre: song.genre,
-            isrc: song.isrc,
+            title: finalSong.title,
+            artist: finalSong.artist,
+            album: finalSong.album,
+            genre: finalSong.genre,
+            isrc: finalSong.isrc,
             coverImage: cover,
-            source: song.source
+            source: finalSong.source
         )
-        if applied {
-            identifiedThisSession += 1
-            lastStatus = "Identified \"\(song.title)\" by \(song.artist) (\(song.source))"
-            if let jobID = request.jobID {
-                PlaylistImportManager.shared.noteTrackIdentified(jobID: jobID)
+        guard applied else { return }
+        identifiedThisSession += 1
+        lastStatus = "Identified \"\(finalSong.title)\" by \(finalSong.artist) (\(finalSong.source))"
+        if let jobID = request.jobID {
+            PlaylistImportManager.shared.noteTrackIdentified(jobID: jobID)
+        }
+
+        // Save lyrics re-timed to this file so they line up even for music videos.
+        if let lyrics = lyricsToAlign, let heard,
+           let aligned = SongAudioListener.align(lyrics: lyrics, heard: heard),
+           let item = MediaManager.shared.items.first(where: { $0.relativePath == request.relativePath }) {
+            SyncedLyricsService.shared.storeAlignedLyrics(aligned, for: item)
+        }
+    }
+
+    private static func ensureSpeechPermissionIfPossible() async {
+        guard SFSpeechRecognizer.authorizationStatus() == .notDetermined,
+              UIApplication.shared.applicationState == .active else { return }
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            SFSpeechRecognizer.requestAuthorization { _ in cont.resume() }
+        }
+    }
+
+    /// Last resort when no name source agrees: search lyrics sites for phrases actually sung in the file,
+    /// and accept a song only if its full lyrics match what was heard.
+    private func identifyFromHeardLyrics(
+        _ heard: [HeardWord],
+        localDuration: Double?
+    ) async -> (song: IdentifiedSong, lyrics: ResolvedTrackLyrics)? {
+        for phrase in SongAudioListener.searchPhrases(from: heard) {
+            var comps = URLComponents(string: "https://lrclib.net/api/search")
+            comps?.queryItems = [URLQueryItem(name: "q", value: phrase)]
+            guard let url = comps?.url else { continue }
+            var request = URLRequest(url: url)
+            request.timeoutInterval = 12
+            request.setValue(Self.userAgent, forHTTPHeaderField: "User-Agent")
+            guard let (data, response) = try? await URLSession.shared.data(for: request),
+                  let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode),
+                  let rows = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { continue }
+
+            for row in rows.prefix(8) {
+                guard let title = row["trackName"] as? String,
+                      let artist = row["artistName"] as? String else { continue }
+                let text = (row["syncedLyrics"] as? String) ?? (row["plainLyrics"] as? String) ?? ""
+                guard !text.isEmpty else { continue }
+                let duration = row["duration"] as? Double
+                let parsed = SyncedLyricsService.parseLRCOrPlain(text: text, duration: duration)
+                let lyrics = ResolvedTrackLyrics(
+                    cacheKey: "heard",
+                    trackTitle: title,
+                    artistName: artist,
+                    isTimeSynced: parsed.isSynced,
+                    sourceLabel: parsed.isSynced ? "Synced Lyrics" : "Lyrics",
+                    attributionText: "Time-synced via LRCLIB",
+                    syncedOffsetSeconds: 0,
+                    expectedDurationSeconds: duration,
+                    lines: parsed.lines
+                )
+                guard case .confirmed(let ratio) = SongAudioListener.verdict(heard: heard, lyrics: lyrics), ratio >= 0.35 else {
+                    continue
+                }
+                // Lyrics match strongly. Pull album/cover from a catalog when one agrees.
+                let claim = Candidate(title: title, artist: artist, album: row["albumName"] as? String,
+                                      durationSeconds: duration, sourceName: "Heard lyrics")
+                if let confirmed = await confirm(claim, localDuration: localDuration) {
+                    return (confirmed, lyrics)
+                }
+                return (IdentifiedSong(
+                    title: title,
+                    artist: artist,
+                    album: row["albumName"] as? String,
+                    durationSeconds: duration,
+                    source: "Heard lyrics (LRCLIB)"
+                ), lyrics)
             }
         }
+        return nil
     }
 
     /// Works out the real title/artist/album/cover for a file. Returns nil when the sources don't agree

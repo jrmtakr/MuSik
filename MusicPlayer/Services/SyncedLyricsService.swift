@@ -429,6 +429,36 @@ final class SyncedLyricsService {
         )
     }
 
+    /// Exact lyrics for a known song, used by import-time song ID to confirm the name by listening.
+    /// Doesn't touch what's on screen.
+    func fetchLyricsForVerification(title: String, artist: String, duration: Double?) async -> ResolvedTrackLyrics? {
+        await fetchFromLRCLIB(cacheKey: "verify", song: title, artist: artist, rawTitle: title, duration: duration)
+    }
+
+    /// Saves lyrics that were already re-timed against this exact file, so playback uses them as-is
+    /// (and the play-time auto-sync doesn't shift them a second time).
+    func storeAlignedLyrics(_ lyrics: ResolvedTrackLyrics, for item: MediaItem) {
+        let key = cacheKey(for: item)
+        let stored = ResolvedTrackLyrics(
+            cacheKey: key,
+            trackTitle: lyrics.trackTitle,
+            artistName: lyrics.artistName,
+            isTimeSynced: lyrics.isTimeSynced,
+            sourceLabel: lyrics.sourceLabel,
+            attributionText: lyrics.attributionText,
+            syncedOffsetSeconds: 0,
+            tempoScale: 1.0,
+            expectedDurationSeconds: item.durationSeconds,
+            lines: lyrics.lines
+        )
+        memoryCache[key] = stored
+        saveToDisk(stored)
+        autoAttemptedKeys.insert(key)
+        if currentLyrics?.cacheKey == key {
+            currentLyrics = stored
+        }
+    }
+
     @discardableResult
     func saveCustomLyrics(
         for item: MediaItem,
