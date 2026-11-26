@@ -201,8 +201,9 @@ enum YouTubeStreamResolver {
         )
         _ = await evaluateCandidate(androidResult)
 
-        // 2. IOS client (native iOS headers, NO browser cookies).
-        if workingResults.isEmpty {
+        // 2. Also fetch IOS client when working results lack HLS so video caching always has an HLS fallback alongside adaptive MP4.
+        let hasWorkingHLS = workingResults.contains { res in res.streams.contains(where: \.isHLS) }
+        if workingResults.isEmpty || !hasWorkingHLS {
             let iosResult = await fetchInnerTube(
                 videoID: videoID,
                 sourcePageURL: url,

@@ -133,6 +133,8 @@ final class WebMediaDownloader {
         let config = URLSessionConfiguration.default
         config.waitsForConnectivity = true
         config.httpShouldSetCookies = true
+        config.timeoutIntervalForRequest = 25
+        config.timeoutIntervalForResource = 900
         return URLSession(configuration: config)
     }()
 
@@ -364,7 +366,7 @@ final class WebMediaDownloader {
 
         let downloadID = UUID()
         let mergedHeaders = enrichedHeaders(headers, for: cleanVideo)
-        activeDownloads.append(BrowserDownloadItem(id: downloadID, title: cleanTitle, sourceURL: cleanVideo, progress: 0, isHLS: false))
+        activeDownloads.append(BrowserDownloadItem(id: downloadID, title: cleanTitle, sourceURL: cleanVideo, progress: 0.02, isHLS: false))
         MediaManager.shared.statusMessage = "Downloading HD \(cleanTitle)..."
 
         let session = ephemeralDataSession
@@ -374,9 +376,19 @@ final class WebMediaDownloader {
                 activeDownloads.removeAll { $0.id == downloadID }
             }
 
-            async let videoData = fetchTempFile(from: cleanVideo, ext: "mp4", headers: mergedHeaders, using: session)
-            updateProgress(downloadID: downloadID, fraction: 0.25)
-            async let audioData = fetchTempFile(from: cleanAudio, ext: "m4a", headers: mergedHeaders, using: session)
+            let tracker = AdaptiveProgressTracker()
+            async let videoData = fetchTempFile(from: cleanVideo, ext: "mp4", headers: mergedHeaders, using: session) { frac in
+                let combined = tracker.update(video: frac)
+                Task { @MainActor [weak self] in
+                    self?.updateProgress(downloadID: downloadID, fraction: combined)
+                }
+            }
+            async let audioData = fetchTempFile(from: cleanAudio, ext: "m4a", headers: mergedHeaders, using: session) { frac in
+                let combined = tracker.update(audio: frac)
+                Task { @MainActor [weak self] in
+                    self?.updateProgress(downloadID: downloadID, fraction: combined)
+                }
+            }
 
             guard let tempVideo = await videoData else {
                 if !Task.isCancelled {
@@ -390,7 +402,6 @@ final class WebMediaDownloader {
                 }
                 return
             }
-            updateProgress(downloadID: downloadID, fraction: 0.75)
             guard let tempAudio = await audioData else {
                 try? FileManager.default.removeItem(at: tempVideo)
                 if !Task.isCancelled {
@@ -410,11 +421,13 @@ final class WebMediaDownloader {
             }
             if Task.isCancelled { return }
 
+            updateProgress(downloadID: downloadID, fraction: 0.91)
+            MediaManager.shared.statusMessage = "Muxing HD video & audio for \(cleanTitle)..."
             let muxedTemp = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString).mp4")
             let ok = await Task.detached(priority: .userInitiated) {
                 FFmpegMediaService.muxVideoAndAudioToMP4(videoURL: tempVideo, audioURL: tempAudio, outputURL: muxedTemp)
             }.value
-            updateProgress(downloadID: downloadID, fraction: 0.95)
+            updateProgress(downloadID: downloadID, fraction: 0.96)
 
             if ok {
                 if let saved = MediaManager.shared.importTemporaryFile(
@@ -447,13 +460,34 @@ final class WebMediaDownloader {
         activeAsyncTasks[downloadID] = asyncTask
     }
 
+    private final class AdaptiveProgressTracker: @unchecked Sendable {
+        private let lock = NSLock()
+        private var videoFraction: Double = 0
+        private var audioFraction: Double = 0
+
+        func update(video: Double) -> Double {
+            lock.lock()
+            defer { lock.unlock() }
+            videoFraction = min(max(video, 0), 1)
+            return 0.02 + 0.70 * videoFraction + 0.18 * audioFraction
+        }
+
+        func update(audio: Double) -> Double {
+            lock.lock()
+            defer { lock.unlock() }
+            audioFraction = min(max(audio, 0), 1)
+            return 0.02 + 0.70 * videoFraction + 0.18 * audioFraction
+        }
+    }
+
     nonisolated private func fetchTempFile(
         from url: URL,
         ext: String,
         headers: [String: String],
-        using session: URLSession
+        using session: URLSession,
+        onProgress: (@Sendable (Double) -> Void)? = nil
     ) async -> URL? {
-        if let first = await performTempDownload(from: url, ext: ext, headers: headers, using: session) {
+        if let first = await performTempDownload(from: url, ext: ext, headers: headers, using: session, onProgress: onProgress) {
             return first
         }
         let minimalHeaders: [String: String] = [
@@ -461,38 +495,234 @@ final class WebMediaDownloader {
             "Accept": "*/*"
         ]
         if minimalHeaders != headers {
-            return await performTempDownload(from: url, ext: ext, headers: minimalHeaders, using: session)
+            return await performTempDownload(from: url, ext: ext, headers: minimalHeaders, using: session, onProgress: onProgress)
         }
         return nil
+    }
+
+    nonisolated private static func queryContentLength(from url: URL) -> Int64? {
+        guard let comps = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let clen = comps.queryItems?.first(where: { $0.name.lowercased() == "clen" })?.value,
+              let val = Int64(clen), val > 0 else {
+            return nil
+        }
+        return val
+    }
+
+    nonisolated private static func parseTotalLength(fromContentRange header: String?) -> Int64? {
+        guard let header, let slash = header.lastIndex(of: "/") else { return nil }
+        let suffix = header[header.index(after: slash)...].trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let total = Int64(suffix), total > 0 else { return nil }
+        return total
     }
 
     nonisolated private func performTempDownload(
         from url: URL,
         ext: String,
         headers: [String: String],
-        using session: URLSession
+        using session: URLSession,
+        onProgress: (@Sendable (Double) -> Void)? = nil
     ) async -> URL? {
-        var req = URLRequest(url: url)
-        headers.forEach { req.setValue($0.value, forHTTPHeaderField: $0.key) }
-        req.timeoutInterval = 120
-        guard let (tempURL, resp) = try? await session.download(for: req),
-              let http = resp as? HTTPURLResponse,
-              (200...299).contains(http.statusCode) else {
-            return nil
-        }
-        let mime = resp.mimeType?.lowercased() ?? ""
-        if mime.contains("html") {
-            try? FileManager.default.removeItem(at: tempURL)
-            return nil
-        }
+        // Chunked HTTP Range downloads prevent YouTube CDN single-stream throttling/stalls and give continuous progress.
+        let chunkSize: Int64 = 1_572_864 // 1.5 MB per chunk
+        let isGooglevideo = url.host?.lowercased().contains("googlevideo.com") == true
+        var expectedTotal: Int64? = Self.queryContentLength(from: url)
+
         let dest = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString).\(ext)")
-        do {
-            try FileManager.default.moveItem(at: tempURL, to: dest)
-            return dest
-        } catch {
-            try? FileManager.default.removeItem(at: tempURL)
+        FileManager.default.createFile(atPath: dest.path, contents: nil)
+        guard let handle = try? FileHandle(forWritingTo: dest) else {
+            try? FileManager.default.removeItem(at: dest)
             return nil
         }
+        var succeeded = false
+        defer {
+            try? handle.close()
+            if !succeeded {
+                try? FileManager.default.removeItem(at: dest)
+            }
+        }
+
+        // First request: ask for small initial 64 KB Range probe so Range-capable servers (including googlevideo.com)
+        // stream chunk-by-chunk at native speed, while 200-only servers stream continuously to disk.
+        let initialProbeSize: Int64 = 65_536
+        var offset: Int64 = 0
+        let firstEnd = expectedTotal.map { min(initialProbeSize - 1, $0 - 1) } ?? (initialProbeSize - 1)
+        var firstReq = URLRequest(url: url)
+        headers.forEach { firstReq.setValue($0.value, forHTTPHeaderField: $0.key) }
+        firstReq.timeoutInterval = 25
+        firstReq.setValue("bytes=0-\(firstEnd)", forHTTPHeaderField: "Range")
+
+        do {
+            let (firstBytes, firstResp) = try await session.bytes(for: firstReq)
+            guard let http = firstResp as? HTTPURLResponse else { return nil }
+            let mime = firstResp.mimeType?.lowercased() ?? ""
+            if mime.contains("html") { return nil }
+
+            if http.statusCode == 200 {
+                // Server ignored Range and is streaming the full body directly: stream to disk with live progress.
+                let total200: Int64 = {
+                    if let expectedTotal { return expectedTotal }
+                    if firstResp.expectedContentLength > 0 { return firstResp.expectedContentLength }
+                    return 0
+                }()
+                var buffer = Data()
+                buffer.reserveCapacity(65_536)
+                var written: Int64 = 0
+                var lastReportWritten: Int64 = 0
+                for try await byte in firstBytes {
+                    if Task.isCancelled { return nil }
+                    buffer.append(byte)
+                    if buffer.count >= 65_536 {
+                        try handle.write(contentsOf: buffer)
+                        written += Int64(buffer.count)
+                        buffer.removeAll(keepingCapacity: true)
+                        if written - lastReportWritten >= 131_072 {
+                            lastReportWritten = written
+                            if total200 > 0 {
+                                onProgress?(min(0.99, Double(written) / Double(total200)))
+                            } else {
+                                let mb = Double(written) / (1024.0 * 1024.0)
+                                onProgress?(min(0.92, mb / (mb + 8.0)))
+                            }
+                        }
+                    }
+                }
+                if !buffer.isEmpty {
+                    try handle.write(contentsOf: buffer)
+                    written += Int64(buffer.count)
+                }
+                guard written > 0 else { return nil }
+                onProgress?(1.0)
+                succeeded = true
+                return dest
+            }
+
+            guard http.statusCode == 206 else {
+                // Retry once without Range header if a non-YouTube server rejected Range probes.
+                guard !isGooglevideo else { return nil }
+                var fullReq = URLRequest(url: url)
+                headers.forEach { fullReq.setValue($0.value, forHTTPHeaderField: $0.key) }
+                fullReq.timeoutInterval = 30
+                guard let (tempURL, fullResp) = try? await session.download(for: fullReq),
+                      let fullHTTP = fullResp as? HTTPURLResponse,
+                      (200...299).contains(fullHTTP.statusCode) else {
+                    return nil
+                }
+                let fullMime = fullResp.mimeType?.lowercased() ?? ""
+                if fullMime.contains("html") {
+                    try? FileManager.default.removeItem(at: tempURL)
+                    return nil
+                }
+                try? handle.close()
+                try? FileManager.default.removeItem(at: dest)
+                try FileManager.default.moveItem(at: tempURL, to: dest)
+                onProgress?(1.0)
+                succeeded = true
+                return dest
+            }
+
+            if let parsedTotal = Self.parseTotalLength(fromContentRange: http.value(forHTTPHeaderField: "Content-Range")) {
+                expectedTotal = parsedTotal
+            }
+            var firstChunkData = Data()
+            firstChunkData.reserveCapacity(Int(initialProbeSize))
+            for try await byte in firstBytes {
+                if Task.isCancelled { return nil }
+                firstChunkData.append(byte)
+            }
+            guard !firstChunkData.isEmpty else { return nil }
+            try handle.write(contentsOf: firstChunkData)
+            offset += Int64(firstChunkData.count)
+            if let expectedTotal, expectedTotal > 0 {
+                onProgress?(min(0.99, Double(offset) / Double(expectedTotal)))
+            }
+        } catch {
+            return nil
+        }
+
+        // Fetch remaining chunks sequentially with per-chunk retry & real progress.
+        while true {
+            if Task.isCancelled { return nil }
+            if let expectedTotal, offset >= expectedTotal {
+                break
+            }
+            let endByte: Int64
+            if let expectedTotal {
+                endByte = min(offset + chunkSize - 1, expectedTotal - 1)
+            } else {
+                endByte = offset + chunkSize - 1
+            }
+            if endByte < offset { break }
+
+            var chunkWritten = false
+            var hitEOF = false
+            for attempt in 0..<3 {
+                if Task.isCancelled { return nil }
+                var chunkReq = URLRequest(url: url)
+                headers.forEach { chunkReq.setValue($0.value, forHTTPHeaderField: $0.key) }
+                chunkReq.timeoutInterval = 25
+                chunkReq.setValue("bytes=\(offset)-\(endByte)", forHTTPHeaderField: "Range")
+
+                do {
+                    let (data, resp) = try await session.data(for: chunkReq)
+                    guard let http = resp as? HTTPURLResponse else { continue }
+                    if http.statusCode == 416 {
+                        hitEOF = true
+                        chunkWritten = true
+                        break
+                    }
+                    guard http.statusCode == 206 || http.statusCode == 200 else {
+                        if http.statusCode == 403 || http.statusCode == 404 {
+                            // CDN token expired or blocked — fail fast so fallback stream takes over cleanly.
+                            return nil
+                        }
+                        if attempt < 2 {
+                            try? await Task.sleep(for: .milliseconds(350 * (attempt + 1)))
+                        }
+                        continue
+                    }
+                    if data.isEmpty {
+                        hitEOF = true
+                        chunkWritten = true
+                        break
+                    }
+                    if expectedTotal == nil {
+                        if let parsedTotal = Self.parseTotalLength(fromContentRange: http.value(forHTTPHeaderField: "Content-Range")) {
+                            expectedTotal = parsedTotal
+                        }
+                    }
+                    try handle.write(contentsOf: data)
+                    offset += Int64(data.count)
+                    chunkWritten = true
+                    if let expectedTotal, expectedTotal > 0 {
+                        onProgress?(min(0.99, Double(offset) / Double(expectedTotal)))
+                    } else {
+                        let mb = Double(offset) / (1024.0 * 1024.0)
+                        onProgress?(min(0.92, mb / (mb + 8.0)))
+                    }
+                    if Int64(data.count) < (endByte - (offset - Int64(data.count)) + 1), expectedTotal == nil {
+                        hitEOF = true
+                    }
+                    break
+                } catch {
+                    if attempt < 2 {
+                        try? await Task.sleep(for: .milliseconds(350 * (attempt + 1)))
+                    }
+                }
+            }
+
+            if !chunkWritten {
+                return nil
+            }
+            if hitEOF {
+                break
+            }
+        }
+
+        guard offset > 0 else { return nil }
+        onProgress?(1.0)
+        succeeded = true
+        return dest
     }
 
     func downloadDirectMedia(
