@@ -191,6 +191,10 @@ final class AppSettings {
     var autoAISyncLyrics: Bool {
         didSet { UserDefaults.standard.set(autoAISyncLyrics, forKey: Keys.autoAISyncLyrics) }
     }
+    /// Listen to each song imported from a playlist link and fix its title/artist/album/cover.
+    var autoIdentifyImportedSongs: Bool {
+        didSet { UserDefaults.standard.set(autoIdentifyImportedSongs, forKey: Keys.autoIdentifyImportedSongs) }
+    }
 
     static var isCrossfadeEnabled: Bool {
         UserDefaults.standard.bool(forKey: Keys.crossfadeEnabled)
@@ -271,6 +275,7 @@ final class AppSettings {
         static let crossfadeEnabled = "musicplayer.crossfade.enabled"
         static let crossfadeDuration = "musicplayer.crossfade.seconds"
         static let autoAISyncLyrics = "musicplayer.lyrics.autoAISync"
+        static let autoIdentifyImportedSongs = "musicplayer.import.autoIdentify"
     }
 
     private static var themeAssetsDirectory: URL {
@@ -351,6 +356,7 @@ final class AppSettings {
             defaults.set(true, forKey: Keys.autoAISyncLyrics)
         }
         self.autoAISyncLyrics = defaults.bool(forKey: Keys.autoAISyncLyrics)
+        self.autoIdentifyImportedSongs = (defaults.object(forKey: Keys.autoIdentifyImportedSongs) as? Bool) ?? true
 
         if FileManager.default.fileExists(atPath: Self.customIconFileURL.path),
            let img = UIImage(contentsOfFile: Self.customIconFileURL.path) {
