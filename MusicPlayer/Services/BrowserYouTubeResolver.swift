@@ -31,6 +31,7 @@ final class BrowserYouTubeResolver: NSObject, WKNavigationDelegate, WKScriptMess
     private var fallbackStreamURLs: [DetectedBrowserMedia] = []
 
     private var activePageFinishContinuation: CheckedContinuation<Void, Never>?
+    private var activePageFinishToken: UUID?
 
     private override init() {
         super.init()
@@ -103,7 +104,7 @@ final class BrowserYouTubeResolver: NSObject, WKNavigationDelegate, WKScriptMess
             return '';
         })();
         """
-        if let raw = try? await wv.evaluateJavaScript(js) as? String, !raw.isEmpty {
+        if let raw = await evaluateJS(js, in: wv), !raw.isEmpty {
             return raw
         }
         return nil
@@ -135,11 +136,14 @@ final class BrowserYouTubeResolver: NSObject, WKNavigationDelegate, WKScriptMess
             let stepMs = 250
             let steps = max(1, maxWaitMs / stepMs)
 
+            let deadline = Date().addingTimeInterval(Double(maxWaitMs) / 1000)
             self.activeTimeoutTask = Task { [weak self] in
                 for _ in 0..<steps {
                     try? await Task.sleep(nanoseconds: UInt64(stepMs) * 1_000_000)
                     guard !Task.isCancelled else { return }
                     if self?.activeResolveContinuation == nil { return }
+                    // Hard wall-clock deadline: slow/unanswered DOM polls must not stretch the wait.
+                    if Date() >= deadline { break }
                     await self?.pollPlayerResponseFromDOM()
                     if self?.activeResolveContinuation == nil { return }
                 }
@@ -218,7 +222,7 @@ final class BrowserYouTubeResolver: NSObject, WKNavigationDelegate, WKScriptMess
             return '';
         })();
         """
-        let raw = try? await wv.evaluateJavaScript(js) as? String
+        let raw = await evaluateJS(js, in: wv, timeoutSeconds: 8)
         let cookies = await Self.youtubeCookieHeader(forceRefresh: true)
         wv.stopLoading()
         wv.loadHTMLString("", baseURL: nil)
@@ -296,11 +300,15 @@ final class BrowserYouTubeResolver: NSObject, WKNavigationDelegate, WKScriptMess
     }
 
     private func loadAndWait(url: URL, in wv: WKWebView, timeoutSeconds: Double) async {
+        let token = UUID()
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             self.activePageFinishContinuation = continuation
+            self.activePageFinishToken = token
             Task { [weak self] in
                 try? await Task.sleep(nanoseconds: UInt64(timeoutSeconds * 1_000_000_000))
-                self?.resumePageFinishIfPending()
+                // Only time out the load that scheduled this timer, not a later one.
+                guard let self, self.activePageFinishToken == token else { return }
+                self.resumePageFinishIfPending()
             }
             wv.load(URLRequest(url: url))
         }
@@ -309,7 +317,39 @@ final class BrowserYouTubeResolver: NSObject, WKNavigationDelegate, WKScriptMess
     private func resumePageFinishIfPending() {
         guard let cont = activePageFinishContinuation else { return }
         activePageFinishContinuation = nil
+        activePageFinishToken = nil
         cont.resume()
+    }
+
+    /// `evaluateJavaScript` can stay unanswered forever when WebKit suspends the web content process
+    /// (app in background, memory pressure). Because every browser operation holds `isBusy`, one hung
+    /// call used to block ALL later browser resolves — after Stop → Retry nothing would ever download.
+    /// This bounds every JS call with a timeout.
+    private func evaluateJS(_ js: String, in wv: WKWebView, timeoutSeconds: Double = 4) async -> String? {
+        let gate = ResumeOnceGate()
+        return await withCheckedContinuation { (continuation: CheckedContinuation<String?, Never>) in
+            wv.evaluateJavaScript(js) { result, _ in
+                let text = result as? String
+                if gate.claim() { continuation.resume(returning: text) }
+            }
+            Task {
+                try? await Task.sleep(nanoseconds: UInt64(timeoutSeconds * 1_000_000_000))
+                if gate.claim() { continuation.resume(returning: nil) }
+            }
+        }
+    }
+
+    /// WebKit's content process can be killed by iOS. Drop the dead web view and unblock any waiter.
+    nonisolated func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        Task { @MainActor in
+            self.resumePageFinishIfPending()
+            self.resumeActiveResolve(with: nil)
+            if self.webView === webView {
+                self.webView?.removeFromSuperview()
+                self.webView = nil
+                self.hostContainerView = nil
+            }
+        }
     }
 
     private func pollPlayerResponseFromDOM() async {
@@ -329,7 +369,7 @@ final class BrowserYouTubeResolver: NSObject, WKNavigationDelegate, WKScriptMess
             return '';
         })();
         """
-        guard let raw = try? await wv.evaluateJavaScript(js) as? String, !raw.isEmpty else { return }
+        guard let raw = await evaluateJS(js, in: wv), !raw.isEmpty else { return }
         handleCapturedPlayerJSON(raw, visitorData: nil)
     }
 
@@ -535,4 +575,19 @@ final class BrowserYouTubeResolver: NSObject, WKNavigationDelegate, WKScriptMess
         });
     })();
     """#
+}
+
+/// Thread-safe "first caller wins" flag so a continuation is resumed exactly once
+/// when racing a completion handler against a timeout.
+final class ResumeOnceGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var done = false
+
+    func claim() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if done { return false }
+        done = true
+        return true
+    }
 }

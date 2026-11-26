@@ -35,6 +35,93 @@ enum PlaylistImportTrackStatus: String, Codable {
     case cancelled
 }
 
+/// Why a single playlist item could not be saved. Shown in the "Import Issues" report.
+enum PlaylistImportFailureReason: String, Codable, CaseIterable, Sendable {
+    case notFoundOnYouTube
+    case videoUnavailable
+    case noPlayableStream
+    case blockedByYouTube
+    case tooLong
+    case networkError
+    case downloadStalled
+    case timedOut
+    case emptyDownload
+    case conversionFailed
+    case saveFailed
+    case other
+
+    var title: String {
+        switch self {
+        case .notFoundOnYouTube: return "Couldn't find a matching video"
+        case .videoUnavailable: return "Video unavailable"
+        case .noPlayableStream: return "No downloadable stream"
+        case .blockedByYouTube: return "Blocked by YouTube"
+        case .tooLong: return "Longer than max duration"
+        case .networkError: return "Network error"
+        case .downloadStalled: return "Download stalled"
+        case .timedOut: return "Timed out"
+        case .emptyDownload: return "Empty or broken file"
+        case .conversionFailed: return "Audio/video conversion failed"
+        case .saveFailed: return "Couldn't save to library"
+        case .other: return "Other error"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .notFoundOnYouTube: return "magnifyingglass"
+        case .videoUnavailable: return "eye.slash"
+        case .noPlayableStream: return "play.slash"
+        case .blockedByYouTube: return "hand.raised"
+        case .tooLong: return "clock.badge.exclamationmark"
+        case .networkError: return "wifi.exclamationmark"
+        case .downloadStalled: return "pause.circle"
+        case .timedOut: return "hourglass"
+        case .emptyDownload: return "doc.badge.ellipsis"
+        case .conversionFailed: return "waveform.badge.exclamationmark"
+        case .saveFailed: return "externaldrive.badge.xmark"
+        case .other: return "exclamationmark.triangle"
+        }
+    }
+
+    /// Plain-language hint about what the user can do.
+    var suggestion: String {
+        switch self {
+        case .notFoundOnYouTube: return "The title/artist search found no video. Try retrying, or search it manually in the Browser tab."
+        case .videoUnavailable: return "The video is private, removed, region-locked or age-restricted. Signing into YouTube in the Browser tab can help."
+        case .noPlayableStream: return "YouTube returned no stream the app can save. Retrying with \"Always Resolve via Built-in Browser\" often fixes this."
+        case .blockedByYouTube: return "YouTube rejected the request (HTTP 403/429). Wait a few minutes, then retry."
+        case .tooLong: return "Turn off \"Skip Tracks Longer Than Max Duration\" or raise the limit in Settings."
+        case .networkError: return "Check your connection and retry."
+        case .downloadStalled: return "The download stopped receiving data. Retry to start it fresh."
+        case .timedOut: return "Finding the stream took too long. Retry."
+        case .emptyDownload: return "The server sent an empty file. Retry."
+        case .conversionFailed: return "The file downloaded but couldn't be converted. Try the other format (Audio/Video)."
+        case .saveFailed: return "Check free storage space on your device."
+        case .other: return "Retry. If it keeps failing, check the details below."
+        }
+    }
+
+    /// Best-effort classification of a raw error string coming from resolvers / URLSession.
+    static func classify(_ message: String) -> PlaylistImportFailureReason {
+        let m = message.lowercased()
+        if m.contains("403") || m.contains("429") || m.contains("sign in to confirm") || m.contains("bot") {
+            return .blockedByYouTube
+        }
+        if m.contains("unavailable") || m.contains("private") || m.contains("removed") || m.contains("age")
+            || m.contains("copyright") || m.contains("not available in your country") || m.contains("login_required") {
+            return .videoUnavailable
+        }
+        if m.contains("timed out") || m.contains("timeout") { return .timedOut }
+        if m.contains("offline") || m.contains("network") || m.contains("internet") || m.contains("connection") || m.contains("host") {
+            return .networkError
+        }
+        if m.contains("empty") || m.contains("bytes") { return .emptyDownload }
+        if m.contains("stream") { return .noPlayableStream }
+        return .other
+    }
+}
+
 struct PlaylistImportTrackJob: Identifiable, Codable, Hashable, Sendable {
     let id: UUID
     let index: Int
@@ -46,6 +133,12 @@ struct PlaylistImportTrackJob: Identifiable, Codable, Hashable, Sendable {
     var errorMessage: String?
     var resolvedViaBrowser: Bool
     var retryCount: Int
+    // Optional so older saved queues still decode.
+    var failureReason: PlaylistImportFailureReason?
+    /// Which part failed, e.g. "Finding video", "Audio track download", "Video track download", "Saving".
+    var failureStage: String?
+    var lastAttemptAt: Date?
+    var totalAttempts: Int?
 }
 
 struct PlaylistImportJob: Identifiable, Codable, Sendable {
@@ -69,7 +162,19 @@ struct PlaylistImportJob: Identifiable, Codable, Sendable {
     var skippedCount: Int = 0
     var failedCount: Int = 0
 
+    // Optional so older saved queues still decode.
+    /// True once every page of the source playlist has been discovered.
+    var discoveryCompleted: Bool?
+    /// False when the user hand-picked a subset of tracks, so re-discovering would re-add songs they deselected.
+    var allowsRediscovery: Bool?
+    /// Number of imported songs the song-ID AI corrected (title/artist/album/cover).
+    var identifiedCount: Int?
+
     var totalCount: Int { tracks.count }
+    var cancelledCount: Int { tracks.reduce(0) { $0 + ($1.status == .cancelled ? 1 : 0) } }
+    var failedTracks: [PlaylistImportTrackJob] { tracks.filter { $0.status == .failed } }
+    /// Stopped jobs (or jobs with failures) can be retried/restarted.
+    var canRetry: Bool { failedCount > 0 || (isCancelled && cancelledCount > 0) || (isCancelled && discoveryCompleted != true) }
     var processedCount: Int { completedCount + skippedCount + failedCount }
     var remainingCount: Int { max(0, totalCount - processedCount) }
     var isFinished: Bool { !isDiscoveringPages && (isCancelled || remainingCount == 0) }
@@ -125,6 +230,7 @@ final class PlaylistImportManager {
     @ObservationIgnored private var activeDownloadTasksByTrackID: [UUID: URLSessionDownloadTask] = [:]
     @ObservationIgnored private var activeResolvingTrackIDs = Set<UUID>()
     @ObservationIgnored private var discoveryTasksByJobID: [UUID: Task<Void, Never>] = [:]
+    @ObservationIgnored private var discoveryTokenByJobID: [UUID: UUID] = [:]
     @ObservationIgnored private var pumpTask: Task<Void, Never>?
     @ObservationIgnored private var pumpWakeupContinuation: CheckedContinuation<Void, Never>?
     @ObservationIgnored private var bgExecutionTaskID: UIBackgroundTaskIdentifier = .invalid
@@ -133,6 +239,19 @@ final class PlaylistImportManager {
     @ObservationIgnored private var cachedMediaByVideoID: [String: MediaItem] = [:]
     @ObservationIgnored private var didRegisterBGTask = false
     @ObservationIgnored private var pendingBGProcessingTask: BGProcessingTask?
+
+    /// Each resolve attempt gets a token. Pause/stop/watchdog invalidate it, so a late result from an
+    /// old attempt can never overwrite state or steal a concurrency slot from a newer attempt.
+    @ObservationIgnored private var resolveAttemptByTrackID: [UUID: UUID] = [:]
+    @ObservationIgnored private var resolveStartedAtByTrackID: [UUID: Date] = [:]
+    @ObservationIgnored private var lastDownloadProgressAtByTrackID: [UUID: Date] = [:]
+    @ObservationIgnored private var downloadStageByTrackID: [UUID: BackgroundDownloadTaskMetadata.Stage] = [:]
+    @ObservationIgnored private var watchdogTask: Task<Void, Never>?
+
+    /// A resolve (finding video + stream) taking longer than this is treated as hung.
+    private static let resolveHardTimeout: TimeInterval = 150
+    /// A foreground download receiving no bytes for this long is treated as stalled.
+    private static let downloadStallTimeout: TimeInterval = 75
 
     private static let maxConcurrentForegroundResolvers = 3
     private static let maxConcurrentDownloadsForeground = 4
@@ -265,6 +384,10 @@ final class PlaylistImportManager {
     }
 
     private func handleWillEnterForeground() {
+        // Time spent suspended isn't a stall: restart the watchdog clocks.
+        let now = Date()
+        for key in lastDownloadProgressAtByTrackID.keys { lastDownloadProgressAtByTrackID[key] = now }
+        for key in resolveStartedAtByTrackID.keys { resolveStartedAtByTrackID[key] = now }
         if bgExecutionTaskID != .invalid {
             UIApplication.shared.endBackgroundTask(bgExecutionTaskID)
             bgExecutionTaskID = .invalid
@@ -286,12 +409,13 @@ final class PlaylistImportManager {
         alreadyDiscoveredTracks: [ExternalPlaylistTrack] = [],
         initialInitialDataJSON: [String: Any]? = nil,
         listIDForInitialData: String? = nil,
-        skipDiscoveryIfComplete: Bool = false
+        skipDiscoveryIfComplete: Bool = false,
+        allowsRediscovery: Bool = true
     ) -> UUID {
         refreshCachedVideoMap()
 
         let jobID = UUID()
-        let job = PlaylistImportJob(
+        var job = PlaylistImportJob(
             id: jobID,
             sourceURLString: sourceURLString,
             playlistName: playlistName,
@@ -307,6 +431,8 @@ final class PlaylistImportManager {
             updatedAt: .now,
             tracks: []
         )
+        job.discoveryCompleted = skipDiscoveryIfComplete ? true : false
+        job.allowsRediscovery = allowsRediscovery
         jobs.insert(job, at: 0)
 
         if !alreadyDiscoveredTracks.isEmpty {
@@ -314,16 +440,12 @@ final class PlaylistImportManager {
         }
 
         if !skipDiscoveryIfComplete {
-            let capturedInitialJSON = initialInitialDataJSON
-            let capturedListID = listIDForInitialData
-            discoveryTasksByJobID[jobID] = Task { [weak self] in
-                await self?.runDiscoveryStream(
-                    jobID: jobID,
-                    urlString: sourceURLString,
-                    initialJSON: capturedInitialJSON,
-                    listID: capturedListID
-                )
-            }
+            startDiscovery(
+                jobID: jobID,
+                urlString: sourceURLString,
+                initialJSON: initialInitialDataJSON,
+                listID: listIDForInitialData
+            )
         }
 
         scheduleDebouncedSave()
@@ -331,11 +453,36 @@ final class PlaylistImportManager {
         return jobID
     }
 
+    private func startDiscovery(jobID: UUID, urlString: String, initialJSON: [String: Any]? = nil, listID: String? = nil) {
+        discoveryTasksByJobID[jobID]?.cancel()
+        if let idx = jobs.firstIndex(where: { $0.id == jobID }) {
+            jobs[idx].isDiscoveringPages = true
+            jobs[idx].discoveryError = nil
+        }
+        let capturedInitialJSON = initialJSON
+        let token = UUID()
+        discoveryTokenByJobID[jobID] = token
+        discoveryTasksByJobID[jobID] = Task { [weak self] in
+            await self?.runDiscoveryStream(
+                jobID: jobID,
+                urlString: urlString,
+                initialJSON: capturedInitialJSON,
+                listID: listID
+            )
+            guard let self, self.discoveryTokenByJobID[jobID] == token else { return }
+            self.discoveryTokenByJobID.removeValue(forKey: jobID)
+            self.discoveryTasksByJobID.removeValue(forKey: jobID)
+        }
+    }
+
     /// Appends newly streamed tracks from an external discovery task (e.g. ImportPlaylistSheetView live stream).
     func appendDiscoveredTracks(_ tracks: [ExternalPlaylistTrack], toJobID jobID: UUID, isComplete: Bool) {
         appendTracks(tracks, toJobID: jobID)
         if isComplete, let idx = jobs.firstIndex(where: { $0.id == jobID }) {
             jobs[idx].isDiscoveringPages = false
+            if !jobs[idx].isCancelled {
+                jobs[idx].discoveryCompleted = true
+            }
             jobs[idx].updatedAt = .now
         }
         scheduleDebouncedSave()
@@ -348,20 +495,32 @@ final class PlaylistImportManager {
         jobs[idx].discoveryError = message
         jobs[idx].updatedAt = .now
         scheduleDebouncedSave()
+        // Discovery may have been the only thing keeping the job "unfinished".
+        finalizeCompletedJobsIfNeeded()
     }
 
     // MARK: - Job Controls
+
+    /// Cancels in-flight network work for a track and invalidates any resolver still running for it.
+    private func abortInFlightWork(forTrackID trackID: UUID) {
+        if let task = activeDownloadTasksByTrackID.removeValue(forKey: trackID) {
+            task.cancel()
+        }
+        activeResolvingTrackIDs.remove(trackID)
+        resolveAttemptByTrackID.removeValue(forKey: trackID)
+        resolveStartedAtByTrackID.removeValue(forKey: trackID)
+        lastDownloadProgressAtByTrackID.removeValue(forKey: trackID)
+        downloadStageByTrackID.removeValue(forKey: trackID)
+        activeDownloadProgressByTrackID.removeValue(forKey: trackID)
+        removePairedVideoURL(forTrackID: trackID)
+    }
 
     func pauseJob(id: UUID) {
         guard let idx = jobs.firstIndex(where: { $0.id == id }) else { return }
         jobs[idx].isPaused = true
         jobs[idx].updatedAt = .now
         for track in jobs[idx].tracks {
-            if let task = activeDownloadTasksByTrackID.removeValue(forKey: track.id) {
-                task.cancel()
-            }
-            activeResolvingTrackIDs.remove(track.id)
-            activeDownloadProgressByTrackID.removeValue(forKey: track.id)
+            abortInFlightWork(forTrackID: track.id)
         }
         for i in jobs[idx].tracks.indices {
             if jobs[idx].tracks[i].status == .resolving || jobs[idx].tracks[i].status == .downloading {
@@ -384,32 +543,101 @@ final class PlaylistImportManager {
         guard let idx = jobs.firstIndex(where: { $0.id == id }), !jobs[idx].isCancelled else { return }
         jobs[idx].isPaused = false
         jobs[idx].updatedAt = .now
+        resetStuckInFlightTracks(jobIndex: idx)
+        restartDiscoveryIfInterrupted(jobIndex: idx)
         refreshCachedVideoMap()
         persistJobsNow()
         ensurePumping()
     }
 
+    /// Retries everything that didn't make it: failed tracks AND tracks that were stopped mid-import.
+    ///
+    /// Bug this fixes: Stop marked every unfinished track `.cancelled`, but Retry only reset `.failed`
+    /// tracks. The job was un-cancelled with tracks that could never be picked up again, so the pump
+    /// loop found nothing to do while the job still showed "remaining" — the import sat stalled forever.
+    /// Tracks discovered after Stop were also dropped, and discovery was never restarted.
     func retryFailedTracks(inJobID id: UUID) {
         guard let idx = jobs.firstIndex(where: { $0.id == id }) else { return }
-        var resetCount = 0
-        for tIdx in jobs[idx].tracks.indices where jobs[idx].tracks[tIdx].status == .failed {
+        var resetFailed = 0
+        var resetCancelled = 0
+        for tIdx in jobs[idx].tracks.indices {
+            let status = jobs[idx].tracks[tIdx].status
+            guard status == .failed || status == .cancelled else { continue }
+            abortInFlightWork(forTrackID: jobs[idx].tracks[tIdx].id)
+            if status == .failed { resetFailed += 1 } else { resetCancelled += 1 }
             jobs[idx].tracks[tIdx].status = .pending
             jobs[idx].tracks[tIdx].errorMessage = nil
+            jobs[idx].tracks[tIdx].failureReason = nil
+            jobs[idx].tracks[tIdx].failureStage = nil
             jobs[idx].tracks[tIdx].retryCount = 0
-            resetCount += 1
         }
-        if resetCount > 0 {
-            jobs[idx].failedCount = max(0, jobs[idx].failedCount - resetCount)
-            jobs[idx].isPaused = false
-            jobs[idx].isCancelled = false
-            jobs[idx].updatedAt = .now
-            persistJobsNow()
-            ensurePumping()
+        // Anything still flagged resolving/downloading without live work behind it is stuck too.
+        resetStuckInFlightTracks(jobIndex: idx)
+
+        let wasCancelled = jobs[idx].isCancelled
+        jobs[idx].failedCount = max(0, jobs[idx].failedCount - resetFailed)
+        jobs[idx].isPaused = false
+        jobs[idx].isCancelled = false
+        jobs[idx].updatedAt = .now
+        if wasCancelled {
+            restartDiscoveryIfInterrupted(jobIndex: idx)
         }
+        // Refresh cookies (a stale sign-in is a common reason for the first failure).
+        Task { _ = await BrowserYouTubeResolver.youtubeCookieHeader(forceRefresh: true) }
+        refreshCachedVideoMap()
+        currentStatusMessage = resetFailed + resetCancelled > 0
+            ? "Retrying \(resetFailed + resetCancelled) tracks in \"\(jobs[idx].playlistName)\"..."
+            : currentStatusMessage
+        persistJobsNow()
+        ensurePumping()
+    }
+
+    /// Retries one specific failed/stopped track.
+    func retryTrack(jobID: UUID, trackID: UUID) {
+        guard let jIdx = jobs.firstIndex(where: { $0.id == jobID }),
+              let tIdx = jobs[jIdx].tracks.firstIndex(where: { $0.id == trackID }) else { return }
+        let status = jobs[jIdx].tracks[tIdx].status
+        guard status == .failed || status == .cancelled else { return }
+        abortInFlightWork(forTrackID: trackID)
+        if status == .failed {
+            jobs[jIdx].failedCount = max(0, jobs[jIdx].failedCount - 1)
+        }
+        jobs[jIdx].tracks[tIdx].status = .pending
+        jobs[jIdx].tracks[tIdx].errorMessage = nil
+        jobs[jIdx].tracks[tIdx].failureReason = nil
+        jobs[jIdx].tracks[tIdx].failureStage = nil
+        jobs[jIdx].tracks[tIdx].retryCount = 0
+        jobs[jIdx].isCancelled = false
+        jobs[jIdx].isPaused = false
+        jobs[jIdx].updatedAt = .now
+        persistJobsNow()
+        ensurePumping()
+    }
+
+    /// Tracks marked resolving/downloading with no live resolver or URLSession task behind them
+    /// would never be picked up again. Put them back in the queue.
+    private func resetStuckInFlightTracks(jobIndex idx: Int) {
+        for tIdx in jobs[idx].tracks.indices {
+            let track = jobs[idx].tracks[tIdx]
+            let isLive = activeDownloadTasksByTrackID[track.id] != nil || resolveAttemptByTrackID[track.id] != nil
+            if (track.status == .resolving || track.status == .downloading) && !isLive {
+                jobs[idx].tracks[tIdx].status = .pending
+            }
+        }
+    }
+
+    private func restartDiscoveryIfInterrupted(jobIndex idx: Int) {
+        let job = jobs[idx]
+        guard job.discoveryCompleted == false,
+              job.allowsRediscovery != false,
+              discoveryTasksByJobID[job.id] == nil,
+              !job.sourceURLString.isEmpty else { return }
+        startDiscovery(jobID: job.id, urlString: job.sourceURLString)
     }
 
     func cancelJob(id: UUID) {
         discoveryTasksByJobID.removeValue(forKey: id)?.cancel()
+        discoveryTokenByJobID.removeValue(forKey: id)
         guard let idx = jobs.firstIndex(where: { $0.id == id }) else { return }
         jobs[idx].isCancelled = true
         jobs[idx].isDiscoveringPages = false
@@ -418,11 +646,7 @@ final class PlaylistImportManager {
 
         for i in jobs[idx].tracks.indices {
             let tid = jobs[idx].tracks[i].id
-            if let task = activeDownloadTasksByTrackID.removeValue(forKey: tid) {
-                task.cancel()
-            }
-            activeResolvingTrackIDs.remove(tid)
-            activeDownloadProgressByTrackID.removeValue(forKey: tid)
+            abortInFlightWork(forTrackID: tid)
             let st = jobs[idx].tracks[i].status
             if st == .pending || st == .resolving || st == .downloading {
                 jobs[idx].tracks[i].status = .cancelled
@@ -495,8 +719,11 @@ final class PlaylistImportManager {
                 }
             }
 
-            if let idx = jobs.firstIndex(where: { $0.id == jobID }) {
+            if let idx = jobs.firstIndex(where: { $0.id == jobID }), !Task.isCancelled {
                 jobs[idx].isDiscoveringPages = false
+                if !jobs[idx].isCancelled {
+                    jobs[idx].discoveryCompleted = true
+                }
                 jobs[idx].updatedAt = .now
                 scheduleDebouncedSave()
                 ensurePumping()
@@ -504,9 +731,10 @@ final class PlaylistImportManager {
         } catch is CancellationError {
             // Ignored
         } catch {
-            markDiscoveryFailed(jobID: jobID, message: error.localizedDescription)
+            if !Task.isCancelled {
+                markDiscoveryFailed(jobID: jobID, message: error.localizedDescription)
+            }
         }
-        discoveryTasksByJobID.removeValue(forKey: jobID)
     }
 
     private func handleDiscoveryPage(
@@ -522,6 +750,7 @@ final class PlaylistImportManager {
         }
         if page.isComplete {
             jobs[idx].isDiscoveringPages = false
+            jobs[idx].discoveryCompleted = true
         }
         jobs[idx].updatedAt = .now
         scheduleDebouncedSave()
@@ -532,12 +761,21 @@ final class PlaylistImportManager {
         guard let idx = jobs.firstIndex(where: { $0.id == jobID }), !jobs[idx].isCancelled else { return }
 
         var existingVideoIDs = Set(jobs[idx].tracks.compactMap(\.youtubeVideoID))
+        // Title+artist keys de-duplicate tracks without a video ID (Spotify/Apple Music) when discovery
+        // is restarted after Stop/relaunch, or when two discovery streams feed the same job.
+        var existingTitleKeys = Set(jobs[idx].tracks.map { Self.dedupKey(title: $0.title, artist: $0.artist) })
         var existingCacheItemsToAdd: [MediaItem] = []
         var itemsToAppend: [PlaylistImportTrackJob] = []
         let baseIndex = jobs[idx].tracks.count
 
         for (offset, track) in newTracks.enumerated() {
             let cleanVID = track.youtubeVideoID?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let titleKey = Self.dedupKey(title: track.title, artist: track.artist)
+            if cleanVID == nil || cleanVID?.isEmpty == true {
+                guard existingTitleKeys.insert(titleKey).inserted else { continue }
+            } else {
+                existingTitleKeys.insert(titleKey)
+            }
             if let cleanVID, !cleanVID.isEmpty {
                 guard existingVideoIDs.insert(cleanVID).inserted else { continue }
                 if let cached = cachedMediaByVideoID[cleanVID] {
@@ -589,6 +827,12 @@ final class PlaylistImportManager {
         }
     }
 
+    private static func dedupKey(title: String, artist: String) -> String {
+        let t = title.lowercased().filter { $0.isLetter || $0.isNumber }
+        let a = artist.lowercased().filter { $0.isLetter || $0.isNumber }
+        return "\(t)|\(a)"
+    }
+
     // MARK: - Worker Scheduler & Execution Loop
 
     private func ensurePumping() {
@@ -601,6 +845,101 @@ final class PlaylistImportManager {
         pumpTask = Task { [weak self] in
             await self?.runPumpLoop()
         }
+        startWatchdogIfNeeded()
+    }
+
+    // MARK: - Stall Watchdog
+
+    /// Safety net so the queue can never sit frozen: a resolve that hangs (e.g. WKWebView JS never
+    /// answering) or a foreground download that stops receiving bytes is failed with a clear reason
+    /// (and auto-retried once), freeing its slot for the next track.
+    private func startWatchdogIfNeeded() {
+        guard watchdogTask == nil else { return }
+        watchdogTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 10_000_000_000)
+                guard let self else { return }
+                let stillBusy = self.runWatchdogPass()
+                if !stillBusy {
+                    self.watchdogTask = nil
+                    return
+                }
+            }
+        }
+    }
+
+    /// Returns false when there is nothing left to watch.
+    private func runWatchdogPass() -> Bool {
+        let now = Date()
+
+        for (trackID, startedAt) in resolveStartedAtByTrackID
+        where now.timeIntervalSince(startedAt) > Self.resolveHardTimeout {
+            guard let jobID = jobs.first(where: { job in job.tracks.contains(where: { $0.id == trackID }) })?.id,
+                  let pair = lookup(jobID: jobID, trackID: trackID),
+                  pair.track.status == .resolving else {
+                resolveStartedAtByTrackID.removeValue(forKey: trackID)
+                continue
+            }
+            // Invalidate the hung attempt; whatever it returns later is ignored.
+            resolveAttemptByTrackID.removeValue(forKey: trackID)
+            resolveStartedAtByTrackID.removeValue(forKey: trackID)
+            activeResolvingTrackIDs.remove(trackID)
+            markTrackFailed(
+                jobID: jobID,
+                trackID: trackID,
+                error: "Finding a stream took longer than \(Int(Self.resolveHardTimeout))s",
+                retryable: true,
+                reason: .timedOut,
+                stage: "Finding video & stream"
+            )
+        }
+
+        // Background URLSession transfers are scheduled by iOS and can legitimately pause while the
+        // app is suspended, so stall detection only applies in the foreground.
+        if UIApplication.shared.applicationState == .active {
+            for (trackID, task) in activeDownloadTasksByTrackID {
+                let last = lastDownloadProgressAtByTrackID[trackID] ?? now
+                guard now.timeIntervalSince(last) > Self.downloadStallTimeout else { continue }
+                guard let jobID = jobs.first(where: { job in job.tracks.contains(where: { $0.id == trackID }) })?.id else { continue }
+                let stage = downloadStageByTrackID[trackID]
+                abortInFlightWork(forTrackID: trackID)
+                task.cancel()
+                let bytes = task.countOfBytesReceived
+                markTrackFailed(
+                    jobID: jobID,
+                    trackID: trackID,
+                    error: "No data received for \(Int(Self.downloadStallTimeout))s (\(ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)) downloaded)",
+                    retryable: true,
+                    reason: .downloadStalled,
+                    stage: Self.stageLabel(stage)
+                )
+            }
+        }
+
+        finalizeCompletedJobsIfNeeded()
+        ensurePumping()
+        return !resolveStartedAtByTrackID.isEmpty || !activeDownloadTasksByTrackID.isEmpty || pumpTask != nil
+    }
+
+    private static func stageLabel(_ stage: BackgroundDownloadTaskMetadata.Stage?) -> String {
+        switch stage {
+        case .pairedAudio: return "Audio track download"
+        case .pairedVideo: return "Video track download"
+        case .audioExtractFromMP4: return "Audio download (from MP4)"
+        case .singleDirect: return "Download"
+        case nil: return "Download"
+        }
+    }
+
+    private func isCurrentAttempt(_ attempt: UUID, trackID: UUID) -> Bool {
+        resolveAttemptByTrackID[trackID] == attempt
+    }
+
+    private func markAttemptStarted(jobID: UUID, trackID: UUID) {
+        guard let jIdx = jobs.firstIndex(where: { $0.id == jobID }),
+              let tIdx = jobs[jIdx].tracks.firstIndex(where: { $0.id == trackID }) else { return }
+        jobs[jIdx].tracks[tIdx].lastAttemptAt = .now
+        jobs[jIdx].tracks[tIdx].totalAttempts = (jobs[jIdx].tracks[tIdx].totalAttempts ?? 0) + 1
     }
 
     private func waitForQueueEvent() async {
@@ -629,11 +968,15 @@ final class PlaylistImportManager {
                   let nextPair = nextResolvableTrack() {
                 let (jobID, trackID) = nextPair
                 setTrackStatus(jobID: jobID, trackID: trackID, status: .resolving)
+                markAttemptStarted(jobID: jobID, trackID: trackID)
                 activeResolvingTrackIDs.insert(trackID)
+                let attempt = UUID()
+                resolveAttemptByTrackID[trackID] = attempt
+                resolveStartedAtByTrackID[trackID] = .now
                 startedWork = true
 
                 Task { [weak self] in
-                    await self?.resolveAndScheduleTrack(jobID: jobID, trackID: trackID)
+                    await self?.resolveAndScheduleTrack(jobID: jobID, trackID: trackID, attempt: attempt)
                 }
             }
 
@@ -666,15 +1009,29 @@ final class PlaylistImportManager {
         return nil
     }
 
-    private func resolveAndScheduleTrack(jobID: UUID, trackID: UUID) async {
+    private func resolveAndScheduleTrack(jobID: UUID, trackID: UUID, attempt: UUID) async {
         defer {
-            activeResolvingTrackIDs.remove(trackID)
+            // Only release the slot if this attempt still owns it (pause/stop/watchdog may have
+            // handed the track to a newer attempt already).
+            if isCurrentAttempt(attempt, trackID: trackID) {
+                resolveAttemptByTrackID.removeValue(forKey: trackID)
+                resolveStartedAtByTrackID.removeValue(forKey: trackID)
+                activeResolvingTrackIDs.remove(trackID)
+            }
             ensurePumping()
         }
 
         guard let (job, track) = lookup(jobID: jobID, trackID: trackID),
               !job.isPaused, !job.isCancelled else {
             return
+        }
+
+        /// After every `await`, make sure the job wasn't paused/stopped and this attempt wasn't timed out.
+        func stillValid() -> Bool {
+            guard isCurrentAttempt(attempt, trackID: trackID),
+                  let fresh = jobs.first(where: { $0.id == jobID }),
+                  !fresh.isPaused, !fresh.isCancelled else { return false }
+            return true
         }
 
         currentStatusMessage = "Finding \"\(track.title)\"..."
@@ -686,10 +1043,12 @@ final class PlaylistImportManager {
         if videoID == nil || videoID?.isEmpty == true {
             if !job.alwaysUseBrowserResolver {
                 videoID = await PlaylistURLImporter.findBestYouTubeVideoID(title: track.title, artist: track.artist)
+                guard stillValid() else { return }
             }
             if videoID == nil || videoID?.isEmpty == true {
                 usedBrowser = true
                 videoID = await BrowserYouTubeResolver.shared.findVideoIDInBrowser(title: track.title, artist: track.artist)
+                guard stillValid() else { return }
             }
             if let foundID = videoID, !foundID.isEmpty {
                 updateTrackVideoID(jobID: jobID, trackID: trackID, videoID: foundID)
@@ -697,7 +1056,14 @@ final class PlaylistImportManager {
         }
 
         guard let resolvedVideoID = videoID, !resolvedVideoID.isEmpty else {
-            markTrackFailed(jobID: jobID, trackID: trackID, error: "Video not found on YouTube", retryable: true)
+            markTrackFailed(
+                jobID: jobID,
+                trackID: trackID,
+                error: "No YouTube video matched \"\(track.artist.isEmpty ? "" : track.artist + " - ")\(track.title)\" (searched API\(usedBrowser ? " + built-in browser" : ""))",
+                retryable: true,
+                reason: .notFoundOnYouTube,
+                stage: "Finding video"
+            )
             return
         }
 
@@ -709,15 +1075,11 @@ final class PlaylistImportManager {
             return
         }
 
-        // Check cancellation/pause before resolution
-        guard let freshJob = jobs.first(where: { $0.id == jobID }), !freshJob.isPaused, !freshJob.isCancelled else {
-            setTrackStatus(jobID: jobID, trackID: trackID, status: .pending)
-            return
-        }
-
         // Step 3: Resolve streams (fast InnerTube with browser cookies -> Built-in Browser WKWebView fallback)
         var resolvedResult: YouTubeResolvedResult?
+        var apiErrorReason: String?
         var cookiesHeader = await BrowserYouTubeResolver.youtubeCookieHeader()
+        guard stillValid() else { return }
 
         if !job.alwaysUseBrowserResolver,
            track.retryCount == 0,
@@ -729,6 +1091,8 @@ final class PlaylistImportManager {
                 visitorData: nil,
                 skipReachabilityProbe: true
             )
+            guard stillValid() else { return }
+            apiErrorReason = resolvedResult?.errorReason
         }
 
         if resolvedResult == nil || (resolvedResult?.streams.isEmpty ?? true) {
@@ -737,14 +1101,20 @@ final class PlaylistImportManager {
                 resolvedResult = browserResolved.result
                 cookiesHeader = browserResolved.cookiesHeader ?? cookiesHeader
             }
+            guard stillValid() else { return }
         }
 
         guard let resolvedResult, !resolvedResult.streams.isEmpty else {
+            let raw = resolvedResult?.errorReason ?? apiErrorReason
+            let reason: PlaylistImportFailureReason = raw.map { PlaylistImportFailureReason.classify($0) } ?? .noPlayableStream
             markTrackFailed(
                 jobID: jobID,
                 trackID: trackID,
-                error: resolvedResult?.errorReason ?? "Could not find playable stream in browser",
-                retryable: track.retryCount == 0
+                error: (raw.map { "YouTube said: \($0)" } ?? "No playable stream found via API or built-in browser")
+                    + " [video \(resolvedVideoID)]",
+                retryable: track.retryCount == 0,
+                reason: reason == .other ? .noPlayableStream : reason,
+                stage: "Getting stream"
             )
             return
         }
@@ -753,7 +1123,14 @@ final class PlaylistImportManager {
         if job.respectMaxDurationLimit {
             let maxMins = UserDefaults.standard.integer(forKey: "musicplayer.maxDuration")
             if maxMins > 0, let dur = resolvedResult.durationSeconds, dur > Double(maxMins) * 60 {
-                markTrackFailed(jobID: jobID, trackID: trackID, error: "Exceeds max cache duration (\(maxMins)m)", retryable: false)
+                markTrackFailed(
+                    jobID: jobID,
+                    trackID: trackID,
+                    error: "Video is \(MediaTimeFormatter.format(dur)), limit is \(maxMins)m",
+                    retryable: false,
+                    reason: .tooLong,
+                    stage: "Checking length"
+                )
                 return
             }
         }
@@ -763,6 +1140,8 @@ final class PlaylistImportManager {
             // HLS-only fallback via foreground WebMediaDownloader if available
             if let hlsStream = resolvedResult.streams.first(where: { $0.isHLS }) {
                 setTrackStatus(jobID: jobID, trackID: trackID, status: .downloading)
+                // Long HLS downloads are exempt from the resolve timeout.
+                resolveStartedAtByTrackID.removeValue(forKey: trackID)
                 if let downloaded = await WebMediaDownloader.shared.downloadTrackIntoPlaylist(
                     hlsStream,
                     targetPlaylistID: job.targetPlaylistID,
@@ -771,10 +1150,36 @@ final class PlaylistImportManager {
                 ) {
                     cachedMediaByVideoID[resolvedVideoID] = downloaded
                     markTrackCompleted(jobID: jobID, trackID: trackID, viaBrowser: usedBrowser)
+                    SongIdentificationService.shared.enqueue(
+                        downloaded,
+                        hintTitle: track.title,
+                        hintArtist: track.artist,
+                        sourceVideoID: resolvedVideoID,
+                        sourcePlatform: sourcePlatform(forJobID: jobID),
+                        jobID: jobID
+                    )
                     return
                 }
+                guard stillValid() else { return }
+                markTrackFailed(
+                    jobID: jobID,
+                    trackID: trackID,
+                    error: "HLS (segmented) stream download failed",
+                    retryable: track.retryCount == 0,
+                    reason: .noPlayableStream,
+                    stage: "HLS download"
+                )
+                return
             }
-            markTrackFailed(jobID: jobID, trackID: trackID, error: "No downloadable stream available", retryable: track.retryCount == 0)
+            let kinds = Set(resolvedResult.streams.map { $0.isHLS ? "HLS" : ($0.isAudio ? "audio" : "video") }).sorted().joined(separator: ", ")
+            markTrackFailed(
+                jobID: jobID,
+                trackID: trackID,
+                error: "No \(job.preferredFormat == .audioOnly ? "audio" : "video") stream the app can save (found: \(kinds.isEmpty ? "none" : kinds))",
+                retryable: track.retryCount == 0,
+                reason: .noPlayableStream,
+                stage: "Picking stream"
+            )
             return
         }
 
@@ -874,12 +1279,15 @@ final class PlaylistImportManager {
 
         guard let metaData = try? JSONEncoder().encode(meta),
               let metaString = String(data: metaData, encoding: .utf8) else {
-            markTrackFailed(jobID: jobID, trackID: track.id, error: "Could not serialize task", retryable: false)
+            markTrackFailed(jobID: jobID, trackID: track.id, error: "Could not serialize task", retryable: false, reason: .other, stage: "Starting download")
             return
         }
 
         setTrackStatus(jobID: jobID, trackID: track.id, status: .downloading)
         activeDownloadProgressByTrackID[track.id] = 0
+        lastDownloadProgressAtByTrackID[track.id] = .now
+        downloadStageByTrackID[track.id] = stage
+        resolveStartedAtByTrackID.removeValue(forKey: track.id)
 
         let task = backgroundSession.downloadTask(with: request)
         task.taskDescription = metaString
@@ -889,21 +1297,55 @@ final class PlaylistImportManager {
 
     // MARK: - Background Delegate Callbacks
 
+    fileprivate func recordDownloadProgress(trackID: UUID, fraction: Double?) {
+        // Ignore late callbacks from tasks that were already cancelled/aborted.
+        guard activeDownloadTasksByTrackID[trackID] != nil else { return }
+        lastDownloadProgressAtByTrackID[trackID] = .now
+        if let fraction {
+            activeDownloadProgressByTrackID[trackID] = fraction
+        }
+    }
+
+    /// True when a URLSession callback belongs to the download we're currently tracking for this track
+    /// (and not a stale task from before a pause/stop/retry).
+    private func isCurrentDownload(trackID: UUID, jobID: UUID, taskIdentifier: Int) -> Bool {
+        if let active = activeDownloadTasksByTrackID[trackID] {
+            return active.taskIdentifier == taskIdentifier
+        }
+        // App relaunched before reconcile finished: trust the persisted status.
+        return lookup(jobID: jobID, trackID: trackID)?.track.status == .downloading
+    }
+
     private func handleBackgroundDownloadFinished(
         stagedFileURL: URL,
         metadata: BackgroundDownloadTaskMetadata,
-        httpStatusCode: Int?
+        httpStatusCode: Int?,
+        taskIdentifier: Int
     ) async {
+        guard isCurrentDownload(trackID: metadata.trackID, jobID: metadata.jobID, taskIdentifier: taskIdentifier) else {
+            try? FileManager.default.removeItem(at: stagedFileURL)
+            return
+        }
         activeDownloadTasksByTrackID.removeValue(forKey: metadata.trackID)
         activeDownloadProgressByTrackID.removeValue(forKey: metadata.trackID)
+        lastDownloadProgressAtByTrackID.removeValue(forKey: metadata.trackID)
+        downloadStageByTrackID.removeValue(forKey: metadata.trackID)
 
         let fileSize = (try? stagedFileURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
         let hasBadHTTPStatus = httpStatusCode.map { !(200...299).contains($0) } ?? false
         if hasBadHTTPStatus || fileSize < 2048 {
             try? FileManager.default.removeItem(at: stagedFileURL)
             removePairedVideoURL(forTrackID: metadata.trackID)
-            let reason = httpStatusCode.map { "Stream returned HTTP \($0)" } ?? "Downloaded stream was empty (\(fileSize) bytes)"
-            handleDownloadFailureOrRetry(metadata: metadata, message: reason)
+            let reason: PlaylistImportFailureReason
+            let message: String
+            if let code = httpStatusCode, hasBadHTTPStatus {
+                reason = (code == 403 || code == 429) ? .blockedByYouTube : (code == 404 || code == 410 ? .videoUnavailable : .other)
+                message = "Server returned HTTP \(code)\(code == 403 ? " (forbidden — stream link expired or blocked)" : code == 429 ? " (too many requests)" : "")"
+            } else {
+                reason = .emptyDownload
+                message = "Downloaded file was empty (\(fileSize) bytes)"
+            }
+            handleDownloadFailureOrRetry(metadata: metadata, message: message, reason: reason)
             return
         }
 
@@ -935,7 +1377,14 @@ final class PlaylistImportManager {
                 )
             } else {
                 try? FileManager.default.removeItem(at: stagedFileURL)
-                markTrackFailed(jobID: metadata.jobID, trackID: metadata.trackID, error: "Paired video missing", retryable: true)
+                markTrackFailed(
+                    jobID: metadata.jobID,
+                    trackID: metadata.trackID,
+                    error: "Audio track downloaded, but the matching video link was lost",
+                    retryable: true,
+                    reason: .other,
+                    stage: "Video track download"
+                )
             }
 
         case .pairedVideo:
@@ -999,6 +1448,14 @@ final class PlaylistImportManager {
         if let imported {
             cachedMediaByVideoID[metadata.videoID] = imported
             markTrackCompleted(jobID: metadata.jobID, trackID: metadata.trackID, viaBrowser: metadata.resolvedViaBrowser)
+            SongIdentificationService.shared.enqueue(
+                imported,
+                hintTitle: metadata.title,
+                hintArtist: metadata.artist,
+                sourceVideoID: metadata.videoID,
+                sourcePlatform: sourcePlatform(forJobID: metadata.jobID),
+                jobID: metadata.jobID
+            )
             importedSinceLastLibraryFlush += 1
             if importedSinceLastLibraryFlush >= 10 {
                 importedSinceLastLibraryFlush = 0
@@ -1010,28 +1467,75 @@ final class PlaylistImportManager {
             }
         } else {
             try? FileManager.default.removeItem(at: fileURL)
-            markTrackFailed(jobID: metadata.jobID, trackID: metadata.trackID, error: "Could not save file to library", retryable: false)
+            markTrackFailed(
+                jobID: metadata.jobID,
+                trackID: metadata.trackID,
+                error: "Could not move the downloaded file into your library (storage full?)",
+                retryable: false,
+                reason: .saveFailed,
+                stage: "Saving"
+            )
         }
 
         finalizeCompletedJobsIfNeeded()
         ensurePumping()
     }
 
-    private func handleBackgroundTaskError(
-        metadata: BackgroundDownloadTaskMetadata,
-        error: Error
-    ) {
-        activeDownloadTasksByTrackID.removeValue(forKey: metadata.trackID)
-        activeDownloadProgressByTrackID.removeValue(forKey: metadata.trackID)
-
-        let nsErr = error as NSError
-        if nsErr.domain == NSURLErrorDomain && nsErr.code == NSURLErrorCancelled {
-            return
-        }
-        handleDownloadFailureOrRetry(metadata: metadata, message: error.localizedDescription)
+    /// Where the playlist came from. Spotify/Apple Music playlists carry exact song titles & artists,
+    /// which the song-ID step trusts more than a YouTube video title.
+    private func sourcePlatform(forJobID jobID: UUID) -> ExternalPlaylistPlatform? {
+        guard let job = jobs.first(where: { $0.id == jobID }) else { return nil }
+        return PlaylistURLImporter.parsePlaylistURL(job.sourceURLString)?.platform
     }
 
-    private func handleDownloadFailureOrRetry(metadata: BackgroundDownloadTaskMetadata, message: String) {
+    /// Called by the song-ID service when it corrected an imported track's metadata.
+    func noteTrackIdentified(jobID: UUID) {
+        guard let idx = jobs.firstIndex(where: { $0.id == jobID }) else { return }
+        jobs[idx].identifiedCount = (jobs[idx].identifiedCount ?? 0) + 1
+        scheduleDebouncedSave()
+    }
+
+    private func handleBackgroundTaskError(
+        metadata: BackgroundDownloadTaskMetadata,
+        error: Error,
+        taskIdentifier: Int
+    ) {
+        let nsErr = error as NSError
+        if nsErr.domain == NSURLErrorDomain && nsErr.code == NSURLErrorCancelled {
+            // We cancelled it ourselves (pause/stop/watchdog). Don't touch newer attempts' state.
+            if activeDownloadTasksByTrackID[metadata.trackID]?.taskIdentifier == taskIdentifier {
+                activeDownloadTasksByTrackID.removeValue(forKey: metadata.trackID)
+                activeDownloadProgressByTrackID.removeValue(forKey: metadata.trackID)
+            }
+            return
+        }
+        guard isCurrentDownload(trackID: metadata.trackID, jobID: metadata.jobID, taskIdentifier: taskIdentifier) else { return }
+        activeDownloadTasksByTrackID.removeValue(forKey: metadata.trackID)
+        activeDownloadProgressByTrackID.removeValue(forKey: metadata.trackID)
+        lastDownloadProgressAtByTrackID.removeValue(forKey: metadata.trackID)
+        downloadStageByTrackID.removeValue(forKey: metadata.trackID)
+
+        let reason: PlaylistImportFailureReason
+        switch nsErr.code {
+        case NSURLErrorTimedOut: reason = .timedOut
+        case NSURLErrorNotConnectedToInternet, NSURLErrorNetworkConnectionLost, NSURLErrorCannotFindHost,
+             NSURLErrorCannotConnectToHost, NSURLErrorDNSLookupFailed, NSURLErrorInternationalRoamingOff,
+             NSURLErrorDataNotAllowed:
+            reason = .networkError
+        default: reason = PlaylistImportFailureReason.classify(error.localizedDescription)
+        }
+        handleDownloadFailureOrRetry(
+            metadata: metadata,
+            message: "\(error.localizedDescription) (code \(nsErr.code))",
+            reason: reason
+        )
+    }
+
+    private func handleDownloadFailureOrRetry(
+        metadata: BackgroundDownloadTaskMetadata,
+        message: String,
+        reason: PlaylistImportFailureReason
+    ) {
         if let audioName = metadata.pairedAudioStagingFileName,
            metadata.stage == .pairedVideo {
             try? FileManager.default.removeItem(at: Self.stagingDirectoryURL.appendingPathComponent(audioName))
@@ -1042,7 +1546,14 @@ final class PlaylistImportManager {
             incrementRetryAndRequeue(jobID: metadata.jobID, trackID: metadata.trackID)
             ensurePumping()
         } else {
-            markTrackFailed(jobID: metadata.jobID, trackID: metadata.trackID, error: message, retryable: false)
+            markTrackFailed(
+                jobID: metadata.jobID,
+                trackID: metadata.trackID,
+                error: message,
+                retryable: false,
+                reason: reason,
+                stage: Self.stageLabel(metadata.stage)
+            )
             finalizeCompletedJobsIfNeeded()
             ensurePumping()
         }
@@ -1070,6 +1581,8 @@ final class PlaylistImportManager {
             }
             if dlTask.state == .running || dlTask.state == .suspended {
                 activeDownloadTasksByTrackID[meta.trackID] = dlTask
+                lastDownloadProgressAtByTrackID[meta.trackID] = .now
+                downloadStageByTrackID[meta.trackID] = meta.stage
                 activeIDs.insert(meta.trackID)
             }
         }
@@ -1077,9 +1590,11 @@ final class PlaylistImportManager {
         var changed = false
         for jIdx in jobs.indices {
             if jobs[jIdx].isDiscoveringPages && discoveryTasksByJobID[jobs[jIdx].id] == nil && !jobs[jIdx].isCancelled {
-                // Resume interrupted discovery seamlessly from the URL
+                // Discovery was interrupted by an app relaunch. Pause the job; Resume restarts discovery
+                // from the source URL (already-queued tracks are de-duplicated).
                 jobs[jIdx].isPaused = true
                 jobs[jIdx].isDiscoveringPages = false
+                jobs[jIdx].discoveryCompleted = false
                 changed = true
             }
             for tIdx in jobs[jIdx].tracks.indices {
@@ -1138,7 +1653,9 @@ final class PlaylistImportManager {
         guard UIApplication.shared.applicationState != .active else { return }
         let content = UNMutableNotificationContent()
         content.title = "Playlist Import Complete"
-        content.body = "\(job.playlistName): \(job.completedCount + job.skippedCount) cached offline."
+        content.body = job.failedCount > 0
+            ? "\(job.playlistName): \(job.completedCount + job.skippedCount) cached offline, \(job.failedCount) failed. Open Import Issues to see why."
+            : "\(job.playlistName): \(job.completedCount + job.skippedCount) cached offline."
         content.sound = .default
         let req = UNNotificationRequest(identifier: "playlist-done-\(job.id.uuidString)", content: content, trigger: nil)
         UNUserNotificationCenter.current().add(req)
@@ -1211,6 +1728,8 @@ final class PlaylistImportManager {
         if prev == .failed { jobs[jIdx].failedCount = max(0, jobs[jIdx].failedCount - 1) }
         jobs[jIdx].tracks[tIdx].status = .completed
         jobs[jIdx].tracks[tIdx].errorMessage = nil
+        jobs[jIdx].tracks[tIdx].failureReason = nil
+        jobs[jIdx].tracks[tIdx].failureStage = nil
         jobs[jIdx].tracks[tIdx].resolvedViaBrowser = viaBrowser
         jobs[jIdx].completedCount += 1
         jobs[jIdx].updatedAt = .now
@@ -1222,18 +1741,34 @@ final class PlaylistImportManager {
               let tIdx = jobs[jIdx].tracks.firstIndex(where: { $0.id == trackID }) else { return }
         let prev = jobs[jIdx].tracks[tIdx].status
         guard prev != .skippedAlreadyCached else { return }
+        if prev == .failed { jobs[jIdx].failedCount = max(0, jobs[jIdx].failedCount - 1) }
         jobs[jIdx].tracks[tIdx].status = .skippedAlreadyCached
+        jobs[jIdx].tracks[tIdx].failureReason = nil
+        jobs[jIdx].tracks[tIdx].errorMessage = nil
         jobs[jIdx].skippedCount += 1
         jobs[jIdx].updatedAt = .now
         scheduleDebouncedSave()
     }
 
-    private func markTrackFailed(jobID: UUID, trackID: UUID, error: String, retryable: Bool) {
+    private func markTrackFailed(
+        jobID: UUID,
+        trackID: UUID,
+        error: String,
+        retryable: Bool,
+        reason: PlaylistImportFailureReason? = nil,
+        stage: String? = nil
+    ) {
         guard let jIdx = jobs.firstIndex(where: { $0.id == jobID }),
               let tIdx = jobs[jIdx].tracks.firstIndex(where: { $0.id == trackID }) else { return }
+        // Never resurrect a track the user stopped.
+        guard jobs[jIdx].tracks[tIdx].status != .cancelled else { return }
         if retryable && jobs[jIdx].tracks[tIdx].retryCount < 1 && !jobs[jIdx].isPaused && !jobs[jIdx].isCancelled {
             jobs[jIdx].tracks[tIdx].retryCount += 1
             jobs[jIdx].tracks[tIdx].status = .pending
+            // Keep the first error around so the report can show it if the retry fails differently.
+            jobs[jIdx].tracks[tIdx].errorMessage = error
+            jobs[jIdx].tracks[tIdx].failureReason = reason ?? PlaylistImportFailureReason.classify(error)
+            jobs[jIdx].tracks[tIdx].failureStage = stage
             scheduleDebouncedSave()
             return
         }
@@ -1243,6 +1778,8 @@ final class PlaylistImportManager {
         }
         jobs[jIdx].tracks[tIdx].status = .failed
         jobs[jIdx].tracks[tIdx].errorMessage = error
+        jobs[jIdx].tracks[tIdx].failureReason = reason ?? PlaylistImportFailureReason.classify(error)
+        jobs[jIdx].tracks[tIdx].failureStage = stage
         jobs[jIdx].updatedAt = .now
         scheduleDebouncedSave()
     }
@@ -1314,11 +1851,12 @@ final class PlaylistImportManager {
             totalBytesWritten: Int64,
             totalBytesExpectedToWrite: Int64
         ) {
-            guard totalBytesExpectedToWrite > 0,
-                  let meta = decodeMetadata(from: downloadTask) else { return }
-            let fraction = min(1.0, max(0.0, Double(totalBytesWritten) / Double(totalBytesExpectedToWrite)))
+            guard let meta = decodeMetadata(from: downloadTask) else { return }
+            let fraction: Double? = totalBytesExpectedToWrite > 0
+                ? min(1.0, max(0.0, Double(totalBytesWritten) / Double(totalBytesExpectedToWrite)))
+                : nil
             Task { @MainActor [weak self] in
-                self?.manager?.activeDownloadProgressByTrackID[meta.trackID] = fraction
+                self?.manager?.recordDownloadProgress(trackID: meta.trackID, fraction: fraction)
             }
         }
 
@@ -1348,26 +1886,30 @@ final class PlaylistImportManager {
                 Task { @MainActor [weak self] in
                     self?.manager?.handleDownloadFailureOrRetry(
                         metadata: meta,
-                        message: "Staging error: \(error.localizedDescription)"
+                        message: "Couldn't move downloaded file: \(error.localizedDescription)",
+                        reason: .saveFailed
                     )
                 }
                 return
             }
 
             let httpStatus = (downloadTask.response as? HTTPURLResponse)?.statusCode
+            let taskID = downloadTask.taskIdentifier
             Task { @MainActor [weak self] in
                 await self?.manager?.handleBackgroundDownloadFinished(
                     stagedFileURL: stagedURL,
                     metadata: meta,
-                    httpStatusCode: httpStatus
+                    httpStatusCode: httpStatus,
+                    taskIdentifier: taskID
                 )
             }
         }
 
         func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
             guard let error, let meta = decodeMetadata(from: task) else { return }
+            let taskID = task.taskIdentifier
             Task { @MainActor [weak self] in
-                self?.manager?.handleBackgroundTaskError(metadata: meta, error: error)
+                self?.manager?.handleBackgroundTaskError(metadata: meta, error: error, taskIdentifier: taskID)
             }
         }
 
