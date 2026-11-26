@@ -1,4 +1,4 @@
-name: Build MusicPlayer IPA
+name: Build MuseJRM IPA
 
 on:
   workflow_dispatch:
@@ -32,16 +32,16 @@ jobs:
             archive \
             -archivePath build/MusicPlayer.xcarchive
 
-      - name: Package MusicPlayer.ipa
+      - name: Package MuseJRM.ipa
         run: |
           mkdir -p build/Payload
-          cp -R build/MusicPlayer.xcarchive/Products/Applications/MusicPlayer.app build/Payload/
-          codesign --force --deep --sign - --timestamp=none build/Payload/MusicPlayer.app
+          cp -R build/MusicPlayer.xcarchive/Products/Applications/MuseJRM.app build/Payload/
+          codesign --force --deep --sign - --timestamp=none build/Payload/MuseJRM.app
           cd build
-          zip -qry MusicPlayer.ipa Payload
+          zip -qry MuseJRM.ipa Payload
 
-      - name: Upload MusicPlayer.ipa artifact
+      - name: Upload MuseJRM.ipa artifact
         uses: actions/upload-artifact@v4
         with:
-          name: MusicPlayer-ipa
-          path: build/MusicPlayer.ipa
+          name: MuseJRM-ipa
+          path: build/MuseJRM.ipa
