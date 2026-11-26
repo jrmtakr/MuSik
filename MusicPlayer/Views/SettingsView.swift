@@ -185,6 +185,20 @@ struct SettingsView: View {
                 Section("Player & Tools") {
                     Toggle("Quick access to Last Playlist", isOn: $settings.quickAccessLastPlaylist)
 
+                    Toggle(isOn: $settings.autoIdentifyImportedSongs) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Auto-Identify Imported Songs")
+                            Text("Fixes each imported song's title, artist, album and cover art so lyrics match. Uses the playlist, YouTube's Music info and music catalogs; only renames when two sources agree")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                            if let reason = SongIdentificationService.shared.engineUnavailableReason {
+                                Text(reason)
+                                    .font(.caption2)
+                                    .foregroundStyle(.orange)
+                            }
+                        }
+                    }
+
                     Toggle(isOn: $settings.autoAISyncLyrics) {
                         VStack(alignment: .leading, spacing: 2) {
                             Text("AI Auto-Sync & Recognize Lyrics")

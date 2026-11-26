@@ -33,6 +33,7 @@ struct ImportPlaylistSheetView: View {
     @State private var handoffBox = DiscoveryHandoffBox()
     @State private var startedJobID: UUID?
     @State private var showingBuiltInBrowser = false
+    @State private var issuesJobID: IdentifiedUUID?
 
     init(initialURL: String? = nil, onPlaylistImported: ((UUID) -> Void)? = nil) {
         self.initialURL = initialURL
@@ -134,6 +135,9 @@ struct ImportPlaylistSheetView: View {
             .sheet(isPresented: $showingBuiltInBrowser) {
                 BrowserTabView(showPlayerSheet: .constant(false), isModal: true)
             }
+            .sheet(item: $issuesJobID) { wrapped in
+                ImportIssuesView(jobID: wrapped.id)
+            }
             .task {
                 if selectedPlaylistID == nil {
                     selectedPlaylistID = mediaManager.playlists.first?.id
@@ -185,8 +189,8 @@ struct ImportPlaylistSheetView: View {
                             }
                             .buttonStyle(.plain)
                         } else {
-                            if job.failedCount > 0 {
-                                Button("Retry (\(job.failedCount))") {
+                            if job.canRetry {
+                                Button(job.failedCount > 0 ? "Retry (\(job.failedCount))" : "Restart") {
                                     playlistImportManager.retryFailedTracks(inJobID: job.id)
                                 }
                                 .font(.caption.weight(.semibold))
@@ -217,6 +221,10 @@ struct ImportPlaylistSheetView: View {
                         Text("\(job.completedCount) saved • \(job.skippedCount) cached\(job.failedCount > 0 ? " • \(job.failedCount) failed" : "")")
                             .font(.caption2)
                             .foregroundStyle(.secondary)
+                    }
+
+                    ImportJobIssuesBar(job: job) {
+                        issuesJobID = IdentifiedUUID(id: job.id)
                     }
                 }
                 .padding(.vertical, 4)
@@ -581,13 +589,16 @@ struct ImportPlaylistSheetView: View {
             alwaysUseBrowserResolver: alwaysUseBrowserResolver,
             respectMaxDurationLimit: respectMaxDurationLimit,
             alreadyDiscoveredTracks: initialSelected,
-            skipDiscoveryIfComplete: true
+            skipDiscoveryIfComplete: true,
+            // If the user hand-picked tracks, a restarted discovery must not re-add the ones they removed.
+            allowsRediscovery: deselectedIDs.isEmpty
         )
 
         if stillStreaming {
             // Keep discovery flagged active while fetchTask continues feeding future pages into jobID!
             if let idx = playlistImportManager.jobs.firstIndex(where: { $0.id == jobID }) {
                 playlistImportManager.jobs[idx].isDiscoveringPages = true
+                playlistImportManager.jobs[idx].discoveryCompleted = false
             }
             handoffBox.adoptedJobID = jobID
         }
@@ -597,7 +608,7 @@ struct ImportPlaylistSheetView: View {
     }
 
     private func jobStatusSubtitle(_ job: PlaylistImportJob) -> String {
-        if job.isCancelled { return "Cancelled" }
+        if job.isCancelled { return "Stopped • \(job.cancelledCount) not downloaded" }
         if job.isFinished { return "Completed • \(job.preferredFormat.displayTitle)" }
         if job.isPaused { return "Paused • \(job.remainingCount) remaining" }
         let suffix = job.alwaysUseBrowserResolver ? "Built-in Browser" : "Browser + API"

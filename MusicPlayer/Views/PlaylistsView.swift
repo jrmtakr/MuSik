@@ -53,6 +53,7 @@ struct PlaylistsView: View {
     @State private var sortOrder: PlaylistSortOrder = .date
     @State private var showCreateAlert = false
     @State private var showImportURLSheet = false
+    @State private var importIssuesJobID: IdentifiedUUID?
     @State private var showCreateGroupSheet = false
     @State private var showJoinGroupSheet = false
     @State private var selectedGroupID: UUID?
@@ -111,13 +112,7 @@ struct PlaylistsView: View {
                                         Text(job.playlistName)
                                             .font(.subheadline.weight(.semibold))
                                             .lineLimit(1)
-                                        Text(job.isFinished
-                                             ? "Completed • \(job.completedCount + job.skippedCount) saved"
-                                             : (job.isPaused
-                                                ? "Paused • \(job.remainingCount) remaining"
-                                                : (job.isDiscoveringPages
-                                                   ? "Discovering pages (\(job.totalCount)+) & caching..."
-                                                   : "Finding & caching via browser in background...")))
+                                        Text(importJobSubtitle(job))
                                             .font(.caption2)
                                             .foregroundStyle(.secondary)
                                     }
@@ -141,8 +136,8 @@ struct PlaylistsView: View {
                                         }
                                         .buttonStyle(.plain)
                                     } else {
-                                        if job.failedCount > 0 {
-                                            Button("Retry (\(job.failedCount))") {
+                                        if job.canRetry {
+                                            Button(job.failedCount > 0 ? "Retry (\(job.failedCount))" : "Restart") {
                                                 playlistImportManager.retryFailedTracks(inJobID: job.id)
                                             }
                                             .font(.caption.weight(.semibold))
@@ -168,6 +163,10 @@ struct PlaylistsView: View {
                                     Text("\(job.completedCount) downloaded • \(job.skippedCount) already cached\(job.failedCount > 0 ? " • \(job.failedCount) failed" : "")")
                                         .font(.caption2)
                                         .foregroundStyle(.secondary)
+                                }
+
+                                ImportJobIssuesBar(job: job) {
+                                    importIssuesJobID = IdentifiedUUID(id: job.id)
                                 }
                             }
                             .padding(.vertical, 3)
@@ -538,7 +537,18 @@ struct PlaylistsView: View {
                     searchRenameText: $searchRenameText
                 )
             )
+            .sheet(item: $importIssuesJobID) { wrapped in
+                ImportIssuesView(jobID: wrapped.id)
+            }
         }
+    }
+
+    private func importJobSubtitle(_ job: PlaylistImportJob) -> String {
+        if job.isCancelled { return "Stopped • \(job.cancelledCount) not downloaded" }
+        if job.isFinished { return "Completed • \(job.completedCount + job.skippedCount) saved" }
+        if job.isPaused { return "Paused • \(job.remainingCount) remaining" }
+        if job.isDiscoveringPages { return "Discovering pages (\(job.totalCount)+) & caching..." }
+        return "Finding & caching via browser in background..."
     }
 
     private func smartPlaylistRow(_ kind: SmartPlaylistKind, count: Int) -> some View {
