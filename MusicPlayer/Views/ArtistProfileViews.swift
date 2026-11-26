@@ -188,8 +188,9 @@ struct ArtistProfileView: View {
 
                         Button {
                             if let localMatch {
-                                mediaManager.play(localMatch)
-                                if localMatch.isVideo { playerSheetBinding.wrappedValue = true }
+                                if mediaManager.play(localMatch) && localMatch.isVideo {
+                                    playerSheetBinding.wrappedValue = true
+                                }
                             } else {
                                 Task { await streamSongAdFree(song) }
                             }

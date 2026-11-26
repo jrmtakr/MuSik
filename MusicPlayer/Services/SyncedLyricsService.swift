@@ -524,13 +524,14 @@ final class SyncedLyricsService {
     /// Checks all candidate lyric sources during upload/import against the actual audio (heard words +
     /// acoustic vocal energy), selects the verified matching lyrics, converts even plain lyrics into
     /// real-time synced line & word timings, and saves them offline ready before playback starts.
+    @discardableResult
     func fetchAndAlignDuringImport(
         item: MediaItem,
         title: String,
         artist: String,
         duration: Double?,
         heard: [HeardWord]?
-    ) async {
+    ) async -> Bool {
         let key = cacheKey(for: item, artistOverride: artist, titleOverride: title)
         let split = splitArtistAndSong(rawTitle: title, rawArtist: artist)
 
@@ -582,11 +583,12 @@ final class SyncedLyricsService {
         }
 
         // Don't lock in clearly wrong lyrics if the audio contradicted the candidate.
-        guard var selected = bestCandidate, bestScore > -0.5 else { return }
+        guard var selected = bestCandidate, bestScore > -0.5 else { return false }
         if !item.isHLS {
             selected = await SongAudioListener.autoAlign(lyrics: selected, heard: heard, fileURL: item.fileURL)
         }
         storeAlignedLyrics(selected, for: item)
+        return true
     }
 
     /// Saves lyrics that were already re-timed against this exact file, so playback uses them as-is

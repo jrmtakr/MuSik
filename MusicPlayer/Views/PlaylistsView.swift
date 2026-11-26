@@ -407,8 +407,7 @@ struct PlaylistsView: View {
                             MediaRowView(
                                 item: item,
                                 onPlay: {
-                                    mediaManager.play(item)
-                                    if item.isVideo { showPlayerSheet = true }
+                                    if mediaManager.play(item) && item.isVideo { showPlayerSheet = true }
                                 },
                                 onQuickLook: {
                                     quickLookTarget = QuickLookTarget(title: item.displayTitle, fileURL: item.fileURL)
@@ -741,9 +740,8 @@ private struct SmartPlaylistDetailView: View {
                         HStack(spacing: 12) {
                             Button {
                                 mediaManager.isShuffleEnabled = false
-                                if let first = tracks.first {
-                                    mediaManager.play(first)
-                                    if first.isVideo { showPlayerSheet = true }
+                                if let first = tracks.first(where: { !mediaManager.isAIAnalysisPending(for: $0) }) ?? tracks.first {
+                                    if mediaManager.play(first) && first.isVideo { showPlayerSheet = true }
                                 }
                             } label: {
                                 Label("Play All", systemImage: "play.fill")
@@ -755,9 +753,9 @@ private struct SmartPlaylistDetailView: View {
 
                             Button {
                                 mediaManager.isShuffleEnabled = true
-                                if let picked = tracks.randomElement() {
-                                    mediaManager.play(picked)
-                                    if picked.isVideo { showPlayerSheet = true }
+                                let readyTracks = tracks.filter { !mediaManager.isAIAnalysisPending(for: $0) }
+                                if let picked = (readyTracks.isEmpty ? tracks : readyTracks).randomElement() {
+                                    if mediaManager.play(picked) && picked.isVideo { showPlayerSheet = true }
                                 }
                             } label: {
                                 Label("Shuffle Play", systemImage: "shuffle")
@@ -783,8 +781,7 @@ private struct SmartPlaylistDetailView: View {
                                             mediaManager.togglePlayPause()
                                         }
                                     } else {
-                                        mediaManager.play(item)
-                                        if item.isVideo { showPlayerSheet = true }
+                                        if mediaManager.play(item) && item.isVideo { showPlayerSheet = true }
                                     }
                                 },
                                 onQuickLook: {
@@ -1006,8 +1003,7 @@ struct PlaylistDetailView: View {
                                                     mediaManager.togglePlayPause()
                                                 }
                                             } else {
-                                                mediaManager.play(item, inPlaylist: playlist.id)
-                                                if item.isVideo {
+                                                if mediaManager.play(item, inPlaylist: playlist.id) && item.isVideo {
                                                     showPlayerSheet = true
                                                 }
                                             }

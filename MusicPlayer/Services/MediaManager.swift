@@ -23,6 +23,8 @@ final class MediaManager {
         /// Set when the song-ID AI filled in the metadata, e.g. "Shazam" or "iTunes match".
         var autoIdentifiedSource: String?
         var isrc: String?
+        /// Explicitly false while newly imported media is still undergoing whole-song AI analysis before playback.
+        var aiAnalysisCompleted: Bool?
     }
 
     private struct LibraryPersistedState: Codable {
@@ -205,7 +207,7 @@ final class MediaManager {
     // MARK: - Scanning & Importing
 
     func loadLocalFiles() {
-        drainInboxIfNeeded()
+        let drainedInboxPaths = drainInboxIfNeeded()
 
         var loadedItems: [MediaItem] = []
         var loadedOthers: [LocalFile] = []
@@ -235,6 +237,45 @@ final class MediaManager {
                 .map(\.relativePath)
             if !newlyAdded.isEmpty {
                 upNextPaths.append(contentsOf: newlyAdded.shuffled())
+            }
+        }
+
+        // Ensure Inbox files, newly discovered external imports, and interrupted pre-play AI tasks are all queued.
+        let autoIDEnabled = (UserDefaults.standard.object(forKey: "musicplayer.import.autoIdentify") as? Bool) ?? true
+        let drainedSet = Set(drainedInboxPaths)
+        var pendingAIItems: [MediaItem] = []
+        var markedPendingDirty = false
+        for item in loadedItems where !item.isHLS {
+            var entry = customMetadataByPath[item.relativePath] ?? CustomTrackMetadata()
+            let status = entry.aiAnalysisCompleted
+            let isDrainedInbox = drainedSet.contains(item.relativePath)
+            let isNewlyDiscovered = !previousPathSet.isEmpty && !previousPathSet.contains(item.relativePath)
+            let manuallyVerified = (entry.isArtistVerified == true && entry.autoIdentifiedSource == nil)
+            if (isDrainedInbox || (status == nil && isNewlyDiscovered && !manuallyVerified)) && autoIDEnabled {
+                entry.aiAnalysisCompleted = false
+                customMetadataByPath[item.relativePath] = entry
+                markedPendingDirty = true
+                pendingAIItems.append(item)
+            } else if status == false && autoIDEnabled {
+                pendingAIItems.append(item)
+            }
+        }
+        if markedPendingDirty {
+            saveLibraryState()
+        }
+        if !pendingAIItems.isEmpty && autoIDEnabled {
+            let capturedPending = pendingAIItems
+            Task { @MainActor in
+                for item in capturedPending {
+                    SongIdentificationService.shared.enqueue(
+                        item,
+                        hintTitle: item.displayTitle,
+                        hintArtist: item.artist ?? "",
+                        sourceVideoID: self.customMetadataByPath[item.relativePath]?.sourceVideoID,
+                        sourcePlatform: nil,
+                        jobID: nil
+                    )
+                }
             }
         }
 
@@ -271,16 +312,21 @@ final class MediaManager {
         }
     }
 
-    private func drainInboxIfNeeded() {
+    @discardableResult
+    private func drainInboxIfNeeded() -> [String] {
         let inboxURL = docsURL.appendingPathComponent("Inbox", isDirectory: true)
         guard FileManager.default.fileExists(atPath: inboxURL.path),
               let contents = try? FileManager.default.contentsOfDirectory(at: inboxURL, includingPropertiesForKeys: nil) else {
-            return
+            return []
         }
+        var drained: [String] = []
         for url in contents {
             let dest = uniqueDestinationURL(for: url.lastPathComponent, inFolder: "")
-            try? FileManager.default.moveItem(at: url, to: dest)
+            if (try? FileManager.default.moveItem(at: url, to: dest)) != nil {
+                drained.append(dest.lastPathComponent)
+            }
         }
+        return drained
     }
 
     @discardableResult
@@ -433,7 +479,11 @@ final class MediaManager {
                 return nil
             }
             let rel = folderPath.isEmpty ? sourceURL.lastPathComponent : "\(folderPath)/\(sourceURL.lastPathComponent)"
-            return outcomeForRelativePath(rel)
+            let outcome = outcomeForRelativePath(rel)
+            if case .media(let importedMedia) = outcome, !importedMedia.isHLS {
+                markAIAnalysisPendingIfNeeded(for: importedMedia, flushState: true)
+            }
+            return outcome
         }
 
         let destURL: URL
@@ -464,18 +514,10 @@ final class MediaManager {
                 let copiedCount = try copyDirectoryContents(from: sourceURL, to: destURL)
                 loadLocalFiles()
                 let prefix = relFolder + "/"
-                for imported in items where imported.relativePath.hasPrefix(prefix) {
-                    Task { @MainActor in
-                        SongIdentificationService.shared.enqueue(
-                            imported,
-                            hintTitle: imported.displayTitle,
-                            hintArtist: imported.artist ?? "",
-                            sourceVideoID: customMetadataByPath[imported.relativePath]?.sourceVideoID,
-                            sourcePlatform: nil,
-                            jobID: nil
-                        )
-                    }
+                for imported in items where imported.relativePath.hasPrefix(prefix) && !imported.isHLS {
+                    markAIAnalysisPendingIfNeeded(for: imported, flushState: false)
                 }
+                saveLibraryState()
                 statusMessage = "Saved folder \"\(destURL.lastPathComponent)\" (\(copiedCount) \(copiedCount == 1 ? "file" : "files"))"
                 return .folder(name: destURL.lastPathComponent, fileCount: copiedCount)
             }
@@ -489,21 +531,13 @@ final class MediaManager {
                 durationsByPath.removeValue(forKey: rel)
                 metadataLoadedPaths.remove(rel)
                 thumbnails.removeValue(forKey: rel)
+                customMetadataByPath[rel]?.aiAnalysisCompleted = nil
             }
             loadLocalFiles()
             statusMessage = "Saved \(destURL.lastPathComponent)"
             let outcome = outcomeForRelativePath(rel)
-            if case .media(let importedMedia) = outcome {
-                Task { @MainActor in
-                    SongIdentificationService.shared.enqueue(
-                        importedMedia,
-                        hintTitle: importedMedia.displayTitle,
-                        hintArtist: importedMedia.artist ?? "",
-                        sourceVideoID: customMetadataByPath[importedMedia.relativePath]?.sourceVideoID,
-                        sourcePlatform: nil,
-                        jobID: nil
-                    )
-                }
+            if case .media(let importedMedia) = outcome, !importedMedia.isHLS {
+                markAIAnalysisPendingIfNeeded(for: importedMedia, flushState: true)
             }
             return outcome
         } catch {
@@ -614,21 +648,13 @@ final class MediaManager {
                 durationsByPath.removeValue(forKey: rel)
                 metadataLoadedPaths.remove(rel)
                 thumbnails.removeValue(forKey: rel)
+                customMetadataByPath[rel]?.aiAnalysisCompleted = nil
             }
             loadLocalFiles()
             statusMessage = "Saved \(destURL.lastPathComponent)"
             let saved = items.first(where: { $0.relativePath == rel })
-            if let saved {
-                Task { @MainActor in
-                    SongIdentificationService.shared.enqueue(
-                        saved,
-                        hintTitle: saved.displayTitle,
-                        hintArtist: saved.artist ?? "",
-                        sourceVideoID: customMetadataByPath[saved.relativePath]?.sourceVideoID,
-                        sourcePlatform: nil,
-                        jobID: nil
-                    )
-                }
+            if let saved, !saved.isHLS {
+                markAIAnalysisPendingIfNeeded(for: saved, flushState: true)
             }
             return saved
         } catch {
@@ -648,6 +674,57 @@ final class MediaManager {
         return nil
     }
 
+    // MARK: - Pre-Playback AI Analysis State
+
+    func isAIAnalysisPending(for item: MediaItem) -> Bool {
+        guard !item.relativePath.hasPrefix("__remote__/"), !item.isHLS else { return false }
+        if SongIdentificationService.shared.isIdentifying(item) {
+            return true
+        }
+        return customMetadataByPath[item.relativePath]?.aiAnalysisCompleted == false
+    }
+
+    func markAIAnalysisPendingIfNeeded(for item: MediaItem, flushState: Bool = true) {
+        guard !item.relativePath.hasPrefix("__remote__/"), !item.isHLS else { return }
+        let autoIDEnabled = (UserDefaults.standard.object(forKey: SongIdentificationService.enabledDefaultsKey) as? Bool) ?? true
+        guard autoIDEnabled else {
+            markAIAnalysisCompleted(relativePath: item.relativePath, flushState: flushState)
+            return
+        }
+        var entry = customMetadataByPath[item.relativePath] ?? CustomTrackMetadata()
+        if entry.isArtistVerified == true && entry.autoIdentifiedSource == nil {
+            return
+        }
+        if entry.aiAnalysisCompleted != true {
+            entry.aiAnalysisCompleted = false
+            customMetadataByPath[item.relativePath] = entry
+            if flushState {
+                saveLibraryState()
+            }
+        }
+        let capturedItem = item
+        Task { @MainActor in
+            SongIdentificationService.shared.enqueue(
+                capturedItem,
+                hintTitle: capturedItem.displayTitle,
+                hintArtist: capturedItem.artist ?? "",
+                sourceVideoID: self.customMetadataByPath[capturedItem.relativePath]?.sourceVideoID,
+                sourcePlatform: nil,
+                jobID: nil
+            )
+        }
+    }
+
+    func markAIAnalysisCompleted(relativePath: String, flushState: Bool = true) {
+        var entry = customMetadataByPath[relativePath] ?? CustomTrackMetadata()
+        guard entry.aiAnalysisCompleted != true else { return }
+        entry.aiAnalysisCompleted = true
+        customMetadataByPath[relativePath] = entry
+        if flushState {
+            saveLibraryState()
+        }
+    }
+
     // MARK: - Playback, Repeat, Favorites, Recents, & Up Next
 
     private func activatePlaybackAudioSession() {
@@ -656,11 +733,20 @@ final class MediaManager {
         try? session.setActive(true)
     }
 
-    func play(_ item: MediaItem, inPlaylist playlistID: UUID? = nil, keepExternalQueue: Bool = false) {
+    @discardableResult
+    func play(_ item: MediaItem, inPlaylist playlistID: UUID? = nil, keepExternalQueue: Bool = false) -> Bool {
         guard FileManager.default.fileExists(atPath: item.fileURL.path) else {
             errorMessage = "File not found: \(item.fileName)"
             loadLocalFiles()
-            return
+            return false
+        }
+
+        if isAIAnalysisPending(for: item) {
+            SongIdentificationService.shared.prioritize(item)
+            let detail = SongIdentificationService.shared.analysisStatusText(for: item)
+                ?? "AI is listening to whole song..."
+            statusMessage = "Waiting for AI analysis before playback: \(detail)"
+            return false
         }
 
         if !keepExternalQueue {
@@ -681,7 +767,7 @@ final class MediaManager {
         if item.prefersFFmpegEngine {
             playWithFFmpegEngine(url: item.fileURL, item: item, headers: nil)
             Task { @MainActor in WholeSongAIService.shared.handlePlaybackStarted(for: item) }
-            return
+            return true
         }
 
         if !item.isVideo {
@@ -696,7 +782,7 @@ final class MediaManager {
                 updateNowPlayingInfo(for: item)
                 syncWrappedSessionStart(for: item)
                 Task { @MainActor in WholeSongAIService.shared.handlePlaybackStarted(for: item) }
-                return
+                return true
             } catch {
                 equalizerPlayer.stop()
                 isUsingEqualizerBackend = false
@@ -722,6 +808,7 @@ final class MediaManager {
         updateNowPlayingInfo(for: item)
         syncWrappedSessionStart(for: item)
         Task { @MainActor in WholeSongAIService.shared.handlePlaybackStarted(for: item) }
+        return true
     }
 
     func playRemoteStream(
@@ -1282,15 +1369,18 @@ final class MediaManager {
 
     private func popNextQueuedItem() -> MediaItem? {
         let byPath = Dictionary(items.map { ($0.relativePath, $0) }, uniquingKeysWith: { first, _ in first })
-        while !upNextPaths.isEmpty {
-            let nextPath = upNextPaths.removeFirst()
-            manualQueuePaths.removeAll { $0 == nextPath }
+        for idx in upNextPaths.indices {
+            let nextPath = upNextPaths[idx]
             if let match = byPath[nextPath] {
+                if isAIAnalysisPending(for: match) {
+                    continue
+                }
+                upNextPaths.remove(at: idx)
+                manualQueuePaths.removeAll { $0 == nextPath }
                 saveLibraryState()
                 return match
             }
         }
-        saveLibraryState()
         return nil
     }
 
@@ -1305,8 +1395,16 @@ final class MediaManager {
             return
         }
 
-        let queue = activeQueue
+        let rawQueue = activeQueue
+        let readyQueue = rawQueue.filter { !isAIAnalysisPending(for: $0) }
+        let queue = readyQueue.isEmpty ? rawQueue : readyQueue
         guard !queue.isEmpty else { return }
+
+        if readyQueue.isEmpty {
+            pause()
+            statusMessage = "Waiting for AI analysis to finish..."
+            return
+        }
 
         if isShuffleEnabled, queue.count > 1 {
             // No-repeat shuffle: every song plays once before any song repeats.
@@ -1514,6 +1612,7 @@ final class MediaManager {
         if let genre, !genre.isEmpty { entry.genre = genre }
         if let isrc, !isrc.isEmpty { entry.isrc = isrc }
         entry.autoIdentifiedSource = source
+        entry.aiAnalysisCompleted = true
 
         if let coverImage, let jpeg = coverImage.jpegData(compressionQuality: 0.85) {
             if let oldCover = entry.coverFileName {
@@ -2108,6 +2207,11 @@ final class MediaManager {
         if let cleanTitle, !cleanTitle.isEmpty { entry.title = cleanTitle }
         if let cleanArtist, !cleanArtist.isEmpty { entry.artist = cleanArtist }
         if let cleanVID, !cleanVID.isEmpty { entry.sourceVideoID = cleanVID }
+        let autoIDEnabled = (UserDefaults.standard.object(forKey: SongIdentificationService.enabledDefaultsKey) as? Bool) ?? true
+        let isHLSExt = ["m3u8", "movpkg"].contains(ext.lowercased())
+        if autoIDEnabled && !isHLSExt && entry.aiAnalysisCompleted != true {
+            entry.aiAnalysisCompleted = false
+        }
         customMetadataByPath[relPath] = entry
 
         if let durationSeconds, durationSeconds.isFinite, durationSeconds > 0 {
@@ -2468,9 +2572,15 @@ final class MediaManager {
     }
 
     func playPlaylist(_ playlist: Playlist, startingAt startItem: MediaItem? = nil) {
-        let playlistItems = items(in: playlist)
-        guard !playlistItems.isEmpty else {
+        let allItems = items(in: playlist)
+        guard !allItems.isEmpty else {
             errorMessage = "Playlist \"\(playlist.name)\" has no playable files."
+            return
+        }
+        let readyItems = allItems.filter { !isAIAnalysisPending(for: $0) }
+        let playlistItems = readyItems.isEmpty ? allItems : readyItems
+        if readyItems.isEmpty, let firstPending = allItems.first {
+            _ = play(firstPending, inPlaylist: playlist.id)
             return
         }
         let first: MediaItem
@@ -2538,13 +2648,19 @@ final class MediaManager {
     }
 
     func shuffleAllOfflineMusic() {
-        let pool = audioItems.isEmpty ? items : audioItems
+        let rawPool = audioItems.isEmpty ? items : audioItems
+        let readyPool = rawPool.filter { !isAIAnalysisPending(for: $0) }
+        let pool = readyPool.isEmpty ? rawPool : readyPool
         let excludedPath = currentItem?.relativePath
         let nonRepeatingPool = pool.count > 1
             ? pool.filter { $0.relativePath != excludedPath }
             : pool
         guard !pool.isEmpty else {
             errorMessage = "No offline tracks available to shuffle."
+            return
+        }
+        if readyPool.isEmpty {
+            _ = play(pool[0])
             return
         }
         isShuffleEnabled = true
@@ -2574,7 +2690,10 @@ final class MediaManager {
             play(queued)
             return
         }
-        if let recent = recentItems.first ?? items.first {
+        if let recent = recentItems.first(where: { !isAIAnalysisPending(for: $0) })
+            ?? items.first(where: { !isAIAnalysisPending(for: $0) })
+            ?? recentItems.first
+            ?? items.first {
             play(recent)
         } else {
             errorMessage = "No offline media in library yet."
@@ -3082,7 +3201,10 @@ final class MediaManager {
         }
         if playlistsChanged { savePlaylists() }
         PlaylistTimeMachineService.shared.updatePathReferences(from: oldPath, to: newPath)
-        Task { @MainActor in WholeSongAIService.shared.rekeyPath(from: oldPath, to: newPath) }
+        Task { @MainActor in
+            WholeSongAIService.shared.rekeyPath(from: oldPath, to: newPath)
+            SongIdentificationService.shared.rekeyPath(from: oldPath, to: newPath)
+        }
         saveLibraryState()
     }
 

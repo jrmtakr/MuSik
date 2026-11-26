@@ -796,8 +796,7 @@ struct LibraryView: View {
                             mediaManager.togglePlayPause()
                         }
                     } else {
-                        mediaManager.play(item)
-                        if item.isVideo {
+                        if mediaManager.play(item) && item.isVideo {
                             showPlayerSheet = true
                         }
                     }

@@ -766,8 +766,7 @@ struct PlaylistSnapshotDetailView: View {
                 }
 
                 Button {
-                    mediaManager.play(matched)
-                    if matched.isVideo {
+                    if mediaManager.play(matched) && matched.isVideo {
                         showPlayerSheet = true
                     }
                 } label: {

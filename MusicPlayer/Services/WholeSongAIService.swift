@@ -163,6 +163,35 @@ final class WholeSongAIService {
         }
     }
 
+    func markCompletedFromImport(
+        relativePath: String,
+        title: String?,
+        album: String?,
+        artist: String?,
+        genre: String?,
+        heardWordCount: Int,
+        heardExcerpt: String?,
+        hasLyrics: Bool
+    ) {
+        if activeTrackPath == relativePath {
+            cancelActiveListen()
+        }
+        resultsByPath[relativePath] = WholeSongAIResult(
+            relativePath: relativePath,
+            completedFullListen: true,
+            identifiedTitle: title,
+            identifiedAlbum: album,
+            identifiedArtist: artist,
+            identifiedGenre: genre,
+            confidenceScore: hasLyrics ? 100 : (heardWordCount > 0 ? 75 : 50),
+            heardWordCount: heardWordCount,
+            heardExcerpt: heardExcerpt,
+            generatedLyricsAvailable: hasLyrics,
+            analyzedAt: .now
+        )
+        scheduleSave()
+    }
+
     func cancelActiveListen() {
         activeTask?.cancel()
         activeTask = nil

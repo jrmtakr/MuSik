@@ -65,6 +65,11 @@ final class SongIdentificationService {
     private(set) var identifiedThisSession = 0
     private(set) var activePath: String?
     private(set) var lastStatus: String?
+    /// Per-track live analysis progress (`0.0 ... 1.0`) and step label for imported songs/videos.
+    private(set) var progressByPath: [String: Double] = [:]
+    private(set) var stepLabelByPath: [String: String] = [:]
+    /// Incremented whenever any track finishes AI analysis so waiting views (like Browser player auto-open) wake up cleanly.
+    private(set) var completedRevision: Int = 0
     /// Set when an optional audio engine can't run; shown in Settings.
     private(set) var engineUnavailableReason: String?
 
@@ -113,10 +118,18 @@ final class SongIdentificationService {
         sourcePlatform: ExternalPlaylistPlatform? = nil,
         jobID: UUID?
     ) {
-        guard isEnabled, !item.isHLS else { return }
+        guard isEnabled, !item.isHLS else {
+            MediaManager.shared.markAIAnalysisCompleted(relativePath: item.relativePath)
+            return
+        }
         // Never fight metadata the user confirmed or edited by hand.
         if let meta = MediaManager.shared.customMetadata(forRelativePath: item.relativePath),
            meta.isArtistVerified == true, meta.autoIdentifiedSource == nil {
+            MediaManager.shared.markAIAnalysisCompleted(relativePath: item.relativePath)
+            return
+        }
+        guard FileManager.default.fileExists(atPath: item.fileURL.path) else {
+            MediaManager.shared.markAIAnalysisCompleted(relativePath: item.relativePath)
             return
         }
 
@@ -138,6 +151,8 @@ final class SongIdentificationService {
 
         guard !queuedPaths.contains(item.relativePath) else { return }
         queuedPaths.insert(item.relativePath)
+        progressByPath[item.relativePath] = 0.02
+        stepLabelByPath[item.relativePath] = "Queued for AI whole-song analysis..."
         queue.append(Request(
             relativePath: item.relativePath,
             fileURL: item.fileURL,
@@ -166,14 +181,86 @@ final class SongIdentificationService {
                 self.pendingCount = self.queue.count
                 self.activePath = request.relativePath
                 await self.process(request)
+                self.progressByPath.removeValue(forKey: request.relativePath)
+                self.stepLabelByPath.removeValue(forKey: request.relativePath)
                 self.activePath = nil
                 self.queuedPaths.remove(request.relativePath)
+                self.completedRevision &+= 1
             }
         }
     }
 
     func isIdentifying(_ item: MediaItem) -> Bool {
         activePath == item.relativePath || queuedPaths.contains(item.relativePath)
+    }
+
+    func isBlockedPendingAI(_ item: MediaItem) -> Bool {
+        guard !item.relativePath.hasPrefix("__remote__/"), !item.isHLS else { return false }
+        if isIdentifying(item) { return true }
+        return MediaManager.shared.customMetadata(forRelativePath: item.relativePath)?.aiAnalysisCompleted == false
+    }
+
+    func analysisProgress(for item: MediaItem) -> Double? {
+        progressByPath[item.relativePath]
+    }
+
+    func analysisStatusText(for item: MediaItem) -> String? {
+        if let step = stepLabelByPath[item.relativePath], !step.isEmpty {
+            return step
+        }
+        if isBlockedPendingAI(item) {
+            return "Queued for AI whole-song analysis..."
+        }
+        return nil
+    }
+
+    /// Moves a queued track to the front of the queue so a user-tapped song finishes analysis first.
+    func prioritize(_ item: MediaItem) {
+        if let idx = queue.firstIndex(where: { $0.relativePath == item.relativePath }), idx > 0 {
+            let target = queue.remove(at: idx)
+            queue.insert(target, at: 0)
+            stepLabelByPath[item.relativePath] = "Prioritized for AI whole-song analysis..."
+        } else if activePath != item.relativePath && !queuedPaths.contains(item.relativePath)
+                    && MediaManager.shared.customMetadata(forRelativePath: item.relativePath)?.aiAnalysisCompleted == false {
+            enqueue(
+                item,
+                hintTitle: item.displayTitle,
+                hintArtist: item.artist ?? "",
+                sourceVideoID: MediaManager.shared.customMetadata(forRelativePath: item.relativePath)?.sourceVideoID,
+                sourcePlatform: nil,
+                jobID: nil
+            )
+        }
+    }
+
+    func rekeyPath(from oldPath: String, to newPath: String) {
+        if let prog = progressByPath.removeValue(forKey: oldPath) {
+            progressByPath[newPath] = prog
+        }
+        if let label = stepLabelByPath.removeValue(forKey: oldPath) {
+            stepLabelByPath[newPath] = label
+        }
+        if activePath == oldPath {
+            activePath = newPath
+        }
+        if queuedPaths.remove(oldPath) != nil {
+            queuedPaths.insert(newPath)
+        }
+        if let newURL = MediaManager.shared.items.first(where: { $0.relativePath == newPath })?.fileURL {
+            queue = queue.map { req in
+                guard req.relativePath == oldPath else { return req }
+                return Request(
+                    relativePath: newPath,
+                    fileURL: newURL,
+                    hintTitle: req.hintTitle,
+                    hintArtist: req.hintArtist,
+                    durationSeconds: req.durationSeconds,
+                    sourceVideoID: req.sourceVideoID,
+                    sourcePlatform: req.sourcePlatform,
+                    jobID: req.jobID
+                )
+            }
+        }
     }
 
     /// Runs whole-song Shazam AI + vocal lyric identification immediately on demand for an item.
@@ -204,7 +291,12 @@ final class SongIdentificationService {
 
     @discardableResult
     private func runFullIdentification(_ request: Request, allowOverwriteVerified: Bool) async -> IdentifiedSong? {
+        defer {
+            MediaManager.shared.markAIAnalysisCompleted(relativePath: request.relativePath)
+        }
         guard FileManager.default.fileExists(atPath: request.fileURL.path) else { return nil }
+        progressByPath[request.relativePath] = 0.08
+        stepLabelByPath[request.relativePath] = "Checking track metadata..."
         lastStatus = "Shazam AI analyzing \"\(request.hintTitle)\"..."
 
         var song = await identify(
@@ -217,10 +309,24 @@ final class SongIdentificationService {
         )
 
         // Listen to the whole song: confirm the name from the sung lyrics, identify unknown uploads
-        // with Shazam acoustic matching, and align lyrics with this exact recording.
+        // with Shazam acoustic matching, and align lyrics with this exact recording before playback.
         await Self.ensureSpeechPermissionIfPossible()
+        progressByPath[request.relativePath] = 0.15
+        stepLabelByPath[request.relativePath] = "AI listening to whole song..."
         lastStatus = "Listening to whole song: \"\(song?.title ?? request.hintTitle)\"..."
-        let heard = await SongAudioListener.listen(to: request.fileURL)
+
+        let capturedPath = request.relativePath
+        let capturedLabelTitle = song?.title ?? request.hintTitle
+        let heard = await SongAudioListener.listen(to: request.fileURL) { [weak self] chunkIdx, totalChunks, totalSeconds in
+            Task { @MainActor in
+                let frac = 0.15 + 0.52 * (Double(chunkIdx) / Double(max(1, totalChunks)))
+                let mins = Int(totalSeconds) / 60
+                let secs = Int(totalSeconds) % 60
+                self?.progressByPath[capturedPath] = frac
+                self?.stepLabelByPath[capturedPath] = "AI listening to song (\(chunkIdx)/\(totalChunks) • \(mins):\(String(format: "%02d", secs)))..."
+                self?.lastStatus = "Listening to whole song (\(chunkIdx)/\(totalChunks)): \"\(capturedLabelTitle)\""
+            }
+        }
         var lyricsToAlign: ResolvedTrackLyrics?
 
         if var candidate = song, let heard {
@@ -243,13 +349,19 @@ final class SongIdentificationService {
             }
         }
 
-        if song == nil, let heard, let byLyrics = await identifyFromHeardLyrics(heard, localDuration: request.durationSeconds) {
-            song = byLyrics.song
-            lyricsToAlign = byLyrics.lyrics
+        if song == nil, let heard {
+            progressByPath[request.relativePath] = 0.72
+            stepLabelByPath[request.relativePath] = "Matching heard lyrics..."
+            if let byLyrics = await identifyFromHeardLyrics(heard, localDuration: request.durationSeconds) {
+                song = byLyrics.song
+                lyricsToAlign = byLyrics.lyrics
+            }
         }
 
         // Shazam acoustic constellation + heard-lyric + iTunes official preview matcher across the whole song.
         if song == nil {
+            progressByPath[request.relativePath] = 0.78
+            stepLabelByPath[request.relativePath] = "Running Shazam AI acoustic match..."
             lastStatus = "Running Shazam AI acoustic fingerprint..."
             if case .match(let shazamSong) = await ShazamFingerprintEngine.shared.recognize(
                 fileURL: request.fileURL,
@@ -262,12 +374,18 @@ final class SongIdentificationService {
             }
         }
 
+        let heardExcerpt = heard.map { $0.prefix(16).map(\.token).joined(separator: " ") }
+        let heardCount = heard?.count ?? 0
+
         guard let finalSong = song else {
             // Even when metadata doesn't warrant renaming the track, still check the audio & align
             // real-time lyrics if a real title/hint is known and matches what was heard.
+            progressByPath[request.relativePath] = 0.88
+            stepLabelByPath[request.relativePath] = "Syncing & aligning lyrics..."
+            var alignedDuringImport = false
             if let item = MediaManager.shared.items.first(where: { $0.relativePath == request.relativePath }),
                !request.hintTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                await SyncedLyricsService.shared.fetchAndAlignDuringImport(
+                alignedDuringImport = await SyncedLyricsService.shared.fetchAndAlignDuringImport(
                     item: item,
                     title: request.hintTitle,
                     artist: request.hintArtist,
@@ -275,10 +393,23 @@ final class SongIdentificationService {
                     heard: heard
                 )
             }
-            lastStatus = "Kept \"\(request.hintTitle)\" and checked audio lyrics"
+            WholeSongAIService.shared.markCompletedFromImport(
+                relativePath: request.relativePath,
+                title: request.hintTitle,
+                album: nil,
+                artist: request.hintArtist.isEmpty ? nil : request.hintArtist,
+                genre: nil,
+                heardWordCount: heardCount,
+                heardExcerpt: heardExcerpt,
+                hasLyrics: alignedDuringImport
+            )
+            progressByPath[request.relativePath] = 1.0
+            lastStatus = "Kept \"\(request.hintTitle)\" and finished whole-song AI analysis"
             return nil
         }
 
+        progressByPath[request.relativePath] = 0.84
+        stepLabelByPath[request.relativePath] = "Saving verified title, artist & cover..."
         var cover: UIImage?
         if let artURL = finalSong.artworkURL {
             cover = await Self.downloadImage(artURL)
@@ -295,11 +426,12 @@ final class SongIdentificationService {
             source: finalSong.source,
             forceOverwriteVerified: allowOverwriteVerified
         )
-        guard applied else { return nil }
-        identifiedThisSession += 1
-        lastStatus = "Identified \"\(finalSong.title)\" by \(finalSong.artist) (\(finalSong.source))"
-        if let jobID = request.jobID {
-            PlaylistImportManager.shared.noteTrackIdentified(jobID: jobID)
+        if applied {
+            identifiedThisSession += 1
+            lastStatus = "Identified \"\(finalSong.title)\" by \(finalSong.artist) (\(finalSong.source))"
+            if let jobID = request.jobID {
+                PlaylistImportManager.shared.noteTrackIdentified(jobID: jobID)
+            }
         }
 
         // Index this confirmed track into our local Shazam acoustic fingerprint DB.
@@ -315,6 +447,8 @@ final class SongIdentificationService {
 
         // Pre-fetch & auto-align lyrics to this exact file during import (Speech anchors + Acoustic vocal alignment)
         // so lyrics always line up immediately on first playback with zero user input.
+        progressByPath[request.relativePath] = 0.92
+        stepLabelByPath[request.relativePath] = "Aligning lyrics across whole song..."
         if let item = MediaManager.shared.items.first(where: { $0.relativePath == request.relativePath }) {
             if let lyrics = lyricsToAlign {
                 let aligned = await SongAudioListener.autoAlign(lyrics: lyrics, heard: heard, fileURL: item.fileURL)
@@ -329,7 +463,18 @@ final class SongIdentificationService {
                 )
             }
         }
-        return finalSong
+        WholeSongAIService.shared.markCompletedFromImport(
+            relativePath: request.relativePath,
+            title: finalSong.title,
+            album: finalSong.album,
+            artist: finalSong.artist,
+            genre: finalSong.genre,
+            heardWordCount: heardCount,
+            heardExcerpt: heardExcerpt,
+            hasLyrics: true
+        )
+        progressByPath[request.relativePath] = 1.0
+        return applied ? finalSong : nil
     }
 
     private static func ensureSpeechPermissionIfPossible() async {

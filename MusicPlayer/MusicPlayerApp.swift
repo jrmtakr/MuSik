@@ -154,8 +154,16 @@ struct MusicPlayerApp: App {
                     }
                     switch mediaManager.importAnyFile(from: url) {
                     case .media(let item):
-                        mediaManager.play(item)
-                        showPlayerSheet = true
+                        SongIdentificationService.shared.prioritize(item)
+                        Task { @MainActor in
+                            while mediaManager.isAIAnalysisPending(for: item) {
+                                try? await Task.sleep(for: .milliseconds(350))
+                            }
+                            let refreshed = mediaManager.items.first(where: { $0.relativePath == item.relativePath }) ?? item
+                            if mediaManager.play(refreshed) {
+                                showPlayerSheet = true
+                            }
+                        }
                     case .document(let file):
                         quickLookTarget = QuickLookTarget(title: file.name, fileURL: file.fileURL)
                     case .folder:

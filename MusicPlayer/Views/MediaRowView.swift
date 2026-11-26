@@ -10,6 +10,7 @@ struct MediaRowView: View {
     var onEditInfo: (() -> Void)? = nil
     var onMove: (() -> Void)? = nil
 
+    @State private var songIDService = SongIdentificationService.shared
     @State private var showVerifyArtistSheet = false
     @State private var collabSendTarget: CollabSongNoteTarget?
 
@@ -21,13 +22,25 @@ struct MediaRowView: View {
         mediaManager.convertingItemID == item.id
     }
 
+    private var isPendingAIAnalysis: Bool {
+        songIDService.isBlockedPendingAI(item)
+    }
+
     private var isFavorite: Bool {
         mediaManager.isFavorite(item)
     }
 
     var body: some View {
         HStack(spacing: 14) {
-            Button(action: onPlay) {
+            Button {
+                if isPendingAIAnalysis {
+                    songIDService.prioritize(item)
+                    mediaManager.statusMessage = songIDService.analysisStatusText(for: item)
+                        ?? "AI is listening to whole song before playback..."
+                } else {
+                    onPlay()
+                }
+            } label: {
                 HStack(spacing: 14) {
                     ZStack {
                         MediaArtworkView(
@@ -38,7 +51,19 @@ struct MediaRowView: View {
                         )
                         .frame(width: 54, height: 54)
 
-                        if isCurrent {
+                        if isPendingAIAnalysis {
+                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                .fill(.black.opacity(0.55))
+                                .frame(width: 54, height: 54)
+                            VStack(spacing: 3) {
+                                ProgressView()
+                                    .controlSize(.small)
+                                    .tint(.white)
+                                Text("AI")
+                                    .font(.system(size: 9, weight: .bold))
+                                    .foregroundStyle(.white.opacity(0.9))
+                            }
+                        } else if isCurrent {
                             RoundedRectangle(cornerRadius: 10, style: .continuous)
                                 .fill(.black.opacity(0.42))
                                 .frame(width: 54, height: 54)
@@ -53,7 +78,7 @@ struct MediaRowView: View {
                         HStack(spacing: 5) {
                             Text(item.displayTitle)
                                 .font(.body.weight(.semibold))
-                                .foregroundStyle(isCurrent ? Color.accentColor : .primary)
+                                .foregroundStyle(isPendingAIAnalysis ? .secondary : (isCurrent ? Color.accentColor : .primary))
                                 .lineLimit(1)
 
                             if isFavorite {
@@ -100,7 +125,26 @@ struct MediaRowView: View {
                                 .foregroundStyle(.secondary)
                         }
 
-                        if isConvertingThis {
+                        if isPendingAIAnalysis {
+                            let stepLabel = songIDService.analysisStatusText(for: item) ?? "AI analyzing whole song..."
+                            VStack(alignment: .leading, spacing: 3) {
+                                HStack(spacing: 6) {
+                                    Image(systemName: "waveform.and.magnifyingglass")
+                                        .font(.caption2.weight(.semibold))
+                                        .foregroundStyle(.purple)
+                                    Text(stepLabel)
+                                        .font(.caption2.weight(.medium))
+                                        .foregroundStyle(.purple)
+                                        .lineLimit(1)
+                                }
+                                if let prog = songIDService.analysisProgress(for: item), prog > 0.01 {
+                                    ProgressView(value: prog)
+                                        .progressViewStyle(.linear)
+                                        .tint(.purple)
+                                }
+                            }
+                            .padding(.top, 2)
+                        } else if isConvertingThis {
                             HStack(spacing: 8) {
                                 ProgressView(value: mediaManager.conversionProgress)
                                     .progressViewStyle(.linear)
@@ -120,11 +164,20 @@ struct MediaRowView: View {
 
             Menu {
                 Button {
-                    onPlay()
+                    if isPendingAIAnalysis {
+                        songIDService.prioritize(item)
+                    } else {
+                        onPlay()
+                    }
                 } label: {
-                    Label(isCurrent && mediaManager.isPlaying ? "Pause" : "Play",
-                          systemImage: isCurrent && mediaManager.isPlaying ? "pause.fill" : "play.fill")
+                    if isPendingAIAnalysis {
+                        Label("AI Analyzing Before Play...", systemImage: "waveform.and.magnifyingglass")
+                    } else {
+                        Label(isCurrent && mediaManager.isPlaying ? "Pause" : "Play",
+                              systemImage: isCurrent && mediaManager.isPlaying ? "pause.fill" : "play.fill")
+                    }
                 }
+                .disabled(isPendingAIAnalysis)
 
                 Button {
                     mediaManager.addToNextPlay(item)
