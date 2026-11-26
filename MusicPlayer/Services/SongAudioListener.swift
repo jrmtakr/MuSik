@@ -560,14 +560,33 @@ enum SongAudioListener {
             return energyWarpedTime(between: startTime, and: endTime, fraction: relWeight / spanWeight)
         }
 
+        let sttAnchoredLines = Set(indexAnchors.map(\.lineIdx))
+        var chorusAnchorCount = 0
+        if let curve, !curve.spectralBands.isEmpty, nonEmptyLines.count >= 12 {
+            let promoted = promoteRepeatedChorusAnchors(
+                lines: nonEmptyLines.map(\.text),
+                cumWeights: cumWeights,
+                existingAnchors: indexAnchors,
+                firstVocalSec: firstVocalSec,
+                lastVocalSec: lastVocalSec,
+                totalDuration: totalDuration,
+                curve: curve,
+                energyWarp: energyWarpedTime
+            )
+            if promoted.count > indexAnchors.count {
+                chorusAnchorCount = promoted.count - indexAnchors.count
+                indexAnchors = promoted
+            }
+        }
+
         var syncedLines: [SyncedLyricLine] = []
         syncedLines.reserveCapacity(nonEmptyLines.count)
         for idx in 0..<nonEmptyLines.count {
             let line = nonEmptyLines[idx]
-            let prevEnd = idx > 0 ? syncedLines[idx - 1].startTime + 0.4 : 0
+            let prevEnd = idx > 0 ? syncedLines[idx - 1].startTime + 0.45 : 0
             let rawStart = max(prevEnd, timeForLine(idx))
-            let nextStart = (idx + 1 < nonEmptyLines.count) ? max(rawStart + 0.6, timeForLine(idx + 1)) : min(totalDuration, rawStart + 4.5)
-            let lineEnd = min(totalDuration, max(rawStart + 0.6, nextStart - 0.08))
+            let nextStart = (idx + 1 < nonEmptyLines.count) ? max(rawStart + 0.45, timeForLine(idx + 1)) : min(totalDuration, rawStart + 4.5)
+            let lineEnd = min(totalDuration, max(rawStart + 0.35, nextStart - 0.08))
             syncedLines.append(SyncedLyricLine(
                 id: line.id,
                 startTime: rawStart,
@@ -578,9 +597,44 @@ enum SongAudioListener {
             ))
         }
 
-        let note = indexAnchors.isEmpty
-            ? "AI vocal-energy real-time sync"
-            : "AI audio-synced (\(indexAnchors.count) vocal anchors)"
+        // Guarded Beat-Grid / Vocal-Onset Micro-Quantizer (±0.14s max, active only when tempo periodicity
+        // passed the split-half steadiness gate and vocal energy rises at the candidate beat).
+        var didBeatSnap = false
+        if let curve {
+            let snapped = refineWithBeatAndVocalOnset(
+                lines: syncedLines,
+                lockedLineIndices: sttAnchoredLines,
+                curve: curve,
+                totalDuration: totalDuration
+            )
+            didBeatSnap = snapped.didSnapBeat
+            syncedLines = snapped.lines
+        }
+
+        if syncedLines.count > 1 {
+            for i in 0..<(syncedLines.count - 1) {
+                let nextStart = syncedLines[i + 1].startTime
+                if syncedLines[i].endTime > nextStart - 0.04 {
+                    let clampedEnd = max(syncedLines[i].startTime + 0.25, nextStart - 0.05)
+                    syncedLines[i] = SyncedLyricLine(
+                        id: syncedLines[i].id,
+                        startTime: syncedLines[i].startTime,
+                        endTime: clampedEnd,
+                        text: syncedLines[i].text,
+                        words: syncedLines[i].words,
+                        isInstrumentalBreak: syncedLines[i].isInstrumentalBreak
+                    )
+                }
+            }
+        }
+
+        var details: [String] = []
+        if !sttAnchoredLines.isEmpty { details.append("\(sttAnchoredLines.count) vocal anchors") }
+        if chorusAnchorCount > 0 { details.append("\(chorusAnchorCount) chorus anchors") }
+        if didBeatSnap, let bpm = curve?.beatGrid?.bpm {
+            details.append(String(format: "%.0f BPM beat-snapped", bpm))
+        }
+        let note = details.isEmpty ? "AI vocal-energy real-time sync" : "AI audio-synced (\(details.joined(separator: ", ")))"
         return ResolvedTrackLyrics(
             cacheKey: lyrics.cacheKey,
             trackTitle: lyrics.trackTitle,
@@ -777,6 +831,11 @@ enum SongAudioListener {
             }
         }
 
+        let lrcNonBreakLines = lyrics.lines.filter { !$0.isInstrumentalBreak }
+        let lrcChorusPairs = curve.spectralBands.isEmpty
+            ? []
+            : Array(detectRepeatedChorusBlocks(in: lrcNonBreakLines.map(\.text)).prefix(3))
+
         // Convert LRC vocal intervals into expected activity markers once per scale.
         var bestScore = -Double.infinity
         var zeroOffsetScore = -Double.infinity
@@ -796,6 +855,18 @@ enum SongAudioListener {
                 return pts
             }
 
+            let chorusTimePairs: [(t1: Double, t2: Double, frames: Int)] = lrcChorusPairs.compactMap { pair in
+                guard pair.firstStartLine + pair.lineCount <= lrcNonBreakLines.count,
+                      pair.repeatStartLine + pair.lineCount <= lrcNonBreakLines.count,
+                      curve.spectralFrameDuration > 0.05 else { return nil }
+                let t1 = lrcNonBreakLines[pair.firstStartLine].startTime * scale
+                let end1 = lrcNonBreakLines[pair.firstStartLine + pair.lineCount - 1].endTime * scale
+                let t2 = lrcNonBreakLines[pair.repeatStartLine].startTime * scale
+                let span = max(6.0, min(28.0, end1 - t1))
+                let fCount = max(12, Int(span / curve.spectralFrameDuration))
+                return (t1, t2, fCount)
+            }
+
             func scoreShift(_ offset: Double) -> Double {
                 var sum = 0.0
                 var count = 0
@@ -810,7 +881,25 @@ enum SongAudioListener {
                 }
                 guard count > 0 else { return -Double.infinity }
                 // Tiny prior preferring smaller shifts when scores tie.
-                return (sum / Double(count)) - min(0.08, abs(offset) * 0.0012)
+                var finalScore = (sum / Double(count)) - min(0.08, abs(offset) * 0.0012)
+                if !chorusTimePairs.isEmpty, !curve.spectralBands.isEmpty, curve.spectralFrameDuration > 0.05 {
+                    var cSum = 0.0
+                    var cCnt = 0
+                    for cp in chorusTimePairs {
+                        let s1 = Int((cp.t1 + offset) / curve.spectralFrameDuration)
+                        let s2 = Int((cp.t2 + offset) / curve.spectralFrameDuration)
+                        if s1 >= 0, s2 >= 0,
+                           s1 + cp.frames <= curve.spectralBands.count,
+                           s2 + cp.frames <= curve.spectralBands.count {
+                            cSum += spectralCosineSimilarity(bands: curve.spectralBands, startA: s1, startB: s2, length: cp.frames)
+                            cCnt += 1
+                        }
+                    }
+                    if cCnt > 0 {
+                        finalScore += 0.14 * (cSum / Double(cCnt))
+                    }
+                }
+                return finalScore
             }
 
             let zScore = scoreShift(0)
@@ -878,10 +967,359 @@ enum SongAudioListener {
         )
     }
 
-    private struct VocalEnvelope {
+    // MARK: - Beat-Grid Quantizer & Repeated-Chorus Detector
+
+    private struct BeatGrid: Sendable {
+        let bpm: Double
+        let periodSeconds: Double
+        let phaseSeconds: Double
+        let confidence: Double
+    }
+
+    private struct RepeatedChorusBlock: Sendable {
+        let firstStartLine: Int
+        let repeatStartLine: Int
+        let lineCount: Int
+    }
+
+    private struct VocalEnvelope: Sendable {
         let frameDurationSeconds: Double
         /// Normalized centered vocal-band activity in roughly [-1, +1].
         let envelope: [Double]
+        /// Present only when tempo periodicity is crisp and consistent across both halves of the track.
+        let beatGrid: BeatGrid?
+        let spectralFrameDuration: Double
+        /// Z-normalized 6-band log-energy spectral descriptors (~2.5 Hz) for chorus self-similarity.
+        let spectralBands: [[Double]]
+    }
+
+    /// Strips parenthetical ad-libs like `(Yeah, uh)` so chorus blocks still match despite minor ad-lib tweaks.
+    private static func normalizedChorusLine(_ text: String) -> String {
+        let noParens = text.replacingOccurrences(of: #"\([^\)]*\)"#, with: " ", options: .regularExpression)
+        return tokens(noParens).joined(separator: " ")
+    }
+
+    /// Finds pairs of repeated >=3-line blocks separated by >=5 lines for chorus self-similarity checks.
+    private static func detectRepeatedChorusBlocks(in lines: [String]) -> [RepeatedChorusBlock] {
+        let tokenSets = lines.map { Set(normalizedChorusLine($0).split(separator: " ").map(String.init)) }
+        let n = lines.count
+        guard n >= 10 else { return [] }
+
+        func jaccard(_ a: Set<String>, _ b: Set<String>) -> Double {
+            guard !a.isEmpty, !b.isEmpty else { return 0 }
+            let inter = a.intersection(b).count
+            return Double(inter) / Double(max(a.count, b.count))
+        }
+
+        var blocks: [RepeatedChorusBlock] = []
+        var usedPairs = Set<Int>()
+        for i in 0..<(n - 3) {
+            guard (0..<3).allSatisfy({ tokenSets[i + $0].count >= 2 }) else { continue }
+            var j = i + 5
+            while j < n - 2 {
+                let key = i * 10000 + j
+                if !usedPairs.contains(key),
+                   (0..<3).allSatisfy({ jaccard(tokenSets[i + $0], tokenSets[j + $0]) >= 0.72 }) {
+                    var len = 3
+                    while i + len < j, j + len < n, len < 8,
+                          tokenSets[i + len].count >= 2,
+                          jaccard(tokenSets[i + len], tokenSets[j + len]) >= 0.70 {
+                        len += 1
+                    }
+                    blocks.append(RepeatedChorusBlock(firstStartLine: i, repeatStartLine: j, lineCount: len))
+                    for di in 0..<len {
+                        for dj in 0..<len {
+                            usedPairs.insert((i + di) * 10000 + (j + dj))
+                        }
+                    }
+                    break
+                }
+                j += 1
+            }
+        }
+        return blocks
+    }
+
+    /// Computes normalized cosine similarity between two multi-band spectral blocks `[startA ..< startA + length]` and `startB`.
+    private static func spectralCosineSimilarity(
+        bands: [[Double]],
+        startA: Int,
+        startB: Int,
+        length: Int
+    ) -> Double {
+        guard length > 0,
+              startA >= 0, startB >= 0,
+              startA + length <= bands.count,
+              startB + length <= bands.count else { return 0 }
+        var dot = 0.0
+        var normA = 0.0
+        var normB = 0.0
+        for k in 0..<length {
+            let va = bands[startA + k]
+            let vb = bands[startB + k]
+            for c in 0..<min(va.count, vb.count) {
+                dot += va[c] * vb[c]
+                normA += va[c] * va[c]
+                normB += vb[c] * vb[c]
+            }
+        }
+        let denom = sqrt(normA * normB)
+        return denom > 1e-8 ? (dot / denom) : 0
+    }
+
+    /// Cross-matches repeated chorus blocks against 6-band acoustic similarity within strict structural & density guards
+    /// so later verses/choruses never drift even when Speech missed words.
+    private static func promoteRepeatedChorusAnchors(
+        lines: [String],
+        cumWeights: [Double],
+        existingAnchors: [(lineIdx: Int, fileTime: Double)],
+        firstVocalSec: Double,
+        lastVocalSec: Double,
+        totalDuration: Double,
+        curve: VocalEnvelope,
+        energyWarp: (Double, Double, Double) -> Double
+    ) -> [(lineIdx: Int, fileTime: Double)] {
+        let blocks = detectRepeatedChorusBlocks(in: lines)
+        guard !blocks.isEmpty, curve.spectralFrameDuration > 0.05, !curve.spectralBands.isEmpty else {
+            return existingAnchors
+        }
+
+        var anchors = existingAnchors.sorted { $0.lineIdx < $1.lineIdx }
+        let dtF = curve.spectralFrameDuration
+        let totalBands = curve.spectralBands.count
+
+        func estimateAt(_ idx: Int) -> Double {
+            if let exact = anchors.first(where: { $0.lineIdx == idx }) { return exact.fileTime }
+            let prev = anchors.last(where: { $0.lineIdx < idx })
+            let next = anchors.first(where: { $0.lineIdx > idx })
+            let sLine = prev?.lineIdx ?? 0
+            let eLine = next?.lineIdx ?? lines.count
+            let sTime = prev?.fileTime ?? firstVocalSec
+            let eTime = next?.fileTime ?? lastVocalSec
+            let spanW = max(1.0, cumWeights[eLine] - cumWeights[sLine])
+            let relW = max(0, cumWeights[idx] - cumWeights[sLine])
+            return energyWarp(sTime, eTime, relW / spanW)
+        }
+
+        for block in blocks {
+            // Skip if repeat already sits near an existing anchor (nothing to rescue).
+            if anchors.contains(where: { abs($0.lineIdx - block.repeatStartLine) <= 4 }) { continue }
+
+            let tAStart = estimateAt(block.firstStartLine)
+            let lastInFirst = min(lines.count - 1, block.firstStartLine + block.lineCount - 1)
+            let tAEnd = estimateAt(lastInFirst + 1 < lines.count ? lastInFirst + 1 : lastInFirst)
+            let estDur = max(8.0, min(28.0, tAEnd - tAStart))
+
+            let idxA = max(0, min(totalBands - 1, Int(tAStart / dtF)))
+            let blkLen = max(14, Int(estDur / dtF))
+            guard idxA + blkLen <= totalBands else { continue }
+
+            let prevAnchor = anchors.last(where: { $0.lineIdx < block.repeatStartLine })
+            let nextAnchor = anchors.first(where: { $0.lineIdx > block.repeatStartLine })
+            let prevLine = prevAnchor?.lineIdx ?? 0
+            let prevTime = prevAnchor?.fileTime ?? firstVocalSec
+            let nextLine = nextAnchor?.lineIdx ?? lines.count
+            let nextTime = nextAnchor?.fileTime ?? lastVocalSec
+
+            let fracJ = Double(block.repeatStartLine) / Double(max(1, lines.count))
+            let winMinT = max(prevTime + 1.5, max(tAStart + estDur + 4.0, (fracJ - 0.22) * totalDuration))
+            let winMaxT = min(nextTime - 1.5, (fracJ + 0.22) * totalDuration)
+            let minIdxB = max(idxA + blkLen + 6, Int(winMinT / dtF))
+            let maxIdxB = min(totalBands - blkLen, Int(winMaxT / dtF))
+            guard maxIdxB > minIdxB else { continue }
+
+            var candidates: [(idx: Int, sim: Double)] = []
+            candidates.reserveCapacity(maxIdxB - minIdxB + 1)
+            for idxB in minIdxB...maxIdxB {
+                let s = spectralCosineSimilarity(bands: curve.spectralBands, startA: idxA, startB: idxB, length: blkLen)
+                candidates.append((idxB, s))
+            }
+            guard let top = candidates.max(by: { $0.sim < $1.sim }) else { continue }
+            let runnerSim = candidates
+                .filter { abs(Double($0.idx - top.idx) * dtF) > 10.0 }
+                .map(\.sim)
+                .max() ?? 0.0
+            let margin = top.sim - runnerSim
+            let acceptableSim = (top.sim >= 0.62 && margin >= 0.08) || (top.sim >= 0.56 && margin >= 0.20)
+            guard acceptableSim else { continue }
+
+            let candidateTime = Double(top.idx) * dtF
+            // Guard word density so no verse gets crushed or stretched implausibly.
+            let leftWords = max(2.0, cumWeights[block.repeatStartLine] - cumWeights[prevLine])
+            let leftRate = leftWords / max(0.5, candidateTime - prevTime)
+            guard leftRate >= 0.35 && leftRate <= 6.5 else { continue }
+
+            if nextLine > block.repeatStartLine + 1 {
+                let rightWords = max(2.0, cumWeights[nextLine] - cumWeights[block.repeatStartLine])
+                let rightRate = rightWords / max(0.5, nextTime - candidateTime)
+                guard rightRate >= 0.35 && rightRate <= 6.5 else { continue }
+            }
+
+            anchors.append((block.repeatStartLine, candidateTime))
+            anchors.sort { $0.lineIdx < $1.lineIdx }
+        }
+        return anchors
+    }
+
+    /// Softly snaps un-anchored plain lines (`<= 0.14s`) onto active beats or vocal phrase rises while
+    /// strictly preserving ordering, minimum line duration, and rubato safety (no-op if no steady beat).
+    private static func refineWithBeatAndVocalOnset(
+        lines: [SyncedLyricLine],
+        lockedLineIndices: Set<Int>,
+        curve: VocalEnvelope,
+        totalDuration: Double
+    ) -> (lines: [SyncedLyricLine], didSnapBeat: Bool) {
+        guard let grid = curve.beatGrid, !lines.isEmpty else {
+            return (lines, false)
+        }
+        let step = grid.periodSeconds > 0.62 ? grid.periodSeconds * 0.5 : grid.periodSeconds
+        let envDt = curve.frameDurationSeconds
+        guard step >= 0.25, envDt > 0.02, !curve.envelope.isEmpty else {
+            return (lines, false)
+        }
+
+        func vocalLevel(at time: Double, span: Double) -> Double {
+            let i0 = max(0, min(curve.envelope.count - 1, Int(time / envDt)))
+            let i1 = max(i0 + 1, min(curve.envelope.count, Int((time + span) / envDt)))
+            let slice = curve.envelope[i0..<i1]
+            return slice.reduce(0, +) / Double(max(1, slice.count))
+        }
+
+        var refined = lines
+        var didSnapAny = false
+        for i in 0..<refined.count {
+            if lockedLineIndices.contains(i) { continue }
+            let orig = refined[i].startTime
+            let minBound = i > 0 ? refined[i - 1].startTime + 0.42 : 0.0
+            let maxBound = (i + 1 < refined.count) ? refined[i + 1].startTime - 0.42 : max(orig, totalDuration - 0.6)
+            guard maxBound > minBound + 0.05 else { continue }
+
+            // Nearest beat/half-beat relative to steady grid phase.
+            let k = ((orig - grid.phaseSeconds) / step).rounded()
+            let beatTime = grid.phaseSeconds + k * step
+            let shift = beatTime - orig
+            guard abs(shift) <= 0.14, abs(shift) >= 0.02,
+                  beatTime >= minBound, beatTime <= maxBound else {
+                continue
+            }
+
+            // Never snap a line onto silence: confirm active vocals at the candidate beat.
+            let activeAfter = vocalLevel(at: max(0, beatTime - 0.04), span: 0.26)
+            let before = vocalLevel(at: max(0, beatTime - 0.22), span: 0.16)
+            guard activeAfter > -0.08 && (activeAfter - before) >= -0.05 else {
+                continue
+            }
+
+            let newEnd = min(totalDuration, max(beatTime + 0.45, refined[i].endTime))
+            if i > 0, refined[i - 1].endTime > beatTime - 0.04 {
+                let prevClampedEnd = max(refined[i - 1].startTime + 0.35, beatTime - 0.05)
+                refined[i - 1] = SyncedLyricLine(
+                    id: refined[i - 1].id,
+                    startTime: refined[i - 1].startTime,
+                    endTime: prevClampedEnd,
+                    text: refined[i - 1].text,
+                    words: refined[i - 1].words,
+                    isInstrumentalBreak: refined[i - 1].isInstrumentalBreak
+                )
+            }
+            refined[i] = SyncedLyricLine(
+                id: refined[i].id,
+                startTime: beatTime,
+                endTime: newEnd,
+                text: refined[i].text,
+                words: refined[i].words,
+                isInstrumentalBreak: refined[i].isInstrumentalBreak
+            )
+            didSnapAny = true
+        }
+        return (refined, didSnapAny)
+    }
+
+    /// Detects steady tempo periodicity (`68-162 BPM`) from 43 Hz spectral flux onset envelopes.
+    /// Returns nil whenever the beat is weak, rubato, or shifts tempo between the first and second halves.
+    private static func estimateSteadyBeatGrid(flux: [Double], frameDt: Double) -> BeatGrid? {
+        guard flux.count >= 256, frameDt > 0 else { return nil }
+        // Adaptive local mean subtraction via prefix sums (window = 17 frames ~ 0.40s).
+        var prefix = [Double](repeating: 0, count: flux.count + 1)
+        for i in 0..<flux.count { prefix[i + 1] = prefix[i] + flux[i] }
+        let halfWin = 8
+        var onset = [Double](repeating: 0, count: flux.count)
+        for i in 0..<flux.count {
+            let a = max(0, i - halfWin)
+            let b = min(flux.count, i + halfWin + 1)
+            let localMean = (prefix[b] - prefix[a]) / Double(max(1, b - a))
+            onset[i] = max(0, flux[i] - localMean)
+        }
+
+        let minLag = max(8, Int((60.0 / (162.0 * frameDt)).rounded()))
+        let maxLag = max(minLag + 2, Int((60.0 / (68.0 * frameDt)).rounded()))
+
+        func peakPeriod(start: Int, end: Int) -> (lag: Int, corr: Double, median: Double)? {
+            let len = end - start
+            guard len > maxLag * 2 else { return nil }
+            var corrs: [(lag: Int, c: Double)] = []
+            corrs.reserveCapacity(maxLag - minLag + 1)
+            for lag in minLag...maxLag {
+                var dot = 0.0
+                var na = 0.0
+                var nb = 0.0
+                for i in start..<(end - lag) {
+                    let va = onset[i]
+                    let vb = onset[i + lag]
+                    dot += va * vb
+                    na += va * va
+                    nb += vb * vb
+                }
+                let denom = sqrt(na * nb)
+                let c = denom > 1e-8 ? (dot / denom) : 0
+                corrs.append((lag, c))
+            }
+            guard let best = corrs.max(by: { $0.c < $1.c }) else { return nil }
+            let sortedVals = corrs.map(\.c).sorted()
+            let med = sortedVals[sortedVals.count / 2]
+            return (best.lag, best.c, med)
+        }
+
+        guard let allPeak = peakPeriod(start: 0, end: onset.count),
+              (allPeak.corr - allPeak.median) >= 0.18,
+              allPeak.corr >= 0.30 else {
+            return nil
+        }
+
+        let mid = onset.count / 2
+        guard let h1 = peakPeriod(start: 0, end: mid),
+              let h2 = peakPeriod(start: mid, end: onset.count) else {
+            return nil
+        }
+        let bpmAll = 60.0 / (Double(allPeak.lag) * frameDt)
+        let bpm1 = 60.0 / (Double(h1.lag) * frameDt)
+        let bpm2 = 60.0 / (Double(h2.lag) * frameDt)
+        let sameTempo = abs(bpm1 - bpm2) / max(bpm1, bpm2) <= 0.05
+        let harmonicHalf = abs((min(bpm1, bpm2) / max(bpm1, bpm2)) - 0.5) <= 0.04
+        guard sameTempo || harmonicHalf else {
+            return nil
+        }
+
+        var phaseBins = [Double](repeating: 0, count: allPeak.lag)
+        for i in 0..<onset.count {
+            phaseBins[i % allPeak.lag] += onset[i]
+        }
+        guard let bestPhaseBin = phaseBins.indices.max(by: { phaseBins[$0] < phaseBins[$1] }) else {
+            return nil
+        }
+        let meanPhase = phaseBins.reduce(0, +) / Double(allPeak.lag)
+        let sharpness = phaseBins[bestPhaseBin] / max(1e-8, meanPhase)
+        guard sharpness >= 1.12 else {
+            return nil
+        }
+
+        let prom = allPeak.corr - allPeak.median
+        return BeatGrid(
+            bpm: bpmAll,
+            periodSeconds: Double(allPeak.lag) * frameDt,
+            phaseSeconds: Double(bestPhaseBin) * frameDt,
+            confidence: min(1.0, prom / 0.35)
+        )
     }
 
     private static func extractVocalActivityCurve(from url: URL) -> VocalEnvelope? {
@@ -937,7 +1375,7 @@ enum SongAudioListener {
 
         let fftSize = 1024
         let log2N = vDSP_Length(10)
-        let hop = 1102 // ~0.10s per frame
+        let hop = 256 // ~43.07 Hz resolution for crisp beat tracking & multi-rate downsampling
         guard samples.count >= fftSize,
               let setup = vDSP_create_fftsetup(log2N, FFTRadix(kFFTRadix2)) else {
             return nil
@@ -952,11 +1390,15 @@ enum SongAudioListener {
         var imag = [Float](repeating: 0, count: halfN)
         var mags = [Float](repeating: 0, count: halfN)
 
-        // At 11,025 Hz with N=1024 (~10.77 Hz/bin), bins 28..315 cover ~300 Hz - 3.4 kHz vocals.
-        let lowBin = 28
-        let highBin = min(halfN, 316)
-        var rawEnergies: [Double] = []
-        rawEnergies.reserveCapacity((samples.count - fftSize) / hop + 1)
+        let estFrames = (samples.count - fftSize) / hop + 1
+        var rawVocal43Hz: [Double] = []
+        rawVocal43Hz.reserveCapacity(estFrames)
+        var rawFlux43Hz: [Double] = []
+        rawFlux43Hz.reserveCapacity(estFrames)
+        var rawBands43Hz: [[Double]] = []
+        rawBands43Hz.reserveCapacity(estFrames)
+        var prevLogMags = [Double](repeating: 0, count: 256)
+        var hasPrev = false
 
         var pos = 0
         while pos + fftSize <= samples.count {
@@ -975,22 +1417,96 @@ enum SongAudioListener {
                     vDSP_zvmags(&split, 1, &mags, 1, vDSP_Length(halfN))
                 }
             }
-            var vocalSum: Float = 0
-            for b in lowBin..<highBin {
-                vocalSum += mags[b]
+
+            // 6 perceptual bands (sub/kick, low-mid, vocal-low, vocal-mid, vocal-hi, air) + 300-3400 Hz vocal sum.
+            var b0: Float = 0, b1: Float = 0, b2: Float = 0, b3: Float = 0, b4: Float = 0, b5: Float = 0, vocalSum: Float = 0
+            for b in 2..<min(halfN, 512) {
+                let m = mags[b]
+                if b < 10 { b0 += m }
+                else if b < 28 { b1 += m }
+                else if b < 95 { b2 += m }
+                else if b < 230 { b3 += m }
+                else if b < 350 { b4 += m }
+                else { b5 += m }
+                if b >= 28 && b < 316 { vocalSum += m }
             }
-            rawEnergies.append(log1p(Double(vocalSum)))
+            rawVocal43Hz.append(log1p(Double(vocalSum)))
+            rawBands43Hz.append([
+                log1p(Double(b0)), log1p(Double(b1)), log1p(Double(b2)),
+                log1p(Double(b3)), log1p(Double(b4)), log1p(Double(b5))
+            ])
+
+            var fluxVal = 0.0
+            for b in 2..<min(halfN, 256) {
+                let lm = log1p(Double(sqrtf(max(0, mags[b]))))
+                if hasPrev {
+                    let d = lm - prevLogMags[b]
+                    if d > 0 { fluxVal += d }
+                }
+                prevLogMags[b] = lm
+            }
+            rawFlux43Hz.append(fluxVal)
+            hasPrev = true
             pos += hop
         }
 
-        guard !rawEnergies.isEmpty else { return nil }
+        // Downsample 43.07 Hz vocal log-energy by 4 (~10.77 Hz / 0.0929s per frame) for smooth phrase curve.
+        let dsEnv = 4
+        let envCount = rawVocal43Hz.count / dsEnv
+        guard envCount > 0 else { return nil }
+        var rawEnergies = [Double](repeating: 0, count: envCount)
+        for i in 0..<envCount {
+            let base = i * dsEnv
+            var s = 0.0
+            for k in 0..<dsEnv { s += rawVocal43Hz[base + k] }
+            rawEnergies[i] = s / Double(dsEnv)
+        }
         let sorted = rawEnergies.sorted()
         let p20 = sorted[max(0, sorted.count / 5)]
         let p80 = sorted[min(sorted.count - 1, (sorted.count * 4) / 5)]
         let mid = (p20 + p80) * 0.5
         let spread = max(0.25, (p80 - p20) * 0.5)
         let centered = rawEnergies.map { min(1.0, max(-1.0, ($0 - mid) / spread)) }
-        return VocalEnvelope(frameDurationSeconds: Double(hop) / sampleRate, envelope: centered)
+
+        // Downsample 43.07 Hz 6-band descriptors by 17 (~2.53 Hz / 0.395s per frame) & z-normalize each band.
+        let dsSpec = 17
+        let specCount = rawBands43Hz.count / dsSpec
+        var spectralBands: [[Double]] = []
+        if specCount >= 8 {
+            spectralBands = Array(repeating: [Double](repeating: 0, count: 6), count: specCount)
+            for i in 0..<specCount {
+                let base = i * dsSpec
+                for c in 0..<6 {
+                    var s = 0.0
+                    for k in 0..<dsSpec { s += rawBands43Hz[base + k][c] }
+                    spectralBands[i][c] = s / Double(dsSpec)
+                }
+            }
+            for c in 0..<6 {
+                var mean = 0.0
+                for i in 0..<specCount { mean += spectralBands[i][c] }
+                mean /= Double(specCount)
+                var variance = 0.0
+                for i in 0..<specCount {
+                    let d = spectralBands[i][c] - mean
+                    variance += d * d
+                }
+                let std = max(0.25, sqrt(variance / Double(specCount)))
+                for i in 0..<specCount {
+                    spectralBands[i][c] = (spectralBands[i][c] - mean) / std
+                }
+            }
+        }
+
+        let fastDt = Double(hop) / sampleRate
+        let beatGrid = estimateSteadyBeatGrid(flux: rawFlux43Hz, frameDt: fastDt)
+        return VocalEnvelope(
+            frameDurationSeconds: fastDt * Double(dsEnv),
+            envelope: centered,
+            beatGrid: beatGrid,
+            spectralFrameDuration: fastDt * Double(dsSpec),
+            spectralBands: spectralBands
+        )
     }
 
     /// Finds lyric lines that were clearly heard, and when. Keeps only anchors that move forward in
