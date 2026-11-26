@@ -376,6 +376,27 @@ final class SongIdentificationService {
         let embedded = await Self.readEmbeddedMetadata(from: request.fileURL)
         let seedTitle = (embedded.title?.isEmpty == false ? embedded.title! : request.hintTitle)
         let seedArtist = (embedded.artist?.isEmpty == false ? embedded.artist! : request.hintArtist)
+        let ytCards = (request.sourceVideoID?.isEmpty == false)
+            ? await Self.youtubeMusicCardsInVideo(videoID: request.sourceVideoID!)
+            : []
+
+        if let earlyComp = ArtistDatabase.detectCompilation(
+            rawTitle: seedTitle,
+            rawArtistTag: seedArtist.isEmpty ? nil : seedArtist,
+            fileName: request.fileURL.lastPathComponent,
+            embeddedAlbum: embedded.album,
+            durationSeconds: request.durationSeconds,
+            youtubeSongs: ytCards.map { ($0.title, $0.artist, $0.genre) },
+            allowLongDurationFallback: false
+        ) {
+            return await finalizeCompilation(
+                earlyComp,
+                ytCards: ytCards,
+                request: request,
+                allowOverwriteVerified: allowOverwriteVerified
+            )
+        }
+
         let fileParsed = ArtistDatabase.parseTrackHints(
             rawTitle: seedTitle,
             rawArtistTag: seedArtist.isEmpty ? nil : seedArtist,
@@ -495,6 +516,23 @@ final class SongIdentificationService {
         let heardCount = heard?.count ?? 0
 
         guard var finalSong = song else {
+            if let lateComp = ArtistDatabase.detectCompilation(
+                rawTitle: seedTitle,
+                rawArtistTag: seedArtist.isEmpty ? nil : seedArtist,
+                fileName: request.fileURL.lastPathComponent,
+                embeddedAlbum: embedded.album,
+                durationSeconds: request.durationSeconds,
+                youtubeSongs: ytCards.map { ($0.title, $0.artist, $0.genre) },
+                allowLongDurationFallback: true
+            ) {
+                return await finalizeCompilation(
+                    lateComp,
+                    ytCards: ytCards,
+                    request: request,
+                    allowOverwriteVerified: allowOverwriteVerified
+                )
+            }
+
             // Even when a song isn't in any database, preserve/apply on-file song name & artist,
             // classify album vs Unknown Single cleanly, extract local artwork/frame, and sync/transcribe lyrics.
             updateTrackStep(path: request.relativePath, progress: 0.88, label: "Saving file metadata & syncing lyrics...")
@@ -638,6 +676,75 @@ final class SongIdentificationService {
         return applied ? finalSong : nil
     }
 
+    private func finalizeCompilation(
+        _ comp: ArtistDatabase.CompilationDetection,
+        ytCards: [Candidate],
+        request: Request,
+        allowOverwriteVerified: Bool
+    ) async -> IdentifiedSong {
+        updateTrackStep(path: request.relativePath, progress: 0.65, label: "Detected compilation — resolving genre & cover...")
+        var resolvedGenre = comp.genre
+        if resolvedGenre == "Music" {
+            for card in ytCards.prefix(3) {
+                if let hit = await Self.itunesMatch(for: card, localDuration: nil),
+                   let norm = ArtistDatabase.normalizeGenreLabel(hit.genre) {
+                    resolvedGenre = norm
+                    break
+                }
+            }
+        }
+        if resolvedGenre == "Music",
+           comp.artistLabel != "Various Artists",
+           let artistGenre = ArtistDatabase.normalizeGenreLabel(ArtistDatabase.genre(forArtist: comp.artistLabel)) {
+            resolvedGenre = artistGenre
+        }
+        let albumLabel = "\(resolvedGenre) Compilation"
+
+        var cover: UIImage?
+        if let artURL = ytCards.compactMap(\.artworkURL).first {
+            cover = await Self.downloadImage(Self.upscaledArtworkURL(artURL))
+        }
+        if cover == nil && MediaManager.shared.thumbnails[request.relativePath] == nil {
+            cover = await Task.detached(priority: .utility) {
+                FFmpegMediaService.extractArtworkOrFrame(from: request.fileURL, at: 4.0, maxDimension: 640)
+            }.value
+        }
+
+        _ = MediaManager.shared.applyAutoIdentifiedMetadata(
+            relativePath: request.relativePath,
+            title: comp.cleanTitle,
+            artist: comp.artistLabel,
+            album: albumLabel,
+            genre: resolvedGenre,
+            isrc: nil,
+            coverImage: cover,
+            source: "AI Compilation Analysis",
+            forceOverwriteVerified: allowOverwriteVerified
+        )
+        WholeSongAIService.shared.markCompletedFromImport(
+            relativePath: request.relativePath,
+            title: comp.cleanTitle,
+            album: albumLabel,
+            artist: comp.artistLabel,
+            genre: resolvedGenre,
+            heardWordCount: 0,
+            heardExcerpt: nil,
+            hasLyrics: false
+        )
+        progressByPath[request.relativePath] = 1.0
+        lastStatus = "Identified \(albumLabel): \"\(comp.cleanTitle)\""
+        return IdentifiedSong(
+            title: comp.cleanTitle,
+            artist: comp.artistLabel,
+            album: albumLabel,
+            genre: resolvedGenre,
+            isrc: nil,
+            artworkURL: ytCards.compactMap(\.artworkURL).first,
+            durationSeconds: request.durationSeconds,
+            source: "AI Compilation Analysis"
+        )
+    }
+
     private static func readEmbeddedMetadata(from url: URL) async -> (title: String?, artist: String?, album: String?) {
         let ffInfo = await Task.detached(priority: .utility) {
             FFmpegMediaService.probeMetadata(for: url)
@@ -766,7 +873,7 @@ final class SongIdentificationService {
 
         // 2) YouTube's own "Music" box for this video.
         if let videoID = sourceVideoID, !videoID.isEmpty,
-           let ytMusic = await Self.youtubeMusicInVideo(videoID: videoID) {
+           let ytMusic = await Self.youtubeMusicCardsInVideo(videoID: videoID).first {
             claims.append(ytMusic)
         }
 
@@ -877,15 +984,14 @@ final class SongIdentificationService {
 
     // MARK: - Source: YouTube "Music" box
 
-    /// Reads the "Music" section YouTube shows under many videos (song / artist / album). YouTube fills it
-    /// with its own audio recognition, so it is accurate and needs no key.
-    private static func youtubeMusicInVideo(videoID: String) async -> Candidate? {
-        guard let url = URL(string: "https://www.youtube.com/youtubei/v1/next?prettyPrint=false") else { return nil }
+    /// Reads all tracks listed in YouTube's "Music" section under a video (single track or multi-track compilation).
+    private static func youtubeMusicCardsInVideo(videoID: String) async -> [Candidate] {
+        guard let url = URL(string: "https://www.youtube.com/youtubei/v1/next?prettyPrint=false") else { return [] }
         let body: [String: Any] = [
             "videoId": videoID,
             "context": ["client": ["clientName": "WEB", "clientVersion": "2.20250220.01.00", "hl": "en", "gl": "US"]]
         ]
-        guard let bodyData = try? JSONSerialization.data(withJSONObject: body) else { return nil }
+        guard let bodyData = try? JSONSerialization.data(withJSONObject: body) else { return [] }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.httpBody = bodyData
@@ -900,13 +1006,13 @@ final class SongIdentificationService {
         }
         guard let (data, response) = try? await URLSession.shared.data(for: request),
               let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode),
-              let json = try? JSONSerialization.jsonObject(with: data) else { return nil }
-        return parseYouTubeMusicSection(json)
+              let json = try? JSONSerialization.jsonObject(with: data) else { return [] }
+        return parseYouTubeMusicCards(json)
     }
 
     /// Handles both layouts YouTube has used: `videoAttributeViewModel` cards (title = song,
     /// subtitle = artist, secondarySubtitle = album) and older `infoRowRenderer` rows (SONG / ARTIST / ALBUM).
-    nonisolated private static func parseYouTubeMusicSection(_ json: Any) -> Candidate? {
+    nonisolated private static func parseYouTubeMusicCards(_ json: Any) -> [Candidate] {
         var attributeCards: [[String: Any]] = []
         var infoRows: [(label: String, value: String)] = []
 
@@ -940,35 +1046,39 @@ final class SongIdentificationService {
         }
         walk(json, depth: 0)
 
-        if let card = attributeCards.first,
-           let title = text(card["title"]), !title.isEmpty,
-           let artist = text(card["subtitle"]), !artist.isEmpty {
+        var results: [Candidate] = []
+        for card in attributeCards {
+            guard let title = text(card["title"]), !title.isEmpty,
+                  let artist = text(card["subtitle"]), !artist.isEmpty else { continue }
             var artURL: URL?
             if let image = card["image"] as? [String: Any],
                let sources = (image["sources"] as? [[String: Any]]) ?? ((image["image"] as? [String: Any])?["sources"] as? [[String: Any]]),
                let urlString = sources.last?["url"] as? String {
                 artURL = URL(string: urlString)
             }
-            return Candidate(
+            results.append(Candidate(
                 title: title,
                 artist: artist,
                 album: text(card["secondarySubtitle"]),
                 artworkURL: artURL,
                 sourceName: "YouTube Music info"
-            )
+            ))
+        }
+        if !results.isEmpty {
+            return results
         }
 
         let song = infoRows.first(where: { $0.label == "SONG" })?.value
         let artist = infoRows.first(where: { $0.label == "ARTIST" || $0.label == "ARTISTS" })?.value
         if let song, let artist, !song.isEmpty, !artist.isEmpty {
-            return Candidate(
+            return [Candidate(
                 title: song,
                 artist: artist,
                 album: infoRows.first(where: { $0.label == "ALBUM" })?.value,
                 sourceName: "YouTube Music info"
-            )
+            )]
         }
-        return nil
+        return []
     }
 
     // MARK: - Catalog: iTunes

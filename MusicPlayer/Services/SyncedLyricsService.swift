@@ -24,6 +24,11 @@ struct SyncedLyricLine: Identifiable, Codable, Hashable, Sendable {
     let text: String
     var words: [LyricWordTiming]
     let isInstrumentalBreak: Bool
+    var hasNativeWordTimings: Bool = false
+
+    enum CodingKeys: String, CodingKey {
+        case id, startTime, endTime, text, words, isInstrumentalBreak, hasNativeWordTimings
+    }
 
     init(
         id: UUID = UUID(),
@@ -31,7 +36,8 @@ struct SyncedLyricLine: Identifiable, Codable, Hashable, Sendable {
         endTime: Double,
         text: String,
         words: [LyricWordTiming] = [],
-        isInstrumentalBreak: Bool = false
+        isInstrumentalBreak: Bool = false,
+        hasNativeWordTimings: Bool = false
     ) {
         self.id = id
         self.startTime = startTime
@@ -39,6 +45,18 @@ struct SyncedLyricLine: Identifiable, Codable, Hashable, Sendable {
         self.text = text
         self.words = words
         self.isInstrumentalBreak = isInstrumentalBreak
+        self.hasNativeWordTimings = hasNativeWordTimings
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        startTime = try c.decode(Double.self, forKey: .startTime)
+        endTime = try c.decode(Double.self, forKey: .endTime)
+        text = try c.decode(String.self, forKey: .text)
+        words = try c.decodeIfPresent([LyricWordTiming].self, forKey: .words) ?? []
+        isInstrumentalBreak = try c.decodeIfPresent(Bool.self, forKey: .isInstrumentalBreak) ?? false
+        hasNativeWordTimings = try c.decodeIfPresent(Bool.self, forKey: .hasNativeWordTimings) ?? false
     }
 }
 
@@ -536,6 +554,14 @@ final class SyncedLyricsService {
         let split = splitArtistAndSong(rawTitle: title, rawArtist: artist)
 
         var candidates: [ResolvedTrackLyrics] = []
+        if let karaoke = await fetchFromStudioKaraoke(
+            cacheKey: key,
+            song: split.song,
+            artist: split.artist,
+            duration: duration
+        ) {
+            candidates.append(karaoke)
+        }
         if let lrclib = await fetchFromLRCLIB(
             cacheKey: key,
             song: split.song,
@@ -565,7 +591,8 @@ final class SyncedLyricsService {
         var bestCandidate: ResolvedTrackLyrics?
         var bestScore = -Double.infinity
         for cand in candidates {
-            var score = cand.isTimeSynced ? 0.25 : 0.0
+            let hasNativeWords = cand.lines.contains { $0.hasNativeWordTimings && !$0.words.isEmpty }
+            var score = hasNativeWords ? 0.50 : (cand.isTimeSynced ? 0.25 : 0.0)
             if let heard, !heard.isEmpty {
                 switch SongAudioListener.verdict(heard: heard, lyrics: cand) {
                 case .confirmed(let ratio):
@@ -694,7 +721,17 @@ final class SyncedLyricsService {
             }
         }
 
-        // 2. Online: LRCLIB Time-Synced & Plain LRC
+        // 2. Studio Word-Level Karaoke (NetEase yrc / Kugou krc) for millisecond word timing
+        if let karaoke = await fetchFromStudioKaraoke(
+            cacheKey: cacheKey,
+            song: song,
+            artist: artist,
+            duration: duration
+        ) {
+            return karaoke
+        }
+
+        // 3. Online: LRCLIB Time-Synced & Plain LRC
         if let lrclib = await fetchFromLRCLIB(
             cacheKey: cacheKey,
             song: song,
@@ -1118,6 +1155,445 @@ final class SyncedLyricsService {
         )
     }
 
+    // MARK: - Studio Word-Level Karaoke Lyrics (NetEase YRC + Kugou KRC)
+
+    private func fetchFromStudioKaraoke(
+        cacheKey: String,
+        song: String,
+        artist: String,
+        duration: Double?
+    ) async -> ResolvedTrackLyrics? {
+        let querySong = Self.normalizeSmartPunctuation(song).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !querySong.isEmpty else { return nil }
+        let rawArtist = Self.normalizeSmartPunctuation(artist)
+        let canonArtist = ArtistDatabase.canonicalizeSingle(rawArtist)
+        let queryArtist = canonArtist.isEmpty ? rawArtist : canonArtist
+
+        if let netease = await fetchFromNetEaseKaraoke(
+            cacheKey: cacheKey,
+            song: querySong,
+            artist: queryArtist,
+            duration: duration
+        ) {
+            return netease
+        }
+
+        if let kugou = await fetchFromKugouKaraoke(
+            cacheKey: cacheKey,
+            song: querySong,
+            artist: queryArtist,
+            duration: duration
+        ) {
+            return kugou
+        }
+        return nil
+    }
+
+    private func fetchFromNetEaseKaraoke(
+        cacheKey: String,
+        song: String,
+        artist: String,
+        duration: Double?
+    ) async -> ResolvedTrackLyrics? {
+        guard let searchURL = URL(string: "https://music.163.com/api/search/get") else { return nil }
+        let query = [artist, Self.extractCoreSongTitle(song)].filter { !$0.isEmpty }.joined(separator: " ")
+        guard !query.isEmpty else { return nil }
+
+        var allowed = CharacterSet.alphanumerics
+        allowed.insert(charactersIn: "-._* ")
+        let encodedQuery = (query.addingPercentEncoding(withAllowedCharacters: allowed) ?? query)
+            .replacingOccurrences(of: " ", with: "+")
+        var req = URLRequest(url: searchURL)
+        req.httpMethod = "POST"
+        req.timeoutInterval = 10
+        req.httpBody = "s=\(encodedQuery)&type=1&limit=5".data(using: .utf8)
+        req.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X)", forHTTPHeaderField: "User-Agent")
+        req.setValue("https://music.163.com/", forHTTPHeaderField: "Referer")
+        req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+
+        guard let (data, resp) = try? await URLSession.shared.data(for: req),
+              let http = resp as? HTTPURLResponse, (200...299).contains(http.statusCode),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let resultObj = json["result"] as? [String: Any],
+              let songs = resultObj["songs"] as? [[String: Any]] else {
+            return nil
+        }
+
+        var bestHit: (id: Int, title: String, artist: String, durationSec: Double?, score: Int)?
+        let normSong = Self.normalizeComparable(song)
+        let normCore = Self.normalizeComparable(Self.extractCoreSongTitle(song))
+        let normArtist = Self.normalizeComparable(artist)
+        let targetCombined = "\(song) \(artist)".lowercased()
+
+        for row in songs {
+            guard let sid = row["id"] as? Int,
+                  let rTitle = row["name"] as? String else { continue }
+            let rArtists = ((row["artists"] as? [[String: Any]]) ?? []).compactMap { $0["name"] as? String }
+            let rArtist = rArtists.first ?? ""
+            let rDur = (row["duration"] as? Double).map { $0 / 1000.0 } ?? (row["duration"] as? Int).map { Double($0) / 1000.0 }
+
+            let nTitle = Self.normalizeComparable(rTitle)
+            let nArtist = Self.normalizeComparable(rArtist)
+            var score = 0
+            if nTitle == normSong || (!normCore.isEmpty && nTitle == normCore) { score += 50 }
+            else if nTitle.contains(normCore) || (!nTitle.isEmpty && normCore.contains(nTitle)) { score += 26 }
+            else { continue }
+
+            if !normArtist.isEmpty {
+                if nArtist == normArtist || rArtists.contains(where: { Self.normalizeComparable($0) == normArtist }) {
+                    score += 40
+                } else if !nArtist.isEmpty && (nArtist.contains(normArtist) || normArtist.contains(nArtist)) {
+                    score += 24
+                } else {
+                    score -= 20
+                }
+            }
+
+            if let duration, let rDur, duration > 5 {
+                let diff = abs(duration - rDur)
+                if diff <= 3.0 { score += 35 }
+                else if diff <= 9.0 { score += 18 }
+                else if diff > 18.0 { score -= 45 }
+            }
+
+            let titleLower = rTitle.lowercased()
+            for kw in ["slowed", "sped up", "nightcore", "remix", "instrumental", "karaoke", "live", "cover", "伴奏"] {
+                if titleLower.contains(kw) && !targetCombined.contains(kw) {
+                    score -= 55
+                    break
+                }
+            }
+
+            if bestHit == nil || score > bestHit!.score {
+                bestHit = (sid, rTitle, rArtist, rDur, score)
+            }
+        }
+
+        guard let chosen = bestHit, chosen.score >= 55,
+              let lyrURL = URL(string: "https://music.163.com/api/song/lyric/v1?id=\(chosen.id)&lv=1&kv=1&tv=-1&yv=1") else {
+            return nil
+        }
+
+        var lyrReq = URLRequest(url: lyrURL)
+        lyrReq.timeoutInterval = 10
+        lyrReq.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X)", forHTTPHeaderField: "User-Agent")
+        lyrReq.setValue("https://music.163.com/", forHTTPHeaderField: "Referer")
+
+        guard let (lData, lResp) = try? await URLSession.shared.data(for: lyrReq),
+              let lHttp = lResp as? HTTPURLResponse, (200...299).contains(lHttp.statusCode),
+              let lJson = try? JSONSerialization.jsonObject(with: lData) as? [String: Any],
+              let yrcObj = lJson["yrc"] as? [String: Any],
+              let yrcText = yrcObj["lyric"] as? String, !yrcText.isEmpty else {
+            return nil
+        }
+
+        let lines = Self.parseKaraokeTimedLines(
+            text: yrcText,
+            isKugouKRC: false,
+            song: chosen.title,
+            artist: chosen.artist,
+            duration: duration ?? chosen.durationSec
+        )
+        guard lines.filter({ !$0.isInstrumentalBreak }).count >= 6 else { return nil }
+        return ResolvedTrackLyrics(
+            cacheKey: cacheKey,
+            trackTitle: chosen.title,
+            artistName: chosen.artist,
+            isTimeSynced: true,
+            sourceLabel: "Word-Synced Lyrics · Studio",
+            attributionText: "Word-by-word karaoke sync via NetEase",
+            syncedOffsetSeconds: 0,
+            expectedDurationSeconds: duration ?? chosen.durationSec,
+            lines: lines
+        )
+    }
+
+    private func fetchFromKugouKaraoke(
+        cacheKey: String,
+        song: String,
+        artist: String,
+        duration: Double?
+    ) async -> ResolvedTrackLyrics? {
+        let keyword = [artist, Self.extractCoreSongTitle(song)].filter { !$0.isEmpty }.joined(separator: " - ")
+        guard !keyword.isEmpty else { return nil }
+        var comps = URLComponents(string: "https://lyrics.kugou.com/search")
+        var items = [
+            URLQueryItem(name: "ver", value: "1"),
+            URLQueryItem(name: "man", value: "yes"),
+            URLQueryItem(name: "client", value: "pc"),
+            URLQueryItem(name: "keyword", value: keyword)
+        ]
+        if let duration, duration > 5 {
+            items.append(URLQueryItem(name: "duration", value: String(Int((duration * 1000.0).rounded()))))
+        }
+        comps?.queryItems = items
+        guard let searchURL = comps?.url else { return nil }
+
+        var req = URLRequest(url: searchURL)
+        req.timeoutInterval = 10
+        req.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X)", forHTTPHeaderField: "User-Agent")
+
+        guard let (data, resp) = try? await URLSession.shared.data(for: req),
+              let http = resp as? HTTPURLResponse, (200...299).contains(http.statusCode),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let candidates = json["candidates"] as? [[String: Any]] else {
+            return nil
+        }
+
+        let normSong = Self.normalizeComparable(song)
+        let normCore = Self.normalizeComparable(Self.extractCoreSongTitle(song))
+        let normArtist = Self.normalizeComparable(artist)
+        let targetCombined = "\(song) \(artist)".lowercased()
+
+        var best: (id: String, accesskey: String, song: String, singer: String, durSec: Double?, score: Int)?
+        for cand in candidates.prefix(8) {
+            guard let cid = cand["id"] as? String,
+                  let key = cand["accesskey"] as? String,
+                  let cSong = cand["song"] as? String else { continue }
+            let cSinger = (cand["singer"] as? String) ?? ""
+            let cDur = (cand["duration"] as? Double).map { $0 / 1000.0 } ?? (cand["duration"] as? Int).map { Double($0) / 1000.0 }
+            let nTitle = Self.normalizeComparable(cSong)
+            let nSinger = Self.normalizeComparable(cSinger)
+
+            var score = 0
+            if nTitle == normSong || (!normCore.isEmpty && nTitle == normCore) { score += 50 }
+            else if nTitle.contains(normCore) || (!nTitle.isEmpty && normCore.contains(nTitle)) { score += 26 }
+            else { continue }
+
+            if !normArtist.isEmpty {
+                if nSinger == normArtist { score += 40 }
+                else if !nSinger.isEmpty && (nSinger.contains(normArtist) || normArtist.contains(nSinger)) { score += 25 }
+                else { score -= 20 }
+            }
+            if let duration, let cDur, duration > 5 {
+                let diff = abs(duration - cDur)
+                if diff <= 3.0 { score += 35 }
+                else if diff <= 9.0 { score += 18 }
+                else if diff > 18.0 { score -= 45 }
+            }
+            let lower = cSong.lowercased()
+            for kw in ["slowed", "sped up", "nightcore", "remix", "instrumental", "karaoke", "live", "cover", "伴奏"] {
+                if lower.contains(kw) && !targetCombined.contains(kw) {
+                    score -= 55
+                    break
+                }
+            }
+            if best == nil || score > best!.score {
+                best = (cid, key, cSong, cSinger, cDur, score)
+            }
+        }
+
+        guard let chosen = best, chosen.score >= 55 else { return nil }
+        var dlComps = URLComponents(string: "https://lyrics.kugou.com/download")
+        dlComps?.queryItems = [
+            URLQueryItem(name: "ver", value: "1"),
+            URLQueryItem(name: "client", value: "pc"),
+            URLQueryItem(name: "id", value: chosen.id),
+            URLQueryItem(name: "accesskey", value: chosen.accesskey),
+            URLQueryItem(name: "fmt", value: "krc"),
+            URLQueryItem(name: "charset", value: "utf8")
+        ]
+        guard let dlURL = dlComps?.url else { return nil }
+
+        var dlReq = URLRequest(url: dlURL)
+        dlReq.timeoutInterval = 10
+        dlReq.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X)", forHTTPHeaderField: "User-Agent")
+
+        guard let (dlData, dlResp) = try? await URLSession.shared.data(for: dlReq),
+              let dlHttp = dlResp as? HTTPURLResponse, (200...299).contains(dlHttp.statusCode),
+              let dlJson = try? JSONSerialization.jsonObject(with: dlData) as? [String: Any],
+              let b64 = dlJson["content"] as? String,
+              let rawData = Data(base64Encoded: b64),
+              let krcText = Self.decodeKugouKRC(rawData), !krcText.isEmpty else {
+            return nil
+        }
+
+        let lines = Self.parseKaraokeTimedLines(
+            text: krcText,
+            isKugouKRC: true,
+            song: chosen.song,
+            artist: chosen.singer,
+            duration: duration ?? chosen.durSec
+        )
+        guard lines.filter({ !$0.isInstrumentalBreak }).count >= 6 else { return nil }
+        return ResolvedTrackLyrics(
+            cacheKey: cacheKey,
+            trackTitle: chosen.song,
+            artistName: chosen.singer,
+            isTimeSynced: true,
+            sourceLabel: "Word-Synced Lyrics · Studio",
+            attributionText: "Word-by-word karaoke sync via Kugou",
+            syncedOffsetSeconds: 0,
+            expectedDurationSeconds: duration ?? chosen.durSec,
+            lines: lines
+        )
+    }
+
+    nonisolated private static func decodeKugouKRC(_ data: Data) -> String? {
+        guard data.count > 10, data.prefix(4) == Data([0x6B, 0x72, 0x63, 0x31]) else {
+            return nil
+        }
+        let key: [UInt8] = [0x40, 0x47, 0x61, 0x77, 0x5E, 0x32, 0x74, 0x47, 0x51, 0x36, 0x31, 0x2D, 0xCE, 0xD2, 0x6E, 0x69]
+        var xorBytes = Data(capacity: data.count - 4)
+        for (i, byte) in data.dropFirst(4).enumerated() {
+            xorBytes.append(byte ^ key[i % 16])
+        }
+        // Zlib RFC 1950 header (2 bytes, e.g. 0x78 0x9c) + raw deflate payload + 4-byte adler32 trailer
+        guard xorBytes.count > 6 else { return nil }
+        let rawDeflate = Data(xorBytes.dropFirst(2).dropLast(4))
+        guard let decompressed = try? (rawDeflate as NSData).decompressed(using: .zlib) as Data else {
+            return nil
+        }
+        return String(data: decompressed, encoding: .utf8)
+    }
+
+    nonisolated private static func parseKaraokeTimedLines(
+        text: String,
+        isKugouKRC: Bool,
+        song: String,
+        artist: String,
+        duration: Double?
+    ) -> [SyncedLyricLine] {
+        let normalized = text
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+            .replacingOccurrences(of: "\u{FEFF}", with: "")
+        let rawLines = normalized.components(separatedBy: "\n")
+
+        guard let lineRegex = try? NSRegularExpression(pattern: #"^\[(\d+),(\d+)\](.*)$"#),
+              let tokenRegex = try? NSRegularExpression(
+                  pattern: isKugouKRC ? #"<(\d+),(\d+),\d+>([^<]*)"# : #"\((\d+),(\d+),\d+\)([^\(]*)"#
+              ) else {
+            return []
+        }
+
+        let normSongArtist = normalizeComparable("\(song) \(artist)")
+        var rawBuilt: [(start: Double, end: Double, text: String, words: [LyricWordTiming])] = []
+
+        for rawLine in rawLines {
+            let trimmed = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty,
+                  !trimmed.hasPrefix("{"),
+                  trimmed.hasPrefix("[") else { continue }
+            let nsLine = trimmed as NSString
+            guard let lm = lineRegex.firstMatch(in: trimmed, range: NSRange(location: 0, length: nsLine.length)),
+                  lm.numberOfRanges > 3,
+                  let startMs = Double(nsLine.substring(with: lm.range(at: 1))),
+                  let durMs = Double(nsLine.substring(with: lm.range(at: 2))) else {
+                continue
+            }
+            let body = nsLine.substring(with: lm.range(at: 3))
+            let lineStart = startMs / 1000.0
+            let lineEnd = max(lineStart + 0.35, (startMs + max(durMs, 350.0)) / 1000.0)
+
+            let nsBody = body as NSString
+            let matches = tokenRegex.matches(in: body, range: NSRange(location: 0, length: nsBody.length))
+            var segments: [(text: String, start: Double, end: Double)] = []
+            for m in matches where m.numberOfRanges > 3 {
+                guard let tRaw = Double(nsBody.substring(with: m.range(at: 1))),
+                      let dRaw = Double(nsBody.substring(with: m.range(at: 2))) else { continue }
+                let tok = nsBody.substring(with: m.range(at: 3))
+                let wStart = isKugouKRC ? (lineStart + tRaw / 1000.0) : (tRaw / 1000.0)
+                let wEnd = max(wStart + 0.05, wStart + (dRaw / 1000.0))
+                segments.append((tok, max(lineStart, wStart), min(lineEnd + 0.5, wEnd)))
+            }
+
+            // Merge sub-syllable runs into space-separated words preserving exact start..end timing.
+            var mergedWords: [LyricWordTiming] = []
+            var curText = ""
+            var curStart: Double?
+            var curEnd: Double = lineStart
+
+            func flushWord() {
+                let clean = curText.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !clean.isEmpty, let s = curStart {
+                    mergedWords.append(LyricWordTiming(text: clean, startTime: s, endTime: max(s + 0.05, curEnd)))
+                }
+                curText = ""
+                curStart = nil
+            }
+
+            for seg in segments {
+                let rawTok = seg.text
+                if rawTok.first?.isWhitespace == true {
+                    flushWord()
+                }
+                let trimmedLeading = rawTok.replacingOccurrences(of: #"^\s+"#, with: "", options: .regularExpression)
+                let hasTrailingSpace = rawTok.last?.isWhitespace == true
+                if !trimmedLeading.isEmpty {
+                    if curStart == nil { curStart = seg.start }
+                    curText += trimmedLeading
+                    curEnd = max(curEnd, seg.end)
+                }
+                if hasTrailingSpace {
+                    flushWord()
+                }
+            }
+            flushWord()
+
+            let plainText = mergedWords.map(\.text).joined(separator: " ")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !plainText.isEmpty else { continue }
+
+            let lowerPlain = plainText.lowercased()
+            if lowerPlain.contains("作词") || lowerPlain.contains("作曲") || lowerPlain.contains("编曲")
+                || lowerPlain.contains("制作人") || lowerPlain.contains("tme")
+                || lowerPlain.range(
+                    of: #"\b(?:produced|written|composed|lyrics|arranged|mixed|mastered)\s+by\b"#,
+                    options: .regularExpression
+                ) != nil
+                || (rawBuilt.count < 4 && (lowerPlain.hasPrefix("composer:") || lowerPlain.hasPrefix("lyricist:") || lowerPlain.hasPrefix("producer:"))) {
+                continue
+            }
+            if rawBuilt.isEmpty, !normSongArtist.isEmpty, normalizeComparable(plainText) == normSongArtist {
+                continue
+            }
+
+            rawBuilt.append((lineStart, max(lineEnd, mergedWords.last?.endTime ?? lineEnd), plainText, mergedWords))
+        }
+
+        var output: [SyncedLyricLine] = []
+        for i in 0..<rawBuilt.count {
+            let cur = rawBuilt[i]
+            let nextStart = (i + 1 < rawBuilt.count) ? rawBuilt[i + 1].start : max(cur.end + 1.0, duration ?? (cur.end + 4.0))
+            if i == 0 && cur.start > 5.0 {
+                output.append(SyncedLyricLine(
+                    startTime: 0.4,
+                    endTime: max(1.0, cur.start - 0.35),
+                    text: "",
+                    words: [],
+                    isInstrumentalBreak: true,
+                    hasNativeWordTimings: false
+                ))
+            }
+            let vocalGap = nextStart - cur.start
+            let boundedEnd = vocalGap > 8.5 ? cur.end : min(cur.end, max(cur.start + 0.35, nextStart - 0.04))
+            output.append(SyncedLyricLine(
+                startTime: cur.start,
+                endTime: boundedEnd,
+                text: cur.text,
+                words: cur.words,
+                isInstrumentalBreak: false,
+                hasNativeWordTimings: true
+            ))
+            if vocalGap > 8.5 && i + 1 < rawBuilt.count {
+                let breakStart = cur.end + 0.3
+                let breakEnd = max(breakStart + 1.0, nextStart - 0.35)
+                if breakEnd > breakStart + 1.0 {
+                    output.append(SyncedLyricLine(
+                        startTime: breakStart,
+                        endTime: breakEnd,
+                        text: "",
+                        words: [],
+                        isInstrumentalBreak: true,
+                        hasNativeWordTimings: false
+                    ))
+                }
+            }
+        }
+        return output
+    }
+
     // MARK: - Genius Clean Plain Lyrics Fallback
 
     private func fetchFromGenius(
@@ -1476,6 +1952,7 @@ final class SyncedLyricsService {
                 }
 
                 let wordTimings: [LyricWordTiming]
+                let hasNativeWords: Bool
                 if let enhancedWordRegex,
                    let parsedEnhanced = parseEnhancedWords(
                        in: entry.rawBody,
@@ -1485,12 +1962,14 @@ final class SyncedLyricsService {
                    ),
                    !parsedEnhanced.isEmpty {
                     wordTimings = parsedEnhanced
+                    hasNativeWords = true
                 } else {
                     wordTimings = synthesizeProportionalWordTimings(
                         text: cleanPlain,
                         lineStart: entry.time,
                         lineEnd: min(nextTime, entry.time + max(2.2, Double(cleanPlain.count) * 0.085))
                     )
+                    hasNativeWords = false
                 }
 
                 // Cap vocal highlight end slightly before long pauses and inject Apple Music instrumental break dots
@@ -1503,7 +1982,8 @@ final class SyncedLyricsService {
                         endTime: lineEndTime,
                         text: cleanPlain,
                         words: wordTimings,
-                        isInstrumentalBreak: false
+                        isInstrumentalBreak: false,
+                        hasNativeWordTimings: hasNativeWords
                     )
                 )
 

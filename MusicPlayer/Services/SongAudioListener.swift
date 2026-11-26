@@ -339,7 +339,8 @@ enum SongAudioListener {
                 endTime: newEnd,
                 text: line.text,
                 words: newWords,
-                isInstrumentalBreak: line.isInstrumentalBreak
+                isInstrumentalBreak: line.isInstrumentalBreak,
+                hasNativeWordTimings: line.hasNativeWordTimings
             ))
         }
         // Keep lines in order even if two anchors disagreed slightly.
@@ -351,7 +352,8 @@ enum SongAudioListener {
                 endTime: max(fixed, remapped[i].endTime),
                 text: remapped[i].text,
                 words: remapped[i].words,
-                isInstrumentalBreak: remapped[i].isInstrumentalBreak
+                isInstrumentalBreak: remapped[i].isInstrumentalBreak,
+                hasNativeWordTimings: remapped[i].hasNativeWordTimings
             )
         }
 
@@ -374,37 +376,38 @@ enum SongAudioListener {
     /// Automatically lines up ANY `lyrics` (both synced `.lrc` and plain/Genius text) against `fileURL`
     /// into real-time synced line + word timings with zero user input:
     ///   1. If `lyrics` are already time-synced: re-times them via whole-song STT word anchors, or falls back to
-    ///      10 Hz vocal-band (300 Hz - 3.4 kHz) energy cross-correlation to remove intro/outro/tempo drift.
+    ///      vocal-band & repeated-chorus cross-correlation to remove intro/outro/tempo drift.
     ///   2. If `lyrics` are plain/untimed text: converts them into real-time synced lines (`isTimeSynced = true`)
-    ///      using STT heard-word anchors across the song or the 10 Hz acoustic vocal-onset span.
-    ///   3. Populates real-time word-by-word `LyricWordTiming` highlights anchored to heard words when available.
+    ///      using STT heard-word anchors, chorus similarity anchors, vocal energy warp, and guarded beat snapping.
+    ///   3. Populates real-time word-by-word `LyricWordTiming` highlights anchored to heard words and 43 Hz vocal/syllable curves.
     static func autoAlign(lyrics: ResolvedTrackLyrics, heard: [HeardWord]?, fileURL: URL) async -> ResolvedTrackLyrics {
         guard !lyrics.lines.isEmpty else { return lyrics }
+
+        let curve: VocalEnvelope? = FileManager.default.fileExists(atPath: fileURL.path)
+            ? await Task.detached(priority: .utility) { Self.extractVocalActivityCurve(from: fileURL) }.value
+            : nil
 
         var working = lyrics
         if working.isTimeSynced {
             if let heard, let sttAligned = align(lyrics: working, heard: heard) {
                 working = sttAligned
             } else {
-                working = await alignAcousticallyIfNeeded(lyrics: working, fileURL: fileURL)
+                working = alignAcousticallyInternal(lyrics: working, curve: curve)
             }
         } else {
-            working = await alignPlainLyricsIntoRealTimeSync(lyrics: working, heard: heard, fileURL: fileURL)
+            working = alignPlainLyricsIntoRealTimeSync(lyrics: working, heard: heard, curve: curve)
         }
-        return withRealTimeWordTimings(in: working, heard: heard)
+        return withRealTimeWordTimings(in: working, heard: heard, curve: curve)
     }
 
     private static func alignPlainLyricsIntoRealTimeSync(
         lyrics: ResolvedTrackLyrics,
         heard: [HeardWord]?,
-        fileURL: URL
-    ) async -> ResolvedTrackLyrics {
+        curve: VocalEnvelope?
+    ) -> ResolvedTrackLyrics {
         let nonEmptyLines = lyrics.lines.filter { !$0.isInstrumentalBreak && !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
         guard !nonEmptyLines.isEmpty else { return lyrics }
 
-        let curve = await Task.detached(priority: .utility) {
-            Self.extractVocalActivityCurve(from: fileURL)
-        }.value
         let totalDuration = curve.map { Double($0.envelope.count) * $0.frameDurationSeconds } ?? lyrics.expectedDurationSeconds ?? 180.0
         guard totalDuration > 10 else { return lyrics }
 
@@ -711,7 +714,8 @@ enum SongAudioListener {
                 endTime: lineEnd,
                 text: group.map(\.token).joined(separator: " "),
                 words: wordTimings,
-                isInstrumentalBreak: false
+                isInstrumentalBreak: false,
+                hasNativeWordTimings: true
             ))
             let gap = nextStart - lineEnd
             if idx + 1 < groups.count && gap >= 7.0 {
@@ -740,50 +744,200 @@ enum SongAudioListener {
         )
     }
 
-    private static func withRealTimeWordTimings(in lyrics: ResolvedTrackLyrics, heard: [HeardWord]?) -> ResolvedTrackLyrics {
+    private static func approximateSyllableCount(_ word: String) -> Int {
+        let lower = word.lowercased().filter { $0.isLetter }
+        guard !lower.isEmpty else { return 1 }
+        let vowels = Set("aeiouy")
+        var groups = 0
+        var prevVowel = false
+        for ch in lower {
+            let isV = vowels.contains(ch)
+            if isV && !prevVowel { groups += 1 }
+            prevVowel = isV
+        }
+        if lower.hasSuffix("e") && groups > 1 { groups -= 1 }
+        return max(1, groups)
+    }
+
+    private static func withRealTimeWordTimings(
+        in lyrics: ResolvedTrackLyrics,
+        heard: [HeardWord]?,
+        curve: VocalEnvelope? = nil
+    ) -> ResolvedTrackLyrics {
         guard lyrics.isTimeSynced, !lyrics.lines.isEmpty else { return lyrics }
 
+        func acousticWordWarp(between startTime: Double, and endTime: Double, fraction: Double) -> Double {
+            let f = min(1.0, max(0.0, fraction))
+            guard f > 0, f < 1, endTime - startTime > 0.25,
+                  let curve, !curve.fastVocalEnvelope.isEmpty else {
+                return startTime + (endTime - startTime) * f
+            }
+            let dt = curve.fastFrameDurationSeconds
+            let i0 = max(0, min(curve.fastVocalEnvelope.count - 1, Int(startTime / dt)))
+            let i1 = max(i0 + 1, min(curve.fastVocalEnvelope.count, Int(ceil(endTime / dt))))
+            guard i1 > i0 + 1 else {
+                return startTime + (endTime - startTime) * f
+            }
+
+            var cum = [Double](repeating: 0, count: i1 - i0 + 1)
+            for k in 0..<(i1 - i0) {
+                let v = curve.fastVocalEnvelope[i0 + k]
+                let o = (i0 + k < curve.fastVocalOnset.count) ? curve.fastVocalOnset[i0 + k] : 0.0
+                let w = v > -0.10 ? (0.28 + max(0, v) * 0.42 + 0.72 * o) : 0.04
+                cum[k + 1] = cum[k] + w
+            }
+            let total = cum.last ?? 0
+            guard total > 0.05 else {
+                return startTime + (endTime - startTime) * f
+            }
+            let target = total * f
+            for k in 0..<(cum.count - 1) where cum[k + 1] >= target {
+                let segSpan = max(1e-6, cum[k + 1] - cum[k])
+                let sub = (target - cum[k]) / segSpan
+                let t = (Double(i0 + k) + sub) * dt
+                return min(endTime, max(startTime, t))
+            }
+            return endTime
+        }
+
         let updatedLines: [SyncedLyricLine] = lyrics.lines.enumerated().map { idx, line in
-            guard !line.isInstrumentalBreak, line.words.isEmpty else { return line }
+            guard !line.isInstrumentalBreak, (!line.hasNativeWordTimings || line.words.isEmpty) else { return line }
             let rawWords = line.text.split(whereSeparator: { $0.isWhitespace }).map(String.init)
             guard !rawWords.isEmpty else { return line }
 
-            let fallbackNextStart = (idx + 1 < lyrics.lines.count)
-                ? max(line.startTime + 0.6, lyrics.lines[idx + 1].startTime - 0.08)
+            let nextLineFloor = (idx + 1 < lyrics.lines.count)
+                ? max(line.startTime + 0.45, lyrics.lines[idx + 1].startTime - 0.05)
                 : max(line.startTime + 3.2, line.endTime)
-            let lineEnd = max(line.startTime + 0.5, line.endTime > line.startTime + 0.25 ? line.endTime : fallbackNextStart)
-            let span = lineEnd - line.startTime
+            let rawStart = max(0, line.startTime)
+            let rawEnd = min(nextLineFloor, max(rawStart + 0.45, line.endTime > rawStart + 0.25 ? line.endTime : nextLineFloor))
+            let minVocalDur = min(rawEnd - rawStart, max(0.50, Double(rawWords.count) * 0.14))
 
-            // Anchor any recognized words from STT near this line window; distribute others smoothly by character length.
-            let localHeard: [HeardWord] = (heard ?? []).filter {
-                $0.time >= line.startTime - 0.6 && $0.time <= lineEnd + 0.6
-            }
-            let totalChars = Double(rawWords.reduce(0) { $0 + max(1, $1.count) })
-            var cursorTime = line.startTime
-            var generatedWords: [LyricWordTiming] = []
-            generatedWords.reserveCapacity(rawWords.count)
+            // Trim silent leading padding and trailing beat tails via 43 Hz vocal energy so words track actual vocals.
+            var vocalStart = rawStart
+            var vocalEnd = rawEnd
+            if let curve, !curve.fastVocalEnvelope.isEmpty {
+                let dt = curve.fastFrameDurationSeconds
+                let iStart = max(0, min(curve.fastVocalEnvelope.count - 1, Int(rawStart / dt)))
+                let iEnd = max(iStart + 1, min(curve.fastVocalEnvelope.count, Int(rawEnd / dt)))
 
-            for (wIdx, wordText) in rawWords.enumerated() {
-                let normWord = normalizeToken(wordText)
-                var wStart = cursorTime
-                if !normWord.isEmpty,
-                   let heardMatch = localHeard.first(where: { $0.token == normWord && $0.time >= cursorTime - 0.25 && $0.time <= lineEnd }) {
-                    wStart = max(cursorTime, min(lineEnd - 0.08, heardMatch.time))
+                let maxTrimLeadIdx = min(iEnd, Int((min(rawStart + 0.50, rawEnd - minVocalDur)) / dt))
+                if maxTrimLeadIdx > iStart {
+                    var scan = iStart
+                    while scan < maxTrimLeadIdx && curve.fastVocalEnvelope[scan] < -0.22 {
+                        scan += 1
+                    }
+                    if scan < maxTrimLeadIdx && curve.fastVocalEnvelope[scan] >= -0.10 {
+                        vocalStart = max(rawStart, min(rawEnd - minVocalDur, Double(scan) * dt - 0.03))
+                    }
                 }
-                let share = Double(max(1, wordText.count)) / max(1.0, totalChars)
-                let estDur = max(0.08, span * share)
-                let wEnd = (wIdx == rawWords.count - 1) ? lineEnd : min(lineEnd, wStart + estDur)
-                generatedWords.append(LyricWordTiming(text: wordText, startTime: wStart, endTime: max(wStart + 0.05, wEnd)))
-                cursorTime = max(cursorTime, wEnd)
+
+                let minEndIdx = max(iStart + 2, Int((vocalStart + minVocalDur) / dt))
+                if iEnd > minEndIdx + 2 {
+                    for rev in stride(from: iEnd - 1, through: minEndIdx + 1, by: -1) {
+                        if curve.fastVocalEnvelope[rev] > -0.15 && curve.fastVocalEnvelope[rev - 1] > -0.18 {
+                            vocalEnd = max(vocalStart + minVocalDur, min(rawEnd, Double(rev + 1) * dt + 0.10))
+                            break
+                        }
+                    }
+                }
+            }
+
+            // Piecewise monotonic SFSpeechRecognizer word anchoring (compensating ~80ms dictation emission lag).
+            let localHeard: [HeardWord] = (heard ?? []).filter {
+                $0.time >= rawStart - 0.35 && $0.time <= rawEnd + 0.35
+            }
+            var wordAnchors: [(wIdx: Int, time: Double)] = []
+            if !localHeard.isEmpty {
+                var hCursor = 0
+                for (wIdx, wordText) in rawWords.enumerated() {
+                    let normW = normalizeToken(wordText)
+                    guard normW.count >= 2 else { continue }
+                    let prevAnchorT = wordAnchors.last?.time ?? (vocalStart - 0.05)
+                    let minAllowed = max(vocalStart, prevAnchorT + 0.06)
+                    let maxAllowed = vocalEnd - max(0.06, Double(rawWords.count - wIdx - 1) * 0.06)
+                    guard maxAllowed > minAllowed else { break }
+
+                    var foundIdx: Int?
+                    for h in hCursor..<localHeard.count {
+                        let ht = localHeard[h].token
+                        let match = (ht == normW) || (normW.count >= 4 && ht.count >= 4 && ht.prefix(4) == normW.prefix(4))
+                        guard match else { continue }
+                        let adjT = localHeard[h].time - 0.08
+                        if adjT >= minAllowed - 0.05 && adjT <= maxAllowed + 0.05 {
+                            foundIdx = h
+                            break
+                        }
+                    }
+                    if let h = foundIdx {
+                        let clampedT = min(maxAllowed, max(minAllowed, localHeard[h].time - 0.08))
+                        wordAnchors.append((wIdx, clampedT))
+                        hCursor = h + 1
+                    }
+                }
+            }
+
+            // Build boundary anchors covering every un-anchored sub-span [wA, tA] -> [wB, tB].
+            var boundaries: [(wIdx: Int, time: Double)] = []
+            if let first = wordAnchors.first, first.wIdx == 0 {
+                boundaries.append(first)
+                boundaries.append(contentsOf: wordAnchors.dropFirst())
+            } else {
+                boundaries.append((0, vocalStart))
+                boundaries.append(contentsOf: wordAnchors)
+            }
+            boundaries.append((rawWords.count, vocalEnd))
+
+            let wordWeights: [Double] = rawWords.map { word in
+                let syl = Double(approximateSyllableCount(word))
+                let chars = Double(max(2, normalizeToken(word).count))
+                var w = syl * 1.15 + chars * 0.22
+                if word.hasSuffix(",") || word.hasSuffix(";") { w += 0.55 }
+                if word.hasSuffix(".") || word.hasSuffix("!") || word.hasSuffix("?") { w += 0.85 }
+                return max(0.6, w)
+            }
+
+            var generatedWords = [LyricWordTiming?](repeating: nil, count: rawWords.count)
+            for b in 0..<(boundaries.count - 1) {
+                let (w0, t0) = boundaries[b]
+                let (w1, t1) = boundaries[b + 1]
+                guard w1 > w0 else { continue }
+                let segWeights = wordWeights[w0..<w1]
+                let segTotal = max(0.1, segWeights.reduce(0, +))
+                var cumW = 0.0
+                for k in w0..<w1 {
+                    let fracStart = cumW / segTotal
+                    cumW += wordWeights[k]
+                    let fracEnd = min(1.0, cumW / segTotal)
+                    let ws = (k == w0) ? t0 : acousticWordWarp(between: t0, and: t1, fraction: fracStart)
+                    let we = (k == w1 - 1) ? t1 : acousticWordWarp(between: t0, and: t1, fraction: fracEnd)
+                    let safeStart = max(t0, min(t1 - 0.04, ws))
+                    let safeEnd = min(t1, max(safeStart + 0.05, we))
+                    generatedWords[k] = LyricWordTiming(text: rawWords[k], startTime: safeStart, endTime: safeEnd)
+                }
+            }
+
+            var finalizedWords = generatedWords.compactMap { $0 }
+            // Ensure strictly non-decreasing monotonic boundaries across consecutive words.
+            for k in 0..<finalizedWords.count {
+                if k > 0 && finalizedWords[k].startTime < finalizedWords[k - 1].startTime + 0.04 {
+                    let s = min(vocalEnd - 0.04, finalizedWords[k - 1].startTime + 0.04)
+                    finalizedWords[k] = LyricWordTiming(
+                        id: finalizedWords[k].id,
+                        text: finalizedWords[k].text,
+                        startTime: s,
+                        endTime: max(s + 0.05, finalizedWords[k].endTime)
+                    )
+                }
             }
 
             return SyncedLyricLine(
                 id: line.id,
-                startTime: line.startTime,
-                endTime: lineEnd,
+                startTime: vocalStart,
+                endTime: vocalEnd,
                 text: line.text,
-                words: generatedWords,
-                isInstrumentalBreak: false
+                words: finalizedWords,
+                isInstrumentalBreak: false,
+                hasNativeWordTimings: false
             )
         }
 
@@ -807,11 +961,14 @@ enum SongAudioListener {
               FileManager.default.fileExists(atPath: fileURL.path) else {
             return lyrics
         }
-
         let curve = await Task.detached(priority: .utility) {
             Self.extractVocalActivityCurve(from: fileURL)
         }.value
+        return alignAcousticallyInternal(lyrics: lyrics, curve: curve)
+    }
 
+    private static func alignAcousticallyInternal(lyrics: ResolvedTrackLyrics, curve: VocalEnvelope?) -> ResolvedTrackLyrics {
+        guard lyrics.isTimeSynced, !lyrics.lines.isEmpty else { return lyrics }
         guard let curve, curve.envelope.count >= 80 else {
             return lyrics
         }
@@ -948,7 +1105,8 @@ enum SongAudioListener {
                 endTime: e,
                 text: line.text,
                 words: words,
-                isInstrumentalBreak: line.isInstrumentalBreak
+                isInstrumentalBreak: line.isInstrumentalBreak,
+                hasNativeWordTimings: line.hasNativeWordTimings
             )
         }
 
@@ -984,8 +1142,13 @@ enum SongAudioListener {
 
     private struct VocalEnvelope: Sendable {
         let frameDurationSeconds: Double
-        /// Normalized centered vocal-band activity in roughly [-1, +1].
+        /// Normalized centered vocal-band activity in roughly [-1, +1] (~10.8 Hz).
         let envelope: [Double]
+        /// High-resolution 43.07 Hz (~23ms) centered vocal-band energy for syllable & pause word alignment.
+        let fastFrameDurationSeconds: Double
+        let fastVocalEnvelope: [Double]
+        /// High-resolution 43.07 Hz positive vocal-band spectral-flux spikes normalized [0, 1].
+        let fastVocalOnset: [Double]
         /// Present only when tempo periodicity is crisp and consistent across both halves of the track.
         let beatGrid: BeatGrid?
         let spectralFrameDuration: Double
@@ -1395,6 +1558,8 @@ enum SongAudioListener {
         rawVocal43Hz.reserveCapacity(estFrames)
         var rawFlux43Hz: [Double] = []
         rawFlux43Hz.reserveCapacity(estFrames)
+        var rawVocalFlux43Hz: [Double] = []
+        rawVocalFlux43Hz.reserveCapacity(estFrames)
         var rawBands43Hz: [[Double]] = []
         rawBands43Hz.reserveCapacity(estFrames)
         var prevLogMags = [Double](repeating: 0, count: 256)
@@ -1437,15 +1602,22 @@ enum SongAudioListener {
             ])
 
             var fluxVal = 0.0
+            var vocalFluxVal = 0.0
             for b in 2..<min(halfN, 256) {
                 let lm = log1p(Double(sqrtf(max(0, mags[b]))))
                 if hasPrev {
                     let d = lm - prevLogMags[b]
-                    if d > 0 { fluxVal += d }
+                    if d > 0 {
+                        fluxVal += d
+                        if b >= 28 {
+                            vocalFluxVal += d
+                        }
+                    }
                 }
                 prevLogMags[b] = lm
             }
             rawFlux43Hz.append(fluxVal)
+            rawVocalFlux43Hz.append(vocalFluxVal)
             hasPrev = true
             pos += hop
         }
@@ -1467,6 +1639,12 @@ enum SongAudioListener {
         let mid = (p20 + p80) * 0.5
         let spread = max(0.25, (p80 - p20) * 0.5)
         let centered = rawEnergies.map { min(1.0, max(-1.0, ($0 - mid) / spread)) }
+
+        // Keep full 43.07 Hz centered vocal energy & p95-normalized vocal onset flux for crisp word/syllable warping.
+        let fastVocalEnvelope = rawVocal43Hz.map { min(1.0, max(-1.0, ($0 - mid) / spread)) }
+        let sortedFlux = rawVocalFlux43Hz.sorted()
+        let fluxP95 = sortedFlux.isEmpty ? 1.0 : max(0.25, sortedFlux[min(sortedFlux.count - 1, (sortedFlux.count * 19) / 20)])
+        let fastVocalOnset = rawVocalFlux43Hz.map { min(1.0, max(0.0, $0 / fluxP95)) }
 
         // Downsample 43.07 Hz 6-band descriptors by 17 (~2.53 Hz / 0.395s per frame) & z-normalize each band.
         let dsSpec = 17
@@ -1503,6 +1681,9 @@ enum SongAudioListener {
         return VocalEnvelope(
             frameDurationSeconds: fastDt * Double(dsEnv),
             envelope: centered,
+            fastFrameDurationSeconds: fastDt,
+            fastVocalEnvelope: fastVocalEnvelope,
+            fastVocalOnset: fastVocalOnset,
             beatGrid: beatGrid,
             spectralFrameDuration: fastDt * Double(dsSpec),
             spectralBands: spectralBands

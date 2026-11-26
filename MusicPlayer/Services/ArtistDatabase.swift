@@ -481,6 +481,191 @@ enum ArtistDatabase {
         return trimmed
     }
 
+    // MARK: - Compilation Detection & Genre Inference
+
+    struct CompilationDetection: Sendable {
+        let genre: String        // e.g. "Hip-Hop", "R&B", "Pop", or "Music"
+        let albumLabel: String   // e.g. "Hip-Hop Compilation" or "Music Compilation"
+        let cleanTitle: String
+        let artistLabel: String  // e.g. "Kanye West" for single-artist comp, else "Various Artists"
+    }
+
+    static func normalizeGenreLabel(_ raw: String?) -> String? {
+        guard let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else {
+            return nil
+        }
+        let lower = trimmed.lowercased()
+        if lower.contains("hip-hop") || lower.contains("hip hop") || lower == "rap" || lower.contains("trap") || lower.contains("drill") {
+            return "Hip-Hop"
+        }
+        if lower.contains("r&b") || lower.contains("rnb") || lower.contains("neo-soul") || lower == "soul" {
+            return "R&B"
+        }
+        if lower.contains("lo-fi") || lower.contains("lofi") || lower.contains("chillhop") {
+            return "Lo-Fi"
+        }
+        if lower.contains("k-pop") || lower.contains("kpop") {
+            return "K-Pop"
+        }
+        if lower.contains("afrobeat") || lower.contains("amapiano") || lower.contains("afropop") {
+            return "Afrobeats"
+        }
+        if lower.contains("country") || lower.contains("americana") {
+            return "Country"
+        }
+        if lower.contains("electronic") || lower.contains("edm") || lower.contains("dance") || lower.contains("house") || lower.contains("techno") || lower.contains("dubstep") || lower.contains("trance") {
+            return "Electronic"
+        }
+        if lower.contains("rock") || lower.contains("alternative") || lower.contains("metal") || lower.contains("punk") || lower.contains("grunge") {
+            return "Rock"
+        }
+        if lower.contains("latin") || lower.contains("reggaeton") || lower.contains("urbano") || lower.contains("corrido") || lower.contains("bachata") {
+            return "Latin"
+        }
+        if lower.contains("jazz") {
+            return "Jazz"
+        }
+        if lower.contains("reggae") || lower.contains("dancehall") {
+            return "Reggae"
+        }
+        if lower.contains("gospel") || lower.contains("christian") || lower.contains("worship") {
+            return "Gospel"
+        }
+        if lower.contains("classical") || lower.contains("soundtrack") {
+            return "Classical"
+        }
+        if lower.contains("pop") {
+            return "Pop"
+        }
+        if let first = trimmed.split(separator: "/").first {
+            let cleaned = String(first).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !cleaned.isEmpty { return cleaned }
+        }
+        return trimmed
+    }
+
+    static func inferGenreFromText(_ text: String) -> String? {
+        let lower = " " + text.lowercased() + " "
+        let rules: [(pattern: String, label: String)] = [
+            (#"\b(hip[- ]?hop|rap|trap|drill|boom[- ]?bap|phonk|cypher)\b"#, "Hip-Hop"),
+            (#"\b(r&b|rnb|neo[- ]?soul|slow jams)\b"#, "R&B"),
+            (#"\b(lo[- ]?fi|lofi|chillhop)\b"#, "Lo-Fi"),
+            (#"\b(k[- ]?pop|kpop)\b"#, "K-Pop"),
+            (#"\b(afrobeats?|afropop|amapiano)\b"#, "Afrobeats"),
+            (#"\b(edm|house|techno|dubstep|trance|dnb|drum\s*&?\s*bass|electronic|synthwave)\b"#, "Electronic"),
+            (#"\b(rock|metal|punk|grunge|indie\s+rock|alt\s+rock)\b"#, "Rock"),
+            (#"\b(country|americana|bluegrass)\b"#, "Country"),
+            (#"\b(latin|reggaeton|corridos|bachata|salsa|cumbia)\b"#, "Latin"),
+            (#"\b(jazz|bebop|swing)\b"#, "Jazz"),
+            (#"\b(reggae|dancehall)\b"#, "Reggae"),
+            (#"\b(gospel|worship|christian)\b"#, "Gospel"),
+            (#"\b(classical|orchestral|symphony)\b"#, "Classical"),
+            (#"\b(pop|synthpop)\b"#, "Pop")
+        ]
+        for (pattern, label) in rules {
+            if lower.range(of: pattern, options: .regularExpression) != nil {
+                return label
+            }
+        }
+        return nil
+    }
+
+    static func detectCompilation(
+        rawTitle: String,
+        rawArtistTag: String? = nil,
+        fileName: String? = nil,
+        embeddedAlbum: String? = nil,
+        durationSeconds: Double? = nil,
+        youtubeSongs: [(title: String, artist: String, genre: String?)] = [],
+        allowLongDurationFallback: Bool = false
+    ) -> CompilationDetection? {
+        let combined = [rawTitle, fileName ?? "", embeddedAlbum ?? ""].joined(separator: " ")
+        let lower = combined.lowercased()
+
+        let singleSongMixGuard = lower.range(
+            of: #"\b(remix|club\s+mix|extended\s+mix|radio\s+mix|acoustic\s+mix|clean\s+mix|instrumental\s+mix|vocal\s+mix|dub\s+mix|vip\s+mix|slowed|reverb|sped\s+up)\b"#,
+            options: .regularExpression
+        ) != nil
+
+        let explicitComp = lower.range(
+            of: #"\b(compilation|comp|megamix|medley|mashup|mixtape|non[- ]?stop|full\s+album|all\s+songs|best\s+of|greatest\s+hits|top\s+\d+|dj\s+set|live\s+set|playlist|jukebox|\d+\s*(?:hr|hrs|hour|hours|min|mins|minute|minutes)\s*(?:of\s+)?(?:mix|music|songs|hits|beats)?)\b"#,
+            options: .regularExpression
+        ) != nil
+
+        let genreOrEraMix = !singleSongMixGuard && lower.range(
+            of: #"\b(?:hip[- ]?hop|rap|trap|r&b|rnb|pop|rock|country|jazz|lofi|lo[- ]?fi|chill|study|workout|gym|summer|party|80s|90s|2000s|2010s|2020s|hits|throwback|unreleased|leaks?|songs|beats)\s+mix\b"#,
+            options: .regularExpression
+        ) != nil
+
+        let distinctYTSongs = Set(youtubeSongs.map { normalizeLookupKey($0.title) }.filter { !$0.isEmpty })
+        let multiSongYT = distinctYTSongs.count >= 2
+        let genericMixWithLongDuration = !singleSongMixGuard && (durationSeconds ?? 0) >= 540
+            && lower.range(of: #"\bmix\b"#, options: .regularExpression) != nil
+        let longUnknownFallback = allowLongDurationFallback && (durationSeconds ?? 0) >= 720 && !singleSongMixGuard
+
+        guard explicitComp || genreOrEraMix || multiSongYT || genericMixWithLongDuration || longUnknownFallback else {
+            return nil
+        }
+
+        // Infer dominant genre cleanly across text tags, catalog artists, and YouTube track cards.
+        var genreCounts: [String: Int] = [:]
+        func addGenreVote(_ raw: String?, weight: Int) {
+            guard let norm = normalizeGenreLabel(raw), !norm.isEmpty else { return }
+            genreCounts[norm, default: 0] += weight
+        }
+
+        addGenreVote(inferGenreFromText(combined), weight: 4)
+        for item in youtubeSongs {
+            addGenreVote(item.genre ?? genre(forArtist: item.artist), weight: 2)
+        }
+
+        let extractedArtists = extractArtists(
+            rawArtistTag: rawArtistTag,
+            rawTitle: rawTitle,
+            fileName: fileName
+        )
+        for artistName in extractedArtists.allArtists where artistName != "Unknown Artist" {
+            addGenreVote(genre(forArtist: artistName), weight: 3)
+        }
+        addGenreVote(extractedArtists.genre, weight: 3)
+
+        let chosenGenre = genreCounts.max(by: { $0.value < $1.value })?.key ?? "Music"
+        let albumLabel = "\(chosenGenre) Compilation"
+
+        let ytDistinctArtists = Set(youtubeSongs.map { canonicalizeSingle($0.artist) }.filter { !$0.isEmpty })
+        let resolvedArtistLabel: String = {
+            if ytDistinctArtists.count == 1, let sole = ytDistinctArtists.first {
+                return sole
+            }
+            if ytDistinctArtists.count >= 2 {
+                return "Various Artists"
+            }
+            if extractedArtists.matchedFromCatalog && extractedArtists.allArtists.count == 1 {
+                return extractedArtists.primaryArtist
+            }
+            if extractedArtists.allArtists.count >= 2 {
+                return "Various Artists"
+            }
+            if let tag = rawArtistTag?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !tag.isEmpty,
+               !looksLikeUploaderChannel(tag) {
+                return canonicalizeSingle(tag)
+            }
+            return "Various Artists"
+        }()
+
+        let cleanTitle = rawTitle
+            .replacingOccurrences(of: #"\.(?:mp3|m4a|wav|flac|aac|ogg|opus|mp4|mov|mkv|webm)$"#, with: "", options: [.regularExpression, .caseInsensitive])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        return CompilationDetection(
+            genre: chosenGenre,
+            albumLabel: albumLabel,
+            cleanTitle: cleanTitle.isEmpty ? rawTitle : cleanTitle,
+            artistLabel: resolvedArtistLabel
+        )
+    }
+
     // MARK: - Parsing Internals
 
     private static func cleanChannelOrTagNoise(_ raw: String) -> String? {

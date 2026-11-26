@@ -449,7 +449,7 @@ final class EqualizerAudioPlayer {
 
     private func startProgressTimer() {
         stopProgressTimer()
-        progressTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
+        progressTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
             self?.updateElapsedTime()
         }
     }

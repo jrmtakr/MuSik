@@ -105,6 +105,7 @@ final class MediaManager {
     private var ffmpegTimeTimer: Timer?
     private var ksBridge: KSMEPlayerBridge?
     private var isScrubbing = false
+    @ObservationIgnored private var lastWrappedHeartbeatUptime: TimeInterval = 0
     private(set) var remoteStreamSourceURL: URL?
 
     private var existingIDsByPath: [String: UUID] = [:]
@@ -940,7 +941,7 @@ final class MediaManager {
 
     private func startFFmpegTimer() {
         ffmpegTimeTimer?.invalidate()
-        ffmpegTimeTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
+        ffmpegTimeTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
             guard let self, self.isUsingFFmpegBackend, let ks = self.ffmpegPlayer else { return }
             if !self.isScrubbing {
                 let elapsed = ks.currentPlaybackTime
@@ -3343,7 +3344,7 @@ final class MediaManager {
     }
 
     private func attachTimeObserver(to player: AVPlayer, playerItem: AVPlayerItem) {
-        let interval = CMTime(seconds: 0.25, preferredTimescale: 600)
+        let interval = CMTime(seconds: 0.05, preferredTimescale: 600)
         timeObserverToken = player.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak self] time in
             guard let self else { return }
             let elapsed = CMTimeGetSeconds(time)
@@ -3569,6 +3570,9 @@ final class MediaManager {
 
     private func syncWrappedHeartbeat() {
         guard isPlaying, let item = currentItem else { return }
+        let nowUptime = ProcessInfo.processInfo.systemUptime
+        guard nowUptime - lastWrappedHeartbeatUptime >= 0.50 else { return }
+        lastWrappedHeartbeatUptime = nowUptime
         let meta = resolvedTitleAndRawArtist(for: item)
         ListeningWrappedService.shared.recordPlaybackHeartbeat(
             for: item,

@@ -1,3 +1,4 @@
+import AVFoundation
 import SwiftUI
 import UIKit
 
@@ -484,10 +485,11 @@ struct AppleMusicLyricsView: View {
             } else if effectiveTime <= word.startTime {
                 progress = 0.0
             } else {
-                let span = max(0.05, word.endTime - word.startTime)
-                progress = min(1.0, max(0.0, (effectiveTime - word.startTime) / span))
+                let span = max(0.04, word.endTime - word.startTime)
+                let norm = min(1.0, max(0.0, (effectiveTime - word.startTime) / span))
+                progress = 1.0 - pow(1.0 - norm, 2.2)
             }
-            let wordOpacity = 0.44 + 0.56 * progress
+            let wordOpacity = 0.36 + 0.64 * progress
             return partial + Text(prefixSpace + word.text)
                 .foregroundColor(.white.opacity(wordOpacity))
         }
@@ -608,8 +610,9 @@ struct AppleMusicLyricsView: View {
     private func interpolatedPlaybackTime(at now: Date, offset: Double, tempoScale: Double = 1.0) -> Double {
         let rawTime: Double
         if mediaManager.isPlaying {
-            let dt = max(0, min(1.5, now.timeIntervalSince(lastSyncWallTime)))
-            rawTime = lastSyncPlaybackTime + dt * Double(mediaManager.playbackRate)
+            let dt = max(0, min(0.18, now.timeIntervalSince(lastSyncWallTime)))
+            let hwLatency = min(0.45, max(0.0, AVAudioSession.sharedInstance().outputLatency))
+            rawTime = max(0, lastSyncPlaybackTime + dt * Double(mediaManager.playbackRate) - hwLatency)
         } else {
             rawTime = mediaManager.currentTime
         }
@@ -619,7 +622,7 @@ struct AppleMusicLyricsView: View {
     private func activeLineIndex(in lines: [SyncedLyricLine], at effectiveTime: Double) -> Int? {
         var bestIdx: Int?
         for (idx, line) in lines.enumerated() where line.startTime >= 0 {
-            if effectiveTime >= line.startTime - 0.12 {
+            if effectiveTime >= line.startTime - 0.04 {
                 bestIdx = idx
             } else {
                 break
