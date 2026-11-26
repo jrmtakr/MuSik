@@ -126,6 +126,7 @@ final class SyncedLyricsService {
     @ObservationIgnored private var memoryCache: [String: ResolvedTrackLyrics] = [:]
     @ObservationIgnored private var activeFetchTask: Task<Void, Never>?
     @ObservationIgnored private var activeAITask: Task<Void, Never>?
+    @ObservationIgnored private var activeAITaskKey: String?
     @ObservationIgnored private var autoAttemptedKeys: Set<String> = []
 
     private static var cacheDirectoryURL: URL {
@@ -185,11 +186,14 @@ final class SyncedLyricsService {
         }
 
         activeFetchTask?.cancel()
-        activeAITask?.cancel()
-        isAIRecognizing = false
-        aiStatusMessage = nil
-        aiErrorMessage = nil
-        lastRecognizedTrackInfo = nil
+        if activeAITaskKey != key {
+            activeAITask?.cancel()
+            activeAITaskKey = nil
+            isAIRecognizing = false
+            aiStatusMessage = nil
+            aiErrorMessage = nil
+            lastRecognizedTrackInfo = nil
+        }
         currentLoadingKey = key
         lastError = nil
         if forceReload || currentLyrics?.cacheKey != key {
@@ -339,9 +343,10 @@ final class SyncedLyricsService {
         guard !isAIRecognizing else { return }
         let key = cacheKey(for: item)
         activeAITask?.cancel()
+        activeAITaskKey = key
         isAIRecognizing = true
         aiErrorMessage = nil
-        aiStatusMessage = "Listening to playing song..."
+        aiStatusMessage = "AI listening across full song..."
 
         let existingLyrics = (currentLyrics?.cacheKey == key) ? currentLyrics : nil
 
@@ -358,15 +363,22 @@ final class SyncedLyricsService {
             ) { [weak self] stepText in
                 self?.aiStatusMessage = stepText
             }
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled else {
+                if self.activeAITaskKey == key {
+                    self.activeAITaskKey = nil
+                }
+                return
+            }
             isAIRecognizing = false
+            activeAITaskKey = nil
             aiStatusMessage = outcome.statusMessage
             aiErrorMessage = outcome.errorMessage
 
             if let updated = outcome.alignedLyrics {
-                memoryCache[key] = updated
-                saveToDisk(updated)
-                currentLyrics = updated
+                storeAlignedLyrics(updated, for: item)
+                if let saved = memoryCache[key] {
+                    currentLyrics = saved
+                }
                 lastError = nil
             }
 
@@ -409,6 +421,7 @@ final class SyncedLyricsService {
                         for: item,
                         artistName: canonicalArtist,
                         updatedTitle: finalTitle,
+                        albumName: outcome.identifiedAlbum,
                         genre: resolvedGenre
                     )
                     autoSaved = true
@@ -1217,7 +1230,7 @@ final class SyncedLyricsService {
 
     // MARK: - YouTube Creator-Uploaded Timed Subtitles Fallback (Non-ASR)
 
-    private func fetchFromYouTubeCreatorSubtitles(
+    func fetchFromYouTubeCreatorSubtitles(
         item: MediaItem,
         cacheKey: String,
         song: String,

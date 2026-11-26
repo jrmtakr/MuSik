@@ -12,6 +12,7 @@ struct SpokenLyricWord: Hashable, Sendable {
 struct LiveLyricsSyncOutcome: Sendable {
     let identifiedTitle: String?
     let identifiedArtist: String?
+    let identifiedAlbum: String?
     let identifiedGenre: String?
     let isHighConfidence: Bool
     let transcriptSnippet: String
@@ -20,6 +21,32 @@ struct LiveLyricsSyncOutcome: Sendable {
     let alignedLineText: String?
     let statusMessage: String
     let errorMessage: String?
+
+    init(
+        identifiedTitle: String?,
+        identifiedArtist: String?,
+        identifiedAlbum: String? = nil,
+        identifiedGenre: String?,
+        isHighConfidence: Bool,
+        transcriptSnippet: String,
+        alignedLyrics: ResolvedTrackLyrics?,
+        computedOffsetSeconds: Double?,
+        alignedLineText: String?,
+        statusMessage: String,
+        errorMessage: String?
+    ) {
+        self.identifiedTitle = identifiedTitle
+        self.identifiedArtist = identifiedArtist
+        self.identifiedAlbum = identifiedAlbum
+        self.identifiedGenre = identifiedGenre
+        self.isHighConfidence = isHighConfidence
+        self.transcriptSnippet = transcriptSnippet
+        self.alignedLyrics = alignedLyrics
+        self.computedOffsetSeconds = computedOffsetSeconds
+        self.alignedLineText = alignedLineText
+        self.statusMessage = statusMessage
+        self.errorMessage = errorMessage
+    }
 }
 
 private struct RecognizedLyricsCandidate {
@@ -84,217 +111,329 @@ enum LiveAudioLyricsAI {
         forceReidentify: Bool = false,
         onProgress: @escaping @MainActor (String) -> Void
     ) async -> LiveLyricsSyncOutcome {
+        let isLocalPlayableFile = !item.relativePath.hasPrefix("__remote__/")
+            && !item.isHLS
+            && FileManager.default.fileExists(atPath: item.fileURL.path)
+
         let authStatus = await requestSpeechPermission()
-        guard authStatus == .authorized else {
-            return LiveLyricsSyncOutcome(
-                identifiedTitle: nil,
-                identifiedArtist: nil,
-                identifiedGenre: nil,
-                isHighConfidence: false,
-                transcriptSnippet: "",
-                alignedLyrics: nil,
-                computedOffsetSeconds: nil,
-                alignedLineText: nil,
-                statusMessage: "Speech Recognition required",
-                errorMessage: "Enable Speech Recognition in iPhone Settings -> MuseJRM -> Speech Recognition so the AI can hear the song."
-            )
-        }
+        let recognizer = (authStatus == .authorized)
+            ? (SFSpeechRecognizer(locale: .current) ?? SFSpeechRecognizer(locale: Locale(identifier: "en-US")))
+            : nil
 
-        let recognizer = SFSpeechRecognizer(locale: .current)
-            ?? SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
-        guard let recognizer, recognizer.isAvailable else {
-            return LiveLyricsSyncOutcome(
-                identifiedTitle: nil,
-                identifiedArtist: nil,
-                identifiedGenre: nil,
-                isHighConfidence: false,
-                transcriptSnippet: "",
-                alignedLyrics: nil,
-                computedOffsetSeconds: nil,
-                alignedLineText: nil,
-                statusMessage: "Speech AI unavailable",
-                errorMessage: "On-device Speech Recognition is temporarily unavailable."
-            )
-        }
+        // 1. Listen across the ENTIRE song or music video (not a single 18s clip that can fail in 1s).
+        var fullHeard: [HeardWord] = []
+        var heardWords: [SpokenLyricWord] = []
 
-        await onProgress("Listening to playing audio...")
-
-        var capture = await captureSpokenWords(
-            item: item,
-            playbackTime: playbackTime,
-            recognizer: recognizer,
-            equalizerPlayer: equalizerPlayer,
-            isEQPlaying: isEQPlaying,
-            playbackRate: playbackRate
-        )
-
-        // If the user opened at 0:00 during a long instrumental/music-video intro, sample deeper into the song too.
-        let totalDur = item.durationSeconds ?? 0
-        if capture.words.count < 4, playbackTime < 12.0, totalDur > 36.0 {
-            await onProgress("Intro quiet — sampling chorus vocals...")
-            let fallbackStart = min(max(18.0, totalDur * 0.28), max(18.0, totalDur - 20.0))
-            let secondTry = await captureAudioClipWords(
-                at: item.fileURL,
-                clipStart: fallbackStart,
-                clipDuration: min(20.0, max(6.0, totalDur - fallbackStart)),
-                recognizer: recognizer
-            )
-            if secondTry.words.count > capture.words.count {
-                capture = secondTry
+        if isLocalPlayableFile {
+            if let recognizer, recognizer.isAvailable {
+                await onProgress("AI listening to full track...")
+                let listened = await SongAudioListener.listen(to: item.fileURL, maxSeconds: 15 * 60) { chunkIdx, totalChunks, totalSeconds in
+                    Task { @MainActor in
+                        let mins = Int(totalSeconds) / 60
+                        let secs = Int(totalSeconds) % 60
+                        onProgress("AI listening across full song (\(chunkIdx)/\(totalChunks) • \(mins):\(String(format: "%02d", secs)))...")
+                    }
+                }
+                if let listened, !listened.isEmpty {
+                    fullHeard = listened
+                    heardWords = listened.map {
+                        SpokenLyricWord(
+                            rawWord: $0.token,
+                            normalized: normalizeWord($0.token),
+                            songTime: $0.time,
+                            confidence: 1.0
+                        )
+                    }.filter { !$0.normalized.isEmpty }
+                }
             }
+
+            // Fallback live tap if file Speech failed while EQ audio happens to be playing
+            if heardWords.count < 3, isEQPlaying, let recognizer, recognizer.isAvailable {
+                await onProgress("Sampling playing audio tap...")
+                let tapCapture = await captureLiveAudioTapWords(
+                    playbackTime: playbackTime,
+                    recognizer: recognizer,
+                    equalizerPlayer: equalizerPlayer,
+                    playbackRate: playbackRate
+                )
+                if tapCapture.words.count > heardWords.count {
+                    heardWords = tapCapture.words
+                    fullHeard = tapCapture.words.map { HeardWord(token: $0.normalized, time: $0.songTime) }
+                }
+            }
+        } else if let recognizer, recognizer.isAvailable {
+            await onProgress("Listening to playing stream...")
+            let capture = await captureSpokenWords(
+                item: item,
+                playbackTime: playbackTime,
+                recognizer: recognizer,
+                equalizerPlayer: equalizerPlayer,
+                isEQPlaying: isEQPlaying,
+                playbackRate: playbackRate
+            )
+            heardWords = capture.words
+            fullHeard = capture.words.map { HeardWord(token: $0.normalized, time: $0.songTime) }
         }
 
-        let heardWords = capture.words
+        if Task.isCancelled {
+            return LiveLyricsSyncOutcome(
+                identifiedTitle: nil,
+                identifiedArtist: nil,
+                identifiedGenre: nil,
+                isHighConfidence: false,
+                transcriptSnippet: "",
+                alignedLyrics: nil,
+                computedOffsetSeconds: nil,
+                alignedLineText: nil,
+                statusMessage: "Cancelled",
+                errorMessage: nil
+            )
+        }
+
         let cleanSnippet = heardWords.prefix(16).map(\.rawWord).joined(separator: " ")
 
-        guard heardWords.count >= 3 else {
+        // 2. Check existing lyrics if not forcing full re-identification (supports both spoken + acoustic alignment).
+        if !forceReidentify,
+           let currentLyrics,
+           !currentLyrics.lines.isEmpty {
+            let verdict = SongAudioListener.verdict(heard: fullHeard, lyrics: currentLyrics)
+            let isContradicted: Bool = {
+                if case .contradicted = verdict { return true }
+                return false
+            }()
+
+            if !isContradicted {
+                await onProgress("Lining lyrics up across whole song...")
+                let aligned: ResolvedTrackLyrics
+                if isLocalPlayableFile {
+                    aligned = await SongAudioListener.autoAlign(
+                        lyrics: currentLyrics,
+                        heard: fullHeard.isEmpty ? nil : fullHeard,
+                        fileURL: item.fileURL
+                    )
+                } else {
+                    var copy = currentLyrics
+                    if let anchor = computeBestOffsetAnchor(
+                        heardWords: heardWords,
+                        in: currentLyrics.lines,
+                        tempoScale: currentLyrics.tempoScale
+                    ) {
+                        copy.syncedOffsetSeconds = anchor.offsetSeconds
+                    }
+                    aligned = copy
+                }
+
+                let anchor = heardWords.isEmpty ? nil : computeBestOffsetAnchor(
+                    heardWords: heardWords,
+                    in: aligned.lines,
+                    tempoScale: 1.0
+                )
+                let canonicalArtist = ArtistDatabase.canonicalizeSingle(currentLyrics.artistName)
+                let genre = ArtistDatabase.genre(forArtist: canonicalArtist)
+                let isStrongCatalogArtist = ArtistDatabase.lookup(canonicalArtist) != nil
+                let isConfirmed = !isContradicted && (
+                    {
+                        if case .confirmed = verdict { return true }
+                        return false
+                    }() || (anchor?.matchedCount ?? 0) >= 3
+                )
+                let summaryNote: String = {
+                    if let attr = aligned.attributionText, attr.contains("aligned") {
+                        return "AI Synced across song (\(aligned.lines.count) lines)"
+                    }
+                    if let anchor {
+                        let signStr = String(format: "%+.1fs", anchor.offsetSeconds)
+                        return "AI Synced (\(signStr)) to \"\(anchor.lineText)\""
+                    }
+                    return "AI Synced \(aligned.lines.count) lyric lines"
+                }()
+
+                return LiveLyricsSyncOutcome(
+                    identifiedTitle: currentLyrics.trackTitle,
+                    identifiedArtist: canonicalArtist.isEmpty ? currentLyrics.artistName : canonicalArtist,
+                    identifiedGenre: genre,
+                    isHighConfidence: isConfirmed && !canonicalArtist.isEmpty && isStrongCatalogArtist,
+                    transcriptSnippet: cleanSnippet,
+                    alignedLyrics: aligned,
+                    computedOffsetSeconds: anchor?.offsetSeconds,
+                    alignedLineText: anchor?.lineText,
+                    statusMessage: summaryNote,
+                    errorMessage: nil
+                )
+            }
+        }
+
+        // 3. Identify song across whole song via Lyrics AI + Custom Shazam Acoustic Fingerprint AI (works even if Speech missed words).
+        await onProgress("Identifying song & matching lyrics across track...")
+
+        var shazamMatch: IdentifiedSong?
+        if isLocalPlayableFile {
+            let cleanArtistHint = item.artist?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let shazamOutcome = await ShazamFingerprintEngine.shared.recognize(
+                fileURL: item.fileURL,
+                durationHint: item.durationSeconds,
+                seedHintTitle: item.displayTitle,
+                seedHintArtist: cleanArtistHint,
+                heardWords: fullHeard.isEmpty ? nil : fullHeard
+            )
+            if case .match(let hit) = shazamOutcome {
+                shazamMatch = hit
+            }
+        }
+
+        var recognized: RecognizedLyricsCandidate?
+        if heardWords.count >= 3 {
+            recognized = await identifyBestSong(
+                heardWords: heardWords,
+                duration: item.durationSeconds,
+                rawTitleHint: shazamMatch?.title ?? item.displayTitle,
+                rawArtistHint: shazamMatch?.artist ?? item.artist
+            )
+        }
+
+        // If Shazam matched acoustically (e.g. heavy beat, autotune, or non-English video), fetch official lyrics for the Shazam track.
+        var candidateLyrics: ResolvedTrackLyrics?
+        var resolvedTitle = recognized?.trackName ?? shazamMatch?.title ?? item.displayTitle
+        var resolvedArtist = recognized?.artistName ?? shazamMatch?.artist ?? (item.artist ?? "")
+        let resolvedAlbum = shazamMatch?.album
+        var resolvedGenre = recognized?.genre ?? shazamMatch?.genre
+
+        if let synced = recognized?.syncedLyrics,
+           !synced.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let parsed = SyncedLyricsService.parseLRCOrPlain(text: synced, duration: item.durationSeconds ?? recognized?.durationSeconds)
+            if !parsed.lines.isEmpty {
+                candidateLyrics = ResolvedTrackLyrics(
+                    cacheKey: cacheKey,
+                    trackTitle: resolvedTitle,
+                    artistName: resolvedArtist,
+                    isTimeSynced: parsed.isSynced,
+                    sourceLabel: "AI Matched Synced",
+                    attributionText: "AI full-song match • \(recognized?.source ?? "LRCLIB")",
+                    syncedOffsetSeconds: 0,
+                    tempoScale: 1.0,
+                    expectedDurationSeconds: recognized?.durationSeconds,
+                    lines: parsed.lines
+                )
+            }
+        }
+
+        if candidateLyrics == nil || !(candidateLyrics?.isTimeSynced ?? false),
+           let shazam = shazamMatch {
+            let shazamLyrics = await SyncedLyricsService.shared.fetchOfficialLyricsCandidate(
+                cacheKey: cacheKey,
+                song: shazam.title,
+                artist: shazam.artist,
+                duration: item.durationSeconds ?? shazam.durationSeconds
+            )
+            if let shazamLyrics, shazamLyrics.isTimeSynced || candidateLyrics == nil {
+                candidateLyrics = shazamLyrics
+                resolvedTitle = shazam.title
+                resolvedArtist = shazam.artist
+                resolvedGenre = shazam.genre ?? resolvedGenre
+            }
+        }
+
+        if candidateLyrics == nil,
+           let plain = recognized?.plainLyrics,
+           !plain.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let parsed = SyncedLyricsService.parseLRCOrPlain(text: plain, duration: item.durationSeconds ?? recognized?.durationSeconds)
+            if !parsed.lines.isEmpty {
+                candidateLyrics = ResolvedTrackLyrics(
+                    cacheKey: cacheKey,
+                    trackTitle: resolvedTitle,
+                    artistName: resolvedArtist,
+                    isTimeSynced: false,
+                    sourceLabel: "AI Matched Lyrics",
+                    attributionText: "AI full-song match • \(recognized?.source ?? "Genius")",
+                    syncedOffsetSeconds: 0,
+                    tempoScale: 1.0,
+                    expectedDurationSeconds: recognized?.durationSeconds,
+                    lines: parsed.lines
+                )
+            }
+        }
+
+        // Last lyrics source: YouTube Creator Timed Captions (already video-timeline aligned for music videos!).
+        if candidateLyrics == nil {
+            let ytLyrics = await SyncedLyricsService.shared.fetchFromYouTubeCreatorSubtitles(
+                item: item,
+                cacheKey: cacheKey,
+                song: resolvedTitle,
+                artist: resolvedArtist
+            )
+            if let ytLyrics {
+                candidateLyrics = ytLyrics
+            }
+        }
+
+        if let rawLyrics = candidateLyrics, !rawLyrics.lines.isEmpty {
+            await onProgress("Aligning lyrics piecewise to song audio...")
+            let aligned: ResolvedTrackLyrics
+            if isLocalPlayableFile {
+                aligned = await SongAudioListener.autoAlign(
+                    lyrics: rawLyrics,
+                    heard: fullHeard.isEmpty ? nil : fullHeard,
+                    fileURL: item.fileURL
+                )
+            } else {
+                var copy = rawLyrics
+                if let anchor = computeBestOffsetAnchor(
+                    heardWords: heardWords,
+                    in: rawLyrics.lines,
+                    tempoScale: 1.0
+                ) {
+                    copy.syncedOffsetSeconds = anchor.offsetSeconds
+                }
+                aligned = copy
+            }
+
+            let highConfidence = (recognized?.textOverlapCount ?? 0) >= 3 && (recognized?.score ?? 0) >= 70
+                || shazamMatch != nil
+            let anchor = heardWords.isEmpty ? nil : computeBestOffsetAnchor(
+                heardWords: heardWords,
+                in: aligned.lines,
+                tempoScale: 1.0
+            )
+            let methodTag = shazamMatch != nil ? "Shazam AI + Whole-Song Audio" : "Whole-Song AI"
             return LiveLyricsSyncOutcome(
-                identifiedTitle: nil,
-                identifiedArtist: nil,
-                identifiedGenre: nil,
-                isHighConfidence: false,
+                identifiedTitle: resolvedTitle,
+                identifiedArtist: resolvedArtist,
+                identifiedAlbum: resolvedAlbum,
+                identifiedGenre: resolvedGenre,
+                isHighConfidence: highConfidence,
+                transcriptSnippet: cleanSnippet,
+                alignedLyrics: aligned,
+                computedOffsetSeconds: anchor?.offsetSeconds,
+                alignedLineText: anchor?.lineText,
+                statusMessage: "Synced \"\(resolvedTitle)\" by \(resolvedArtist) (\(methodTag))",
+                errorMessage: nil
+            )
+        }
+
+        // If Shazam at least identified the song metadata even with no LRCLIB entry, return metadata cleanly
+        if let shazamMatch {
+            return LiveLyricsSyncOutcome(
+                identifiedTitle: shazamMatch.title,
+                identifiedArtist: shazamMatch.artist,
+                identifiedAlbum: shazamMatch.album,
+                identifiedGenre: shazamMatch.genre,
+                isHighConfidence: true,
                 transcriptSnippet: cleanSnippet,
                 alignedLyrics: nil,
                 computedOffsetSeconds: nil,
                 alignedLineText: nil,
-                statusMessage: "Couldn't catch clear vocals",
-                errorMessage: "No clear sung words detected around this timestamp. Scrub to where vocals are singing and tap AI Sync."
-            )
-        }
-
-        // 1. Check whether the currently loaded synced lyrics already match what is singing right now.
-        if !forceReidentify,
-           let currentLyrics,
-           currentLyrics.isTimeSynced,
-           let anchor = computeBestOffsetAnchor(
-               heardWords: heardWords,
-               in: currentLyrics.lines,
-               tempoScale: currentLyrics.tempoScale
-           ),
-           anchor.matchedCount >= 3 && anchor.score >= 0.42 {
-            var updated = currentLyrics
-            updated.syncedOffsetSeconds = anchor.offsetSeconds
-            let canonicalArtist = ArtistDatabase.canonicalizeSingle(currentLyrics.artistName)
-            let genre = ArtistDatabase.genre(forArtist: canonicalArtist)
-            let isStrongCatalogArtist = ArtistDatabase.lookup(canonicalArtist) != nil
-            let signStr = String(format: "%+.1fs", anchor.offsetSeconds)
-            return LiveLyricsSyncOutcome(
-                identifiedTitle: currentLyrics.trackTitle,
-                identifiedArtist: canonicalArtist.isEmpty ? currentLyrics.artistName : canonicalArtist,
-                identifiedGenre: genre,
-                isHighConfidence: anchor.matchedCount >= 4 && (!canonicalArtist.isEmpty && isStrongCatalogArtist),
-                transcriptSnippet: cleanSnippet,
-                alignedLyrics: updated,
-                computedOffsetSeconds: anchor.offsetSeconds,
-                alignedLineText: anchor.lineText,
-                statusMessage: "AI Synced (\(signStr)) to \"\(anchor.lineText)\"",
+                statusMessage: "Identified \"\(shazamMatch.title)\" by \(shazamMatch.artist) (no lyrics found online)",
                 errorMessage: nil
             )
         }
 
-        // 2. Lyrics are missing, plain, or didn't match the playing vocals — identify the real song & canonical artist!
-        await onProgress("Heard \"\(heardWords.prefix(6).map(\.rawWord).joined(separator: " "))\" — identifying song & artist...")
-
-        if let recognized = await identifyBestSong(
-            heardWords: heardWords,
-            duration: item.durationSeconds,
-            rawTitleHint: item.displayTitle,
-            rawArtistHint: item.artist
-        ) {
-            let highConfidence = recognized.textOverlapCount >= 3 && recognized.score >= 70
-
-            if let synced = recognized.syncedLyrics, !synced.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                let parsed = SyncedLyricsService.parseLRCOrPlain(text: synced, duration: item.durationSeconds ?? recognized.durationSeconds)
-                if !parsed.lines.isEmpty {
-                    let anchor = computeBestOffsetAnchor(
-                        heardWords: heardWords,
-                        in: parsed.lines,
-                        tempoScale: 1.0
-                    )
-                    let offset = anchor?.offsetSeconds ?? 0
-                    let built = ResolvedTrackLyrics(
-                        cacheKey: cacheKey,
-                        trackTitle: recognized.trackName,
-                        artistName: recognized.artistName,
-                        isTimeSynced: parsed.isSynced,
-                        sourceLabel: "AI Matched Synced",
-                        attributionText: "AI heard vocals • \(recognized.source)",
-                        syncedOffsetSeconds: offset,
-                        tempoScale: 1.0,
-                        expectedDurationSeconds: recognized.durationSeconds,
-                        lines: parsed.lines
-                    )
-                    let offsetSummary = anchor != nil ? String(format: " (%+.1fs)", offset) : ""
-                    return LiveLyricsSyncOutcome(
-                        identifiedTitle: recognized.trackName,
-                        identifiedArtist: recognized.artistName,
-                        identifiedGenre: recognized.genre,
-                        isHighConfidence: highConfidence,
-                        transcriptSnippet: cleanSnippet,
-                        alignedLyrics: built,
-                        computedOffsetSeconds: anchor?.offsetSeconds,
-                        alignedLineText: anchor?.lineText,
-                        statusMessage: "AI Identified \"\(recognized.trackName)\" by \(recognized.artistName)\(offsetSummary)",
-                        errorMessage: nil
-                    )
-                }
-            }
-
-            if let plain = recognized.plainLyrics, !plain.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                let parsed = SyncedLyricsService.parseLRCOrPlain(text: plain, duration: item.durationSeconds ?? recognized.durationSeconds)
-                if !parsed.lines.isEmpty {
-                    let built = ResolvedTrackLyrics(
-                        cacheKey: cacheKey,
-                        trackTitle: recognized.trackName,
-                        artistName: recognized.artistName,
-                        isTimeSynced: false,
-                        sourceLabel: "AI Matched Lyrics",
-                        attributionText: "AI heard vocals • \(recognized.source)",
-                        syncedOffsetSeconds: 0,
-                        tempoScale: 1.0,
-                        expectedDurationSeconds: recognized.durationSeconds,
-                        lines: parsed.lines
-                    )
-                    return LiveLyricsSyncOutcome(
-                        identifiedTitle: recognized.trackName,
-                        identifiedArtist: recognized.artistName,
-                        identifiedGenre: recognized.genre,
-                        isHighConfidence: highConfidence,
-                        transcriptSnippet: cleanSnippet,
-                        alignedLyrics: built,
-                        computedOffsetSeconds: nil,
-                        alignedLineText: nil,
-                        statusMessage: "AI Identified \"\(recognized.trackName)\" by \(recognized.artistName)",
-                        errorMessage: nil
-                    )
-                }
-            }
-        }
-
-        // Last resort: align existing lyrics even with looser match if identification had no better synced candidate
-        if let currentLyrics,
-           currentLyrics.isTimeSynced,
-           let anchor = computeBestOffsetAnchor(
-               heardWords: heardWords,
-               in: currentLyrics.lines,
-               tempoScale: currentLyrics.tempoScale
-           ),
-           anchor.matchedCount >= 2 {
-            var updated = currentLyrics
-            updated.syncedOffsetSeconds = anchor.offsetSeconds
-            let signStr = String(format: "%+.1fs", anchor.offsetSeconds)
-            return LiveLyricsSyncOutcome(
-                identifiedTitle: currentLyrics.trackTitle,
-                identifiedArtist: currentLyrics.artistName,
-                identifiedGenre: ArtistDatabase.genre(forArtist: currentLyrics.artistName),
-                isHighConfidence: false,
-                transcriptSnippet: cleanSnippet,
-                alignedLyrics: updated,
-                computedOffsetSeconds: anchor.offsetSeconds,
-                alignedLineText: anchor.lineText,
-                statusMessage: "AI Aligned (\(signStr))",
-                errorMessage: nil
-            )
+        let noMatchReason: String
+        if authStatus != .authorized && isLocalPlayableFile {
+            noMatchReason = "Enable Speech Recognition in Settings -> MuseJRM, or let Shazam AI analyze when online."
+        } else if heardWords.count < 3 {
+            noMatchReason = "No clear vocals or Shazam match detected across the audio track."
+        } else {
+            noMatchReason = "Heard \"\(cleanSnippet)\" — couldn't find matching lyrics online."
         }
 
         return LiveLyricsSyncOutcome(
@@ -306,8 +445,8 @@ enum LiveAudioLyricsAI {
             alignedLyrics: nil,
             computedOffsetSeconds: nil,
             alignedLineText: nil,
-            statusMessage: "No matching song found",
-            errorMessage: "Heard \"\(cleanSnippet)\" — couldn't find a synced match automatically. Try searching by title."
+            statusMessage: "Couldn't match lyrics automatically",
+            errorMessage: noMatchReason
         )
     }
 
@@ -547,15 +686,21 @@ enum LiveAudioLyricsAI {
         let sourceWords = meaningful.count >= 4 ? meaningful : heardWords
         guard sourceWords.count >= 3 else { return nil }
 
-        // Build 2 overlapping lyric phrases (center chorus + leading phrase) to avoid noise at clip edges.
-        let phraseA = sourceWords.prefix(12).map(\.rawWord).joined(separator: " ")
-        let midStart = max(0, (sourceWords.count / 2) - 4)
-        let midEnd = min(sourceWords.count, midStart + 10)
-        let phraseB = sourceWords[midStart..<midEnd].map(\.rawWord).joined(separator: " ")
-
-        var queries = [phraseA]
-        if phraseB != phraseA && phraseB.split(separator: " ").count >= 4 {
-            queries.append(phraseB)
+        // Build distinctive phrases distributed across the whole song (skips intro dialogue/skits in music videos).
+        var queries: [String] = []
+        if sourceWords.count >= 24 {
+            let anchors = [sourceWords.count / 5, sourceWords.count / 2, (sourceWords.count * 4) / 5]
+            for start in anchors {
+                let slice = sourceWords[start..<min(sourceWords.count, start + 10)]
+                let phrase = slice.map(\.rawWord).joined(separator: " ")
+                if !phrase.isEmpty && !queries.contains(phrase) {
+                    queries.append(phrase)
+                }
+            }
+        }
+        if queries.isEmpty {
+            let phraseA = sourceWords.prefix(12).map(\.rawWord).joined(separator: " ")
+            queries.append(phraseA)
         }
 
         async let geniusTask = searchGeniusByLyrics(queries: queries)

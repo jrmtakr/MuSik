@@ -574,7 +574,13 @@ final class ShazamFingerprintEngine: SongRecognitionEngine, @unchecked Sendable 
     }
 
     private static func decodeMono11kSamples(from url: URL) -> [Float]? {
-        let asset = AVURLAsset(url: url)
+        guard let prepared = SongAudioListener.prepareReadableAudioFile(for: url) else { return nil }
+        defer {
+            if let cleanupURL = prepared.cleanupURL {
+                try? FileManager.default.removeItem(at: cleanupURL)
+            }
+        }
+        let asset = AVURLAsset(url: prepared.url)
         guard let reader = try? AVAssetReader(asset: asset) else { return nil }
         let tracks = asset.tracks(withMediaType: .audio)
         guard let audioTrack = tracks.first else { return nil }

@@ -31,23 +31,59 @@ enum SongAudioListener {
 
     // MARK: - Listening
 
-    /// Transcribes the whole file. Returns nil when speech recognition isn't allowed or available.
-    static func listen(to fileURL: URL, maxSeconds: Double = 15 * 60) async -> [HeardWord]? {
+    /// Prepares an AVFoundation-readable audio file URL, remuxing FFmpeg containers (e.g. MKV/TS/WebM) to M4A if needed.
+    static func prepareReadableAudioFile(for fileURL: URL) -> (url: URL, cleanupURL: URL?)? {
+        guard FileManager.default.fileExists(atPath: fileURL.path) else { return nil }
+        let directAsset = AVURLAsset(url: fileURL)
+        if !directAsset.tracks(withMediaType: .audio).isEmpty {
+            return (fileURL, nil)
+        }
+        let remuxURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("audio_remux_\(UUID().uuidString).m4a")
+        if FFmpegMediaService.remuxAudioTrackToM4A(inputURL: fileURL, outputURL: remuxURL),
+           FileManager.default.fileExists(atPath: remuxURL.path),
+           !AVURLAsset(url: remuxURL).tracks(withMediaType: .audio).isEmpty {
+            return (remuxURL, remuxURL)
+        }
+        try? FileManager.default.removeItem(at: remuxURL)
+        return nil
+    }
+
+    /// Transcribes the whole file (audio or music video). Returns nil when speech recognition isn't allowed or available.
+    static func listen(
+        to fileURL: URL,
+        maxSeconds: Double = 15 * 60,
+        onProgress: (@Sendable (Int, Int, Double) -> Void)? = nil
+    ) async -> [HeardWord]? {
         guard SFSpeechRecognizer.authorizationStatus() == .authorized,
-              let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US")) ?? SFSpeechRecognizer(),
+              let recognizer = SFSpeechRecognizer(locale: .current)
+                ?? SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
+                ?? SFSpeechRecognizer(),
               recognizer.isAvailable else { return nil }
 
-        let asset = AVURLAsset(url: fileURL)
-        guard let duration = try? await asset.load(.duration).seconds, duration.isFinite, duration > 5,
-              !((try? await asset.loadTracks(withMediaType: .audio)) ?? []).isEmpty else { return nil }
+        guard let prepared = prepareReadableAudioFile(for: fileURL) else { return nil }
+        defer {
+            if let cleanupURL = prepared.cleanupURL {
+                try? FileManager.default.removeItem(at: cleanupURL)
+            }
+        }
+
+        let asset = AVURLAsset(url: prepared.url)
+        guard let duration = try? await asset.load(.duration).seconds, duration.isFinite, duration > 3 else {
+            return nil
+        }
 
         let total = min(duration, maxSeconds)
+        let totalChunks = max(1, Int(ceil(total / chunkSeconds)))
         var heard: [HeardWord] = []
         var start: Double = 0
+        var chunkIdx = 0
         while start < total {
             if Task.isCancelled { break }
             let length = min(chunkSeconds, total - start)
             if length < 2 { break }
+            chunkIdx += 1
+            onProgress?(chunkIdx, totalChunks, total)
             if let chunkURL = await exportAudioChunk(asset: asset, start: start, length: length) {
                 let words = await recognize(url: chunkURL, recognizer: recognizer, offset: start)
                 heard.append(contentsOf: words)
@@ -59,47 +95,155 @@ enum SongAudioListener {
     }
 
     private static func exportAudioChunk(asset: AVAsset, start: Double, length: Double) async -> URL? {
-        guard let session = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetAppleM4A) else { return nil }
-        let out = FileManager.default.temporaryDirectory.appendingPathComponent("listen_\(UUID().uuidString).m4a")
-        session.outputURL = out
-        session.outputFileType = .m4a
-        session.timeRange = CMTimeRange(
+        if let session = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetAppleM4A) {
+            let out = FileManager.default.temporaryDirectory.appendingPathComponent("listen_\(UUID().uuidString).m4a")
+            session.outputURL = out
+            session.outputFileType = .m4a
+            session.timeRange = CMTimeRange(
+                start: CMTime(seconds: start, preferredTimescale: 600),
+                duration: CMTime(seconds: length, preferredTimescale: 600)
+            )
+            await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                session.exportAsynchronously { cont.resume() }
+            }
+            if session.status == .completed,
+               FileManager.default.fileExists(atPath: out.path),
+               ((try? FileManager.default.attributesOfItem(atPath: out.path)[.size] as? NSNumber)?.intValue ?? 0) > 512 {
+                return out
+            }
+            try? FileManager.default.removeItem(at: out)
+        }
+
+        // Video containers (.mp4/.mov) and non-standard audio tracks frequently fail AVAssetExportPresetAppleM4A;
+        // fall back to direct AVAssetReader 16 kHz mono PCM WAV decoding which SFSpeechURLRecognitionRequest accepts natively.
+        return await Task.detached(priority: .utility) {
+            exportWAVChunkWithAssetReader(asset: asset, start: start, length: length)
+        }.value
+    }
+
+    private static func exportWAVChunkWithAssetReader(asset: AVAsset, start: Double, length: Double) -> URL? {
+        guard let reader = try? AVAssetReader(asset: asset),
+              let audioTrack = asset.tracks(withMediaType: .audio).first else {
+            return nil
+        }
+
+        reader.timeRange = CMTimeRange(
             start: CMTime(seconds: start, preferredTimescale: 600),
             duration: CMTime(seconds: length, preferredTimescale: 600)
         )
-        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-            session.exportAsynchronously { cont.resume() }
+
+        let sampleRate = 16_000
+        let settings: [String: Any] = [
+            AVFormatIDKey: kAudioFormatLinearPCM,
+            AVSampleRateKey: Double(sampleRate),
+            AVNumberOfChannelsKey: 1,
+            AVLinearPCMBitDepthKey: 16,
+            AVLinearPCMIsBigEndianKey: false,
+            AVLinearPCMIsFloatKey: false,
+            AVLinearPCMIsNonInterleaved: false
+        ]
+        let output = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: settings)
+        output.alwaysCopiesSampleData = false
+        guard reader.canAdd(output) else { return nil }
+        reader.add(output)
+        guard reader.startReading() else { return nil }
+
+        var pcmData = Data()
+        while reader.status == .reading {
+            guard let sb = output.copyNextSampleBuffer(),
+                  let bb = CMSampleBufferGetDataBuffer(sb) else {
+                break
+            }
+            var totalLen = 0
+            var ptr: UnsafeMutablePointer<Int8>?
+            if CMBlockBufferGetDataPointer(bb, atOffset: 0, lengthAtOffsetOut: nil, totalLengthOut: &totalLen, dataPointerOut: &ptr) == noErr,
+               let ptr, totalLen > 0 {
+                pcmData.append(Data(bytes: ptr, count: totalLen))
+            }
+            CMSampleBufferInvalidate(sb)
         }
-        guard session.status == .completed, FileManager.default.fileExists(atPath: out.path) else {
-            try? FileManager.default.removeItem(at: out)
+
+        guard pcmData.count >= sampleRate * 2 else { return nil }
+        let wavURL = FileManager.default.temporaryDirectory.appendingPathComponent("listen_\(UUID().uuidString).wav")
+        var header = Data(capacity: 44)
+        let dataBytes = UInt32(pcmData.count)
+        let riffSize = dataBytes &+ 36
+        let byteRate = UInt32(sampleRate * 2)
+        func appendLE32(_ v: UInt32) {
+            var le = v.littleEndian
+            header.append(Data(bytes: &le, count: 4))
+        }
+        func appendLE16(_ v: UInt16) {
+            var le = v.littleEndian
+            header.append(Data(bytes: &le, count: 2))
+        }
+        header.append(contentsOf: [0x52, 0x49, 0x46, 0x46]) // "RIFF"
+        appendLE32(riffSize)
+        header.append(contentsOf: [0x57, 0x41, 0x56, 0x45]) // "WAVE"
+        header.append(contentsOf: [0x66, 0x6D, 0x74, 0x20]) // "fmt "
+        appendLE32(16)
+        appendLE16(1) // PCM
+        appendLE16(1) // Mono
+        appendLE32(UInt32(sampleRate))
+        appendLE32(byteRate)
+        appendLE16(2) // Block align
+        appendLE16(16) // Bits per sample
+        header.append(contentsOf: [0x64, 0x61, 0x74, 0x61]) // "data"
+        appendLE32(dataBytes)
+
+        var wavFile = header
+        wavFile.append(pcmData)
+        do {
+            try wavFile.write(to: wavURL, options: .atomic)
+            return wavURL
+        } catch {
+            try? FileManager.default.removeItem(at: wavURL)
             return nil
         }
-        return out
     }
 
     private static func recognize(url: URL, recognizer: SFSpeechRecognizer, offset: Double) async -> [HeardWord] {
+        if recognizer.supportsOnDeviceRecognition {
+            let (words, hadError) = await recognizeOnce(url: url, recognizer: recognizer, offset: offset, requireOnDevice: true)
+            if !words.isEmpty || !hadError || Task.isCancelled {
+                return words
+            }
+        }
+        let (fallbackWords, _) = await recognizeOnce(url: url, recognizer: recognizer, offset: offset, requireOnDevice: false)
+        return fallbackWords
+    }
+
+    private static func recognizeOnce(
+        url: URL,
+        recognizer: SFSpeechRecognizer,
+        offset: Double,
+        requireOnDevice: Bool
+    ) async -> ([HeardWord], Bool) {
         let request = SFSpeechURLRecognitionRequest(url: url)
         request.shouldReportPartialResults = false
         request.taskHint = .dictation
-        if recognizer.supportsOnDeviceRecognition {
-            request.requiresOnDeviceRecognition = true
-        }
+        request.requiresOnDeviceRecognition = requireOnDevice
+
         let gate = ResumeOnceGate()
-        return await withCheckedContinuation { (cont: CheckedContinuation<[HeardWord], Never>) in
+        return await withCheckedContinuation { (cont: CheckedContinuation<([HeardWord], Bool), Never>) in
             let task = recognizer.recognitionTask(with: request) { result, error in
                 if let result, result.isFinal {
                     let words = result.bestTranscription.segments.compactMap { seg -> HeardWord? in
                         let token = normalizeToken(seg.substring)
                         return token.isEmpty ? nil : HeardWord(token: token, time: offset + seg.timestamp)
                     }
-                    if gate.claim() { cont.resume(returning: words) }
+                    if gate.claim() { cont.resume(returning: (words, false)) }
                 } else if error != nil {
-                    if gate.claim() { cont.resume(returning: []) }
+                    let partialWords = result?.bestTranscription.segments.compactMap { seg -> HeardWord? in
+                        let token = normalizeToken(seg.substring)
+                        return token.isEmpty ? nil : HeardWord(token: token, time: offset + seg.timestamp)
+                    } ?? []
+                    if gate.claim() { cont.resume(returning: (partialWords, true)) }
                 }
             }
-            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 120) {
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 90) {
                 task.cancel()
-                if gate.claim() { cont.resume(returning: []) }
+                if gate.claim() { cont.resume(returning: ([], true)) }
             }
         }
     }
@@ -524,9 +668,9 @@ enum SongAudioListener {
                 bestScale = scale
             }
 
-            // Sweep -20s...+40s in 0.25s steps (covers intros, channel bumpers, and trimmed starts).
-            var offset = -20.0
-            while offset <= 40.0 {
+            // Sweep -30s...+95s in 0.25s steps (covers long music-video intros, skits, and trimmed starts).
+            var offset = -30.0
+            while offset <= 95.0 {
                 let s = scoreShift(offset)
                 if s > bestScore {
                     bestScore = s
@@ -588,7 +732,13 @@ enum SongAudioListener {
     }
 
     private static func extractVocalActivityCurve(from url: URL) -> VocalEnvelope? {
-        let asset = AVURLAsset(url: url)
+        guard let prepared = prepareReadableAudioFile(for: url) else { return nil }
+        defer {
+            if let cleanupURL = prepared.cleanupURL {
+                try? FileManager.default.removeItem(at: cleanupURL)
+            }
+        }
+        let asset = AVURLAsset(url: prepared.url)
         guard let reader = try? AVAssetReader(asset: asset),
               let audioTrack = asset.tracks(withMediaType: .audio).first else {
             return nil
