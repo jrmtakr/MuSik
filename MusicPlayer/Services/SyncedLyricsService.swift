@@ -2145,7 +2145,7 @@ final class SyncedLyricsService {
         return s
     }
 
-    private static func normalizeSmartPunctuation(_ text: String) -> String {
+    nonisolated private static func normalizeSmartPunctuation(_ text: String) -> String {
         text
             .replacingOccurrences(of: "\u{2019}", with: "'")
             .replacingOccurrences(of: "\u{2018}", with: "'")
@@ -2172,7 +2172,7 @@ final class SyncedLyricsService {
         return s.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    private static func normalizeComparable(_ text: String) -> String {
+    nonisolated private static func normalizeComparable(_ text: String) -> String {
         let stripped = normalizeSmartPunctuation(text)
             .folding(options: [.diacriticInsensitive, .caseInsensitive], locale: .current)
             .replacingOccurrences(of: #"[\(\[].*?[\)\]]"#, with: " ", options: .regularExpression)
