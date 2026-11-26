@@ -661,7 +661,7 @@ enum ArtistDatabase {
     private static func mergeUniqueArtists(
         _ primaryList: [String],
         _ secondaryList: [String],
-        customAliases: [String: String]
+        customAliases: [String: String] = [:]
     ) -> [String] {
         var result: [String] = []
         var seen = Set<String>()
