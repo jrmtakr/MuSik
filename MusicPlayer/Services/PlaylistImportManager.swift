@@ -263,10 +263,10 @@ final class PlaylistImportManager {
     /// A foreground download receiving no bytes for this long is treated as stalled.
     private static let downloadStallTimeout: TimeInterval = 75
 
-    private static let maxConcurrentForegroundResolvers = 3
-    private static let maxConcurrentDownloadsForeground = 4
-    private static let maxConcurrentDownloadsBackground = 6
-    private static let lookaheadResolveBuffer = 2
+    private static let maxConcurrentForegroundResolvers = 1
+    private static let maxConcurrentDownloadsForeground = 1
+    private static let maxConcurrentDownloadsBackground = 1
+    private static let lookaheadResolveBuffer = 0
 
     private static var jobsFileURL: URL {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -291,7 +291,7 @@ final class PlaylistImportManager {
         config.allowsCellularAccess = true
         config.allowsExpensiveNetworkAccess = true
         config.allowsConstrainedNetworkAccess = true
-        config.httpMaximumConnectionsPerHost = 6
+        config.httpMaximumConnectionsPerHost = 2
 
         self.backgroundSession = URLSession(configuration: config, delegate: proxy, delegateQueue: nil)
 
@@ -1045,14 +1045,15 @@ final class PlaylistImportManager {
         }
 
         while true {
-            let isBackground = UIApplication.shared.applicationState == .background
-            let maxDownloads = isBackground ? Self.maxConcurrentDownloadsBackground : Self.maxConcurrentDownloadsForeground
-            let maxResolvers = isBackground ? 2 : Self.maxConcurrentForegroundResolvers
+            let maxDownloads = 1
+            let maxResolvers = 1
 
             var startedWork = false
-            while activeResolvingTrackIDs.count < maxResolvers,
-                  activeResolvingTrackIDs.count + activeDownloadTasksByTrackID.count < maxDownloads + Self.lookaheadResolveBuffer,
-                  let nextPair = nextResolvableTrack() {
+            // Strictly resolve & download ONE song/video at a time so URL imports proceed
+            // cleanly in order without flooding YouTube with concurrent connections.
+            if activeResolvingTrackIDs.isEmpty,
+               activeDownloadTasksByTrackID.isEmpty,
+               let nextPair = nextResolvableTrack() {
                 let (jobID, trackID) = nextPair
                 setTrackStatus(jobID: jobID, trackID: trackID, status: .resolving)
                 markAttemptStarted(jobID: jobID, trackID: trackID)
@@ -1080,10 +1081,12 @@ final class PlaylistImportManager {
                 }
             }
 
-            if !startedWork || activeResolvingTrackIDs.count >= maxResolvers {
+            _ = maxDownloads
+            _ = maxResolvers
+            if !startedWork || activeResolvingTrackIDs.count >= 1 || !activeDownloadTasksByTrackID.isEmpty {
                 await waitForQueueEvent()
             } else {
-                await Task.yield()
+                try? await Task.sleep(nanoseconds: 650_000_000)
             }
         }
     }
@@ -1223,7 +1226,53 @@ final class PlaylistImportManager {
             }
         }
 
-        // Step 4: Select best stream & enqueue into background URLSession
+        // Step 4: On retries (after a 403/timeout/stall on background URLSession), download directly
+        // through WebMediaDownloader with full client-matched headers + fallback stream rotation so a
+        // single blocked CDN URL never fails the whole track.
+        if track.retryCount > 0 {
+            setTrackStatus(jobID: jobID, trackID: trackID, status: .downloading)
+            resolveStartedAtByTrackID.removeValue(forKey: trackID)
+            let fallbackTitle = track.title.isEmpty ? resolvedResult.title : track.title
+            let fallbackArtist = track.artist.isEmpty ? resolvedResult.author : track.artist
+            if let primaryCandidate = resolvedResult.streams.first {
+                let labeledPrimary = DetectedBrowserMedia(
+                    url: primaryCandidate.url,
+                    pairedAudioURL: primaryCandidate.pairedAudioURL,
+                    isHLS: primaryCandidate.isHLS,
+                    isAudio: primaryCandidate.isAudio,
+                    title: primaryCandidate.title ?? fallbackTitle,
+                    author: primaryCandidate.author ?? fallbackArtist,
+                    qualityLabel: primaryCandidate.qualityLabel,
+                    referer: primaryCandidate.referer,
+                    customHeaders: primaryCandidate.customHeaders,
+                    durationSeconds: primaryCandidate.durationSeconds ?? resolvedResult.durationSeconds,
+                    isActivelyPlaying: false
+                )
+                if let downloaded = await WebMediaDownloader.shared.downloadTrackIntoPlaylist(
+                    labeledPrimary,
+                    fallbackStreams: Array(resolvedResult.streams.dropFirst()),
+                    targetPlaylistID: job.targetPlaylistID,
+                    maxDurationMinutes: 0,
+                    sourceVideoID: resolvedVideoID,
+                    preferAudioOnly: job.preferredFormat == .audioOnly
+                ) {
+                    cachedMediaByVideoID[resolvedVideoID] = downloaded
+                    markTrackCompleted(jobID: jobID, trackID: trackID, viaBrowser: usedBrowser)
+                    SongIdentificationService.shared.enqueue(
+                        downloaded,
+                        hintTitle: track.title,
+                        hintArtist: track.artist,
+                        sourceVideoID: resolvedVideoID,
+                        sourcePlatform: sourcePlatform(forJobID: jobID),
+                        jobID: jobID
+                    )
+                    return
+                }
+            }
+            guard stillValid() else { return }
+        }
+
+        // Select best stream & enqueue into URLSession
         guard let picked = selectBestStream(from: resolvedResult.streams, format: job.preferredFormat) else {
             // HLS-only fallback via foreground WebMediaDownloader if available
             if let rawHLS = resolvedResult.streams.first(where: { $0.isHLS }) {

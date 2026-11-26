@@ -283,11 +283,21 @@ final class SongIdentificationService {
             )
         }
 
-        // Save lyrics re-timed to this file so they line up even for music videos.
-        if let lyrics = lyricsToAlign, let heard,
-           let aligned = SongAudioListener.align(lyrics: lyrics, heard: heard),
-           let item = MediaManager.shared.items.first(where: { $0.relativePath == request.relativePath }) {
-            SyncedLyricsService.shared.storeAlignedLyrics(aligned, for: item)
+        // Pre-fetch & auto-align lyrics to this exact file during import (Speech anchors + Acoustic vocal alignment)
+        // so lyrics always line up immediately on first playback with zero user input.
+        if let item = MediaManager.shared.items.first(where: { $0.relativePath == request.relativePath }) {
+            if let lyrics = lyricsToAlign {
+                let aligned = await SongAudioListener.autoAlign(lyrics: lyrics, heard: heard, fileURL: item.fileURL)
+                SyncedLyricsService.shared.storeAlignedLyrics(aligned, for: item)
+            } else {
+                await SyncedLyricsService.shared.fetchAndAlignDuringImport(
+                    item: item,
+                    title: finalSong.title,
+                    artist: finalSong.artist,
+                    duration: finalSong.durationSeconds ?? request.durationSeconds,
+                    heard: heard
+                )
+            }
         }
         return finalSong
     }

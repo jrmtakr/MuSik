@@ -183,7 +183,7 @@ enum YouTubeStreamResolver {
             return false
         }
 
-        // 1. ANDROID client first: progressive MP4 (`formats`) downloads 100% reliably via full GET (HTTP 200) without PO-token 403s
+        // 1. ANDROID client first (native Android headers, NO browser cookies so InnerTube doesn't reject session).
         let androidResult = await fetchInnerTube(
             videoID: videoID,
             sourcePageURL: url,
@@ -197,11 +197,11 @@ enum YouTubeStreamResolver {
                 "androidSdkVersion": 34
             ],
             visitorData: visitorDataForRequests,
-            cookiesHeader: cookiesHeader
+            cookiesHeader: nil
         )
         _ = await evaluateCandidate(androidResult)
 
-        // 2. IOS client (provides HLS manifests or adaptive streams)
+        // 2. IOS client (native iOS headers, NO browser cookies).
         if workingResults.isEmpty {
             let iosResult = await fetchInnerTube(
                 videoID: videoID,
@@ -217,31 +217,27 @@ enum YouTubeStreamResolver {
                     "osVersion": "18.3.2"
                 ],
                 visitorData: visitorDataForRequests,
-                cookiesHeader: cookiesHeader
+                cookiesHeader: nil
             )
             _ = await evaluateCandidate(iosResult)
         }
 
-        // 3. ANDROID_VR client fallback
+        // 3. MWEB client fallback (uses user browser cookies when logged in / age-gated).
         if workingResults.isEmpty {
-            let vrResult = await fetchInnerTube(
+            let mwebResult = await fetchInnerTube(
                 videoID: videoID,
                 sourcePageURL: url,
-                clientName: "ANDROID_VR",
-                clientHeaderID: "28",
-                clientVersion: androidVRClientVersion,
-                userAgent: androidVRUserAgent,
+                clientName: "MWEB",
+                clientHeaderID: "2",
+                clientVersion: "2.20250311.00.00",
+                userAgent: WebMediaDownloader.browserUserAgent,
                 extraClientFields: [
-                    "deviceMake": "Oculus",
-                    "deviceModel": "Quest 3",
-                    "osName": "Android",
-                    "osVersion": "12L",
-                    "androidSdkVersion": 32
+                    "platform": "MOBILE"
                 ],
                 visitorData: visitorDataForRequests,
                 cookiesHeader: cookiesHeader
             )
-            _ = await evaluateCandidate(vrResult)
+            _ = await evaluateCandidate(mwebResult)
         }
 
         // 4. Mobile web watch HTML fallback
@@ -350,12 +346,12 @@ enum YouTubeStreamResolver {
     }
 
     private static func isURLReachable(_ url: URL, headers: [String: String]?) async -> Bool {
-        // Test the exact un-ranged GET that URLSession.downloadTask uses (YouTube CDN can return 206 on Range: 0-65535 then 403 on full GET).
+        // Test the exact un-ranged GET that URLSession.downloadTask uses (YouTube CDN can return
+        // 206 on a tiny Range probe then 403 on the full GET download).
         var req = URLRequest(url: url)
         req.httpMethod = "GET"
         req.timeoutInterval = 7
         headers?.forEach { req.setValue($0.value, forHTTPHeaderField: $0.key) }
-        req.setValue("bytes=0-1023", forHTTPHeaderField: "Range")
         do {
             let (bytes, resp) = try await URLSession.shared.bytes(for: req)
             guard let http = resp as? HTTPURLResponse, (200...299).contains(http.statusCode) else {

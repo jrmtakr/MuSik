@@ -463,6 +463,19 @@ final class MediaManager {
 
                 let copiedCount = try copyDirectoryContents(from: sourceURL, to: destURL)
                 loadLocalFiles()
+                let prefix = relFolder + "/"
+                for imported in items where imported.relativePath.hasPrefix(prefix) {
+                    Task { @MainActor in
+                        SongIdentificationService.shared.enqueue(
+                            imported,
+                            hintTitle: imported.displayTitle,
+                            hintArtist: imported.artist ?? "",
+                            sourceVideoID: customMetadataByPath[imported.relativePath]?.sourceVideoID,
+                            sourcePlatform: nil,
+                            jobID: nil
+                        )
+                    }
+                }
                 statusMessage = "Saved folder \"\(destURL.lastPathComponent)\" (\(copiedCount) \(copiedCount == 1 ? "file" : "files"))"
                 return .folder(name: destURL.lastPathComponent, fileCount: copiedCount)
             }
@@ -1566,6 +1579,18 @@ final class MediaManager {
         }
 
         let refreshedItem = items.first(where: { $0.relativePath == item.relativePath }) ?? item
+        if !refreshedItem.isHLS {
+            Task { @MainActor in
+                SongIdentificationService.shared.enqueue(
+                    refreshedItem,
+                    hintTitle: refreshedItem.displayTitle,
+                    hintArtist: refreshedItem.artist ?? "",
+                    sourceVideoID: cleanVID ?? customMetadataByPath[refreshedItem.relativePath]?.sourceVideoID,
+                    sourcePlatform: nil,
+                    jobID: nil
+                )
+            }
+        }
 
         if let explicitPlaylistID,
            let idx = playlists.firstIndex(where: { $0.id == explicitPlaylistID }) {

@@ -1695,7 +1695,7 @@ final class WebMediaDownloader {
                         maxDurationSeconds: meta.maxDurationSeconds,
                         maxDurationMinutes: meta.maxDurationMinutes,
                         destinationFolder: meta.destinationFolder,
-                        fallbackStreams: [],
+                        fallbackStreams: meta.fallbackStreams,
                         didRetryHeaderless: true
                     )
                     return

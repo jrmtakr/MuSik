@@ -1,3 +1,4 @@
+import Accelerate
 import AVFoundation
 import Foundation
 @preconcurrency import Speech
@@ -222,6 +223,261 @@ enum SongAudioListener {
             expectedDurationSeconds: nil,
             lines: remapped
         )
+    }
+
+    // MARK: - Hybrid Automatic Whole-Song Aligner (STT + Acoustic Vocal-Band Cross-Correlation)
+
+    /// Automatically lines up `lyrics` against `fileURL` with zero user input:
+    ///   1. First tries word-level speech anchors (`align(lyrics:heard:)`) across the whole song.
+    ///   2. If speech heard too few words (heavy beat, reverb, non-English, or no permission),
+    ///      extracts a 10 Hz vocal-presence envelope (300 Hz - 3.4 kHz FFT energy) across the whole
+    ///      track and slides offset/tempo to lock `.lrc` lines to where vocals actually enter & pause.
+    static func autoAlign(lyrics: ResolvedTrackLyrics, heard: [HeardWord]?, fileURL: URL) async -> ResolvedTrackLyrics {
+        guard lyrics.isTimeSynced, !lyrics.lines.isEmpty else { return lyrics }
+        if let heard, let sttAligned = align(lyrics: lyrics, heard: heard) {
+            return sttAligned
+        }
+        return await alignAcousticallyIfNeeded(lyrics: lyrics, fileURL: fileURL)
+    }
+
+    static func alignAcousticallyIfNeeded(lyrics: ResolvedTrackLyrics, fileURL: URL) async -> ResolvedTrackLyrics {
+        guard lyrics.isTimeSynced,
+              !lyrics.lines.isEmpty,
+              FileManager.default.fileExists(atPath: fileURL.path) else {
+            return lyrics
+        }
+
+        let curve = await Task.detached(priority: .utility) {
+            Self.extractVocalActivityCurve(from: fileURL)
+        }.value
+
+        guard let curve, curve.envelope.count >= 80 else {
+            return lyrics
+        }
+
+        let dt = curve.frameDurationSeconds // 0.1s per frame
+        let actualDuration = Double(curve.envelope.count) * dt
+        let lastLyricTime = lyrics.lines.map { max($0.endTime, $0.startTime) }.max() ?? 0
+        guard lastLyricTime > 12 else { return lyrics }
+
+        // Test natural tempo (1.0) and mild stretch ratio if official LRC length differs by 1.5%-7%.
+        var candidateScales: [Double] = [1.0]
+        if let expectedDur = lyrics.expectedDurationSeconds,
+           expectedDur > 20, actualDuration > 20 {
+            let ratio = actualDuration / expectedDur
+            if ratio >= 0.93 && ratio <= 1.07 && abs(ratio - 1.0) >= 0.015 {
+                candidateScales.append(ratio)
+            }
+        }
+
+        // Convert LRC vocal intervals into expected activity markers once per scale.
+        var bestScore = -Double.infinity
+        var zeroOffsetScore = -Double.infinity
+        var bestOffset: Double = 0
+        var bestScale: Double = 1.0
+
+        for scale in candidateScales {
+            let sampleTimes: [(time: Double, isSing: Bool)] = lyrics.lines.flatMap { line -> [(Double, Bool)] in
+                if line.isInstrumentalBreak {
+                    return [(line.startTime * scale, false)]
+                }
+                let start = line.startTime * scale
+                let mid = ((line.startTime + line.endTime) * 0.5) * scale
+                let gapBefore = start - 0.8
+                var pts: [(Double, Bool)] = [(start, true), (mid, true)]
+                if gapBefore > 0.5 { pts.append((gapBefore, false)) }
+                return pts
+            }
+
+            func scoreShift(_ offset: Double) -> Double {
+                var sum = 0.0
+                var count = 0
+                for pt in sampleTimes {
+                    let t = pt.time + offset
+                    guard t >= 0, t < actualDuration else { continue }
+                    let idx = Int(t / dt)
+                    guard idx >= 0, idx < curve.envelope.count else { continue }
+                    let v = curve.envelope[idx] // centered around ~0 (-1 silent, +1 vocal active)
+                    sum += pt.isSing ? v : (-v * 0.45)
+                    count += 1
+                }
+                guard count > 0 else { return -Double.infinity }
+                // Tiny prior preferring smaller shifts when scores tie.
+                return (sum / Double(count)) - min(0.08, abs(offset) * 0.0012)
+            }
+
+            let zScore = scoreShift(0)
+            if scale == 1.0 { zeroOffsetScore = zScore }
+            if zScore > bestScore {
+                bestScore = zScore
+                bestOffset = 0
+                bestScale = scale
+            }
+
+            // Sweep -20s...+40s in 0.25s steps (covers intros, channel bumpers, and trimmed starts).
+            var offset = -20.0
+            while offset <= 40.0 {
+                let s = scoreShift(offset)
+                if s > bestScore {
+                    bestScore = s
+                    bestOffset = offset
+                    bestScale = scale
+                }
+                offset += 0.25
+            }
+        }
+
+        // Require a genuine correlation improvement before shifting timestamps away from 0.
+        let meaningfulImprovement = abs(bestOffset) >= 0.4 && bestScore > zeroOffsetScore + 0.06 && bestScore > 0.08
+        guard meaningfulImprovement || abs(bestScale - 1.0) >= 0.015 else {
+            return lyrics
+        }
+
+        let appliedOffset = meaningfulImprovement ? bestOffset : 0
+        let appliedScale = bestScale
+        let remapped = lyrics.lines.map { line in
+            let s = max(0, line.startTime * appliedScale + appliedOffset)
+            let e = max(s, line.endTime * appliedScale + appliedOffset)
+            let words = line.words.map {
+                LyricWordTiming(
+                    id: $0.id,
+                    text: $0.text,
+                    startTime: max(0, $0.startTime * appliedScale + appliedOffset),
+                    endTime: max(0, $0.endTime * appliedScale + appliedOffset)
+                )
+            }
+            return SyncedLyricLine(
+                id: line.id,
+                startTime: s,
+                endTime: e,
+                text: line.text,
+                words: words,
+                isInstrumentalBreak: line.isInstrumentalBreak
+            )
+        }
+
+        let note = String(format: "auto-aligned (%+.1fs)", appliedOffset)
+        return ResolvedTrackLyrics(
+            cacheKey: lyrics.cacheKey,
+            trackTitle: lyrics.trackTitle,
+            artistName: lyrics.artistName,
+            isTimeSynced: true,
+            sourceLabel: "Synced Lyrics · auto-aligned",
+            attributionText: (lyrics.attributionText ?? "LRCLIB") + " · \(note)",
+            syncedOffsetSeconds: 0,
+            tempoScale: 1.0,
+            expectedDurationSeconds: actualDuration,
+            lines: remapped
+        )
+    }
+
+    private struct VocalEnvelope {
+        let frameDurationSeconds: Double
+        /// Normalized centered vocal-band activity in roughly [-1, +1].
+        let envelope: [Double]
+    }
+
+    private static func extractVocalActivityCurve(from url: URL) -> VocalEnvelope? {
+        let asset = AVURLAsset(url: url)
+        guard let reader = try? AVAssetReader(asset: asset),
+              let audioTrack = asset.tracks(withMediaType: .audio).first else {
+            return nil
+        }
+
+        let sampleRate: Double = 11_025
+        let settings: [String: Any] = [
+            AVFormatIDKey: kAudioFormatLinearPCM,
+            AVSampleRateKey: sampleRate,
+            AVNumberOfChannelsKey: 1,
+            AVLinearPCMBitDepthKey: 16,
+            AVLinearPCMIsBigEndianKey: false,
+            AVLinearPCMIsFloatKey: false,
+            AVLinearPCMIsNonInterleaved: false
+        ]
+        let output = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: settings)
+        output.alwaysCopiesSampleData = false
+        guard reader.canAdd(output) else { return nil }
+        reader.add(output)
+        guard reader.startReading() else { return nil }
+
+        let maxSamples = Int(sampleRate * 900)
+        var samples: [Float] = []
+        var scale: Float = 1.0 / 32768.0
+        while reader.status == .reading, samples.count < maxSamples {
+            guard let sb = output.copyNextSampleBuffer(),
+                  let bb = CMSampleBufferGetDataBuffer(sb) else { break }
+            var length = 0
+            var pointer: UnsafeMutablePointer<Int8>?
+            if CMBlockBufferGetDataPointer(bb, atOffset: 0, lengthAtOffsetOut: nil, totalLengthOut: &length, dataPointerOut: &pointer) == noErr,
+               let ptr = pointer, length >= 2 {
+                let count = min(length / MemoryLayout<Int16>.size, maxSamples - samples.count)
+                var raw = [Float](repeating: 0, count: count)
+                var scaled = [Float](repeating: 0, count: count)
+                ptr.withMemoryRebound(to: Int16.self, capacity: count) { i16 in
+                    vDSP_vflt16(i16, 1, &raw, 1, vDSP_Length(count))
+                }
+                vDSP_vsmul(raw, 1, &scale, &scaled, 1, vDSP_Length(count))
+                samples.append(contentsOf: scaled)
+            }
+            CMSampleBufferInvalidate(sb)
+        }
+
+        let fftSize = 1024
+        let log2N = vDSP_Length(10)
+        let hop = 1102 // ~0.10s per frame
+        guard samples.count >= fftSize,
+              let setup = vDSP_create_fftsetup(log2N, FFTRadix(kFFTRadix2)) else {
+            return nil
+        }
+        defer { vDSP_destroy_fftsetup(setup) }
+
+        var window = [Float](repeating: 0, count: fftSize)
+        vDSP_hann_window(&window, vDSP_Length(fftSize), Int32(vDSP_HANN_NORM))
+        let halfN = fftSize / 2
+        var windowed = [Float](repeating: 0, count: fftSize)
+        var real = [Float](repeating: 0, count: halfN)
+        var imag = [Float](repeating: 0, count: halfN)
+        var mags = [Float](repeating: 0, count: halfN)
+
+        // At 11,025 Hz with N=1024 (~10.77 Hz/bin), bins 28..315 cover ~300 Hz - 3.4 kHz vocals.
+        let lowBin = 28
+        let highBin = min(halfN, 316)
+        var rawEnergies: [Double] = []
+        rawEnergies.reserveCapacity((samples.count - fftSize) / hop + 1)
+
+        var pos = 0
+        while pos + fftSize <= samples.count {
+            samples.withUnsafeBufferPointer { sPtr in
+                vDSP_vmul(sPtr.baseAddress! + pos, 1, window, 1, &windowed, 1, vDSP_Length(fftSize))
+            }
+            real.withUnsafeMutableBufferPointer { rPtr in
+                imag.withUnsafeMutableBufferPointer { iPtr in
+                    var split = DSPSplitComplex(realp: rPtr.baseAddress!, imagp: iPtr.baseAddress!)
+                    windowed.withUnsafeBufferPointer { wPtr in
+                        wPtr.baseAddress!.withMemoryRebound(to: DSPComplex.self, capacity: halfN) { cPtr in
+                            vDSP_ctoz(cPtr, 2, &split, 1, vDSP_Length(halfN))
+                        }
+                    }
+                    vDSP_fft_zrip(setup, &split, 1, log2N, FFTDirection(FFT_FORWARD))
+                    vDSP_zvmags(&split, 1, &mags, 1, vDSP_Length(halfN))
+                }
+            }
+            var vocalSum: Float = 0
+            for b in lowBin..<highBin {
+                vocalSum += mags[b]
+            }
+            rawEnergies.append(log1p(Double(vocalSum)))
+            pos += hop
+        }
+
+        guard !rawEnergies.isEmpty else { return nil }
+        let sorted = rawEnergies.sorted()
+        let p20 = sorted[max(0, sorted.count / 5)]
+        let p80 = sorted[min(sorted.count - 1, (sorted.count * 4) / 5)]
+        let mid = (p20 + p80) * 0.5
+        let spread = max(0.25, (p80 - p20) * 0.5)
+        let centered = rawEnergies.map { min(1.0, max(-1.0, ($0 - mid) / spread)) }
+        return VocalEnvelope(frameDurationSeconds: Double(hop) / sampleRate, envelope: centered)
     }
 
     /// Finds lyric lines that were clearly heard, and when. Keeps only anchors that move forward in

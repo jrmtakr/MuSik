@@ -229,13 +229,19 @@ final class SyncedLyricsService {
                 customArtist: customArtist
             )
             guard !Task.isCancelled else { return }
-            currentLoadingKey = nil
-            if let resolved {
+            if var resolved {
+                // Automatically line synced lyrics up to the actual local audio file with zero user input.
+                if resolved.isTimeSynced && !item.relativePath.hasPrefix("__remote__/") && !item.isHLS {
+                    resolved = await SongAudioListener.autoAlign(lyrics: resolved, heard: nil, fileURL: item.fileURL)
+                    guard !Task.isCancelled else { return }
+                }
+                currentLoadingKey = nil
                 memoryCache[key] = resolved
                 saveToDisk(resolved)
                 currentLyrics = resolved
                 lastError = nil
             } else {
+                currentLoadingKey = nil
                 lastError = "No lyrics for first time listen"
                 if customTitle == nil && customArtist == nil && !item.relativePath.hasPrefix("__remote__/") {
                     WholeSongAIService.shared.triggerIfFirstTimeUnknown(item: item)
@@ -500,6 +506,33 @@ final class SyncedLyricsService {
     /// Doesn't touch what's on screen.
     func fetchLyricsForVerification(title: String, artist: String, duration: Double?) async -> ResolvedTrackLyrics? {
         await fetchFromLRCLIB(cacheKey: "verify", song: title, artist: artist, rawTitle: title, duration: duration)
+    }
+
+    /// Pre-fetches best lyrics during upload/import and aligns them against the local audio file
+    /// using speech anchors + acoustic vocal-energy cross-correlation so lyrics are ready & synced before play.
+    func fetchAndAlignDuringImport(
+        item: MediaItem,
+        title: String,
+        artist: String,
+        duration: Double?,
+        heard: [HeardWord]?
+    ) async {
+        let key = cacheKey(for: item, artistOverride: artist, titleOverride: title)
+        guard loadFromDisk(key: key) == nil else { return }
+
+        guard var lyrics = await fetchBestLyrics(
+            item: item,
+            cacheKey: key,
+            customTitle: title,
+            customArtist: artist
+        ) else {
+            return
+        }
+
+        if lyrics.isTimeSynced && !item.isHLS {
+            lyrics = await SongAudioListener.autoAlign(lyrics: lyrics, heard: heard, fileURL: item.fileURL)
+        }
+        storeAlignedLyrics(lyrics, for: item)
     }
 
     /// Saves lyrics that were already re-timed against this exact file, so playback uses them as-is
