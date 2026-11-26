@@ -14,7 +14,6 @@ final class MediaManager {
     struct CustomTrackMetadata: Codable, Hashable {
         var title: String?
         var artist: String?
-        var album: String?
         var coverFileName: String?
         var sourceVideoID: String?
         var isArtistVerified: Bool?
@@ -2978,6 +2977,18 @@ final class MediaManager {
         customMetadataByPath = state.customMetadataByPath
         lastPlaylistID = state.lastPlaylistID
         repeatMode = state.repeatMode
+    }
+
+    func reloadAllFromDisk() {
+        durationsByPath.removeAll()
+        titlesByPath.removeAll()
+        artistsByPath.removeAll()
+        albumsByPath.removeAll()
+        metadataLoadedPaths.removeAll()
+        thumbnails.removeAll()
+        loadPlaylists()
+        loadLibraryState()
+        loadLocalFiles()
     }
 
     private func saveLibraryState() {

@@ -27,6 +27,7 @@ struct SettingsView: View {
     @Binding var showPlayerSheet: Bool
 
     @State private var showWiFiSheet = false
+    @State private var showBackupSheet = false
     @State private var showEqualizerSheet = false
     @State private var showMangaReaderSheet = false
     @State private var showWrappedSheet = false
@@ -280,6 +281,20 @@ struct SettingsView: View {
                             }
                         }
                     }
+
+                    Button {
+                        showBackupSheet = true
+                    } label: {
+                        HStack {
+                            Label("Backup & Restore All Songs/Videos", systemImage: "externaldrive.badge.icloud")
+                            Spacer()
+                            if let last = LibraryBackupService.shared.lastBackupDate {
+                                Text(last, style: .relative)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
                 }
 
                 Section("Video Setting") {
@@ -437,6 +452,9 @@ struct SettingsView: View {
             .miniPlayerInset(showPlayerSheet: $showPlayerSheet)
             .sheet(isPresented: $showWiFiSheet) {
                 WiFiTransferView()
+            }
+            .sheet(isPresented: $showBackupSheet) {
+                LibraryBackupSheet()
             }
             .sheet(isPresented: $showEqualizerSheet) {
                 EqualizerView()

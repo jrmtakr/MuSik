@@ -371,6 +371,21 @@ private final class HTTPConnectionSession {
             return
         }
 
+        if path == "/api/backup.zip" {
+            Task {
+                let archiveURL = await LibraryBackupService.shared.createFullBackup()
+                DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                    guard let self else { return }
+                    if let archiveURL {
+                        self.streamFileDownload(at: archiveURL, fileName: archiveURL.lastPathComponent)
+                    } else {
+                        self.sendResponse(status: "500 Internal Server Error", contentType: "text/plain", body: Data("Backup creation failed".utf8))
+                    }
+                }
+            }
+            return
+        }
+
         if path.hasPrefix("/files/") {
             let encoded = String(path.dropFirst("/files/".count))
             let decoded = encoded.removingPercentEncoding ?? encoded
@@ -798,6 +813,7 @@ private final class HTTPConnectionSession {
               <button type="button" class="btn" onclick="document.getElementById('fileInput').click()">Upload Files</button>
               <button type="button" class="btn sec" onclick="createFolder()">New Folder</button>
               <button type="button" class="btn sec" onclick="loadFiles()">Refresh</button>
+              <a href="/api/backup.zip" class="btn sec" style="text-decoration:none;display:inline-flex;align-items:center;">Download Full Backup (.zip)</a>
             </div>
             <input id="fileInput" type="file" multiple style="display:none" />
           </div>
