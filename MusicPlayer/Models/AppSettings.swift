@@ -195,6 +195,10 @@ final class AppSettings {
     var autoIdentifyImportedSongs: Bool {
         didSet { UserDefaults.standard.set(autoIdentifyImportedSongs, forKey: Keys.autoIdentifyImportedSongs) }
     }
+    /// Keep playlist imports running while the screen is locked (plays silence when nothing else is playing).
+    var keepImportingWhenLocked: Bool {
+        didSet { UserDefaults.standard.set(keepImportingWhenLocked, forKey: Keys.keepImportingWhenLocked) }
+    }
 
     static var isCrossfadeEnabled: Bool {
         UserDefaults.standard.bool(forKey: Keys.crossfadeEnabled)
@@ -276,6 +280,7 @@ final class AppSettings {
         static let crossfadeDuration = "musicplayer.crossfade.seconds"
         static let autoAISyncLyrics = "musicplayer.lyrics.autoAISync"
         static let autoIdentifyImportedSongs = "musicplayer.import.autoIdentify"
+        static let keepImportingWhenLocked = "musicplayer.import.keepAliveWhenLocked"
     }
 
     private static var themeAssetsDirectory: URL {
@@ -357,6 +362,7 @@ final class AppSettings {
         }
         self.autoAISyncLyrics = defaults.bool(forKey: Keys.autoAISyncLyrics)
         self.autoIdentifyImportedSongs = (defaults.object(forKey: Keys.autoIdentifyImportedSongs) as? Bool) ?? true
+        self.keepImportingWhenLocked = (defaults.object(forKey: Keys.keepImportingWhenLocked) as? Bool) ?? true
 
         if FileManager.default.fileExists(atPath: Self.customIconFileURL.path),
            let img = UIImage(contentsOfFile: Self.customIconFileURL.path) {
