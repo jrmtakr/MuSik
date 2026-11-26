@@ -155,26 +155,12 @@ struct AppleMusicLyricsView: View {
     @State private var lastSyncPlaybackTime: Double = 0
     @State private var isUserScrolling = false
     @State private var resumeAutoScrollTask: Task<Void, Never>?
-    @State private var showQuickTimingControls = false
-    @State private var showManualSearchSheet = false
-    @State private var customSongTitle = ""
-    @State private var customArtistName = ""
-    @State private var customLyricsPasteText = ""
     @State private var copiedBannerText: String?
     @State private var randomGifURL: URL?
 
-    private var hasDurationMismatchWarning: Bool {
-        guard let lyrics = lyricsService.currentLyrics,
-              let lrcDur = lyrics.expectedDurationSeconds, lrcDur > 15,
-              let trackDur = item.durationSeconds, trackDur > 15 else {
-            return false
-        }
-        return abs(lrcDur - trackDur) > 12.0 && abs(lyrics.syncedOffsetSeconds) < 0.25 && abs(lyrics.tempoScale - 1.0) < 0.02
-    }
-
     var body: some View {
         VStack(spacing: 0) {
-            aiSyncControlBar
+            aiStatusHeaderBar
 
             ZStack(alignment: .bottom) {
                 if let lyrics = lyricsService.currentLyrics, !lyrics.lines.isEmpty {
@@ -227,7 +213,7 @@ struct AppleMusicLyricsView: View {
                             isUserScrolling = false
                             resumeAutoScrollTask?.cancel()
                         } label: {
-                            Label("Sync to Current Line", systemImage: "arrow.up.and.down.text.horizontal")
+                            Label("Back to Current Line", systemImage: "arrow.up.and.down.text.horizontal")
                                 .font(.caption.weight(.semibold))
                                 .foregroundStyle(.white)
                                 .padding(.horizontal, 14)
@@ -271,181 +257,35 @@ struct AppleMusicLyricsView: View {
         .onChange(of: mediaManager.isPlaying) { _, _ in
             syncClockSnapshot()
         }
-        .sheet(isPresented: $showManualSearchSheet) {
-            manualLyricsSearchSheet
-        }
     }
 
-    // MARK: - Top AI Recognition & Quick Timing Bar
+    // MARK: - Top AI Status Banner (Passive Only)
 
-    private var aiSyncControlBar: some View {
-        VStack(spacing: 6) {
-            HStack(spacing: 8) {
-                Button {
-                    AppHaptics.selection()
-                    lyricsService.recognizeAndAlignWithAI(
-                        for: item,
-                        playbackTime: mediaManager.currentTime,
-                        equalizerPlayer: mediaManager.equalizerPlayer,
-                        isEQPlaying: mediaManager.equalizerPlayer.isPlaying,
-                        playbackRate: mediaManager.playbackRate,
-                        forceReidentify: false
-                    )
-                } label: {
+    @ViewBuilder
+    private var aiStatusHeaderBar: some View {
+        let statusMsg = lyricsService.aiErrorMessage ?? lyricsService.aiStatusMessage
+        let savedInfo = lyricsService.lastRecognizedTrackInfo
+        let showSavedBanner = savedInfo?.relativePath == item.relativePath && savedInfo?.wasAutoSaved == true
+
+        if (statusMsg != nil && !(statusMsg?.isEmpty ?? true)) || showSavedBanner {
+            VStack(spacing: 6) {
+                if let msg = statusMsg, !msg.isEmpty {
                     HStack(spacing: 6) {
-                        if lyricsService.isAIRecognizing {
-                            ProgressView()
-                                .controlSize(.mini)
-                                .tint(.white)
-                        } else {
-                            Image(systemName: "waveform.and.magnifyingglass")
-                                .font(.caption.weight(.bold))
-                        }
-                        Text(lyricsService.isAIRecognizing ? "Listening..." : "AI Listen & Sync")
-                            .font(.caption.weight(.semibold))
+                        Image(systemName: lyricsService.aiErrorMessage != nil ? "exclamationmark.triangle.fill" : "sparkles")
+                            .font(.caption2)
+                            .foregroundStyle(lyricsService.aiErrorMessage != nil ? .orange : .green)
+                        Text(msg)
+                            .font(.caption2.weight(.medium))
+                            .foregroundStyle(.white.opacity(0.88))
+                            .lineLimit(2)
+                        Spacer()
                     }
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 11)
-                    .padding(.vertical, 6)
-                    .background(
-                        lyricsService.isAIRecognizing ? Color.accentColor.opacity(0.65) : Color.white.opacity(0.16),
-                        in: Capsule()
-                    )
-                    .overlay(Capsule().strokeBorder(.white.opacity(0.22), lineWidth: 0.7))
-                }
-                .buttonStyle(.plain)
-                .disabled(lyricsService.isAIRecognizing)
-                .contextMenu {
-                    Button {
-                        lyricsService.recognizeAndAlignWithAI(
-                            for: item,
-                            playbackTime: mediaManager.currentTime,
-                            equalizerPlayer: mediaManager.equalizerPlayer,
-                            isEQPlaying: mediaManager.equalizerPlayer.isPlaying,
-                            playbackRate: mediaManager.playbackRate,
-                            forceReidentify: true
-                        )
-                    } label: {
-                        Label("Force AI Song Re-Identification", systemImage: "sparkles")
-                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .background(Color.black.opacity(0.26), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
                 }
 
-                if lyricsService.currentLyrics?.isTimeSynced == true {
-                    Button {
-                        AppHaptics.selection()
-                        withAnimation(.spring(response: 0.3, dampingFraction: 0.85)) {
-                            showQuickTimingControls.toggle()
-                        }
-                    } label: {
-                        let off = lyricsService.currentLyrics?.syncedOffsetSeconds ?? 0
-                        HStack(spacing: 5) {
-                            Image(systemName: "slider.horizontal.3")
-                                .font(.caption2.weight(.bold))
-                            Text(abs(off) > 0.01 ? String(format: "%+.2fs", off) : "Timing")
-                                .font(.caption.monospacedDigit().weight(.semibold))
-                            if hasDurationMismatchWarning {
-                                Circle()
-                                    .fill(.orange)
-                                    .frame(width: 6, height: 6)
-                            }
-                        }
-                        .foregroundStyle(hasDurationMismatchWarning ? .orange : .white)
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 6)
-                        .background(showQuickTimingControls ? Color.white.opacity(0.26) : Color.white.opacity(0.13), in: Capsule())
-                    }
-                    .buttonStyle(.plain)
-                }
-
-                Spacer()
-
-                Button {
-                    lyricsService.recognizeAndAlignWithAI(
-                        for: item,
-                        playbackTime: mediaManager.currentTime,
-                        equalizerPlayer: mediaManager.equalizerPlayer,
-                        isEQPlaying: mediaManager.equalizerPlayer.isPlaying,
-                        playbackRate: mediaManager.playbackRate,
-                        forceReidentify: true
-                    )
-                } label: {
-                    Label("ID Song", systemImage: "sparkles")
-                        .font(.caption2.weight(.semibold))
-                        .foregroundStyle(.white.opacity(0.9))
-                        .padding(.horizontal, 9)
-                        .padding(.vertical, 6)
-                        .background(Color.white.opacity(0.12), in: Capsule())
-                }
-                .buttonStyle(.plain)
-                .disabled(lyricsService.isAIRecognizing)
-            }
-
-            if showQuickTimingControls, let lyrics = lyricsService.currentLyrics, lyrics.isTimeSynced {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 6) {
-                        ForEach([-2.0, -0.5, -0.25, 0.25, 0.5, 2.0], id: \.self) { delta in
-                            Button(delta > 0 ? String(format: "+%.2gs", delta) : String(format: "%.2gs", delta)) {
-                                AppHaptics.light()
-                                lyricsService.adjustTimingOffset(by: delta)
-                            }
-                            .font(.caption2.monospacedDigit().weight(.semibold))
-                            .foregroundStyle(.white)
-                            .padding(.horizontal, 9)
-                            .padding(.vertical, 5)
-                            .background(Color.white.opacity(0.16), in: Capsule())
-                            .buttonStyle(.plain)
-                        }
-
-                        if let lrcDur = lyrics.expectedDurationSeconds,
-                           let trackDur = item.durationSeconds,
-                           lrcDur > 15, trackDur > 15,
-                           abs(lrcDur - trackDur) / max(lrcDur, trackDur) > 0.08 {
-                            Button(abs(lyrics.tempoScale - 1.0) > 0.02 ? "1.0x Speed" : "Fit Speed") {
-                                AppHaptics.selection()
-                                lyricsService.toggleDurationTempoFit(for: item)
-                            }
-                            .font(.caption2.weight(.bold))
-                            .foregroundStyle(.white)
-                            .padding(.horizontal, 9)
-                            .padding(.vertical, 5)
-                            .background(Color.accentColor.opacity(0.55), in: Capsule())
-                            .buttonStyle(.plain)
-                        }
-
-                        Button("Reset") {
-                            AppHaptics.selection()
-                            lyricsService.resetTimingOffset()
-                        }
-                        .font(.caption2.weight(.semibold))
-                        .foregroundStyle(.white.opacity(0.8))
-                        .padding(.horizontal, 9)
-                        .padding(.vertical, 5)
-                        .background(Color.white.opacity(0.12), in: Capsule())
-                        .buttonStyle(.plain)
-                    }
-                }
-                .transition(.move(edge: .top).combined(with: .opacity))
-            }
-
-            if let msg = lyricsService.aiErrorMessage ?? lyricsService.aiStatusMessage, !msg.isEmpty {
-                HStack(spacing: 6) {
-                    Image(systemName: lyricsService.aiErrorMessage != nil ? "exclamationmark.triangle.fill" : "sparkles")
-                        .font(.caption2)
-                        .foregroundStyle(lyricsService.aiErrorMessage != nil ? .orange : .green)
-                    Text(msg)
-                        .font(.caption2.weight(.medium))
-                        .foregroundStyle(.white.opacity(0.88))
-                        .lineLimit(2)
-                    Spacer()
-                }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 5)
-                .background(Color.black.opacity(0.26), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-            }
-
-            if let info = lyricsService.lastRecognizedTrackInfo,
-               info.relativePath == item.relativePath {
-                if info.wasAutoSaved {
+                if showSavedBanner, let info = savedInfo {
                     HStack(spacing: 6) {
                         Image(systemName: "checkmark.seal.fill")
                             .font(.caption2)
@@ -459,35 +299,11 @@ struct AppleMusicLyricsView: View {
                     .padding(.horizontal, 10)
                     .padding(.vertical, 5)
                     .background(Color.green.opacity(0.18), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-                } else {
-                    Button {
-                        AppHaptics.selection()
-                        lyricsService.applyRecognizedMetadata(info, to: item)
-                    } label: {
-                        HStack(spacing: 6) {
-                            Image(systemName: "checkmark.circle.badge.plus")
-                                .font(.caption2.weight(.bold))
-                            Text("Save to Artist DB: \(info.artistName) — \(info.songTitle)")
-                                .font(.caption2.weight(.semibold))
-                                .lineLimit(1)
-                            Spacer()
-                            Text("Save")
-                                .font(.caption2.weight(.bold))
-                                .padding(.horizontal, 7)
-                                .padding(.vertical, 2)
-                                .background(.white.opacity(0.2), in: Capsule())
-                        }
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 5)
-                        .background(Color.accentColor.opacity(0.45), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-                    }
-                    .buttonStyle(.plain)
                 }
             }
+            .padding(.horizontal, 20)
+            .padding(.bottom, 6)
         }
-        .padding(.horizontal, 20)
-        .padding(.bottom, 6)
     }
 
     // MARK: - Main Lyrics Scroll View
@@ -727,40 +543,6 @@ struct AppleMusicLyricsView: View {
                 }
                 Spacer()
             }
-
-            HStack(spacing: 8) {
-                if lyrics.isTimeSynced {
-                    Button("-0.25s") {
-                        lyricsService.adjustTimingOffset(by: -0.25)
-                    }
-                    .font(.caption2.weight(.semibold))
-                    .buttonStyle(.bordered)
-                    .tint(.white)
-
-                    Button("+0.25s") {
-                        lyricsService.adjustTimingOffset(by: 0.25)
-                    }
-                    .font(.caption2.weight(.semibold))
-                    .buttonStyle(.bordered)
-                    .tint(.white)
-                }
-
-                Button("Wrong Lyrics?") {
-                    customSongTitle = item.displayTitle
-                    customArtistName = item.artist ?? ""
-                    showManualSearchSheet = true
-                }
-                .font(.caption2.weight(.semibold))
-                .buttonStyle(.bordered)
-                .tint(.white)
-
-                Button("Genius Web") {
-                    onOpenGeniusWeb(item.displayTitle, item.artist ?? "")
-                }
-                .font(.caption2.weight(.semibold))
-                .buttonStyle(.bordered)
-                .tint(.white)
-            }
         }
     }
 
@@ -802,116 +584,18 @@ struct AppleMusicLyricsView: View {
                         .multilineTextAlignment(.center)
                 }
                 .padding(.top, 2)
-            } else if !item.relativePath.hasPrefix("__remote__/") {
-                Button {
-                    AppHaptics.light()
-                    wholeSongAI.startWholeSongListen(for: item, force: true)
-                } label: {
-                    Label("AI Listen Whole Song", systemImage: "waveform.and.magnifyingglass")
-                        .font(.caption.weight(.semibold))
+            } else if lyricsService.isAIRecognizing {
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .tint(.white)
+                    Text(lyricsService.aiStatusMessage ?? "Analyzing audio and syncing lyrics...")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.white.opacity(0.75))
                 }
-                .buttonStyle(.bordered)
-                .tint(.white.opacity(0.85))
-            }
-
-            VStack(spacing: 10) {
-                Button {
-                    lyricsService.recognizeAndAlignWithAI(
-                        for: item,
-                        playbackTime: mediaManager.currentTime,
-                        equalizerPlayer: mediaManager.equalizerPlayer,
-                        isEQPlaying: mediaManager.equalizerPlayer.isPlaying,
-                        playbackRate: mediaManager.playbackRate,
-                        forceReidentify: true
-                    )
-                } label: {
-                    Label(
-                        lyricsService.isAIRecognizing ? "Listening to Song..." : "AI Listen & Identify Song",
-                        systemImage: "waveform.and.magnifyingglass"
-                    )
-                    .font(.subheadline.weight(.semibold))
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(lyricsService.isAIRecognizing)
-
-                HStack(spacing: 12) {
-                    Button {
-                        customSongTitle = item.displayTitle
-                        customArtistName = item.artist ?? ""
-                        showManualSearchSheet = true
-                    } label: {
-                        Label("Search Lyrics", systemImage: "magnifyingglass")
-                            .font(.subheadline.weight(.semibold))
-                    }
-                    .buttonStyle(.bordered)
-                    .tint(.white)
-
-                    Button {
-                        onOpenGeniusWeb(item.displayTitle, item.artist ?? "")
-                    } label: {
-                        Label("Open Genius", systemImage: "safari")
-                            .font(.subheadline.weight(.semibold))
-                    }
-                    .buttonStyle(.bordered)
-                    .tint(.white)
-                }
+                .padding(.top, 2)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-
-    private var manualLyricsSearchSheet: some View {
-        NavigationStack {
-            Form {
-                Section("Match Song & Artist") {
-                    TextField("Song Title", text: $customSongTitle)
-                    TextField("Artist Name", text: $customArtistName)
-                }
-                Section {
-                    Button("Fetch Synced Lyrics") {
-                        showManualSearchSheet = false
-                        lyricsService.loadLyricsIfNeeded(
-                            for: item,
-                            forceReload: true,
-                            customTitle: customSongTitle,
-                            customArtist: customArtistName
-                        )
-                    }
-                    .fontWeight(.semibold)
-                }
-
-                Section {
-                    TextEditor(text: $customLyricsPasteText)
-                        .frame(minHeight: 140)
-                        .font(.subheadline)
-                    Button("Save Pasted Lyrics / .LRC") {
-                        if lyricsService.saveCustomLyrics(
-                            for: item,
-                            text: customLyricsPasteText,
-                            titleOverride: customSongTitle,
-                            artistOverride: customArtistName
-                        ) {
-                            customLyricsPasteText = ""
-                            showManualSearchSheet = false
-                        }
-                    }
-                    .fontWeight(.semibold)
-                    .disabled(customLyricsPasteText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                } header: {
-                    Text("Or Paste Lyrics / .LRC")
-                } footer: {
-                    Text("Supports time-synced [mm:ss.xx] .lrc timestamps or plain text. Saved offline for this song.")
-                }
-            }
-            .navigationTitle("Find Lyrics")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel") { showManualSearchSheet = false }
-                }
-            }
-        }
-        .presentationDetents([.medium, .large])
     }
 
     // MARK: - Playback Clock Interpolation & Helpers

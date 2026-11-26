@@ -408,17 +408,46 @@ enum SongAudioListener {
         let totalDuration = curve.map { Double($0.envelope.count) * $0.frameDurationSeconds } ?? lyrics.expectedDurationSeconds ?? 180.0
         guard totalDuration > 10 else { return lyrics }
 
-        // Detect first & last true vocal entry from acoustic envelope to skip silent intros/outros.
+        // Detect sustained vocal onset & release (ignoring isolated single-frame drum transients in long intros).
         var firstVocalSec: Double = min(4.0, totalDuration * 0.08)
         var lastVocalSec: Double = max(firstVocalSec + 6.0, totalDuration - min(5.0, totalDuration * 0.05))
         if let curve, curve.envelope.count >= 40 {
             let dt = curve.frameDurationSeconds
-            if let firstIdx = curve.envelope.firstIndex(where: { $0 > 0.12 }) {
+            let winFrames = 12 // 1.2s sustained vocal window
+            var sustainedStartIdx: Int?
+            if curve.envelope.count > winFrames {
+                for i in 0...(curve.envelope.count - winFrames) {
+                    let slice = curve.envelope[i..<(i + winFrames)]
+                    let mean = slice.reduce(0, +) / Double(winFrames)
+                    let activeCount = slice.filter { $0 > 0.06 }.count
+                    if mean > -0.02 && activeCount >= 5 {
+                        sustainedStartIdx = i
+                        break
+                    }
+                }
+            }
+            if let sustainedStartIdx {
+                firstVocalSec = max(0, Double(sustainedStartIdx) * dt - 0.3)
+            } else if let firstIdx = curve.envelope.firstIndex(where: { $0 > 0.12 }) {
                 firstVocalSec = max(0, Double(firstIdx) * dt - 0.3)
             }
-            if let lastIdx = curve.envelope.lastIndex(where: { $0 > 0.12 }) {
-                lastVocalSec = min(totalDuration, max(firstVocalSec + 6.0, Double(lastIdx) * dt + 0.8))
+
+            if curve.envelope.count > winFrames {
+                for i in stride(from: curve.envelope.count - winFrames, through: 0, by: -1) {
+                    let slice = curve.envelope[i..<(i + winFrames)]
+                    let mean = slice.reduce(0, +) / Double(winFrames)
+                    let activeCount = slice.filter { $0 > 0.05 }.count
+                    if mean > -0.05 && activeCount >= 4 {
+                        lastVocalSec = min(totalDuration, max(firstVocalSec + 6.0, Double(i + winFrames) * dt + 0.5))
+                        break
+                    }
+                }
             }
+        }
+        if let heardFirst = heard?.first(where: { $0.time > 0.4 }),
+           heardFirst.time < totalDuration * 0.45,
+           heardFirst.time > firstVocalSec {
+            firstVocalSec = max(0, heardFirst.time - 0.35)
         }
 
         // Find monotonic anchors between line indices and actual heard vocal timestamps.
@@ -481,6 +510,39 @@ enum SongAudioListener {
             cumWeights[i + 1] = cumWeights[i] + weights[i]
         }
 
+        // Map normalized progress [0, 1] onto acoustic vocal-band energy curve between anchors
+        // so lines naturally linger/pause across instrumental bridges even when Speech missed words.
+        func energyWarpedTime(between startTime: Double, and endTime: Double, fraction: Double) -> Double {
+            let f = min(1.0, max(0.0, fraction))
+            guard f > 0, f < 1, endTime - startTime > 3.0, let curve, !curve.envelope.isEmpty else {
+                return startTime + (endTime - startTime) * f
+            }
+            let dt = curve.frameDurationSeconds
+            let i0 = max(0, min(curve.envelope.count - 1, Int(startTime / dt)))
+            let i1 = max(i0 + 1, min(curve.envelope.count, Int(endTime / dt)))
+            guard i1 > i0 + 1 else {
+                return startTime + (endTime - startTime) * f
+            }
+            var cumEnergy = [Double](repeating: 0, count: i1 - i0 + 1)
+            for k in 0..<(i1 - i0) {
+                let v = curve.envelope[i0 + k] // [-1, +1]
+                let vocalWeight = v > -0.05 ? (0.35 + max(0, v)) : 0.10
+                cumEnergy[k + 1] = cumEnergy[k] + vocalWeight
+            }
+            let totalEnergy = cumEnergy.last ?? 0
+            guard totalEnergy > 0.1 else {
+                return startTime + (endTime - startTime) * f
+            }
+            let targetEnergy = totalEnergy * f
+            for k in 0..<(cumEnergy.count - 1) where cumEnergy[k + 1] >= targetEnergy {
+                let segSpan = max(1e-6, cumEnergy[k + 1] - cumEnergy[k])
+                let sub = (targetEnergy - cumEnergy[k]) / segSpan
+                let t = (Double(i0 + k) + sub) * dt
+                return min(endTime, max(startTime, t))
+            }
+            return endTime
+        }
+
         func timeForLine(_ idx: Int) -> Double {
             if let exact = indexAnchors.first(where: { $0.lineIdx == idx }) {
                 return exact.fileTime
@@ -495,7 +557,7 @@ enum SongAudioListener {
 
             let spanWeight = max(1.0, cumWeights[endLine] - cumWeights[startLine])
             let relWeight = max(0, cumWeights[idx] - cumWeights[startLine])
-            return startTime + (endTime - startTime) * (relWeight / spanWeight)
+            return energyWarpedTime(between: startTime, and: endTime, fraction: relWeight / spanWeight)
         }
 
         var syncedLines: [SyncedLyricLine] = []
@@ -517,7 +579,7 @@ enum SongAudioListener {
         }
 
         let note = indexAnchors.isEmpty
-            ? "AI vocal-span real-time sync"
+            ? "AI vocal-energy real-time sync"
             : "AI audio-synced (\(indexAnchors.count) vocal anchors)"
         return ResolvedTrackLyrics(
             cacheKey: lyrics.cacheKey,
@@ -530,6 +592,97 @@ enum SongAudioListener {
             tempoScale: 1.0,
             expectedDurationSeconds: totalDuration,
             lines: syncedLines
+        )
+    }
+
+    /// Generates time-synced lyrics directly from the whole-song AI Speech transcription when
+    /// an unreleased or local song does not exist in any online lyrics database.
+    static func buildSyncedLyricsFromHeard(
+        _ heard: [HeardWord],
+        trackTitle: String,
+        artistName: String,
+        cacheKey: String,
+        duration: Double?
+    ) -> ResolvedTrackLyrics? {
+        let words = heard
+            .filter { !$0.token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            .sorted { $0.time < $1.time }
+        guard words.count >= 4 else { return nil }
+
+        let totalDur = max(duration ?? 0, (words.last?.time ?? 0) + 4.0)
+        var groups: [[HeardWord]] = []
+        var cur: [HeardWord] = []
+        for w in words {
+            if let prev = cur.last {
+                let gap = w.time - prev.time
+                if gap >= 0.95 || cur.count >= 8 {
+                    groups.append(cur)
+                    cur = [w]
+                } else {
+                    cur.append(w)
+                }
+            } else {
+                cur.append(w)
+            }
+        }
+        if !cur.isEmpty { groups.append(cur) }
+
+        var lines: [SyncedLyricLine] = []
+        if let firstTime = groups.first?.first?.time, firstTime > 5.5 {
+            lines.append(SyncedLyricLine(
+                startTime: 0.4,
+                endTime: max(1.0, firstTime - 0.35),
+                text: "",
+                words: [],
+                isInstrumentalBreak: true
+            ))
+        }
+
+        for (idx, group) in groups.enumerated() {
+            guard let first = group.first, let last = group.last else { continue }
+            let nextStart: Double = {
+                if idx + 1 < groups.count, let nf = groups[idx + 1].first {
+                    return nf.time
+                }
+                return min(totalDur, last.time + 2.5)
+            }()
+            let lineEnd = min(totalDur, max(first.time + 0.35, min(last.time + 0.45, nextStart - 0.08)))
+            let wordTimings = group.enumerated().map { wIdx, w in
+                let wNext = (wIdx + 1 < group.count) ? group[wIdx + 1].time : lineEnd
+                let wEnd = max(w.time + 0.08, min(lineEnd, wNext))
+                return LyricWordTiming(text: w.token, startTime: w.time, endTime: wEnd)
+            }
+            lines.append(SyncedLyricLine(
+                startTime: first.time,
+                endTime: lineEnd,
+                text: group.map(\.token).joined(separator: " "),
+                words: wordTimings,
+                isInstrumentalBreak: false
+            ))
+            let gap = nextStart - lineEnd
+            if idx + 1 < groups.count && gap >= 7.0 {
+                lines.append(SyncedLyricLine(
+                    startTime: lineEnd + 0.35,
+                    endTime: max(lineEnd + 1.0, nextStart - 0.35),
+                    text: "",
+                    words: [],
+                    isInstrumentalBreak: true
+                ))
+            }
+        }
+
+        guard !lines.isEmpty else { return nil }
+        return ResolvedTrackLyrics(
+            cacheKey: cacheKey,
+            trackTitle: trackTitle,
+            artistName: artistName.isEmpty ? "Unknown Artist" : artistName,
+            isTimeSynced: true,
+            sourceLabel: "AI Whole-Song Lyrics",
+            attributionText: "AI transcribed whole song automatically",
+            syncedOffsetSeconds: 0,
+            tempoScale: 1.0,
+            expectedDurationSeconds: totalDur,
+            lines: lines
         )
     }
 

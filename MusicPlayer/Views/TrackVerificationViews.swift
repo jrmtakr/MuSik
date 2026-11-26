@@ -9,17 +9,11 @@ struct VerifyTrackArtistSheet: View {
     var onConfirmed: ((String, String) -> Void)? = nil
 
     @State private var wholeSongAI = WholeSongAIService.shared
-    @State private var songIDService = SongIdentificationService.shared
-    @State private var isRunningShazamAI = false
-    @State private var shazamStatusNote: String?
     @State private var searchQuery: String
     @State private var customArtistInput: String = ""
     @State private var isSearching = false
-    @State private var isListeningVocals = false
     @State private var hasRunInitialSearch = false
     @State private var verificationResult: TrackVerificationResult?
-    @State private var vocalTranscript: String?
-    @State private var vocalErrorMessage: String?
     @State private var applyCleanTitle = true
     @State private var saveCoverArtIfMissing = true
 
@@ -152,75 +146,6 @@ struct VerifyTrackArtistSheet: View {
                 .disabled(isSearching || searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
 
-            Button {
-                Task { await runVocalClipScan() }
-            } label: {
-                HStack {
-                    if isListeningVocals {
-                        ProgressView()
-                            .padding(.trailing, 4)
-                        Text("Listening to vocal chorus...")
-                    } else {
-                        Label("Match by Hearing Song Vocals", systemImage: "waveform")
-                    }
-                }
-                .font(.subheadline.weight(.semibold))
-            }
-            .disabled(isListeningVocals)
-
-            Button {
-                wholeSongAI.startWholeSongListen(for: liveItem, force: true)
-            } label: {
-                VStack(alignment: .leading, spacing: 6) {
-                    if wholeSongAI.isListening(to: liveItem) {
-                        HStack {
-                            ProgressView()
-                                .padding(.trailing, 4)
-                            Text(wholeSongAI.statusMessage ?? "AI listening to whole song...")
-                        }
-                        ProgressView(value: max(0.02, wholeSongAI.progressFraction))
-                    } else {
-                        Label("AI Listen Whole Song & Identify", systemImage: "waveform.and.magnifyingglass")
-                    }
-                }
-                .font(.subheadline.weight(.semibold))
-            }
-            .disabled(wholeSongAI.isListening(to: liveItem))
-
-            Button {
-                Task {
-                    isRunningShazamAI = true
-                    shazamStatusNote = nil
-                    let found = await songIDService.identifyNow(liveItem)
-                    isRunningShazamAI = false
-                    if let found {
-                        searchQuery = "\(found.artist) \(found.title)"
-                        shazamStatusNote = "Shazam AI: \(found.title) — \(found.artist)" + (found.album.map { " (\($0))" } ?? "")
-                        await runVerificationLookup()
-                    } else {
-                        shazamStatusNote = songIDService.lastStatus ?? "Could not match acoustically — try lyrics search above."
-                    }
-                }
-            } label: {
-                HStack {
-                    if isRunningShazamAI || songIDService.isIdentifying(liveItem) {
-                        ProgressView()
-                            .padding(.trailing, 4)
-                        Text(songIDService.lastStatus ?? "Shazam AI fingerprinting full song...")
-                    } else {
-                        Label("Identify with Shazam AI", systemImage: "shazam.logo.fill")
-                    }
-                }
-                .font(.subheadline.weight(.semibold))
-            }
-            .disabled(isRunningShazamAI)
-
-            if let shazamStatusNote {
-                Text(shazamStatusNote)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            }
-
             Toggle("Also clean up Song Title when confirming", isOn: $applyCleanTitle)
             if mediaManager.thumbnails[liveItem.relativePath] == nil {
                 Toggle("Save Album Art if missing", isOn: $saveCoverArtIfMissing)
@@ -241,12 +166,7 @@ struct VerifyTrackArtistSheet: View {
                     Text(aiErr)
                         .foregroundStyle(.orange)
                 }
-                if let transcript = vocalTranscript, !transcript.isEmpty {
-                    Text("Heard vocals: \"\(transcript)\"")
-                } else if let vocalErrorMessage {
-                    Text(vocalErrorMessage)
-                        .foregroundStyle(.orange)
-                } else if let ytCap = verificationResult?.youtubeCaptionSnippet {
+                if let ytCap = verificationResult?.youtubeCaptionSnippet {
                     Text("Found YouTube lyrics caption: \"\(ytCap)\"")
                 }
             }
@@ -339,65 +259,16 @@ struct VerifyTrackArtistSheet: View {
 
     private func runVerificationLookup() async {
         isSearching = true
-        vocalErrorMessage = nil
         let result = await TrackVerificationService.verifyTrack(
             rawTitle: searchQuery,
             rawArtist: nil,
             localDuration: liveItem.durationSeconds,
             sourceVideoID: mediaManager.sourceVideoID(for: liveItem),
-            extraLyricSnippet: vocalTranscript,
+            extraLyricSnippet: wholeSongAI.result(for: liveItem)?.heardExcerpt,
             ignoredChannels: wrapped.ignoredChannels
         )
         verificationResult = result
         isSearching = false
-    }
-
-    private func runVocalClipScan() async {
-        isListeningVocals = true
-        vocalErrorMessage = nil
-
-        if mediaManager.currentItem?.relativePath == liveItem.relativePath {
-            let liveCapture = await LiveAudioLyricsAI.capturePlaybackTranscript(
-                for: liveItem,
-                playbackTime: mediaManager.currentTime,
-                equalizerPlayer: mediaManager.equalizerPlayer,
-                isEQPlaying: mediaManager.equalizerPlayer.isPlaying,
-                playbackRate: mediaManager.playbackRate
-            )
-            if !liveCapture.transcript.isEmpty {
-                vocalTranscript = liveCapture.transcript
-                let result = await TrackVerificationService.verifyTrack(
-                    rawTitle: searchQuery,
-                    rawArtist: liveItem.artist,
-                    localDuration: liveItem.durationSeconds,
-                    sourceVideoID: mediaManager.sourceVideoID(for: liveItem),
-                    extraLyricSnippet: liveCapture.transcript,
-                    ignoredChannels: wrapped.ignoredChannels
-                )
-                verificationResult = result
-                isListeningVocals = false
-                return
-            }
-        }
-
-        let scan = await TrackVerificationService.identifyFromVocalClip(
-            audioURL: liveItem.fileURL,
-            durationSeconds: liveItem.durationSeconds,
-            titleHint: searchQuery,
-            rawArtist: liveItem.artist,
-            sourceVideoID: mediaManager.sourceVideoID(for: liveItem),
-            ignoredChannels: wrapped.ignoredChannels
-        )
-        isListeningVocals = false
-        if let err = scan.errorMessage {
-            vocalErrorMessage = err
-        }
-        if let transcript = scan.transcript {
-            vocalTranscript = transcript
-        }
-        if let verification = scan.verification {
-            verificationResult = verification
-        }
     }
 
     private func confirmCandidate(_ cand: TrackVerificationCandidate) {

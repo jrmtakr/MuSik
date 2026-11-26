@@ -583,12 +583,30 @@ final class SyncedLyricsService {
         }
 
         // Don't lock in clearly wrong lyrics if the audio contradicted the candidate.
-        guard var selected = bestCandidate, bestScore > -0.5 else { return false }
-        if !item.isHLS {
-            selected = await SongAudioListener.autoAlign(lyrics: selected, heard: heard, fileURL: item.fileURL)
+        if var selected = bestCandidate, bestScore > -0.5 {
+            if !item.isHLS {
+                selected = await SongAudioListener.autoAlign(lyrics: selected, heard: heard, fileURL: item.fileURL)
+            }
+            storeAlignedLyrics(selected, for: item)
+            return true
         }
-        storeAlignedLyrics(selected, for: item)
-        return true
+
+        // Unreleased / offline-only song fallback: build real-time synced lyrics from whole-song AI Speech transcription.
+        if let heard, heard.count >= 4 {
+            let finalTitle = split.song.isEmpty ? item.displayTitle : split.song
+            let finalArtist = split.artist.isEmpty ? (item.artist ?? "Unknown Artist") : split.artist
+            if let transcribed = SongAudioListener.buildSyncedLyricsFromHeard(
+                heard,
+                trackTitle: finalTitle,
+                artistName: finalArtist,
+                cacheKey: cacheKey(for: item),
+                duration: duration ?? item.durationSeconds
+            ) {
+                storeAlignedLyrics(transcribed, for: item)
+                return true
+            }
+        }
+        return false
     }
 
     /// Saves lyrics that were already re-timed against this exact file, so playback uses them as-is
@@ -1107,15 +1125,25 @@ final class SyncedLyricsService {
         song: String,
         artist: String
     ) async -> ResolvedTrackLyrics? {
+        await fetchGeniusTrackDetails(cacheKey: cacheKey, song: song, artist: artist)?.lyrics
+    }
+
+    func fetchGeniusTrackDetails(
+        cacheKey: String = "genius_lookup",
+        song: String,
+        artist: String
+    ) async -> (title: String, artist: String, album: String?, lyrics: ResolvedTrackLyrics)? {
         let querySong = Self.normalizeSmartPunctuation(song)
-        let queryArtist = Self.normalizeSmartPunctuation(artist)
+        let rawArtist = Self.normalizeSmartPunctuation(artist)
+        let canonicalArtist = ArtistDatabase.canonicalizeSingle(rawArtist)
+        let queryArtist = canonicalArtist.isEmpty ? rawArtist : canonicalArtist
         let coreSong = Self.extractCoreSongTitle(querySong)
 
         let combined = [queryArtist, querySong].filter { !$0.isEmpty }.joined(separator: " ")
         if let primaryHit = await findBestGeniusHit(query: combined, targetSong: querySong, coreSong: coreSong, targetArtist: queryArtist),
            primaryHit.score >= 35 {
-            if let fetched = await loadGeniusPage(hit: primaryHit, cacheKey: cacheKey) {
-                return fetched
+            if let loaded = await loadGeniusPageWithAlbum(hit: primaryHit, cacheKey: cacheKey) {
+                return loaded
             }
         }
 
@@ -1124,8 +1152,8 @@ final class SyncedLyricsService {
         if !queryArtist.isEmpty, !titleQuery.isEmpty, titleQuery.lowercased() != combined.lowercased(),
            let rescueHit = await findBestGeniusHit(query: titleQuery, targetSong: querySong, coreSong: coreSong, targetArtist: queryArtist),
            rescueHit.score >= 42 {
-            if let fetched = await loadGeniusPage(hit: rescueHit, cacheKey: cacheKey) {
-                return fetched
+            if let loaded = await loadGeniusPageWithAlbum(hit: rescueHit, cacheKey: cacheKey) {
+                return loaded
             }
         }
 
@@ -1199,6 +1227,13 @@ final class SyncedLyricsService {
         hit: (url: URL, title: String, artist: String, score: Int),
         cacheKey: String
     ) async -> ResolvedTrackLyrics? {
+        await loadGeniusPageWithAlbum(hit: hit, cacheKey: cacheKey)?.lyrics
+    }
+
+    private func loadGeniusPageWithAlbum(
+        hit: (url: URL, title: String, artist: String, score: Int),
+        cacheKey: String
+    ) async -> (title: String, artist: String, album: String?, lyrics: ResolvedTrackLyrics)? {
         var pageReq = URLRequest(url: hit.url)
         pageReq.timeoutInterval = 12
         pageReq.setValue(WebMediaDownloader.browserUserAgent, forHTTPHeaderField: "User-Agent")
@@ -1218,16 +1253,40 @@ final class SyncedLyricsService {
         let parsed = Self.parseLRCOrPlain(text: plain, duration: nil)
         guard !parsed.lines.isEmpty else { return nil }
 
-        return ResolvedTrackLyrics(
+        let extractedAlbum: String? = {
+            let patterns = [
+                #"\\"(?:primaryAlbum|album)\\"\s*:\s*\{[^}]*\\"name\\"\s*:\s*\\"([^"\\]+)\\""#,
+                #""(?:primaryAlbum|album)"\s*:\s*\{[^}]*"name"\s*:\s*"([^"]+)""#
+            ]
+            let fullRange = NSRange(location: 0, length: (html as NSString).length)
+            for pat in patterns {
+                if let regex = try? NSRegularExpression(pattern: pat),
+                   let m = regex.firstMatch(in: html, range: fullRange),
+                   m.numberOfRanges > 1 {
+                    let raw = (html as NSString).substring(with: m.range(at: 1)).trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !raw.isEmpty {
+                        return Self.decodeHTMLEntities(raw)
+                    }
+                }
+            }
+            return nil
+        }()
+
+        let cleanTitle = hit.title.replacingOccurrences(of: #"\*+$"#, with: "", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanArtist = ArtistDatabase.canonicalizeSingle(hit.artist)
+
+        let resolved = ResolvedTrackLyrics(
             cacheKey: cacheKey,
-            trackTitle: hit.title,
-            artistName: hit.artist,
+            trackTitle: cleanTitle.isEmpty ? hit.title : cleanTitle,
+            artistName: cleanArtist.isEmpty ? hit.artist : cleanArtist,
             isTimeSynced: false,
             sourceLabel: "Plain Lyrics",
             attributionText: "Lyrics via Genius",
             syncedOffsetSeconds: 0,
             lines: parsed.lines
         )
+        return (resolved.trackTitle, resolved.artistName, extractedAlbum, resolved)
     }
 
     // MARK: - YouTube Creator-Uploaded Timed Subtitles Fallback (Non-ASR)
@@ -1699,7 +1758,10 @@ final class SyncedLyricsService {
                 .replacingOccurrences(of: #"</(?:div|p|li)>"#, with: "\n", options: [.regularExpression, .caseInsensitive])
                 .replacingOccurrences(of: #"<[^>]+>"#, with: "", options: .regularExpression)
             snippet = decodeHTMLEntities(snippet)
-            let cleaned = snippet.trimmingCharacters(in: .whitespacesAndNewlines)
+            let cleaned = snippet
+                .replacingOccurrences(of: #"(?im)^\s*\d+\s+Contributors?.*$"#, with: "", options: .regularExpression)
+                .replacingOccurrences(of: #"(?im)^\s*\[(?:intro|verse|chorus|pre-?chorus|post-?chorus|bridge|outro|hook|refrain|interlude|skit|instrumental|break|part\s+\w+)[^\]]*\]\s*$"#, with: "", options: .regularExpression)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
             if !cleaned.isEmpty {
                 chunks.append(cleaned)
             }

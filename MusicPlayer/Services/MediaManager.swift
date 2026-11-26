@@ -686,11 +686,6 @@ final class MediaManager {
 
     func markAIAnalysisPendingIfNeeded(for item: MediaItem, flushState: Bool = true) {
         guard !item.relativePath.hasPrefix("__remote__/"), !item.isHLS else { return }
-        let autoIDEnabled = (UserDefaults.standard.object(forKey: SongIdentificationService.enabledDefaultsKey) as? Bool) ?? true
-        guard autoIDEnabled else {
-            markAIAnalysisCompleted(relativePath: item.relativePath, flushState: flushState)
-            return
-        }
         var entry = customMetadataByPath[item.relativePath] ?? CustomTrackMetadata()
         if entry.isArtistVerified == true && entry.autoIdentifiedSource == nil {
             return

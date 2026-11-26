@@ -890,58 +890,6 @@ struct NowPlayingView: View {
             } else {
                 Menu {
                     Button {
-                        lyricsService.recognizeAndAlignWithAI(
-                            for: item,
-                            playbackTime: mediaManager.currentTime,
-                            equalizerPlayer: mediaManager.equalizerPlayer,
-                            isEQPlaying: mediaManager.equalizerPlayer.isPlaying,
-                            playbackRate: mediaManager.playbackRate,
-                            forceReidentify: false
-                        )
-                    } label: {
-                        Label("AI Listen & Auto-Sync Lyrics", systemImage: "waveform.and.magnifyingglass")
-                    }
-
-                    Button {
-                        lyricsService.recognizeAndAlignWithAI(
-                            for: item,
-                            playbackTime: mediaManager.currentTime,
-                            equalizerPlayer: mediaManager.equalizerPlayer,
-                            isEQPlaying: mediaManager.equalizerPlayer.isPlaying,
-                            playbackRate: mediaManager.playbackRate,
-                            forceReidentify: true
-                        )
-                    } label: {
-                        Label("AI Re-Identify Song by Audio", systemImage: "sparkles")
-                    }
-
-                    Button {
-                        lyricsService.loadLyricsIfNeeded(for: item, forceReload: true)
-                    } label: {
-                        Label("Reload Synced Lyrics", systemImage: "arrow.clockwise")
-                    }
-
-                    if lyricsService.currentLyrics?.isTimeSynced == true {
-                        Button {
-                            lyricsService.adjustTimingOffset(by: -0.5)
-                        } label: {
-                            Label("Timing -0.5s (Earlier)", systemImage: "minus.circle")
-                        }
-                        Button {
-                            lyricsService.adjustTimingOffset(by: 0.5)
-                        } label: {
-                            Label("Timing +0.5s (Later)", systemImage: "plus.circle")
-                        }
-                        Button {
-                            lyricsService.resetTimingOffset()
-                        } label: {
-                            Label("Reset Timing Offset", systemImage: "clock.arrow.circlepath")
-                        }
-                    }
-
-                    Divider()
-
-                    Button {
                         lyricsTarget = GeniusLyricsTarget(
                             rawTitle: item.displayTitle,
                             rawArtist: item.artist ?? ""

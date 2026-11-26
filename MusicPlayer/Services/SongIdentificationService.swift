@@ -1,3 +1,4 @@
+import AVFoundation
 import Foundation
 import Observation
 @preconcurrency import Speech
@@ -176,7 +177,7 @@ final class SongIdentificationService {
         sourcePlatform: ExternalPlaylistPlatform? = nil,
         jobID: UUID?
     ) {
-        guard isEnabled, !item.isHLS else {
+        guard !item.isHLS else {
             MediaManager.shared.markAIAnalysisCompleted(relativePath: item.relativePath)
             return
         }
@@ -369,14 +370,26 @@ final class SongIdentificationService {
             MediaManager.shared.markAIAnalysisCompleted(relativePath: request.relativePath)
         }
         guard FileManager.default.fileExists(atPath: request.fileURL.path) else { return nil }
-        progressByPath[request.relativePath] = 0.08
-        stepLabelByPath[request.relativePath] = "Checking track metadata..."
-        lastStatus = "Shazam AI analyzing \"\(request.hintTitle)\"..."
+        updateTrackStep(path: request.relativePath, progress: 0.08, label: "Reading track tags & metadata...")
+        lastStatus = "AI analyzing \"\(request.hintTitle)\"..."
+
+        let embedded = await Self.readEmbeddedMetadata(from: request.fileURL)
+        let seedTitle = (embedded.title?.isEmpty == false ? embedded.title! : request.hintTitle)
+        let seedArtist = (embedded.artist?.isEmpty == false ? embedded.artist! : request.hintArtist)
+        let fileParsed = ArtistDatabase.parseTrackHints(
+            rawTitle: seedTitle,
+            rawArtistTag: seedArtist.isEmpty ? nil : seedArtist,
+            fileName: request.fileURL.lastPathComponent,
+            ignoredChannels: ListeningWrappedService.shared.ignoredChannels
+        )
+        let bestSeedTitle = fileParsed.songTitle.isEmpty ? seedTitle : fileParsed.songTitle
+        let bestSeedArtist = (fileParsed.artistHint ?? (seedArtist.isEmpty ? nil : ArtistDatabase.canonicalizeSingle(seedArtist))) ?? ""
+        let fileAlbumOrProject = (embedded.album?.isEmpty == false ? embedded.album : nil) ?? fileParsed.albumHint
 
         var song = await identify(
             fileURL: request.fileURL,
-            hintTitle: request.hintTitle,
-            hintArtist: request.hintArtist,
+            hintTitle: bestSeedTitle,
+            hintArtist: bestSeedArtist,
             durationSeconds: request.durationSeconds,
             sourceVideoID: request.sourceVideoID,
             sourcePlatform: request.sourcePlatform
@@ -385,12 +398,11 @@ final class SongIdentificationService {
         // Listen to the whole song: confirm the name from the sung lyrics, identify unknown uploads
         // with Shazam acoustic matching, and align lyrics with this exact recording before playback.
         await Self.ensureSpeechPermissionIfPossible()
-        progressByPath[request.relativePath] = 0.15
-        stepLabelByPath[request.relativePath] = "AI listening to whole song..."
-        lastStatus = "Listening to whole song: \"\(song?.title ?? request.hintTitle)\"..."
+        updateTrackStep(path: request.relativePath, progress: 0.15, label: "AI listening to whole song...")
+        lastStatus = "Listening to whole song: \"\(song?.title ?? bestSeedTitle)\"..."
 
         let capturedPath = request.relativePath
-        let capturedLabelTitle = song?.title ?? request.hintTitle
+        let capturedLabelTitle = song?.title ?? bestSeedTitle
         let heard = await SongAudioListener.listen(to: request.fileURL) { [weak self] chunkIdx, totalChunks, totalSeconds in
             Task { @MainActor in
                 let frac = 0.15 + 0.52 * (Double(chunkIdx) / Double(max(1, totalChunks)))
@@ -424,8 +436,7 @@ final class SongIdentificationService {
         }
 
         if song == nil, let heard {
-            progressByPath[request.relativePath] = 0.72
-            stepLabelByPath[request.relativePath] = "Matching heard lyrics..."
+            updateTrackStep(path: request.relativePath, progress: 0.72, label: "Matching heard lyrics...")
             if let byLyrics = await identifyFromHeardLyrics(heard, localDuration: request.durationSeconds) {
                 song = byLyrics.song
                 lyricsToAlign = byLyrics.lyrics
@@ -434,59 +445,133 @@ final class SongIdentificationService {
 
         // Shazam acoustic constellation + heard-lyric + iTunes official preview matcher across the whole song.
         if song == nil {
-            progressByPath[request.relativePath] = 0.78
-            stepLabelByPath[request.relativePath] = "Running Shazam AI acoustic match..."
+            updateTrackStep(path: request.relativePath, progress: 0.77, label: "Running Shazam AI acoustic match...")
             lastStatus = "Running Shazam AI acoustic fingerprint..."
             if case .match(let shazamSong) = await ShazamFingerprintEngine.shared.recognize(
                 fileURL: request.fileURL,
                 durationHint: request.durationSeconds,
-                seedHintTitle: request.hintTitle,
-                seedHintArtist: request.hintArtist,
+                seedHintTitle: bestSeedTitle,
+                seedHintArtist: bestSeedArtist,
                 heardWords: heard
             ) {
                 song = shazamSong
             }
         }
 
+        // Unreleased / leak song rescue via Genius (matches unreleased catalog such as Kanye West / Ye leaks).
+        if song == nil, !bestSeedTitle.isEmpty {
+            updateTrackStep(path: request.relativePath, progress: 0.81, label: "Checking unreleased catalog & lyrics...")
+            if let geniusHit = await SyncedLyricsService.shared.fetchGeniusTrackDetails(
+                song: bestSeedTitle,
+                artist: bestSeedArtist
+            ) {
+                var acceptable = true
+                if let heard, !heard.isEmpty {
+                    if case .contradicted = SongAudioListener.verdict(heard: heard, lyrics: geniusHit.lyrics) {
+                        acceptable = false
+                    }
+                }
+                if acceptable {
+                    let releaseAlbum = Self.normalizeReleaseLabel(
+                        geniusHit.album ?? fileAlbumOrProject,
+                        fallbackWhenNoAlbum: fileParsed.isExplicitSingle ? "Single" : "Unknown Single"
+                    )
+                    song = IdentifiedSong(
+                        title: geniusHit.title,
+                        artist: geniusHit.artist,
+                        album: releaseAlbum,
+                        genre: ArtistDatabase.genre(forArtist: geniusHit.artist),
+                        isrc: nil,
+                        artworkURL: nil,
+                        durationSeconds: request.durationSeconds,
+                        source: "Genius Unreleased Match"
+                    )
+                    lyricsToAlign = geniusHit.lyrics
+                }
+            }
+        }
+
         let heardExcerpt = heard.map { $0.prefix(16).map(\.token).joined(separator: " ") }
         let heardCount = heard?.count ?? 0
 
-        guard let finalSong = song else {
-            // Even when metadata doesn't warrant renaming the track, still check the audio & align
-            // real-time lyrics if a real title/hint is known and matches what was heard.
-            progressByPath[request.relativePath] = 0.88
-            stepLabelByPath[request.relativePath] = "Syncing & aligning lyrics..."
+        guard var finalSong = song else {
+            // Even when a song isn't in any database, preserve/apply on-file song name & artist,
+            // classify album vs Unknown Single cleanly, extract local artwork/frame, and sync/transcribe lyrics.
+            updateTrackStep(path: request.relativePath, progress: 0.88, label: "Saving file metadata & syncing lyrics...")
+            let fallbackTitle = bestSeedTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ? (request.fileURL.deletingPathExtension().lastPathComponent)
+                : bestSeedTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+            let fallbackArtist = bestSeedArtist.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ? "Unknown Artist"
+                : bestSeedArtist.trimmingCharacters(in: .whitespacesAndNewlines)
+            let fallbackAlbum: String = {
+                if let explicitProj = fileAlbumOrProject, !explicitProj.isEmpty {
+                    return explicitProj
+                }
+                return fileParsed.isExplicitSingle ? "Single" : "Unknown Single"
+            }()
+            let fallbackGenre = (fallbackArtist != "Unknown Artist") ? ArtistDatabase.genre(forArtist: fallbackArtist) : nil
+            let existingThumb = MediaManager.shared.thumbnails[request.relativePath]
+            let frameCover: UIImage? = (existingThumb == nil)
+                ? await Task.detached(priority: .utility) { FFmpegMediaService.extractArtworkOrFrame(from: request.fileURL, at: 2.0, maxDimension: 640) }.value
+                : nil
+
+            if fallbackArtist != "Unknown Artist" || fallbackTitle != request.hintTitle || frameCover != nil || !fallbackAlbum.isEmpty {
+                _ = MediaManager.shared.applyAutoIdentifiedMetadata(
+                    relativePath: request.relativePath,
+                    title: fallbackTitle,
+                    artist: fallbackArtist,
+                    album: fallbackAlbum,
+                    genre: fallbackGenre,
+                    isrc: nil,
+                    coverImage: frameCover,
+                    source: "On-File AI Analysis",
+                    forceOverwriteVerified: allowOverwriteVerified
+                )
+            }
+
             var alignedDuringImport = false
-            if let item = MediaManager.shared.items.first(where: { $0.relativePath == request.relativePath }),
-               !request.hintTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            if let item = MediaManager.shared.items.first(where: { $0.relativePath == request.relativePath }) {
                 alignedDuringImport = await SyncedLyricsService.shared.fetchAndAlignDuringImport(
                     item: item,
-                    title: request.hintTitle,
-                    artist: request.hintArtist,
+                    title: fallbackTitle,
+                    artist: fallbackArtist == "Unknown Artist" ? "" : fallbackArtist,
                     duration: request.durationSeconds,
                     heard: heard
                 )
             }
             WholeSongAIService.shared.markCompletedFromImport(
                 relativePath: request.relativePath,
-                title: request.hintTitle,
-                album: nil,
-                artist: request.hintArtist.isEmpty ? nil : request.hintArtist,
-                genre: nil,
+                title: fallbackTitle,
+                album: fallbackAlbum,
+                artist: fallbackArtist,
+                genre: fallbackGenre,
                 heardWordCount: heardCount,
                 heardExcerpt: heardExcerpt,
                 hasLyrics: alignedDuringImport
             )
             progressByPath[request.relativePath] = 1.0
-            lastStatus = "Kept \"\(request.hintTitle)\" and finished whole-song AI analysis"
+            lastStatus = "AI analyzed: \"\(fallbackTitle)\" by \(fallbackArtist) (\(fallbackAlbum))"
             return nil
         }
 
-        progressByPath[request.relativePath] = 0.84
-        stepLabelByPath[request.relativePath] = "Saving verified title, artist & cover..."
+        // Prefer explicit on-file project/album tag (e.g. "Bully") when catalog returned nil or generic empty release;
+        // otherwise classify release cleanly as Album vs "Single" vs "Unknown Single".
+        if finalSong.album?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true {
+            finalSong.album = fileAlbumOrProject ?? (fileParsed.isExplicitSingle ? "Single" : "Single")
+        } else {
+            finalSong.album = Self.normalizeReleaseLabel(finalSong.album, fallbackWhenNoAlbum: fileAlbumOrProject ?? "Single")
+        }
+
+        updateTrackStep(path: request.relativePath, progress: 0.85, label: "Saving verified title, artist & cover...")
         var cover: UIImage?
         if let artURL = finalSong.artworkURL {
             cover = await Self.downloadImage(artURL)
+        }
+        if cover == nil && MediaManager.shared.thumbnails[request.relativePath] == nil {
+            cover = await Task.detached(priority: .utility) {
+                FFmpegMediaService.extractArtworkOrFrame(from: request.fileURL, at: 2.0, maxDimension: 640)
+            }.value
         }
 
         let applied = MediaManager.shared.applyAutoIdentifiedMetadata(
@@ -502,7 +587,7 @@ final class SongIdentificationService {
         )
         if applied {
             identifiedThisSession += 1
-            lastStatus = "Identified \"\(finalSong.title)\" by \(finalSong.artist) (\(finalSong.source))"
+            lastStatus = "Identified \"\(finalSong.title)\" by \(finalSong.artist) (\(finalSong.album ?? "Single"))"
             if let jobID = request.jobID {
                 PlaylistImportManager.shared.noteTrackIdentified(jobID: jobID)
             }
@@ -511,24 +596,26 @@ final class SongIdentificationService {
         // Index this confirmed track into our local Shazam acoustic fingerprint DB.
         let indexFileURL = request.fileURL
         let indexPath = request.relativePath
+        let confirmedSnapshot = finalSong
         Task.detached(priority: .background) {
             await ShazamFingerprintEngine.shared.indexConfirmedTrack(
                 fileURL: indexFileURL,
                 trackKey: indexPath,
-                song: finalSong
+                song: confirmedSnapshot
             )
         }
 
         // Pre-fetch & auto-align lyrics to this exact file during import (Speech anchors + Acoustic vocal alignment)
         // so lyrics always line up immediately on first playback with zero user input.
-        progressByPath[request.relativePath] = 0.92
-        stepLabelByPath[request.relativePath] = "Aligning lyrics across whole song..."
+        updateTrackStep(path: request.relativePath, progress: 0.92, label: "Aligning lyrics across whole song...")
+        var hasFinalLyrics = false
         if let item = MediaManager.shared.items.first(where: { $0.relativePath == request.relativePath }) {
             if let lyrics = lyricsToAlign {
                 let aligned = await SongAudioListener.autoAlign(lyrics: lyrics, heard: heard, fileURL: item.fileURL)
                 SyncedLyricsService.shared.storeAlignedLyrics(aligned, for: item)
+                hasFinalLyrics = true
             } else {
-                await SyncedLyricsService.shared.fetchAndAlignDuringImport(
+                hasFinalLyrics = await SyncedLyricsService.shared.fetchAndAlignDuringImport(
                     item: item,
                     title: finalSong.title,
                     artist: finalSong.artist,
@@ -545,10 +632,49 @@ final class SongIdentificationService {
             genre: finalSong.genre,
             heardWordCount: heardCount,
             heardExcerpt: heardExcerpt,
-            hasLyrics: true
+            hasLyrics: hasFinalLyrics
         )
         progressByPath[request.relativePath] = 1.0
         return applied ? finalSong : nil
+    }
+
+    private static func readEmbeddedMetadata(from url: URL) async -> (title: String?, artist: String?, album: String?) {
+        let ffInfo = await Task.detached(priority: .utility) {
+            FFmpegMediaService.probeMetadata(for: url)
+        }.value
+        var title = ffInfo?.title?.trimmingCharacters(in: .whitespacesAndNewlines)
+        var artist = ffInfo?.artist?.trimmingCharacters(in: .whitespacesAndNewlines)
+        var album = ffInfo?.album?.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if (title?.isEmpty != false) || (artist?.isEmpty != false) || (album?.isEmpty != false) {
+            let asset = AVURLAsset(url: url)
+            if let commonMeta = try? await asset.load(.commonMetadata) {
+                for meta in commonMeta {
+                    let key = meta.commonKey
+                    let strVal = try? await meta.load(.stringValue)?.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard let val = strVal, !val.isEmpty else { continue }
+                    if key == .commonKeyTitle && (title?.isEmpty != false) { title = val }
+                    else if key == .commonKeyArtist && (artist?.isEmpty != false) { artist = val }
+                    else if key == .commonKeyAlbumName && (album?.isEmpty != false) { album = val }
+                }
+            }
+        }
+        return (
+            (title?.isEmpty == false) ? title : nil,
+            (artist?.isEmpty == false) ? artist : nil,
+            (album?.isEmpty == false) ? album : nil
+        )
+    }
+
+    private static func normalizeReleaseLabel(_ raw: String?, fallbackWhenNoAlbum: String) -> String {
+        guard let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else {
+            return fallbackWhenNoAlbum
+        }
+        let lower = trimmed.lowercased()
+        if lower == "single" || lower.hasSuffix(" - single") || lower.hasSuffix(" [single]") || lower.hasSuffix(" (single)") {
+            return "Single"
+        }
+        return trimmed
     }
 
     private static func ensureSpeechPermissionIfPossible() async {
