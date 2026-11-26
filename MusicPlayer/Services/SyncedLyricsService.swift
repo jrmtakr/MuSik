@@ -775,7 +775,7 @@ final class SyncedLyricsService {
     private func fetchSingleLRCLIBObject(url: URL) async -> [String: Any]? {
         var req = URLRequest(url: url)
         req.timeoutInterval = 8
-        req.setValue("MuSeJRM/2.0 (iOS)", forHTTPHeaderField: "User-Agent")
+        req.setValue("MuseJRM/2.0 (iOS)", forHTTPHeaderField: "User-Agent")
         guard let (data, resp) = try? await URLSession.shared.data(for: req),
               let http = resp as? HTTPURLResponse,
               (200...299).contains(http.statusCode),
@@ -788,7 +788,7 @@ final class SyncedLyricsService {
     private func fetchLRCLIBSearchArray(url: URL) async -> [[String: Any]] {
         var req = URLRequest(url: url)
         req.timeoutInterval = 10
-        req.setValue("MuSeJRM/2.0 (iOS)", forHTTPHeaderField: "User-Agent")
+        req.setValue("MuseJRM/2.0 (iOS)", forHTTPHeaderField: "User-Agent")
         guard let (data, resp) = try? await URLSession.shared.data(for: req),
               let http = resp as? HTTPURLResponse,
               (200...299).contains(http.statusCode),

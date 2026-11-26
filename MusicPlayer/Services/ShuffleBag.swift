@@ -18,8 +18,9 @@ struct ShuffleBag {
     /// front), so while it keeps playing it must not be counted as "played" in the new cycle.
     private var carriedOverPath: String?
 
-    /// How many of the most recently played songs are kept out of the start of a new cycle.
-    var recentGuard = 3
+    /// Up to this many of the most recently played songs are kept out of the start of a new cycle
+    /// (capped at a third of the playlist so small playlists still shuffle).
+    var recentGuard = 10
 
     mutating func reset() {
         remaining = []

@@ -220,6 +220,16 @@ final class PlaylistImportManager {
         jobs.filter { !$0.isFinished }
     }
 
+    /// Songs being worked on right now (found on YouTube / downloading), for the "Now caching" list.
+    func inFlightTracks(in job: PlaylistImportJob) -> [PlaylistImportTrackJob] {
+        job.tracks.filter { $0.status == .resolving || $0.status == .downloading }
+    }
+
+    /// The next few songs waiting in line.
+    func upNextTracks(in job: PlaylistImportJob, limit: Int = 3) -> [PlaylistImportTrackJob] {
+        Array(job.tracks.lazy.filter { $0.status == .pending }.prefix(limit))
+    }
+
     var primaryActiveJob: PlaylistImportJob? {
         activeJobs.first(where: { !$0.isPaused }) ?? activeJobs.first
     }
@@ -338,6 +348,15 @@ final class PlaylistImportManager {
 
     private func observeAppLifecycle() {
         NotificationCenter.default.addObserver(
+            forName: UIApplication.willTerminateNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.handleWillTerminate()
+            }
+        }
+        NotificationCenter.default.addObserver(
             forName: UIApplication.didEnterBackgroundNotification,
             object: nil,
             queue: .main
@@ -368,9 +387,13 @@ final class PlaylistImportManager {
         }
         guard activeJobs.contains(where: { !$0.isPaused && !$0.isCancelled }) else { return }
 
+        // Stay awake while locked/backgrounded so songs keep being found, not just downloaded.
+        if !MediaManager.shared.isPlaying {
+            ImportKeepAlive.shared.start()
+        }
         scheduleNextBGProcessingTaskIfNeeded()
         if bgExecutionTaskID == .invalid {
-            bgExecutionTaskID = UIApplication.shared.beginBackgroundTask(withName: "MuSeJRM.PlaylistBgQueue") { [weak self] in
+            bgExecutionTaskID = UIApplication.shared.beginBackgroundTask(withName: "MuseJRM.PlaylistBgQueue") { [weak self] in
                 Task { @MainActor in
                     self?.persistJobsNow()
                     if let self, self.bgExecutionTaskID != .invalid {
@@ -383,11 +406,38 @@ final class PlaylistImportManager {
         ensurePumping()
     }
 
+    /// Swiping MuseJRM away in the app switcher makes iOS stop it (and cancel its downloads) — no app
+    /// can keep running after that. Save the queue right now, synchronously, and leave a notification
+    /// so it's one tap to continue. The import resumes automatically on the next launch.
+    private func handleWillTerminate() {
+        ImportKeepAlive.shared.stop()
+        let snapshot = Array(jobs.prefix(20))
+        if let data = try? JSONEncoder().encode(snapshot) {
+            try? data.write(to: Self.jobsFileURL, options: [.atomic])
+        }
+        MediaManager.shared.flushBatchPlaylistImport(playlistID: nil, summary: nil, reloadLibrary: false)
+
+        let unfinished = activeJobs.filter { !$0.isCancelled }
+        guard let first = unfinished.first else { return }
+        let remaining = unfinished.reduce(0) { $0 + $1.remainingCount }
+        let content = UNMutableNotificationContent()
+        content.title = "Playlist import paused"
+        content.body = "\(remaining) songs left in \"\(first.playlistName)\". Open MuseJRM to keep importing — it picks up where it left off."
+        content.sound = .default
+        let request = UNNotificationRequest(
+            identifier: "playlist-import-paused",
+            content: content,
+            trigger: UNTimeIntervalNotificationTrigger(timeInterval: 2, repeats: false)
+        )
+        UNUserNotificationCenter.current().add(request)
+    }
+
     private func handleWillEnterForeground() {
         // Time spent suspended isn't a stall: restart the watchdog clocks.
         let now = Date()
         for key in lastDownloadProgressAtByTrackID.keys { lastDownloadProgressAtByTrackID[key] = now }
         for key in resolveStartedAtByTrackID.keys { resolveStartedAtByTrackID[key] = now }
+        ImportKeepAlive.shared.stop()
         if bgExecutionTaskID != .invalid {
             UIApplication.shared.endBackgroundTask(bgExecutionTaskID)
             bgExecutionTaskID = .invalid
@@ -413,6 +463,7 @@ final class PlaylistImportManager {
         allowsRediscovery: Bool = true
     ) -> UUID {
         refreshCachedVideoMap()
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
 
         let jobID = UUID()
         var job = PlaylistImportJob(
@@ -916,6 +967,17 @@ final class PlaylistImportManager {
             }
         }
 
+        // Background keep-alive: not needed while music is playing (that keeps the app awake), but
+        // needed again if the music stops while an import is still running.
+        let hasRunnableJobs = activeJobs.contains(where: { !$0.isPaused && !$0.isCancelled })
+        if UIApplication.shared.applicationState == .background {
+            if hasRunnableJobs && !MediaManager.shared.isPlaying {
+                ImportKeepAlive.shared.start()
+            } else if !hasRunnableJobs || MediaManager.shared.isPlaying {
+                ImportKeepAlive.shared.stop()
+            }
+        }
+
         finalizeCompletedJobsIfNeeded()
         ensurePumping()
         return !resolveStartedAtByTrackID.isEmpty || !activeDownloadTasksByTrackID.isEmpty || pumpTask != nil
@@ -984,6 +1046,7 @@ final class PlaylistImportManager {
                 finalizeCompletedJobsIfNeeded()
                 if activeDownloadTasksByTrackID.isEmpty && activeResolvingTrackIDs.isEmpty {
                     BrowserYouTubeResolver.shared.releaseIdleWebView()
+                    ImportKeepAlive.shared.stop()
                     if let bgTask = pendingBGProcessingTask {
                         bgTask.setTaskCompleted(success: true)
                         pendingBGProcessingTask = nil
@@ -1590,11 +1653,11 @@ final class PlaylistImportManager {
         var changed = false
         for jIdx in jobs.indices {
             if jobs[jIdx].isDiscoveringPages && discoveryTasksByJobID[jobs[jIdx].id] == nil && !jobs[jIdx].isCancelled {
-                // Discovery was interrupted by an app relaunch. Pause the job; Resume restarts discovery
-                // from the source URL (already-queued tracks are de-duplicated).
-                jobs[jIdx].isPaused = true
+                // Discovery was interrupted (app was swiped away / killed). Restart it from the source URL
+                // automatically; already-queued tracks are de-duplicated.
                 jobs[jIdx].isDiscoveringPages = false
                 jobs[jIdx].discoveryCompleted = false
+                restartDiscoveryIfInterrupted(jobIndex: jIdx)
                 changed = true
             }
             for tIdx in jobs[jIdx].tracks.indices {

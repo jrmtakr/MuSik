@@ -3179,7 +3179,7 @@ final class MediaManager {
     private func updateNowPlayingInfo(for item: MediaItem) {
         let custom = customMetadataByPath[item.relativePath]
         let resolvedTitle = custom?.title ?? item.metadataTitle ?? titlesByPath[item.relativePath] ?? item.name
-        let resolvedArtist = custom?.artist ?? item.artist ?? artistsByPath[item.relativePath] ?? (item.isVideo ? "MuSeJRM Video" : "Unknown Artist")
+        let resolvedArtist = custom?.artist ?? item.artist ?? artistsByPath[item.relativePath] ?? (item.isVideo ? "MuseJRM Video" : "Unknown Artist")
         let queue = activeQueue
         let queueIdx = queue.firstIndex(where: { $0.relativePath == item.relativePath })
         NowPlayingManager.updateNowPlayingInfo(
