@@ -151,10 +151,10 @@ enum LiveAudioLyricsAI {
             if heardWords.count < 3, isEQPlaying, let recognizer, recognizer.isAvailable {
                 await onProgress("Sampling playing audio tap...")
                 let tapCapture = await captureLiveAudioTapWords(
-                    playbackTime: playbackTime,
-                    recognizer: recognizer,
+                    startPlaybackTime: playbackTime,
+                    playbackRate: playbackRate,
                     equalizerPlayer: equalizerPlayer,
-                    playbackRate: playbackRate
+                    recognizer: recognizer
                 )
                 if tapCapture.words.count > heardWords.count {
                     heardWords = tapCapture.words
@@ -703,8 +703,9 @@ enum LiveAudioLyricsAI {
             queries.append(phraseA)
         }
 
-        async let geniusTask = searchGeniusByLyrics(queries: queries)
-        async let lrclibTask = searchLRCLIBByTranscript(queries: queries)
+        let finalQueries = queries
+        async let geniusTask = searchGeniusByLyrics(queries: finalQueries)
+        async let lrclibTask = searchLRCLIBByTranscript(queries: finalQueries)
 
         let geniusHits = await geniusTask
         var lrclibCandidates = await lrclibTask
