@@ -254,30 +254,17 @@ final class SongIdentificationService {
             cover = await Self.downloadImage(artURL)
         }
 
-        let applied: Bool
-        if allowOverwriteVerified,
-           let item = MediaManager.shared.items.first(where: { $0.relativePath == request.relativePath }) {
-            MediaManager.shared.verifyArtist(
-                finalSong.artist,
-                for: item,
-                cleanTitle: finalSong.title,
-                album: finalSong.album,
-                genre: finalSong.genre,
-                artworkImage: cover
-            )
-            applied = true
-        } else {
-            applied = MediaManager.shared.applyAutoIdentifiedMetadata(
-                relativePath: request.relativePath,
-                title: finalSong.title,
-                artist: finalSong.artist,
-                album: finalSong.album,
-                genre: finalSong.genre,
-                isrc: finalSong.isrc,
-                coverImage: cover,
-                source: finalSong.source
-            )
-        }
+        let applied = MediaManager.shared.applyAutoIdentifiedMetadata(
+            relativePath: request.relativePath,
+            title: finalSong.title,
+            artist: finalSong.artist,
+            album: finalSong.album,
+            genre: finalSong.genre,
+            isrc: finalSong.isrc,
+            coverImage: cover,
+            source: finalSong.source,
+            forceOverwriteVerified: allowOverwriteVerified
+        )
         guard applied else { return nil }
         identifiedThisSession += 1
         lastStatus = "Identified \"\(finalSong.title)\" by \(finalSong.artist) (\(finalSong.source))"

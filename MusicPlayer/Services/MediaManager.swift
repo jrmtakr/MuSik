@@ -1482,10 +1482,11 @@ final class MediaManager {
         genre: String?,
         isrc: String?,
         coverImage: UIImage?,
-        source: String
+        source: String,
+        forceOverwriteVerified: Bool = false
     ) -> Bool {
         var entry = customMetadataByPath[relativePath] ?? CustomTrackMetadata()
-        if entry.isArtistVerified == true && entry.autoIdentifiedSource == nil {
+        if !forceOverwriteVerified && entry.isArtistVerified == true && entry.autoIdentifiedSource == nil {
             return false
         }
         let cleanTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
