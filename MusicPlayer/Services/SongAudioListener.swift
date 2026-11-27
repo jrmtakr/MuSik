@@ -1360,6 +1360,13 @@ enum SongAudioListener {
             .sorted { $0.time < $1.time }
         guard !sortedHeard.isEmpty || curve != nil else { return lyrics }
 
+        let curveDuration = curve.map {
+            let count = $0.singingEnvelope.isEmpty ? $0.envelope.count : $0.singingEnvelope.count
+            return Double(count) * $0.frameDurationSeconds
+        } ?? 0
+        let maxHeardTime = (sortedHeard.last?.time ?? 0) + 1.0
+        let maxAudioTime = max(curveDuration, maxHeardTime)
+
         func tokensMatch(_ a: String, _ b: String) -> Bool {
             if a == b { return true }
             if a.count >= 4 && b.count >= 4 && a.prefix(4) == b.prefix(4) { return true }
@@ -1370,8 +1377,9 @@ enum SongAudioListener {
             sortedHeard.filter { $0.time >= start && $0.time <= end }
         }
 
-        func isQuietInCurve(from start: Double, to end: Double) -> Bool {
+        func isQuietInCurve(from start: Double, to end: Double, strict: Bool = false) -> Bool {
             guard let curve else { return false }
+            if maxAudioTime > 2.0 && start >= maxAudioTime - 1.5 { return false }
             let env = curve.singingEnvelope.isEmpty ? curve.envelope : curve.singingEnvelope
             guard !env.isEmpty else { return false }
             let dt = curve.frameDurationSeconds
@@ -1383,7 +1391,10 @@ enum SongAudioListener {
             let activeCount = slice.filter { $0 > 0.08 }.count
             let activeFrac = Double(activeCount) / Double(slice.count)
             let peak = slice.max() ?? -1.0
-            return mean <= -0.03 && activeFrac < 0.22 && peak < 0.28
+            if strict {
+                return mean <= -0.14 && activeFrac < 0.14 && peak < 0.18
+            }
+            return mean <= -0.05 && activeFrac < 0.20 && peak < 0.25
         }
 
         func hasCoOccurringPhraseAnywhere(_ contentTokens: [String], windowSeconds: Double = 6.0) -> Bool {
@@ -1448,11 +1459,29 @@ enum SongAudioListener {
         // and restore unambiguous asterisk-censored words that were actually spoken/sung cleanly.
         let parenRegex = try? NSRegularExpression(pattern: #"\(([^()]+)\)"#)
         let maskRegex = try? NSRegularExpression(pattern: #"\b([A-Za-z]{1,2}\*{1,}[A-Za-z]*)(?![A-Za-z0-9*])"#)
+        let profanityAllowlist: Set<String> = [
+            "fuck", "fucking", "fucked", "fucker", "motherfucker", "shit", "shitty",
+            "bitch", "bitches", "nigga", "niggas", "nigger", "pussy", "cock", "dick",
+            "damn", "ass", "hoe", "hoes", "slut", "whore"
+        ]
+
+        let groundedIndices: [Int] = lyrics.lines.enumerated().compactMap { idx, ln in
+            guard !ln.isInstrumentalBreak, !(maxAudioTime > 2.0 && ln.startTime >= maxAudioTime - 1.5) else {
+                return nil
+            }
+            let content = tokens(ln.text).filter { $0.count >= 3 && !stopWords.contains($0) }
+            guard !content.isEmpty else { return nil }
+            let localH = heardSlice(from: ln.startTime - 3.0, to: max(ln.endTime, ln.startTime + 2.0) + 3.0)
+            let hitCount = content.filter { lt in localH.contains(where: { tokensMatch(lt, $0.token) }) }.count
+            return hitCount >= 1 ? idx : nil
+        }
+        let firstGroundedIdx = groundedIndices.first ?? lyrics.lines.count
+        let lastGroundedIdx = groundedIndices.last ?? -1
 
         var pass1Lines: [SyncedLyricLine] = []
         for idx in 0..<lyrics.lines.count {
             var line = lyrics.lines[idx]
-            if line.isInstrumentalBreak {
+            if line.isInstrumentalBreak || (maxAudioTime > 2.0 && line.startTime >= maxAudioTime - 1.5) {
                 pass1Lines.append(line)
                 continue
             }
@@ -1460,7 +1489,8 @@ enum SongAudioListener {
             let winStart = line.startTime - 2.5
             let winEnd = max(line.endTime, line.startTime + 2.0) + 3.5
             let localHeard = heardSlice(from: winStart, to: winEnd)
-            let quietHere = isQuietInCurve(from: line.startTime, to: max(line.startTime + 0.8, line.endTime))
+            let quietHere = isQuietInCurve(from: line.startTime, to: max(line.startTime + 0.8, line.endTime), strict: false)
+            let quietStrict = isQuietInCurve(from: line.startTime, to: max(line.startTime + 0.8, line.endTime), strict: true)
 
             // Strip any parenthetical ad-lib / sample `( ... )` absent locally and across the track.
             var textAfterParens = line.text
@@ -1490,7 +1520,7 @@ enum SongAudioListener {
                             } else if localHits == 0 && pContent.count >= 2 && quietHere {
                                 shouldStrip = true
                             }
-                        } else if isStandaloneParen && localHits == 0 && quietHere {
+                        } else if isStandaloneParen && localHits == 0 && (quietHere || idx < firstGroundedIdx) {
                             shouldStrip = true
                         }
 
@@ -1517,20 +1547,21 @@ enum SongAudioListener {
                 continue
             }
 
-            // Drop strictly silent edge intro/outro lines when curve has zero singing AND local heard has 0 hits.
+            // Drop strictly silent edge intro/outro lines outside grounded singing bounds.
             let lineToks = tokens(textAfterParens)
             let lineContent = lineToks.filter { $0.count >= 3 && !stopWords.contains($0) }
             let localContentHits = lineContent.filter { lt in
                 localHeard.contains(where: { tokensMatch(lt, $0.token) })
             }.count
-            let isNearStartOrEnd = line.startTime < 20.0 || idx <= 1 || idx >= lyrics.lines.count - 2
-            if quietHere && localContentHits == 0 && isNearStartOrEnd && (!lineContent.isEmpty || (idx == 0 && line.startTime < 12.0)) {
+            let isOutsideGroundedEdges = (idx < firstGroundedIdx && line.startTime < 20.0) || (idx > lastGroundedIdx)
+            if quietStrict && localContentHits == 0 && isOutsideGroundedEdges && (!lineContent.isEmpty || (idx == 0 && line.startTime < 12.0)) {
                 continue
             }
 
-            // Uncensor exact-length masked words (`F***` -> `Fuck`) only when local heard literally sings the word.
+            // Uncensor explicit allowlisted masked words (`F***` -> `Fuck`) only when heard directly inside that line's tight span.
             var finalText = textAfterParens
             if canUseWordReconciliation, let maskRegex, finalText.contains("*") {
+                let tightHeard = heardSlice(from: line.startTime - 0.5, to: max(line.endTime, line.startTime + 1.0) + 0.5)
                 let ns = finalText as NSString
                 let maskMatches = maskRegex.matches(in: finalText, range: NSRange(location: 0, length: ns.length))
                 if !maskMatches.isEmpty {
@@ -1540,8 +1571,10 @@ enum SongAudioListener {
                         let lowerMask = rawMask.lowercased()
                         let maskChars = Array(lowerMask)
                         guard maskChars.count >= 3 else { continue }
-                        if let matchedHeard = localHeard.first(where: { hw in
-                            let cand = Array(hw.token.lowercased())
+                        if let matchedHeard = tightHeard.first(where: { hw in
+                            let lowerCand = hw.token.lowercased()
+                            guard profanityAllowlist.contains(lowerCand) else { return false }
+                            let cand = Array(lowerCand)
                             guard cand.count == maskChars.count else { return false }
                             for (mc, cc) in zip(maskChars, cand) where mc != "*" {
                                 if mc != cc { return false }
@@ -1593,6 +1626,7 @@ enum SongAudioListener {
         }
 
         func isLineLocallyGrounded(_ line: SyncedLyricLine) -> Bool {
+            if maxAudioTime > 2.0 && line.startTime >= maxAudioTime - 1.5 { return true }
             let lineToks = tokens(line.text)
             let content = lineToks.filter { $0.count >= 3 && !stopWords.contains($0) }
             guard !content.isEmpty else { return true }
@@ -1631,7 +1665,7 @@ enum SongAudioListener {
                 tokens($0.text).filter { $0.count >= 3 && !stopWords.contains($0) }.count >= 2
             }.count
 
-            if runCount >= 3 && meaningfulLineCount >= 2 {
+            if runCount >= 4 && meaningfulLineCount >= 3 {
                 let prevBoundEnd = reconciledLines.last?.endTime ?? 0
                 let nextBoundStart = (runEndIdx < pass1Lines.count) ? pass1Lines[runEndIdx].startTime : totalDuration
                 let spanStart = max(prevBoundEnd + 0.02, (run.first?.startTime ?? prevBoundEnd) - 1.5)
@@ -1644,7 +1678,7 @@ enum SongAudioListener {
                 let spanOverlap = spanMeaningful.isEmpty ? 0.0 :
                     Double(spanMeaningful.filter { sw in runVocab.contains(where: { tokensMatch($0, sw.token) }) }.count) / Double(spanMeaningful.count)
 
-                if spanHeard.count >= 6 && spanOverlap < 0.18 {
+                if spanHeard.count >= 12 && spanMeaningful.count >= 6 && spanOverlap < 0.12 {
                     let synthesized = buildSyncedLines(
                         from: spanHeard,
                         totalDuration: totalDuration,

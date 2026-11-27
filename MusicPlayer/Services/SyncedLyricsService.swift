@@ -2705,7 +2705,7 @@ final class SyncedLyricsService {
     private static func stripNoisyTitleTokens(_ text: String) -> String {
         text
             .replacingOccurrences(
-                of: #"\s*[\(\[]\s*(?:official|lyrics?|lyric video|audio|video|visualizer|mv|m/v|hd|4k|explicit|clean|remaster(?:ed)?(?:\s*\d{4})?)[^\)\]]*[\)\]]"#,
+                of: #"\s*[\(\[]\s*(?:official|lyrics?|lyric video|audio|video|visualizer|mv|m/v|hd|4k|explicit|clean|mixed|dj\s*mix|remaster(?:ed)?(?:\s*\d{4})?)[^\)\]]*[\)\]]"#,
                 with: "",
                 options: [.regularExpression, .caseInsensitive]
             )
@@ -2739,7 +2739,7 @@ final class SyncedLyricsService {
     private static func extractCoreSongTitle(_ title: String) -> String {
         var s = normalizeSmartPunctuation(title)
         s = s.replacingOccurrences(
-            of: #"\s*[\(\[]\s*(?:slowed(?:\s*(?:\+|&|and)?\s*reverb)?|sped\s*up|speed\s*up|nightcore|reverb|bass\s*boosted|acoustic(?:\s*version)?|unplugged|live(?:\s*at\s*[^\)\]]*)?|remix|rework|vip|edit|version|radio\s*edit|clean|explicit|dirty|uncensored|demo|og|extended|alternate|alt\.?\s*version|v\d+|part\s*\w+|pt\.?\s*\w+|8d(?:\s*audio)?|cover)[^\)\]]*[\)\]]"#,
+            of: #"\s*[\(\[]\s*(?:slowed(?:\s*(?:\+|&|and)?\s*reverb)?|sped\s*up|speed\s*up|nightcore|reverb|bass\s*boosted|acoustic(?:\s*version)?|unplugged|live(?:\s*at\s*[^\)\]]*)?|remix|rework|vip|edit|version|radio\s*edit|clean|explicit|dirty|uncensored|mixed|mix|dj\s*mix|demo|og|extended|alternate|alt\.?\s*version|v\d+|part\s*\w+|pt\.?\s*\w+|8d(?:\s*audio)?|cover)[^\)\]]*[\)\]]"#,
             with: "",
             options: [.regularExpression, .caseInsensitive]
         )

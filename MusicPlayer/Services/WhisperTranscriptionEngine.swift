@@ -114,7 +114,7 @@ actor WhisperTranscriptionEngine {
             withoutTimestamps: false,
             wordTimestamps: true,
             suppressBlank: true,
-            noSpeechThreshold: 0.72,
+            noSpeechThreshold: 0.92,
             chunkingStrategy: nil
         )
 
@@ -137,56 +137,119 @@ actor WhisperTranscriptionEngine {
         var noSpeechSum = 0.0
         var noSpeechWeight = 0.0
 
-        for result in results {
-            let lang = result.language.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            if !lang.isEmpty {
-                langCounts[lang, default: 0] += max(1, result.segments.count)
-            }
-            for seg in result.segments {
-                let segDur = max(0.1, Double(seg.end - seg.start))
-                noSpeechSum += Double(seg.noSpeechProb) * segDur
-                noSpeechWeight += segDur
-                if seg.noSpeechProb > 0.85 { continue }
-                if let segWords = seg.words, !segWords.isEmpty {
-                    for w in segWords {
-                        let cleanedRaw = w.word
+        func extractWords(from segResults: [TranscriptionResult], timeUpperBound: Double? = nil) -> (words: [TranscribedWord], langs: [String: Int], nsSum: Double, nsWeight: Double) {
+            var localWords: [TranscribedWord] = []
+            var localLangs: [String: Int] = [:]
+            var localSum = 0.0
+            var localWeight = 0.0
+            let captionNoisePhrases = [
+                "thanks for watching", "thank you for watching", "subscribe to",
+                "subtitles by", "amara.org", "구독과 좋아요"
+            ]
+            for result in segResults {
+                let lang = result.language.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                if !lang.isEmpty {
+                    localLangs[lang, default: 0] += max(1, result.segments.count)
+                }
+                for seg in result.segments {
+                    let segDur = max(0.1, Double(seg.end - seg.start))
+                    localSum += Double(seg.noSpeechProb) * segDur
+                    localWeight += segDur
+                    // Hip-hop / beat-backed vocals frequently sit in noSpeechProb 0.72..0.94; only discard extreme silence
+                    // or explicit caption-noise hallucinations when probability is elevated.
+                    if seg.noSpeechProb > 0.96 { continue }
+                    let lowerSeg = seg.text.lowercased()
+                    if seg.noSpeechProb > 0.45 && captionNoisePhrases.contains(where: { lowerSeg.contains($0) }) {
+                        continue
+                    }
+                    if let segWords = seg.words, !segWords.isEmpty {
+                        for w in segWords {
+                            let cleanedRaw = w.word
+                                .replacingOccurrences(of: #"<\|[^>]+\|>"#, with: "", options: .regularExpression)
+                                .trimmingCharacters(in: .whitespacesAndNewlines)
+                            let parts = cleanedRaw.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+                            guard !parts.isEmpty else { continue }
+                            let s0 = max(0, Double(w.start))
+                            if let timeUpperBound, s0 >= timeUpperBound { continue }
+                            let e0 = max(s0 + 0.05, Double(w.end))
+                            let stepDur = (e0 - s0) / Double(parts.count)
+                            for (idx, p) in parts.enumerated() {
+                                let tok = SongAudioListener.normalizeToken(p)
+                                guard !tok.isEmpty else { continue }
+                                let ws = s0 + Double(idx) * stepDur
+                                let we = max(ws + 0.05, s0 + Double(idx + 1) * stepDur)
+                                localWords.append(TranscribedWord(rawText: p, token: tok, startTime: ws, endTime: we))
+                            }
+                        }
+                    } else {
+                        let cleanSeg = seg.text
                             .replacingOccurrences(of: #"<\|[^>]+\|>"#, with: "", options: .regularExpression)
                             .trimmingCharacters(in: .whitespacesAndNewlines)
-                        let parts = cleanedRaw.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+                        let parts = cleanSeg.split(whereSeparator: { $0.isWhitespace }).map(String.init)
                         guard !parts.isEmpty else { continue }
-                        let s0 = max(0, Double(w.start))
-                        let e0 = max(s0 + 0.05, Double(w.end))
+                        let s0 = max(0, Double(seg.start))
+                        if let timeUpperBound, s0 >= timeUpperBound { continue }
+                        let e0 = max(s0 + 0.2, Double(seg.end))
                         let stepDur = (e0 - s0) / Double(parts.count)
                         for (idx, p) in parts.enumerated() {
                             let tok = SongAudioListener.normalizeToken(p)
                             guard !tok.isEmpty else { continue }
                             let ws = s0 + Double(idx) * stepDur
                             let we = max(ws + 0.05, s0 + Double(idx + 1) * stepDur)
-                            words.append(TranscribedWord(rawText: p, token: tok, startTime: ws, endTime: we))
+                            localWords.append(TranscribedWord(rawText: p, token: tok, startTime: ws, endTime: we))
                         }
                     }
-                } else {
-                    let cleanSeg = seg.text
-                        .replacingOccurrences(of: #"<\|[^>]+\|>"#, with: "", options: .regularExpression)
-                        .trimmingCharacters(in: .whitespacesAndNewlines)
-                    let parts = cleanSeg.split(whereSeparator: { $0.isWhitespace }).map(String.init)
-                    guard !parts.isEmpty else { continue }
-                    let s0 = max(0, Double(seg.start))
-                    let e0 = max(s0 + 0.2, Double(seg.end))
-                    let stepDur = (e0 - s0) / Double(parts.count)
-                    for (idx, p) in parts.enumerated() {
-                        let tok = SongAudioListener.normalizeToken(p)
-                        guard !tok.isEmpty else { continue }
-                        let ws = s0 + Double(idx) * stepDur
-                        let we = max(ws + 0.05, s0 + Double(idx + 1) * stepDur)
-                        words.append(TranscribedWord(rawText: p, token: tok, startTime: ws, endTime: we))
+                }
+            }
+            return (localWords, localLangs, localSum, localWeight)
+        }
+
+        let mainPass = extractWords(from: results)
+        words = mainPass.words
+        langCounts = mainPass.langs
+        noSpeechSum = mainPass.nsSum
+        noSpeechWeight = mainPass.nsWeight
+        let dominantLang = langCounts.max(by: { $0.value < $1.value })?.key
+
+        // Opening blind-spot rescue: when loud opening vocals (e.g. heavy vocoder/autotune hooks) precede a loud rap verse
+        // in window 0, decode just the opening slice once with the resolved song language.
+        let firstWordTime = words.first?.startTime ?? totalSec
+        if totalSec >= 20.0 && firstWordTime >= 9.0 {
+            let checkEnd = min(pcm.samples.count, Int(12.0 * Double(WhisperKit.sampleRate)))
+            if checkEnd > WhisperKit.sampleRate * 2 {
+                let sumSq = pcm.samples[0..<checkEnd].reduce(0.0) { $0 + Double($1 * $1) }
+                let openingRMS = sqrt(sumSq / Double(checkEnd))
+                if openingRMS > 0.03 {
+                    let rescueSamples = Array(pcm.samples[0..<min(pcm.samples.count, Int(16.0 * Double(WhisperKit.sampleRate)))])
+                    let rescueLang = dominantLang ?? languageHint ?? "en"
+                    let rescueOpts = DecodingOptions(
+                        verbose: false,
+                        task: .transcribe,
+                        language: rescueLang,
+                        temperature: 0.0,
+                        temperatureIncrementOnFallback: 0.25,
+                        temperatureFallbackCount: 1,
+                        usePrefillPrompt: true,
+                        detectLanguage: false,
+                        skipSpecialTokens: true,
+                        withoutTimestamps: false,
+                        wordTimestamps: true,
+                        suppressBlank: true,
+                        noSpeechThreshold: 0.96,
+                        chunkingStrategy: nil
+                    )
+                    if let rescueResults = try? await kit.transcribe(audioArray: rescueSamples, decodeOptions: rescueOpts) {
+                        let rescued = extractWords(from: rescueResults, timeUpperBound: firstWordTime - 0.15).words
+                        if !rescued.isEmpty {
+                            words = rescued + words
+                        }
                     }
                 }
             }
         }
-        let dominantLang = langCounts.max(by: { $0.value < $1.value })?.key
+
         let avgNoSpeech = noSpeechWeight > 0 ? (noSpeechSum / noSpeechWeight) : 0.0
-        guard !words.isEmpty || avgNoSpeech >= 0.72 else { return nil }
+        guard !words.isEmpty || avgNoSpeech >= 0.90 else { return nil }
         return TranscriptionSummary(
             words: words,
             detectedLanguage: dominantLang,
