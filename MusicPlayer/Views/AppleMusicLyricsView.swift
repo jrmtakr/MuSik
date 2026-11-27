@@ -154,6 +154,10 @@ struct AppleMusicLyricsView: View {
     @State private var wholeSongAI = WholeSongAIService.shared
     @State private var lastSyncWallTime: Date = .now
     @State private var lastSyncPlaybackTime: Double = 0
+    @State private var pinnedSeekIndex: Int?
+    @State private var pinnedSeekRawTarget: Double = 0
+    @State private var pinnedSeekEffectiveMin: Double = 0
+    @State private var pinnedSeekExpiresAt: Date = .distantPast
     @State private var isUserScrolling = false
     @State private var resumeAutoScrollTask: Task<Void, Never>?
     @State private var copiedBannerText: String?
@@ -171,7 +175,9 @@ struct AppleMusicLyricsView: View {
                             offset: lyrics.syncedOffsetSeconds,
                             tempoScale: lyrics.tempoScale
                         )
-                        let activeIdx = lyrics.isTimeSynced ? activeLineIndex(in: lyrics.lines, at: effectiveTime) : nil
+                        let activeIdx = lyrics.isTimeSynced
+                            ? activeLineIndex(in: lyrics.lines, at: effectiveTime, now: timeline.date)
+                            : nil
 
                         lyricsScrollContent(
                             lyrics: lyrics,
@@ -237,6 +243,8 @@ struct AppleMusicLyricsView: View {
         }
         .onChange(of: item.relativePath) { _, _ in
             isUserScrolling = false
+            pinnedSeekIndex = nil
+            pinnedSeekExpiresAt = .distantPast
             syncClockSnapshot()
             pickRandomTikTokGif()
             lyricsService.loadLyricsIfNeeded(for: item)
@@ -334,12 +342,20 @@ struct AppleMusicLyricsView: View {
                                     isPast: isPast,
                                     effectiveTime: effectiveTime
                                 )
+                                .contentShape(Rectangle())
                                 .onTapGesture {
-                                    seekToLine(line, offset: lyrics.syncedOffsetSeconds, tempoScale: lyrics.tempoScale)
+                                    seekToLine(
+                                        line,
+                                        index: idx,
+                                        in: lyrics.lines,
+                                        offset: lyrics.syncedOffsetSeconds,
+                                        tempoScale: lyrics.tempoScale
+                                    )
                                 }
                             } else {
                                 lyricLineButton(
                                     line: line,
+                                    index: idx,
                                     lyrics: lyrics,
                                     isActive: isActive,
                                     isPast: isPast,
@@ -367,7 +383,7 @@ struct AppleMusicLyricsView: View {
                 }
             )
             .simultaneousGesture(
-                DragGesture(minimumDistance: 6)
+                DragGesture(minimumDistance: 2)
                     .onChanged { _ in
                         markUserScrolling()
                     }
@@ -401,6 +417,7 @@ struct AppleMusicLyricsView: View {
     @ViewBuilder
     private func lyricLineButton(
         line: SyncedLyricLine,
+        index lineIndex: Int,
         lyrics: ResolvedTrackLyrics,
         isActive: Bool,
         isPast: Bool,
@@ -424,7 +441,13 @@ struct AppleMusicLyricsView: View {
 
         Button {
             if lyrics.isTimeSynced {
-                seekToLine(line, offset: lyrics.syncedOffsetSeconds, tempoScale: lyrics.tempoScale)
+                seekToLine(
+                    line,
+                    index: lineIndex,
+                    in: lyrics.lines,
+                    offset: lyrics.syncedOffsetSeconds,
+                    tempoScale: lyrics.tempoScale
+                )
             }
         } label: {
             Group {
@@ -443,12 +466,12 @@ struct AppleMusicLyricsView: View {
             .italic(line.isSpokenDialogue)
             .lineSpacing(4)
             .multilineTextAlignment(.leading)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.vertical, 4)
-            .contentShape(Rectangle())
             .shadow(color: isActive ? .white.opacity(0.24) : .clear, radius: isActive ? 10 : 0)
             .scaleEffect(scale, anchor: .leading)
             .blur(radius: blurRadius)
+            .padding(.vertical, 6)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
             .animation(.spring(response: 0.38, dampingFraction: 0.84), value: isActive)
             .animation(.easeOut(duration: 0.2), value: isUserScrolling)
         }
@@ -456,7 +479,13 @@ struct AppleMusicLyricsView: View {
         .contextMenu {
             if lyrics.isTimeSynced {
                 Button {
-                    seekToLine(line, offset: lyrics.syncedOffsetSeconds, tempoScale: lyrics.tempoScale)
+                    seekToLine(
+                        line,
+                        index: lineIndex,
+                        in: lyrics.lines,
+                        offset: lyrics.syncedOffsetSeconds,
+                        tempoScale: lyrics.tempoScale
+                    )
                 } label: {
                     Label("Play from Here", systemImage: "play.fill")
                 }
@@ -608,8 +637,12 @@ struct AppleMusicLyricsView: View {
     // MARK: - Playback Clock Interpolation & Helpers
 
     private func syncClockSnapshot(explicitTime: Double? = nil) {
+        let reported = explicitTime ?? mediaManager.currentTime
+        if Date() < pinnedSeekExpiresAt && reported < pinnedSeekRawTarget - 0.08 {
+            return
+        }
         lastSyncWallTime = .now
-        lastSyncPlaybackTime = explicitTime ?? mediaManager.currentTime
+        lastSyncPlaybackTime = reported
     }
 
     private func interpolatedPlaybackTime(at now: Date, offset: Double, tempoScale: Double = 1.0) -> Double {
@@ -623,32 +656,63 @@ struct AppleMusicLyricsView: View {
         } else {
             rawTime = mediaManager.currentTime
         }
-        return rawTime * tempoScale + offset
+        var effective = rawTime * tempoScale + offset
+        if now < pinnedSeekExpiresAt {
+            effective = max(effective, pinnedSeekEffectiveMin)
+        }
+        return effective
     }
 
-    private func activeLineIndex(in lines: [SyncedLyricLine], at effectiveTime: Double) -> Int? {
+    private func activeLineIndex(in lines: [SyncedLyricLine], at effectiveTime: Double, now: Date = .now) -> Int? {
         var bestIdx: Int?
+        var bestStart = -Double.infinity
         for (idx, line) in lines.enumerated() where line.startTime >= 0 {
             if effectiveTime >= line.startTime - 0.04 {
-                bestIdx = idx
-            } else {
-                break
+                if line.startTime >= bestStart - 0.001 || bestIdx == nil {
+                    bestIdx = idx
+                    bestStart = max(bestStart, line.startTime)
+                }
+            }
+        }
+        if now < pinnedSeekExpiresAt,
+           let pinnedIdx = pinnedSeekIndex,
+           lines.indices.contains(pinnedIdx) {
+            let pinnedStart = lines[pinnedIdx].startTime
+            if bestIdx == nil || bestIdx! < pinnedIdx || effectiveTime < pinnedStart + 0.12 {
+                return pinnedIdx
             }
         }
         return bestIdx
     }
 
-    private func seekToLine(_ line: SyncedLyricLine, offset: Double, tempoScale: Double = 1.0) {
+    private func seekToLine(
+        _ line: SyncedLyricLine,
+        index lineIndex: Int,
+        in lines: [SyncedLyricLine],
+        offset: Double,
+        tempoScale: Double = 1.0
+    ) {
         AppHaptics.light()
-        let target = max(0, (line.startTime - offset) / max(0.25, tempoScale))
+        let nextStart: Double? = (lineIndex + 1 < lines.count && lines[lineIndex + 1].startTime > line.startTime)
+            ? lines[lineIndex + 1].startTime
+            : nil
+        let maxInside = nextStart.map { max(line.startTime, $0 - 0.06) } ?? max(line.startTime, line.endTime - 0.06)
+        let entryEffective = min(maxInside, line.startTime + 0.06)
+        let target = max(0, (entryEffective - offset) / max(0.25, tempoScale))
+
+        lastSyncPlaybackTime = target
+        lastSyncWallTime = .now
+        pinnedSeekIndex = lineIndex
+        pinnedSeekRawTarget = target
+        pinnedSeekEffectiveMin = line.startTime
+        pinnedSeekExpiresAt = Date().addingTimeInterval(0.85)
+        isUserScrolling = false
+        resumeAutoScrollTask?.cancel()
+
         mediaManager.seek(to: target)
         if !mediaManager.isPlaying {
             mediaManager.resume()
         }
-        lastSyncPlaybackTime = target
-        lastSyncWallTime = .now
-        isUserScrolling = false
-        resumeAutoScrollTask?.cancel()
     }
 
     private func markUserScrolling() {

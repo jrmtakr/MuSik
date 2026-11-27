@@ -411,7 +411,7 @@ final class EqualizerAudioPlayer {
         guard sampleRate > 0 else { return }
 
         let totalFrames = file.length
-        let startFrame = min(max(AVAudioFramePosition(seconds * sampleRate), 0), totalFrames)
+        let startFrame = min(max(AVAudioFramePosition((seconds * sampleRate).rounded()), 0), totalFrames)
         let remainingFrames = totalFrames - startFrame
 
         scheduleGeneration &+= 1
@@ -469,7 +469,7 @@ final class EqualizerAudioPlayer {
             return
         }
 
-        let playedSeconds = Double(playerTime.sampleTime) / sampleRate
+        let playedSeconds = max(0, Double(playerTime.sampleTime) / sampleRate)
         let updated = max(0, seekOffsetSeconds + playedSeconds)
         currentTime = duration > 0 ? min(updated, duration) : updated
         onProgressUpdate?(currentTime, duration)

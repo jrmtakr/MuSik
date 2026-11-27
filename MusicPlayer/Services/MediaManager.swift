@@ -105,6 +105,8 @@ final class MediaManager {
     private var ffmpegTimeTimer: Timer?
     private var ksBridge: KSMEPlayerBridge?
     private var isScrubbing = false
+    @ObservationIgnored private var seekSettlingUntil: Date = .distantPast
+    @ObservationIgnored private var seekSettlingTarget: Double = 0
     @ObservationIgnored private var lastWrappedHeartbeatUptime: TimeInterval = 0
     private(set) var remoteStreamSourceURL: URL?
 
@@ -951,6 +953,7 @@ final class MediaManager {
         cleanupObservers()
         ffmpegTimeTimer?.invalidate()
         ffmpegTimeTimer = nil
+        seekSettlingUntil = .distantPast
         ffmpegPlayer?.shutdown()
         ffmpegPlayer = nil
         ksBridge = nil
@@ -979,8 +982,16 @@ final class MediaManager {
             guard let self, self.isUsingFFmpegBackend, let ks = self.ffmpegPlayer else { return }
             if !self.isScrubbing {
                 let elapsed = ks.currentPlaybackTime
+                let settling = Date() < self.seekSettlingUntil
                 if elapsed.isFinite && elapsed >= 0 {
-                    self.currentTime = elapsed
+                    if settling && elapsed < self.seekSettlingTarget - 0.15 {
+                        // Ignore stale pre-seek ticks until KSPlayer lands on the target timestamp.
+                    } else {
+                        if settling {
+                            self.seekSettlingUntil = .distantPast
+                        }
+                        self.currentTime = elapsed
+                    }
                 }
             }
             let dur = ks.duration
@@ -1135,6 +1146,8 @@ final class MediaManager {
         crossfadeTriggeredForCurrentTrack = false
         let upperBound = max(duration, 0)
         let clamped = min(max(seconds, 0), upperBound > 0 ? upperBound : max(seconds, 0))
+        seekSettlingTarget = clamped
+        seekSettlingUntil = Date().addingTimeInterval(0.75)
 
         if isUsingFFmpegBackend, let ks = ffmpegPlayer {
             let wasPlaying = isPlaying
@@ -1145,6 +1158,12 @@ final class MediaManager {
                     if wasPlaying {
                         ks.play()
                     }
+                    let actual = ks.currentPlaybackTime
+                    if !actual.isFinite || actual >= clamped - 0.15 {
+                        self.seekSettlingUntil = .distantPast
+                    } else {
+                        self.seekSettlingUntil = Date().addingTimeInterval(0.20)
+                    }
                     if let currentItem = self.currentItem {
                         self.updateNowPlayingInfo(for: currentItem)
                     }
@@ -1154,6 +1173,7 @@ final class MediaManager {
         }
 
         if isUsingEqualizerBackend {
+            seekSettlingUntil = .distantPast
             equalizerPlayer.seek(to: clamped)
             currentTime = equalizerPlayer.currentTime
             if let currentItem {
@@ -1165,10 +1185,15 @@ final class MediaManager {
         guard let player else { return }
         currentTime = clamped
         let cmTime = CMTime(seconds: clamped, preferredTimescale: 600)
-        player.seek(to: cmTime, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
+        player.seek(to: cmTime, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] finished in
             DispatchQueue.main.async {
-                guard let self, let item = self.currentItem else { return }
-                self.updateNowPlayingInfo(for: item)
+                guard let self else { return }
+                if finished {
+                    self.seekSettlingUntil = .distantPast
+                }
+                if let item = self.currentItem {
+                    self.updateNowPlayingInfo(for: item)
+                }
             }
         }
     }
@@ -3439,7 +3464,13 @@ final class MediaManager {
             guard let self else { return }
             let elapsed = CMTimeGetSeconds(time)
             if elapsed.isFinite, elapsed >= 0, !self.isScrubbing {
-                self.currentTime = elapsed
+                let settling = Date() < self.seekSettlingUntil
+                if !settling || abs(elapsed - self.seekSettlingTarget) <= 0.20 {
+                    if settling {
+                        self.seekSettlingUntil = .distantPast
+                    }
+                    self.currentTime = elapsed
+                }
             }
 
             let itemDuration = CMTimeGetSeconds(playerItem.duration)
