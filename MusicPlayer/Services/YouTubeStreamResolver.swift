@@ -1490,13 +1490,16 @@ enum YouTubeStreamResolver {
     }
 
     private static func expectedArtistTokens(rawTitle: String, author: String?) -> Set<String> {
-        if let dashRange = rawTitle.range(of: #"\s[-–—]\s"#, options: .regularExpression) {
-            let left = String(rawTitle[..<dashRange.lowerBound])
+        if let sepRange = rawTitle.range(of: #"\s(?:[-–—]|\|)\s"#, options: .regularExpression) {
+            let left = String(rawTitle[..<sepRange.lowerBound])
             let toks = Set(normalizedWordTokens(left))
             if !toks.isEmpty { return toks }
         }
-        let cleanedA = cleanAuthorName(author)
-        if !cleanedA.isEmpty, author?.lowercased().contains("topic") != true {
+        // Without "Artist - Track" in title, only trust Topic / VEVO official artist channels as hard constraints;
+        // random fan uploaders (e.g. "Young Thug is the GOAT" reuploading "WAP") must not block the real artist.
+        let lowerAuthor = author?.lowercased() ?? ""
+        if lowerAuthor.contains("- topic") || lowerAuthor.contains("vevo") {
+            let cleanedA = cleanAuthorName(author)
             let toks = Set(normalizedWordTokens(cleanedA))
             if !toks.isEmpty { return toks }
         }
@@ -1537,11 +1540,13 @@ enum YouTubeStreamResolver {
             .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
             .trimmingCharacters(in: .whitespacesAndNewlines)
 
-        let hasArtistDash = rawTitle.range(of: #"\s[-–—]\s"#, options: .regularExpression) != nil
+        let hasArtistSep = rawTitle.range(of: #"\s(?:[-–—]|\|)\s"#, options: .regularExpression) != nil
         let cleanedA = cleanAuthorName(author)
+        let lowerAuthor = author?.lowercased() ?? ""
+        let isOfficialArtistChannel = lowerAuthor.contains("- topic") || lowerAuthor.contains("vevo")
         var queries: [String] = []
         let normalizeSpace: (String) -> String = { s in
-            s.lowercased().replacingOccurrences(of: " - ", with: " ")
+            s.lowercased().replacingOccurrences(of: " - ", with: " ").replacingOccurrences(of: " | ", with: " ")
         }
         var seenNorm = Set<String>()
         func appendUnique(_ q: String) {
@@ -1551,17 +1556,29 @@ enum YouTubeStreamResolver {
             queries.append(trimmed)
         }
 
-        if !hasArtistDash, !cleanedA.isEmpty {
+        let noDashCore = core.replacingOccurrences(of: #"\s(?:[-–—]|\|)\s"#, with: " ", options: .regularExpression)
+        let tokenCore = normalizedWordTokens(core).joined(separator: " ")
+
+        if !hasArtistSep, !cleanedA.isEmpty {
             let aToks = Set(normalizedWordTokens(cleanedA))
             let tToks = Set(normalizedWordTokens(core))
+            let baseCore = tokenCore.isEmpty ? noDashCore : tokenCore
             if !aToks.isEmpty && aToks.isDisjoint(with: tToks) {
-                appendUnique("\(cleanedA) \(core)")
+                if isOfficialArtistChannel {
+                    appendUnique("\(cleanedA) \(baseCore)")
+                    appendUnique(baseCore)
+                } else {
+                    appendUnique(baseCore)
+                    appendUnique("\(cleanedA) \(baseCore)")
+                }
             }
         }
-        let noDashCore = core.replacingOccurrences(of: #"\s[-–—]\s"#, with: " ", options: .regularExpression)
         appendUnique(noDashCore)
         if cleaned != core {
             appendUnique(cleaned)
+        }
+        if !tokenCore.isEmpty {
+            appendUnique(tokenCore)
         }
         return Array(queries.prefix(2))
     }
