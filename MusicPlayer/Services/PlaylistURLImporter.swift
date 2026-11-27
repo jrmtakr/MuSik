@@ -1524,7 +1524,7 @@ enum PlaylistURLImporter {
         req.httpBody = bodyData
         req.timeoutInterval = 15
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.setValue(WebMediaDownloader.browserUserAgent, forHTTPHeaderField: "User-Agent")
+        req.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36", forHTTPHeaderField: "User-Agent")
         req.setValue("https://www.youtube.com", forHTTPHeaderField: "Origin")
         req.setValue("https://www.youtube.com/", forHTTPHeaderField: "Referer")
         req.setValue("1", forHTTPHeaderField: "X-YouTube-Client-Name")
@@ -1612,7 +1612,7 @@ enum PlaylistURLImporter {
         req.httpBody = bodyData
         req.timeoutInterval = 15
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.setValue(WebMediaDownloader.browserUserAgent, forHTTPHeaderField: "User-Agent")
+        req.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36", forHTTPHeaderField: "User-Agent")
         req.setValue("https://www.youtube.com", forHTTPHeaderField: "Origin")
         req.setValue("https://www.youtube.com/", forHTTPHeaderField: "Referer")
         req.setValue("1", forHTTPHeaderField: "X-YouTube-Client-Name")
@@ -1655,6 +1655,98 @@ enum PlaylistURLImporter {
         }
 
         walk(root, depth: 0)
+        if !results.isEmpty {
+            return results
+        }
+
+        // Fallback to YouTube Music WEB_REMIX search when main WEB search returns empty (e.g. restricted/explicit queries).
+        guard let remixURL = URL(string: "https://music.youtube.com/youtubei/v1/search?prettyPrint=false") else {
+            return []
+        }
+        let remixBody: [String: Any] = [
+            "context": [
+                "client": [
+                    "clientName": "WEB_REMIX",
+                    "clientVersion": remixClientVersion,
+                    "hl": "en",
+                    "gl": "US"
+                ]
+            ],
+            "query": trimmed
+        ]
+        guard let remixData = try? JSONSerialization.data(withJSONObject: remixBody) else { return [] }
+        var remixReq = URLRequest(url: remixURL)
+        remixReq.httpMethod = "POST"
+        remixReq.httpBody = remixData
+        remixReq.timeoutInterval = 12
+        remixReq.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        remixReq.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36", forHTTPHeaderField: "User-Agent")
+        remixReq.setValue("https://music.youtube.com", forHTTPHeaderField: "Origin")
+        remixReq.setValue("67", forHTTPHeaderField: "X-YouTube-Client-Name")
+        remixReq.setValue(remixClientVersion, forHTTPHeaderField: "X-YouTube-Client-Version")
+
+        guard let (rData, rResp) = try? await URLSession.shared.data(for: remixReq),
+              let rHTTP = rResp as? HTTPURLResponse,
+              (200...299).contains(rHTTP.statusCode),
+              let rRoot = try? JSONSerialization.jsonObject(with: rData) as? [String: Any] else {
+            return []
+        }
+
+        func walkRemix(_ node: Any, depth: Int) {
+            guard depth < 24, results.count < limit else { return }
+            if let arr = node as? [Any] {
+                for item in arr { walkRemix(item, depth: depth + 1) }
+                return
+            }
+            guard let dict = node as? [String: Any] else { return }
+            if let mr = dict["musicResponsiveListItemRenderer"] as? [String: Any] {
+                var vid = (((mr["overlay"] as? [String: Any])?["musicItemThumbnailOverlayRenderer"] as? [String: Any])?["content"] as? [String: Any])
+                    .flatMap { ($0["musicPlayButtonRenderer"] as? [String: Any])?["playNavigationEndpoint"] as? [String: Any] }
+                    .flatMap { ($0["watchEndpoint"] as? [String: Any])?["videoId"] as? String }
+                let flexCols = mr["flexColumns"] as? [[String: Any]] ?? []
+                if vid == nil {
+                    for col in flexCols {
+                        let runs = ((col["musicResponsiveListItemFlexColumnRenderer"] as? [String: Any])?["text"] as? [String: Any])?["runs"] as? [[String: Any]] ?? []
+                        for run in runs {
+                            if let v2 = ((run["navigationEndpoint"] as? [String: Any])?["watchEndpoint"] as? [String: Any])?["videoId"] as? String, !v2.isEmpty {
+                                vid = v2
+                                break
+                            }
+                        }
+                        if vid != nil { break }
+                    }
+                }
+                if let vid, !vid.isEmpty, seen.insert(vid).inserted {
+                    let cols = flexCols.compactMap { ytText(($0["musicResponsiveListItemFlexColumnRenderer"] as? [String: Any])?["text"]) }
+                    let rawTitle = cols.first ?? ""
+                    guard !rawTitle.isEmpty else { return }
+                    var artistName = ""
+                    var durSec: Double?
+                    if cols.count > 1 {
+                        let metaParts = cols[1].components(separatedBy: " • ")
+                        for part in metaParts {
+                            let clean = part.trimmingCharacters(in: .whitespacesAndNewlines)
+                            if let sec = parseDurationSeconds(clean) {
+                                durSec = Double(sec)
+                            } else if artistName.isEmpty,
+                                      clean != "Song", clean != "Video",
+                                      !clean.hasSuffix("views"), !clean.hasSuffix("plays") {
+                                artistName = clean
+                            }
+                        }
+                    }
+                    results.append((vid, cleanTitle(rawTitle), artistName, durSec))
+                }
+                return
+            }
+            for (_, val) in dict {
+                if val is [String: Any] || val is [Any] {
+                    walkRemix(val, depth: depth + 1)
+                }
+            }
+        }
+
+        walkRemix(rRoot, depth: 0)
         return results
     }
 

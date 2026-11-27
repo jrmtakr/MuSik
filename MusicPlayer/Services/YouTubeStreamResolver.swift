@@ -75,6 +75,23 @@ enum YouTubeStreamResolver {
         return nil
     }
 
+    static func unwrapGoogleRedirectIfNeeded(_ url: URL) -> URL {
+        guard let host = url.host?.lowercased(),
+              host == "google.com" || host.hasSuffix(".google.com") || host.contains(".google."),
+              url.path == "/url",
+              let comps = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
+            return url
+        }
+        for name in ["q", "url", "u"] {
+            if let raw = comps.queryItems?.first(where: { $0.name == name })?.value,
+               let target = URL(string: raw),
+               isYouTubeURL(target) {
+                return target
+            }
+        }
+        return url
+    }
+
     private static func sanitizedVideoID(_ raw: String) -> String? {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.count >= 8 else { return nil }
@@ -526,11 +543,20 @@ enum YouTubeStreamResolver {
     private static let desktopBrowserUserAgent =
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
-    private static func hasSignedInCookies(_ cookiesHeader: String?) -> Bool {
+    static func hasSignedInCookies(_ cookiesHeader: String?) -> Bool {
         guard let cookiesHeader, !cookiesHeader.isEmpty else { return false }
         return cookiesHeader.contains("SAPISID=")
             || cookiesHeader.contains("__Secure-3PAPISID=")
             || cookiesHeader.contains("__Secure-1PAPISID=")
+    }
+
+    static func isLoginOrAgeGateReason(_ reason: String?) -> Bool {
+        guard let lower = reason?.lowercased(), !lower.isEmpty else { return false }
+        return lower.contains("sign in")
+            || lower.contains("inappropriate")
+            || lower.contains("confirm your age")
+            || lower.contains("age")
+            || lower.contains("login")
     }
 
     private static func sapisidAuthHeaders(cookiesHeader: String?, origin: String) -> [String: String] {
@@ -1472,7 +1498,15 @@ enum YouTubeStreamResolver {
                       let streamURL = URL(string: streamStr) else {
                     continue
                 }
-                let isHLS = transURLStr.contains("/hls") || streamStr.lowercased().contains(".m3u8")
+                let hdrs = ["User-Agent": desktopBrowserUserAgent]
+                let lowerStream = streamStr.lowercased()
+                if lowerStream.contains("/opus") {
+                    continue
+                }
+                guard await isURLReachable(streamURL, headers: hdrs) else {
+                    continue
+                }
+                let isHLS = transURLStr.contains("/hls") || lowerStream.contains(".m3u8")
                 let candidate = DetectedBrowserMedia(
                     url: streamURL,
                     pairedAudioURL: nil,
@@ -1482,7 +1516,7 @@ enum YouTubeStreamResolver {
                     author: targetAuthor,
                     qualityLabel: isHLS ? "HLS Audio" : "MP3 Audio",
                     referer: entry.url.absoluteString,
-                    customHeaders: ["User-Agent": desktopBrowserUserAgent],
+                    customHeaders: hdrs,
                     durationSeconds: trackDur ?? targetDuration,
                     isActivelyPlaying: true
                 )

@@ -49,6 +49,11 @@ final class BrowserYouTubeResolver: NSObject, WKNavigationDelegate, WKScriptMess
         cachedCookieState?.value
     }
 
+    static func hasSignedInYouTubeCookies(timeoutSeconds: Double = 0.5) async -> Bool {
+        let header = await youtubeCookieHeader(timeoutSeconds: timeoutSeconds)
+        return YouTubeStreamResolver.hasSignedInCookies(header)
+    }
+
     /// Reads current YouTube & Google session cookies from the shared built-in browser data store,
     /// caching in memory for 60s and bounding WebKit IPC wait so interactive taps never hang.
     static func youtubeCookieHeader(forceRefresh: Bool = false, timeoutSeconds: Double = 1.0) async -> String? {

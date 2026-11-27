@@ -86,6 +86,20 @@ final class BrowserController {
         )
     }
 
+    func stopAndLeaveYouTubeWatchPage() {
+        pausePageMedia()
+        guard let wv = webView else { return }
+        if let current = wv.url, YouTubeStreamResolver.extractVideoID(from: current) != nil {
+            if let nonWatchBack = wv.backForwardList.backList.last(where: {
+                YouTubeStreamResolver.extractVideoID(from: $0.url) == nil
+            }) {
+                wv.go(to: nonWatchBack)
+            } else if let home = URL(string: "https://m.youtube.com") {
+                wv.load(URLRequest(url: home))
+            }
+        }
+    }
+
     func resumePageMediaControl(startPlayback: Bool = false, allowVideoID: String? = nil) {
         let allowPart: String
         if let allowVideoID, !allowVideoID.isEmpty {
@@ -188,31 +202,53 @@ struct WebViewWrapper: UIViewRepresentable {
             try {
                 var u = new URL(rawHref, window.location.href);
                 var h = u.hostname.toLowerCase();
+                if ((h === 'google.com' || h.endsWith('.google.com') || h.indexOf('.google.') !== -1) && u.pathname === '/url') {
+                    var unwrapped = u.searchParams.get('q') || u.searchParams.get('url') || u.searchParams.get('u');
+                    if (unwrapped) {
+                        u = new URL(unwrapped, window.location.href);
+                        h = u.hostname.toLowerCase();
+                    }
+                }
                 if (h === 'youtu.be') {
                     var seg = u.pathname.replace(/^\\/+/, '').split('/')[0];
                     return seg && seg.length >= 8 ? seg : null;
                 }
                 if (h !== 'youtube.com' && !h.endsWith('.youtube.com')) return null;
                 // Keep playlist browse & account/sign-in pages navigable unless clicking an actual watch/shorts video.
-                if u.pathname.indexOf('/playlist') === 0 && !u.searchParams.get('v') { return null; }
+                if (u.pathname.indexOf('/playlist') === 0 && !u.searchParams.get('v')) { return null; }
                 if (u.pathname.indexOf('/signin') === 0 || u.pathname.indexOf('/ServiceLogin') === 0 || u.pathname.indexOf('/account') === 0) { return null; }
                 var v = u.searchParams.get('v');
                 if (v) return v;
-                var m = u.pathname.match(/\\/(shorts|embed|live)\\/([a-zA-Z0-9_-]{8,16})/);
+                var m = u.pathname.match(/\\/(shorts|embed|live|v)\\/([a-zA-Z0-9_-]{8,16})/);
                 if (m) return m[2];
                 return null;
             } catch (e) { return null; }
+        }
+
+        function resolveAbsoluteYTURL(rawHref) {
+            if (!rawHref) return '';
+            try {
+                var u = new URL(rawHref, window.location.href);
+                var h = u.hostname.toLowerCase();
+                if ((h === 'google.com' || h.endsWith('.google.com') || h.indexOf('.google.') !== -1) && u.pathname === '/url') {
+                    var unwrapped = u.searchParams.get('q') || u.searchParams.get('url') || u.searchParams.get('u');
+                    if (unwrapped) {
+                        return new URL(unwrapped, window.location.href).toString();
+                    }
+                }
+                return u.toString();
+            } catch (e) { return rawHref; }
         }
 
         function currentYTVideoId() {
             return extractYTVideoIdFromURL(window.location.href);
         }
 
+        var ytCardSelector = 'ytm-video-with-context-renderer, ytm-compact-video-renderer, ytm-compact-radio-renderer, ytm-radio-renderer, ytm-rich-item-renderer, ytm-grid-video-renderer, ytm-playlist-video-renderer, ytm-playlist-panel-video-renderer, ytm-compact-playlist-renderer, ytm-media-item, ytm-video-card-renderer, ytm-reel-item-renderer, ytm-shorts-lockup-view-model, ytd-video-renderer, ytd-compact-video-renderer, ytd-radio-renderer, ytd-compact-radio-renderer, ytd-rich-item-renderer, ytd-grid-video-renderer, yt-lockup-view-model';
+
         function extractCardTitle(el) {
             try {
-                var card = el && el.closest
-                    ? el.closest('ytm-video-with-context-renderer, ytm-compact-video-renderer, ytm-rich-item-renderer, ytm-grid-video-renderer, ytm-playlist-video-renderer, ytm-playlist-panel-video-renderer, ytm-reel-item-renderer, ytm-shorts-lockup-view-model, ytd-video-renderer, ytd-compact-video-renderer, ytd-rich-item-renderer, ytd-grid-video-renderer, yt-lockup-view-model')
-                    : null;
+                var card = el && el.closest ? el.closest(ytCardSelector) : null;
                 var scope = card || el;
                 if (scope && scope.querySelector) {
                     var titleEl = scope.querySelector('h3, h4, #video-title, .media-item-headline, .compact-media-item-headline, .reel-item-headline, [role="heading"]');
@@ -234,14 +270,30 @@ struct WebViewWrapper: UIViewRepresentable {
         var lastYTPlayRequestAt = 0;
         var lastYTNavInterceptAt = 0;
         var lastUserGestureAt = 0;
+        var lastGestureTitle = '';
+        var touchStartPoint = null;
         var sentYTPayloads = new Set();
 
-        function noteUserGesture() {
+        function noteUserGesture(e) {
             lastUserGestureAt = Date.now();
+            try {
+                var info = findYTVideoTargetFromEvent(e);
+                if (info && info.title) {
+                    lastGestureTitle = info.title;
+                }
+            } catch (err) {}
         }
-        document.addEventListener('pointerdown', noteUserGesture, true);
-        document.addEventListener('touchstart', noteUserGesture, true);
-        document.addEventListener('click', noteUserGesture, true);
+        window.addEventListener('pointerdown', noteUserGesture, true);
+        window.addEventListener('touchstart', function(e) {
+            try {
+                if (e && e.touches && e.touches[0]) {
+                    touchStartPoint = { x: e.touches[0].clientX, y: e.touches[0].clientY };
+                }
+            } catch (err) {}
+            noteUserGesture(e);
+        }, true);
+        window.addEventListener('touchend', noteUserGesture, true);
+        window.addEventListener('click', noteUserGesture, true);
 
         function shouldBlockYTWebPlayback() {
             var vid = currentYTVideoId();
@@ -530,53 +582,85 @@ struct WebViewWrapper: UIViewRepresentable {
             }
         }, true);
 
-        document.addEventListener('click', function(e) {
+        function isMenuControlElement(node) {
             try {
-                lastUserGestureAt = Date.now();
-                var t = e.target;
-                if (!t || !t.closest) return;
+                if (!node || !node.closest) return false;
+                return !!node.closest('ytm-menu-renderer, ytd-menu-renderer, ytm-subscribe-button-renderer, ytd-subscribe-button-renderer, button[aria-label*="Action" i], button[aria-label*="More" i], button[aria-label*="Menu" i], button[aria-label*="Save" i], button[aria-label*="Subscribe" i], yt-icon-button.dropdown-trigger');
+            } catch (e) { return false; }
+        }
 
-                // Never open or cache clicked YouTube videos (/watch, /shorts, youtu.be) until an explicit user click:
-                // keep the feed/search page open and immediately resolve -> cache -> open native player for the clicked video.
-                if (window.__mpInterceptYouTubePlayback && isYTHost()) {
-                    var anchor = t.closest('a[href]');
-                    if (anchor) {
-                        var rawHref = anchor.getAttribute('href') || anchor.href || '';
-                        var clickedVid = extractYTVideoIdFromURL(rawHref);
-                        if (clickedVid && (!window.__mpAllowWebVideoID || window.__mpAllowWebVideoID !== clickedVid)) {
-                            e.preventDefault();
-                            e.stopPropagation();
-                            if (typeof e.stopImmediatePropagation === 'function') e.stopImmediatePropagation();
-                            document.querySelectorAll('video,audio').forEach(function(m) {
-                                try { m.muted = true; m.pause(); } catch (err) {}
-                            });
-                            var absURL = rawHref;
-                            try { absURL = new URL(rawHref, window.location.href).toString(); } catch (err) {}
-                            notifyYTPlayRequest(true, clickedVid, absURL, extractCardTitle(anchor));
-                            return;
+        function findYTVideoTargetFromEvent(e) {
+            try {
+                if (!e) return null;
+                var path = (typeof e.composedPath === 'function') ? e.composedPath() : [];
+                if ((!path || !path.length) && e.target) path = [e.target];
+                for (var i = 0; i < path.length; i++) {
+                    var node = path[i];
+                    if (!node || node.nodeType !== 1) continue;
+                    if (isMenuControlElement(node)) return null;
+                    if (node.tagName && node.tagName.toLowerCase() === 'a' && node.getAttribute) {
+                        var rawHref = node.getAttribute('href') || node.href || '';
+                        var vid = extractYTVideoIdFromURL(rawHref);
+                        if (vid) {
+                            return { videoId: vid, url: resolveAbsoluteYTURL(rawHref), title: extractCardTitle(node) };
                         }
                     }
-                    // Also intercept taps on video thumbnail cards whose navigation runs via custom Polymer/JS handlers.
-                    var thumbAnchor = t.closest('ytm-video-with-context-renderer, ytm-compact-video-renderer, ytm-rich-item-renderer, ytm-grid-video-renderer, ytm-playlist-video-renderer, ytm-playlist-panel-video-renderer, ytm-reel-item-renderer, ytm-shorts-lockup-view-model, ytd-video-renderer, ytd-compact-video-renderer, ytd-rich-item-renderer, ytd-grid-video-renderer, yt-lockup-view-model');
-                    if (thumbAnchor && !t.closest('button, yt-icon-button, ytm-menu-renderer, ytd-menu-renderer')) {
-                        var innerLink = thumbAnchor.querySelector('a[href*="/watch"], a[href*="/shorts/"], a[href*="youtu.be/"]');
-                        if (innerLink) {
-                            var innerHref = innerLink.getAttribute('href') || innerLink.href || '';
-                            var innerVid = extractYTVideoIdFromURL(innerHref);
-                            if (innerVid && (!window.__mpAllowWebVideoID || window.__mpAllowWebVideoID !== innerVid)) {
-                                e.preventDefault();
-                                e.stopPropagation();
-                                if (typeof e.stopImmediatePropagation === 'function') e.stopImmediatePropagation();
-                                var fullURL = innerHref;
-                                try { fullURL = new URL(innerHref, window.location.href).toString(); } catch (err) {}
-                                notifyYTPlayRequest(true, innerVid, fullURL, extractCardTitle(thumbAnchor));
-                                return;
+                    if (node.matches && node.matches(ytCardSelector) && node.querySelector) {
+                        var inner = node.querySelector('a[href*="/watch"], a[href*="/shorts/"], a[href*="youtu.be/"], a[href*="/v/"]');
+                        if (inner) {
+                            var iHref = inner.getAttribute('href') || inner.href || '';
+                            var iVid = extractYTVideoIdFromURL(iHref);
+                            if (iVid) {
+                                return { videoId: iVid, url: resolveAbsoluteYTURL(iHref), title: extractCardTitle(node) };
                             }
                         }
                     }
                 }
+                var t = e.target;
+                if (t && t.closest) {
+                    if (isMenuControlElement(t)) return null;
+                    var a = t.closest('a[href]');
+                    if (a) {
+                        var aHref = a.getAttribute('href') || a.href || '';
+                        var aVid = extractYTVideoIdFromURL(aHref);
+                        if (aVid) {
+                            return { videoId: aVid, url: resolveAbsoluteYTURL(aHref), title: extractCardTitle(a) };
+                        }
+                    }
+                    var card = t.closest(ytCardSelector);
+                    if (card && card.querySelector) {
+                        var cLink = card.querySelector('a[href*="/watch"], a[href*="/shorts/"], a[href*="youtu.be/"], a[href*="/v/"]');
+                        if (cLink) {
+                            var cHref = cLink.getAttribute('href') || cLink.href || '';
+                            var cVid = extractYTVideoIdFromURL(cHref);
+                            if (cVid) {
+                                return { videoId: cVid, url: resolveAbsoluteYTURL(cHref), title: extractCardTitle(card) };
+                            }
+                        }
+                    }
+                }
+            } catch (err) {}
+            return null;
+        }
+
+        window.addEventListener('click', function(e) {
+            try {
+                lastUserGestureAt = Date.now();
+                var hit = findYTVideoTargetFromEvent(e);
+                if (hit && window.__mpInterceptYouTubePlayback && (!window.__mpAllowWebVideoID || window.__mpAllowWebVideoID !== hit.videoId)) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    if (typeof e.stopImmediatePropagation === 'function') e.stopImmediatePropagation();
+                    document.querySelectorAll('video,audio').forEach(function(m) {
+                        try { m.muted = true; m.pause(); } catch (err) {}
+                    });
+                    notifyYTPlayRequest(true, hit.videoId, hit.url, hit.title);
+                    return;
+                }
 
                 if (!shouldBlockYTWebPlayback()) return;
+                var t = e.target;
+                if (!t || !t.closest) return;
                 if (t.closest('a[href]')) return;
                 if (t.closest('#movie_player, ytm-player, .html5-video-player, video, .ytp-cued-thumbnail-overlay, .ytp-large-play-button, .ytp-play-button, .player-controls-content, .player-control-play-pause-icon, .ytm-custom-control-play-button, button[aria-label*="Play" i]')) {
                     e.preventDefault();
@@ -635,22 +719,21 @@ struct WebViewWrapper: UIViewRepresentable {
             scanPerformance();
         }
 
-        function hookHistoryMethod(name, interceptOnGesture) {
+        function hookHistoryMethod(name, isReplace) {
             try {
                 var orig = history[name];
                 if (typeof orig === 'function') {
                     history[name] = function() {
                         try {
                             var targetArg = arguments.length >= 3 ? arguments[2] : null;
-                            if (interceptOnGesture && targetArg && window.__mpInterceptYouTubePlayback && isYTHost() && (Date.now() - lastUserGestureAt) < 1500) {
+                            if (targetArg && window.__mpInterceptYouTubePlayback && isYTHost()) {
                                 var targetVid = extractYTVideoIdFromURL(String(targetArg));
-                                if (targetVid && targetVid !== currentYTVideoId() && (!window.__mpAllowWebVideoID || window.__mpAllowWebVideoID !== targetVid)) {
+                                if (targetVid && (!window.__mpAllowWebVideoID || window.__mpAllowWebVideoID !== targetVid)) {
                                     var now = Date.now();
-                                    var absTarget = String(targetArg);
-                                    try { absTarget = new URL(absTarget, window.location.href).toString(); } catch (e) {}
-                                    if (now - lastYTNavInterceptAt > 400) {
+                                    var absTarget = resolveAbsoluteYTURL(String(targetArg));
+                                    if (!isReplace && (now - lastUserGestureAt) < 8000 && (now - lastYTNavInterceptAt) > 400) {
                                         lastYTNavInterceptAt = now;
-                                        notifyYTPlayRequest(true, targetVid, absTarget, '');
+                                        notifyYTPlayRequest(true, targetVid, absTarget, lastGestureTitle || '');
                                     }
                                     return undefined;
                                 }
@@ -663,8 +746,46 @@ struct WebViewWrapper: UIViewRepresentable {
                 }
             } catch (e) {}
         }
-        hookHistoryMethod('pushState', true);
-        hookHistoryMethod('replaceState', false);
+        hookHistoryMethod('pushState', false);
+        hookHistoryMethod('replaceState', true);
+
+        window.addEventListener('yt-navigate-start', function(e) {
+            try {
+                if (!window.__mpInterceptYouTubePlayback || !isYTHost()) return;
+                var ep = e && e.detail && e.detail.endpoint ? e.detail.endpoint : null;
+                var rawURL = (ep && ep.commandMetadata && ep.commandMetadata.webCommandMetadata && ep.commandMetadata.webCommandMetadata.url) || '';
+                var vid = (ep && ep.watchEndpoint && ep.watchEndpoint.videoId) || extractYTVideoIdFromURL(rawURL);
+                if (vid && (!window.__mpAllowWebVideoID || window.__mpAllowWebVideoID !== vid)) {
+                    if (typeof e.preventDefault === 'function') e.preventDefault();
+                    e.stopPropagation();
+                    if (typeof e.stopImmediatePropagation === 'function') e.stopImmediatePropagation();
+                    if ((Date.now() - lastUserGestureAt) < 8000) {
+                        var fullURL = rawURL ? resolveAbsoluteYTURL(rawURL) : ('https://m.youtube.com/watch?v=' + vid);
+                        notifyYTPlayRequest(true, vid, fullURL, lastGestureTitle || '');
+                    }
+                }
+            } catch (err) {}
+        }, true);
+
+        try {
+            if (window.navigation && typeof window.navigation.addEventListener === 'function') {
+                window.navigation.addEventListener('navigate', function(e) {
+                    try {
+                        if (!window.__mpInterceptYouTubePlayback || !isYTHost()) return;
+                        var destURL = e && e.destination && e.destination.url ? e.destination.url : '';
+                        var targetVid = extractYTVideoIdFromURL(destURL);
+                        if (targetVid && (!window.__mpAllowWebVideoID || window.__mpAllowWebVideoID !== targetVid)) {
+                            if (e.cancelable && typeof e.preventDefault === 'function') {
+                                e.preventDefault();
+                            }
+                            if ((Date.now() - lastUserGestureAt) < 8000) {
+                                notifyYTPlayRequest(true, targetVid, resolveAbsoluteYTURL(destURL), lastGestureTitle || '');
+                            }
+                        }
+                    } catch (err) {}
+                });
+            }
+        } catch (err) {}
 
         window.addEventListener('yt-navigate-finish', function() {
             setTimeout(scan, 50);
@@ -1077,11 +1198,12 @@ struct WebViewWrapper: UIViewRepresentable {
             decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
         ) {
             let isMainOrBlank = navigationAction.targetFrame?.isMainFrame ?? true
-            if isMainOrBlank, let targetURL = navigationAction.request.url {
+            if isMainOrBlank, let rawTargetURL = navigationAction.request.url {
+                let targetURL = YouTubeStreamResolver.unwrapGoogleRedirectIfNeeded(rawTargetURL)
                 if lastInterceptYouTubePlayback,
-                   navigationAction.navigationType == .linkActivated,
                    YouTubeStreamResolver.isYouTubeURL(targetURL),
                    !(targetURL.path.hasPrefix("/playlist") && !(targetURL.query?.contains("v=") ?? false)),
+                   !(targetURL.path.hasPrefix("/signin") || targetURL.path.hasPrefix("/ServiceLogin") || targetURL.path.hasPrefix("/account")),
                    let vid = YouTubeStreamResolver.extractVideoID(from: targetURL) {
                     DispatchQueue.main.async {
                         self.onYouTubePlayRequested(vid, targetURL, nil, nil)
@@ -1229,7 +1351,7 @@ struct BrowserTabView: View {
     @State private var cachedMediaByYouTubeID: [String: UUID] = [:]
 
     private var shouldInterceptYouTubePlayback: Bool {
-        settings.autoCacheDetectedMedia || !settings.inlineVideoPlayback
+        true
     }
     @State private var latestYouTubeVisitorData: String?
     @State private var activeCacheVideoID: String?
@@ -1881,12 +2003,22 @@ struct BrowserTabView: View {
         activeCacheVideoID = nil
         urlString = tab.urlString
         if let parsed = resolvedURL(from: tab.urlString) {
-            if activeURL == parsed {
+            let safeURL: URL
+            if YouTubeStreamResolver.isYouTubeURL(parsed),
+               YouTubeStreamResolver.extractVideoID(from: parsed) != nil,
+               let ytHome = URL(string: "https://m.youtube.com") {
+                safeURL = ytHome
+                urlString = ytHome.absoluteString
+                browserStore.updateActiveTab(urlString: ytHome.absoluteString, title: "YouTube")
+            } else {
+                safeURL = parsed
+            }
+            if activeURL == safeURL {
                 if forceReload {
-                    browser.load(parsed)
+                    browser.load(safeURL)
                 }
             } else {
-                activeURL = parsed
+                activeURL = safeURL
             }
         }
     }
@@ -2521,7 +2653,7 @@ struct BrowserTabView: View {
         cachingOverlayTitle = hintTitle ?? (browser.pageTitle.isEmpty ? "Loading Video..." : browser.pageTitle)
 
         let watchdogTask = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 22_000_000_000)
+            try? await Task.sleep(nanoseconds: 38_000_000_000)
             guard !Task.isCancelled, activeYouTubeResolveToken == resolveToken else { return }
             activeYouTubeResolveTask?.cancel()
             activeYouTubeResolveTask = nil
@@ -2577,15 +2709,29 @@ struct BrowserTabView: View {
             if !Task.isCancelled,
                activeYouTubeResolveToken == resolveToken,
                (resolved == nil || resolved?.streams.isEmpty == true) {
-                resolvingStepLabel = "Trying browser playback..."
-                if let browserResolved = await BrowserYouTubeResolver.shared.resolveStreamsInBrowser(
-                    videoID: videoID,
-                    priorityLockTimeout: 3.0
-                ) {
-                    if !browserResolved.result.streams.isEmpty {
-                        resolved = browserResolved.result
-                    } else if resolved == nil || resolved?.title == "YouTube Video" {
-                        resolved = browserResolved.result
+                let hasSignedCookies = await BrowserYouTubeResolver.hasSignedInYouTubeCookies(timeoutSeconds: 0.4)
+                let skipBrowserLoginWall = !hasSignedCookies && YouTubeStreamResolver.isLoginOrAgeGateReason(resolved?.errorReason)
+                if !skipBrowserLoginWall {
+                    resolvingStepLabel = "Trying in-app resolver..."
+                    if let browserResolved = await BrowserYouTubeResolver.shared.resolveStreamsInBrowser(
+                        videoID: videoID,
+                        priorityLockTimeout: 3.0
+                    ) {
+                        if !browserResolved.result.streams.isEmpty {
+                            resolved = browserResolved.result
+                        } else if resolved == nil || resolved?.title == "YouTube Video" {
+                            let mergedTitle = (browserResolved.result.title != "YouTube Video")
+                                ? browserResolved.result.title
+                                : (resolved?.title ?? "YouTube Video")
+                            resolved = YouTubeResolvedResult(
+                                videoID: videoID,
+                                title: mergedTitle,
+                                author: browserResolved.result.author ?? resolved?.author,
+                                durationSeconds: browserResolved.result.durationSeconds ?? resolved?.durationSeconds,
+                                streams: [],
+                                errorReason: browserResolved.result.errorReason ?? resolved?.errorReason
+                            )
+                        }
                     }
                 }
                 if (resolved == nil || resolved?.streams.isEmpty == true),
@@ -2661,13 +2807,20 @@ struct BrowserTabView: View {
         if let visitorData, !visitorData.isEmpty {
             latestYouTubeVisitorData = visitorData
         }
-        // Passively track the active YouTube page video without auto-resolving or auto-caching until user clicks a video.
+        // Never allow YouTube watch/player pages to stay visible in the browser tab (e.g. via SPA routing):
+        // immediately navigate back to the feed/browse page and resolve/cache natively.
+        browser.stopAndLeaveYouTubeWatchPage()
+        let alreadyHandled = (activeCacheVideoID == videoID)
+            || (inFlightYouTubeResolveID == videoID)
+            || startedYouTubeCacheIDs.contains(videoID)
         if currentYouTubeVideoID != videoID {
             currentYouTubeVideoID = videoID
             browser.clearDetectedStreams()
             promptedURLsThisPage.removeAll()
         }
-        _ = url
+        if !alreadyHandled {
+            handleYouTubePlayRequest(videoID: videoID, url: url, visitorData: visitorData)
+        }
     }
 
     private func handleYouTubePlayerJSON(videoID: String, jsonData: Data, pageURL: URL?, visitorData: String?) {
@@ -2716,7 +2869,7 @@ struct BrowserTabView: View {
             return
         }
 
-        if settings.autoCacheDetectedMedia {
+        if settings.autoCacheDetectedMedia || forcePlayerOpen {
             guard !startedYouTubeCacheIDs.contains(videoID) else {
                 if downloader.activeDownloads.isEmpty && awaitingAIAutoPlayItem == nil {
                     isResolvingYouTubeCache = false
@@ -2733,10 +2886,10 @@ struct BrowserTabView: View {
                 cachingOverlayTitle = nil
                 awaitingAutoOpenPlayer = false
                 activeCacheVideoID = nil
-                if shouldInterceptYouTubePlayback {
-                    browser.pausePageMedia()
-                } else {
-                    browser.resumePageMediaControl()
+                browser.pausePageMedia()
+                if forcePlayerOpen {
+                    streamDetectedMedia(primary)
+                    return
                 }
                 downloadStatus = "Skipped \"\(result.title)\" (exceeds \(settings.maxCacheDurationMinutes) min limit)."
                 mediaManager.errorMessage = "Skipped \"\(result.title)\" (exceeds \(settings.maxCacheDurationMinutes) min limit)."

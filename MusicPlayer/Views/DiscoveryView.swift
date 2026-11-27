@@ -656,11 +656,12 @@ struct DiscoveryView: View {
                 Label("Cache Offline", systemImage: "arrow.down.circle")
             }
 
-            if let vid = song.videoID {
+            if song.videoID != nil {
                 Button {
-                    openURLInBrowser("https://m.youtube.com/watch?v=\(vid)", title: song.title)
+                    let q = "\(song.artist) \(song.title)".addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
+                    openURLInBrowser("https://m.youtube.com/results?search_query=\(q)", title: song.title)
                 } label: {
-                    Label("Open in Browser", systemImage: "safari")
+                    Label("Search on YouTube", systemImage: "magnifyingglass")
                 }
             }
         }
