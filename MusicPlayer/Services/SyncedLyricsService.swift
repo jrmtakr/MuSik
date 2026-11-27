@@ -308,9 +308,13 @@ final class SyncedLyricsService {
                     var alignedOffline = offline
                     if !item.isHLS {
                         let artistHintOrNil: String? = rawArtist.isEmpty ? nil : rawArtist
-                        let preHeard = await SongAudioListener.listen(to: item.fileURL, titleHint: rawTitle, artistHint: artistHintOrNil)
+                        let preSummary = await SongAudioListener.listenWithSummary(
+                            to: item.fileURL,
+                            titleHint: rawTitle,
+                            artistHint: artistHintOrNil
+                        )
                         guard !Task.isCancelled else { return }
-                        alignedOffline = await SongAudioListener.autoAlign(lyrics: offline, heard: preHeard, fileURL: item.fileURL)
+                        alignedOffline = await SongAudioListener.autoAlign(lyrics: offline, heard: preSummary.words, fileURL: item.fileURL)
                         guard !Task.isCancelled else { return }
                     }
                     alignedOffline.alignmentVersion = Self.currentAlignmentVersion
