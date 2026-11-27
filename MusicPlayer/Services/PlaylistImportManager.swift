@@ -1187,8 +1187,10 @@ final class PlaylistImportManager {
         }
 
         if resolvedResult == nil || (resolvedResult?.streams.isEmpty ?? true) {
-            let hasSignedCookies = YouTubeStreamResolver.hasSignedInCookies(cookiesHeader)
-                || await BrowserYouTubeResolver.hasSignedInYouTubeCookies(timeoutSeconds: 0.4)
+            var hasSignedCookies = YouTubeStreamResolver.hasSignedInCookies(cookiesHeader)
+            if !hasSignedCookies {
+                hasSignedCookies = await BrowserYouTubeResolver.hasSignedInYouTubeCookies(timeoutSeconds: 0.4)
+            }
             let skipBrowserLoginWall = !job.alwaysUseBrowserResolver && !hasSignedCookies && (
                 YouTubeStreamResolver.isLoginOrAgeGateReason(resolvedResult?.errorReason)
                     || YouTubeStreamResolver.isAgeOrLoginRestrictedReason(resolvedResult?.errorReason)
