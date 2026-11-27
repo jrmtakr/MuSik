@@ -603,7 +603,13 @@ enum TrackVerificationService {
                     continue
                 }
                 let lowerArtist = artistName.lowercased()
+                let lowerTitle = title.lowercased()
                 if lowerArtist.contains("genius ") || lowerArtist.contains("romanization") || lowerArtist.contains("translation") {
+                    continue
+                }
+                if lowerTitle.contains("english translation") || lowerTitle.contains("english cover") ||
+                    lowerTitle.contains("(romanized)") || lowerTitle.contains("[romanized]") ||
+                    lowerTitle.contains("(romaji)") || lowerTitle.contains("traduction") {
                     continue
                 }
                 let thumbURL = (result["song_art_image_thumbnail_url"] as? String).flatMap { URL(string: $0) }
@@ -812,15 +818,34 @@ enum TrackVerificationService {
             let normCandTitle = ArtistDatabase.normalizeLookupKey(b.trackTitle)
             let normCandArtist = ArtistDatabase.normalizeLookupKey(b.artistName)
 
+            var titleAligned = normSongQuery.isEmpty
             if !normSongQuery.isEmpty {
                 if normCandTitle == normSongQuery {
                     score += 42
                     reasons.append("Exact Title")
+                    titleAligned = true
                 } else if normCandTitle.contains(normSongQuery) || normSongQuery.contains(normCandTitle) {
                     score += 24
                     reasons.append("Close Title")
-                } else if !b.matchedViaLyrics {
-                    score -= 12
+                    titleAligned = true
+                } else {
+                    let qTokens = Set(normSongQuery.split(separator: " ").map(String.init).filter { $0.count >= 2 })
+                    let cTokens = Set(normCandTitle.split(separator: " ").map(String.init).filter { $0.count >= 2 })
+                    let shared = qTokens.intersection(cTokens).count
+                    if !qTokens.isEmpty && Double(shared) / Double(max(qTokens.count, cTokens.count)) >= 0.55 {
+                        score += 18
+                        titleAligned = true
+                    } else {
+                        // Penalize unrelated titles strongly so duration + bogus word hits never hijack named tracks/instrumentals.
+                        score -= 40
+                    }
+                }
+            }
+            let candLower = b.trackTitle.lowercased()
+            let queryLower = songQuery.lowercased()
+            if candLower.contains("english cover") || candLower.contains("english translation") || candLower.contains("romanized") {
+                if !queryLower.contains("cover") && !queryLower.contains("translation") {
+                    score -= 45
                 }
             }
 
@@ -880,7 +905,7 @@ enum TrackVerificationService {
                 durationSeconds: b.durationSeconds,
                 lyricsSnippet: b.lyricsSnippet,
                 artworkURL: b.artworkURL,
-                score: score,
+                score: titleAligned || b.sources.contains("YouTube Credits") ? score : min(score, 62),
                 matchReasons: reasons,
                 sources: b.sources
             )

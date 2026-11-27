@@ -84,17 +84,25 @@ final class ShazamFingerprintEngine: SongRecognitionEngine, @unchecked Sendable 
     // MARK: - SongRecognitionEngine
 
     func recognize(fileURL: URL, durationHint: Double?) async -> SongRecognitionOutcome {
-        await recognize(fileURL: fileURL, durationHint: durationHint, seedHintTitle: nil, seedHintArtist: nil, heardWords: nil)
+        await recognize(
+            fileURL: fileURL,
+            durationHint: durationHint,
+            seedHintTitle: nil,
+            seedHintArtist: nil,
+            heardWords: nil,
+            allowLyricSearch: true
+        )
     }
 
     /// Recognizes an audio/video file across its whole duration using Shazam acoustic landmarks
-    /// and (when available) heard lyrics + official iTunes 30-second preview acoustic verification.
+    /// and (when available) heard lyrics + official iTunes/Deezer 30-second preview acoustic verification.
     func recognize(
         fileURL: URL,
         durationHint: Double?,
         seedHintTitle: String?,
         seedHintArtist: String?,
-        heardWords: [HeardWord]?
+        heardWords: [HeardWord]?,
+        allowLyricSearch: Bool = true
     ) async -> SongRecognitionOutcome {
         guard FileManager.default.fileExists(atPath: fileURL.path) else {
             return .noMatch
@@ -114,12 +122,13 @@ final class ShazamFingerprintEngine: SongRecognitionEngine, @unchecked Sendable 
             return .match(localHit)
         }
 
-        // 2. Gather candidate songs (from heard vocal phrases, LRCLIB lyric hits, and non-generic filename hints).
+        // 2. Gather candidate songs (from non-generic filename hints + Deezer/iTunes, plus LRCLIB only on vocal tracks).
         let candidates = await gatherITunesPreviewCandidates(
             fileURL: fileURL,
             seedTitle: seedHintTitle,
             seedArtist: seedHintArtist,
-            heardWords: heardWords
+            heardWords: heardWords,
+            allowLyricSearch: allowLyricSearch
         )
 
         guard !candidates.isEmpty else {
@@ -130,8 +139,9 @@ final class ShazamFingerprintEngine: SongRecognitionEngine, @unchecked Sendable 
         let songMap = buildLookupMap(landmarks: songLandmarks)
         var bestCandidate: ITunesPreviewCandidate?
         var bestAlignedCount = 0
+        var bestSecondPeak = 0
 
-        for candidate in candidates.prefix(8) {
+        for candidate in candidates.prefix(10) {
             if let durationHint, let candDur = candidate.durationSeconds,
                durationHint > 10, abs(durationHint - candDur) > 12 {
                 continue
@@ -140,18 +150,22 @@ final class ShazamFingerprintEngine: SongRecognitionEngine, @unchecked Sendable 
                   !previewLandmarks.isEmpty else {
                 continue
             }
-            let aligned = bestTimeOffsetMatchCount(songMap: songMap, previewLandmarks: previewLandmarks)
-            if aligned > bestAlignedCount {
-                bestAlignedCount = aligned
+            let (peakVotes, secondVotes) = bestTimeOffsetMatchPeaks(songMap: songMap, previewLandmarks: previewLandmarks)
+            // Guard against repetitive 4-bar chord/drum loops causing low-prominence hash collisions.
+            let prominent = peakVotes >= 26 && (secondVotes == 0 || Double(peakVotes) >= Double(secondVotes) * 1.65)
+            if prominent && peakVotes > bestAlignedCount {
+                bestAlignedCount = peakVotes
+                bestSecondPeak = secondVotes
                 bestCandidate = candidate
             }
             // Early exit on an unmistakable acoustic lock.
-            if aligned >= 45 { break }
+            if prominent && peakVotes >= 48 { break }
         }
 
-        guard let matched = bestCandidate, bestAlignedCount >= 16 else {
+        guard let matched = bestCandidate, bestAlignedCount >= 26 else {
             return .noMatch
         }
+        _ = bestSecondPeak
 
         let identified = IdentifiedSong(
             title: matched.title,
@@ -215,13 +229,13 @@ final class ShazamFingerprintEngine: SongRecognitionEngine, @unchecked Sendable 
                durationHint > 10, abs(durationHint - recDur) > 15 {
                 continue
             }
-            if let peak = deltaMap.values.max(), peak >= 18 {
+            if let peak = deltaMap.values.max(), peak >= 26 {
                 ranked.append((idx, peak))
             }
         }
         ranked.sort { $0.peakVotes > $1.peakVotes }
         guard let top = ranked.first else { return nil }
-        if ranked.count >= 2 && top.peakVotes < Int(Double(ranked[1].peakVotes) * 1.4) && top.peakVotes < 40 {
+        if ranked.count >= 2 && Double(top.peakVotes) < Double(ranked[1].peakVotes) * 1.60 && top.peakVotes < 48 {
             return nil
         }
 
@@ -299,27 +313,42 @@ final class ShazamFingerprintEngine: SongRecognitionEngine, @unchecked Sendable 
         fileURL: URL,
         seedTitle: String?,
         seedArtist: String?,
-        heardWords: [HeardWord]?
+        heardWords: [HeardWord]?,
+        allowLyricSearch: Bool
     ) async -> [ITunesPreviewCandidate] {
         var searchQueries: [String] = []
+        let langCtx = SongAudioListener.detectLanguageContext(title: seedTitle, artist: seedArtist)
 
         if let seedTitle, !seedTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            let cleaned = ArtistDatabase.cleanSongTitleForSearch(rawTitle: seedTitle, rawArtistTag: seedArtist)
-            let combined = [cleaned.artistHint ?? seedArtist ?? "", cleaned.songOnly]
+            let parsed = ArtistDatabase.parseTrackHints(
+                rawTitle: seedTitle,
+                rawArtistTag: seedArtist,
+                fileName: fileURL.lastPathComponent
+            )
+            let combined = [parsed.artistHint ?? seedArtist ?? "", parsed.songTitle]
                 .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
                 .filter { !$0.isEmpty }
                 .joined(separator: " ")
             if !Self.looksGenericUploadName(combined) {
                 searchQueries.append(combined)
             }
+            if let alt = parsed.alternatePair {
+                let altCombined = [alt.artist, alt.song]
+                    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                    .filter { !$0.isEmpty }
+                    .joined(separator: " ")
+                if !altCombined.isEmpty && !Self.looksGenericUploadName(altCombined) {
+                    searchQueries.append(altCombined)
+                }
+            }
         }
 
-        // Listen to heard words if not already supplied, then search LRCLIB + iTunes by vocal phrases.
+        // Only query LRCLIB by heard words when the track actually has vocal lyrics in a transcribable language.
         var words = heardWords
-        if words == nil {
+        if words == nil && allowLyricSearch {
             words = await SongAudioListener.listen(to: fileURL)
         }
-        if let words, !words.isEmpty {
+        if allowLyricSearch, let words, words.count >= 8 {
             let phrases = SongAudioListener.searchPhrases(from: words)
             for phrase in phrases.prefix(3) {
                 if let lrcTitles = await fetchLRCLIBCandidateTerms(phrase: phrase) {
@@ -329,7 +358,7 @@ final class ShazamFingerprintEngine: SongRecognitionEngine, @unchecked Sendable 
             }
         }
 
-        // Deduplicate queries and fetch iTunes previewable tracks.
+        // Deduplicate queries and fetch iTunes (plus regional storefronts & global Deezer) previewable tracks.
         var seenQuery = Set<String>()
         var results: [ITunesPreviewCandidate] = []
         var seenTrackKeys = Set<String>()
@@ -337,14 +366,23 @@ final class ShazamFingerprintEngine: SongRecognitionEngine, @unchecked Sendable 
         for q in searchQueries {
             let norm = q.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
             guard !norm.isEmpty, seenQuery.insert(norm).inserted else { continue }
-            let fetched = await searchITunesWithPreviews(term: q)
-            for item in fetched {
+            for country in langCtx.preferredITunesCountries {
+                let fetched = await searchITunesWithPreviews(term: q, country: country)
+                for item in fetched {
+                    let tk = "\(item.title.lowercased())|\(item.artist.lowercased())"
+                    if seenTrackKeys.insert(tk).inserted {
+                        results.append(item)
+                    }
+                }
+            }
+            let deezerFetched = await searchDeezerWithPreviews(term: q)
+            for item in deezerFetched {
                 let tk = "\(item.title.lowercased())|\(item.artist.lowercased())"
                 if seenTrackKeys.insert(tk).inserted {
                     results.append(item)
                 }
             }
-            if results.count >= 8 { break }
+            if results.count >= 10 { break }
         }
 
         return results
@@ -369,12 +407,13 @@ final class ShazamFingerprintEngine: SongRecognitionEngine, @unchecked Sendable 
         }
     }
 
-    private func searchITunesWithPreviews(term: String) async -> [ITunesPreviewCandidate] {
+    private func searchITunesWithPreviews(term: String, country: String = "us") async -> [ITunesPreviewCandidate] {
         var comps = URLComponents(string: "https://itunes.apple.com/search")
         comps?.queryItems = [
             URLQueryItem(name: "term", value: term),
             URLQueryItem(name: "media", value: "music"),
             URLQueryItem(name: "entity", value: "song"),
+            URLQueryItem(name: "country", value: country),
             URLQueryItem(name: "limit", value: "6")
         ]
         guard let url = comps?.url else { return [] }
@@ -406,6 +445,47 @@ final class ShazamFingerprintEngine: SongRecognitionEngine, @unchecked Sendable 
                 genre: genre,
                 artworkURL: artStr.flatMap { URL(string: $0) },
                 durationSeconds: durMs.map { $0 / 1000.0 },
+                previewURL: previewURL
+            )
+        }
+    }
+
+    private func searchDeezerWithPreviews(term: String) async -> [ITunesPreviewCandidate] {
+        var comps = URLComponents(string: "https://api.deezer.com/search")
+        comps?.queryItems = [
+            URLQueryItem(name: "q", value: term),
+            URLQueryItem(name: "limit", value: "5")
+        ]
+        guard let url = comps?.url else { return [] }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 10
+        guard let (data, resp) = try? await URLSession.shared.data(for: req),
+              let http = resp as? HTTPURLResponse, (200...299).contains(http.statusCode),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let rows = json["data"] as? [[String: Any]] else {
+            return []
+        }
+
+        return rows.compactMap { row in
+            guard let title = row["title"] as? String,
+                  let artistObj = row["artist"] as? [String: Any],
+                  let artist = artistObj["name"] as? String,
+                  let previewStr = row["preview"] as? String,
+                  !previewStr.isEmpty,
+                  let previewURL = URL(string: previewStr) else {
+                return nil
+            }
+            let albumObj = row["album"] as? [String: Any]
+            let album = albumObj?["title"] as? String
+            let artStr = (albumObj?["cover_xl"] as? String) ?? (albumObj?["cover_big"] as? String) ?? (albumObj?["cover_medium"] as? String)
+            let dur = row["duration"] as? Double
+            return ITunesPreviewCandidate(
+                title: title,
+                artist: artist,
+                album: album,
+                genre: ArtistDatabase.genre(forArtist: artist),
+                artworkURL: artStr.flatMap { URL(string: $0) },
+                durationSeconds: dur,
                 previewURL: previewURL
             )
         }
@@ -445,7 +525,7 @@ final class ShazamFingerprintEngine: SongRecognitionEngine, @unchecked Sendable 
         return map
     }
 
-    private func bestTimeOffsetMatchCount(songMap: [UInt32: [UInt16]], previewLandmarks: [Landmark]) -> Int {
+    private func bestTimeOffsetMatchPeaks(songMap: [UInt32: [UInt16]], previewLandmarks: [Landmark]) -> (peakVotes: Int, secondVotes: Int) {
         var offsetHistogram: [Int: Int] = [:]
         for lm in previewLandmarks {
             guard let songFrames = songMap[lm.hash] else { continue }
@@ -454,7 +534,12 @@ final class ShazamFingerprintEngine: SongRecognitionEngine, @unchecked Sendable 
                 offsetHistogram[delta, default: 0] += 1
             }
         }
-        return offsetHistogram.values.max() ?? 0
+        guard let top = offsetHistogram.max(by: { $0.value < $1.value }) else { return (0, 0) }
+        let second = offsetHistogram
+            .filter { abs($0.key - top.key) >= 4 }
+            .values
+            .max() ?? 0
+        return (top.value, second)
     }
 
     private static func looksGenericUploadName(_ text: String) -> Bool {

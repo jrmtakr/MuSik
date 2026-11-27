@@ -42,7 +42,93 @@ enum SongAudioListener {
 
     // MARK: - Listening
 
-    /// Prepares an AVFoundation-readable audio file URL, remuxing FFmpeg containers (e.g. MKV/TS/WebM) to M4A if needed.
+    struct ListenSummary: Sendable {
+        let words: [HeardWord]
+        let detectedLanguage: String?
+        let isMostlyInstrumental: Bool
+    }
+
+    /// Detects obvious non-English script or catalog metadata hints so we don't run English-only Speech on foreign tracks.
+    static func detectLanguageContext(title: String?, artist: String?) -> (isNonEnglish: Bool, speechLocaleID: String?, preferredITunesCountries: [String]) {
+        let combined = [title ?? "", artist ?? ""].joined(separator: " ")
+        var hasHiraganaOrKatakana = false
+        var hasHan = false
+        var hasHangul = false
+        var hasCyrillic = false
+        var hasArabic = false
+        var hasSpanishOrPortuguese = false
+        var hasFrench = false
+
+        for scalar in combined.unicodeScalars {
+            let v = scalar.value
+            if (0x3040...0x309F).contains(v) || (0x30A0...0x30FF).contains(v) || (0xFF65...0xFF9F).contains(v) {
+                hasHiraganaOrKatakana = true
+            } else if (0x4E00...0x9FFF).contains(v) || (0x3400...0x4DBF).contains(v) {
+                hasHan = true
+            } else if (0xAC00...0xD7AF).contains(v) || (0x1100...0x11FF).contains(v) || (0x3130...0x318F).contains(v) {
+                hasHangul = true
+            } else if (0x0400...0x04FF).contains(v) {
+                hasCyrillic = true
+            } else if (0x0600...0x06FF).contains(v) {
+                hasArabic = true
+            }
+        }
+        let lower = combined.lowercased()
+        if lower.contains("ñ") || lower.contains("á") || lower.contains("é") || lower.contains("í") || lower.contains("ó") || lower.contains("ú") || lower.contains("ã") || lower.contains("ç") {
+            hasSpanishOrPortuguese = true
+        }
+        if lower.contains("à") || lower.contains("è") || lower.contains("ê") || lower.contains("î") || lower.contains("ô") || lower.contains("û") {
+            hasFrench = true
+        }
+
+        let catalogGenre = artist.flatMap { ArtistDatabase.genre(forArtist: $0) } ?? ""
+        let catalogKPopJPop = catalogGenre.localizedCaseInsensitiveContains("K-Pop") || catalogGenre.localizedCaseInsensitiveContains("J-Pop")
+        let artistLower = (artist ?? "").lowercased()
+        let knownFrenchArtist = artistLower == "lacrim" || artistLower == "stromae" || artistLower == "aya nakamura" || artistLower == "gims"
+        let knownJapaneseName = lower.contains("ikasz") || lower.contains("ikasuze") || lower.contains("kashiwa") ||
+            lower.contains("kaiware") || lower.contains("yasuha") || lower.contains("kokubu") ||
+            lower.contains("nakashima") || lower.contains("anime") || lower.contains("city pop")
+
+        if hasHiraganaOrKatakana || (hasHan && !hasHangul) || knownJapaneseName {
+            return (true, "ja-JP", ["us", "jp"])
+        }
+        if hasHangul {
+            return (true, "ko-KR", ["us", "kr"])
+        }
+        if catalogKPopJPop {
+            let isLikelyKR = artistLower == "hyuna" || artistLower == "ikon" || artistLower == "bts" ||
+                artistLower == "blackpink" || artistLower == "twice" || artistLower == "newjeans" ||
+                artistLower == "stray kids" || artistLower == "jennie" || artistLower == "rosé"
+            return (true, isLikelyKR ? "ko-KR" : "ja-JP", isLikelyKR ? ["us", "kr"] : ["us", "jp"])
+        }
+        if hasCyrillic {
+            return (true, "ru-RU", ["us", "ru"])
+        }
+        if hasArabic {
+            return (true, "ar-SA", ["us", "ae", "eg"])
+        }
+        if knownFrenchArtist || hasFrench {
+            return (true, "fr-FR", ["us", "fr"])
+        }
+        if hasSpanishOrPortuguese {
+            return (true, "es-ES", ["us", "mx", "es", "br"])
+        }
+        return (false, nil, ["us"])
+    }
+
+    static func hasInstrumentalFilenameHint(_ text: String) -> Bool {
+        let norm = " \(normalizeTokenText(text)) "
+        let keywords = [" instrumental ", " off vocal ", " karaoke ", " type beat ", " bgm ", " soundtrack "]
+        return keywords.contains { norm.contains($0) }
+    }
+
+    private static func normalizeTokenText(_ raw: String) -> String {
+        raw.folding(options: [.diacriticInsensitive, .caseInsensitive], locale: Locale(identifier: "en_US"))
+            .replacingOccurrences(of: #"[^a-z0-9]+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Prepares an AVFoundation-readable audio file URL, remuxing FFmpeg containers (e.g. MKV/TS/WebM) to M4A or decoding Opus/FLAC/OGG to WAV.
     static func prepareReadableAudioFile(for fileURL: URL) -> (url: URL, cleanupURL: URL?)? {
         guard FileManager.default.fileExists(atPath: fileURL.path) else { return nil }
         let directAsset = AVURLAsset(url: fileURL)
@@ -57,42 +143,77 @@ enum SongAudioListener {
             return (remuxURL, remuxURL)
         }
         try? FileManager.default.removeItem(at: remuxURL)
+
+        let wavURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("audio_dec_\(UUID().uuidString).wav")
+        if FFmpegMediaService.decodeAudioToWAV(inputURL: fileURL, outputURL: wavURL),
+           FileManager.default.fileExists(atPath: wavURL.path),
+           !AVURLAsset(url: wavURL).tracks(withMediaType: .audio).isEmpty {
+            return (wavURL, wavURL)
+        }
+        try? FileManager.default.removeItem(at: wavURL)
         return nil
     }
 
-    /// Transcribes the whole file (audio or music video).
-    /// Uses cached on-device CoreML Whisper (`allowDownload: false` so playback never stalls on model download),
-    /// falling back immediately to 5s-overlapping Apple `SFSpeechRecognizer` chunks when Whisper isn't cached yet.
-    static func listen(
+    /// Transcribes the whole file (audio or music video) and returns words + detected language + instrumental flag.
+    static func listenWithSummary(
         to fileURL: URL,
+        titleHint: String? = nil,
+        artistHint: String? = nil,
         maxSeconds: Double = 15 * 60,
-        languageHint: String? = "en",
+        languageHint: String? = nil,
         onProgress: (@Sendable (Int, Int, Double) -> Void)? = nil
-    ) async -> [HeardWord]? {
-        if let whisperWords = await WhisperTranscriptionEngine.shared.transcribeWholeFile(
+    ) async -> ListenSummary {
+        let langCtx = detectLanguageContext(title: titleHint ?? fileURL.deletingPathExtension().lastPathComponent, artist: artistHint)
+        let titleIsInstrumental = hasInstrumentalFilenameHint([titleHint ?? "", fileURL.deletingPathExtension().lastPathComponent].joined(separator: " "))
+        let effectiveHint = languageHint ?? (langCtx.isNonEnglish ? nil : nil) // Allow Whisper auto language ID
+
+        if let summary = await WhisperTranscriptionEngine.shared.transcribeWholeFileSummary(
             fileURL: fileURL,
             maxSeconds: maxSeconds,
             allowDownload: false,
-            languageHint: languageHint,
+            languageHint: effectiveHint,
             onProgress: onProgress
-        ), !whisperWords.isEmpty {
-            return whisperWords.map {
-                HeardWord(
-                    token: $0.token,
-                    rawText: $0.rawText,
-                    time: $0.startTime,
-                    endTime: $0.endTime
-                )
+        ) {
+            let heardWords = summary.words.map {
+                HeardWord(token: $0.token, rawText: $0.rawText, time: $0.startTime, endTime: $0.endTime)
             }
+            let meaningfulCount = heardWords.filter { $0.token.count >= 3 && !stopWords.contains($0.token) }.count
+            let wpm = Double(heardWords.count) / max(0.5, summary.durationSeconds / 60.0)
+            let isInst = titleIsInstrumental
+                || heardWords.isEmpty
+                || summary.avgNoSpeechProb >= 0.72
+                || meaningfulCount < 10
+                || (summary.durationSeconds >= 45 && wpm < 7.0)
+            return ListenSummary(
+                words: heardWords,
+                detectedLanguage: summary.detectedLanguage ?? (langCtx.isNonEnglish ? langCtx.speechLocaleID : nil),
+                isMostlyInstrumental: isInst
+            )
         }
 
-        guard SFSpeechRecognizer.authorizationStatus() == .authorized,
-              let recognizer = SFSpeechRecognizer(locale: .current)
-                ?? SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
-                ?? SFSpeechRecognizer(),
-              recognizer.isAvailable else { return nil }
+        // If the track title/artist clearly points to a non-English language and Apple Speech doesn't support that locale
+        // on-device, never run English Speech to invent phonetic English gibberish!
+        guard SFSpeechRecognizer.authorizationStatus() == .authorized else {
+            return ListenSummary(words: [], detectedLanguage: langCtx.speechLocaleID, isMostlyInstrumental: titleIsInstrumental)
+        }
 
-        guard let prepared = prepareReadableAudioFile(for: fileURL) else { return nil }
+        let recognizer: SFSpeechRecognizer? = {
+            if let localeID = langCtx.speechLocaleID {
+                let foreignRec = SFSpeechRecognizer(locale: Locale(identifier: localeID))
+                return (foreignRec?.isAvailable == true) ? foreignRec : nil
+            }
+            return SFSpeechRecognizer(locale: .current)
+                ?? SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
+                ?? SFSpeechRecognizer()
+        }()
+        guard let recognizer, recognizer.isAvailable else {
+            return ListenSummary(words: [], detectedLanguage: langCtx.speechLocaleID, isMostlyInstrumental: titleIsInstrumental)
+        }
+
+        guard let prepared = prepareReadableAudioFile(for: fileURL) else {
+            return ListenSummary(words: [], detectedLanguage: langCtx.speechLocaleID, isMostlyInstrumental: titleIsInstrumental)
+        }
         defer {
             if let cleanupURL = prepared.cleanupURL {
                 try? FileManager.default.removeItem(at: cleanupURL)
@@ -101,7 +222,7 @@ enum SongAudioListener {
 
         let asset = AVURLAsset(url: prepared.url)
         guard let duration = try? await asset.load(.duration).seconds, duration.isFinite, duration > 3 else {
-            return nil
+            return ListenSummary(words: [], detectedLanguage: langCtx.speechLocaleID, isMostlyInstrumental: titleIsInstrumental)
         }
 
         let total = min(duration, maxSeconds)
@@ -131,7 +252,29 @@ enum SongAudioListener {
             if start + length >= total { break }
             start += chunkStepSeconds
         }
-        return heard
+        let meaningfulCount = heard.filter { $0.token.count >= 3 && !stopWords.contains($0.token) }.count
+        let wpm = Double(heard.count) / max(0.5, total / 60.0)
+        let isInst = titleIsInstrumental || heard.isEmpty || meaningfulCount < 10 || (total >= 45 && wpm < 7.0)
+        return ListenSummary(
+            words: heard,
+            detectedLanguage: langCtx.speechLocaleID,
+            isMostlyInstrumental: isInst
+        )
+    }
+
+    static func listen(
+        to fileURL: URL,
+        maxSeconds: Double = 15 * 60,
+        languageHint: String? = nil,
+        onProgress: (@Sendable (Int, Int, Double) -> Void)? = nil
+    ) async -> [HeardWord]? {
+        let summary = await listenWithSummary(
+            to: fileURL,
+            maxSeconds: maxSeconds,
+            languageHint: languageHint,
+            onProgress: onProgress
+        )
+        return summary.words.isEmpty ? nil : summary.words
     }
 
     private static func exportAudioChunk(asset: AVAsset, start: Double, length: Double) async -> URL? {

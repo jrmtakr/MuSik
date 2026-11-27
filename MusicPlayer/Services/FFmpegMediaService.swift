@@ -486,6 +486,259 @@ enum FFmpegMediaService {
         return result
     }
 
+    /// Decodes any FFmpeg-readable audio track (including `.webm` Opus/Vorbis, FLAC, OGG, MP3, MKV)
+    /// into a standard 16-bit interleaved PCM `.wav` readable by `AVFoundation` / `WhisperKit` / `SFSpeechRecognizer`.
+    static func decodeAudioToWAV(inputURL: URL, outputURL: URL, maxSeconds: Double = 900) -> Bool {
+        _ = networkInitOnce
+        var inCtx: UnsafeMutablePointer<AVFormatContext>?
+        guard avformat_open_input(&inCtx, inputURL.path, nil, nil) == 0, let inputFmtCtx = inCtx else {
+            return false
+        }
+        defer {
+            var ctx: UnsafeMutablePointer<AVFormatContext>? = inputFmtCtx
+            avformat_close_input(&ctx)
+        }
+        guard avformat_find_stream_info(inputFmtCtx, nil) >= 0 else { return false }
+
+        var audioStreamIndex: Int32 = -1
+        for i in 0 ..< Int(inputFmtCtx.pointee.nb_streams) {
+            if let st = inputFmtCtx.pointee.streams[i],
+               let par = st.pointee.codecpar,
+               par.pointee.codec_type == AVMEDIA_TYPE_AUDIO {
+                audioStreamIndex = Int32(i)
+                break
+            }
+        }
+        guard audioStreamIndex >= 0,
+              let inStream = inputFmtCtx.pointee.streams[Int(audioStreamIndex)],
+              let par = inStream.pointee.codecpar,
+              let decoder = avcodec_find_decoder(par.pointee.codec_id),
+              let allocatedCtx = avcodec_alloc_context3(decoder) else {
+            return false
+        }
+        var decCtx: UnsafeMutablePointer<AVCodecContext>? = allocatedCtx
+        defer { avcodec_free_context(&decCtx) }
+
+        guard avcodec_parameters_to_context(allocatedCtx, par) >= 0,
+              avcodec_open2(allocatedCtx, decoder, nil) >= 0 else {
+            return false
+        }
+
+        var pkt = av_packet_alloc()
+        var frame = av_frame_alloc()
+        defer {
+            av_packet_free(&pkt)
+            av_frame_free(&frame)
+        }
+        guard let pkt, let frame else { return false }
+
+        try? FileManager.default.removeItem(at: outputURL)
+        FileManager.default.createFile(atPath: outputURL.path, contents: nil)
+        guard let fh = try? FileHandle(forWritingTo: outputURL) else { return false }
+
+        var wroteHeader = false
+        var outChannels = 2
+        var outSampleRate = 44100
+        var writtenBytes: UInt64 = 0
+        var writtenFrames: Int64 = 0
+        var maxFrames: Int64 = Int64(44100.0 * maxSeconds)
+        var succeeded = false
+
+        defer {
+            try? fh.close()
+            if !succeeded {
+                try? FileManager.default.removeItem(at: outputURL)
+            }
+        }
+
+        func appendLE32(_ v: UInt32, into data: inout Data) {
+            var le = v.littleEndian
+            data.append(Data(bytes: &le, count: 4))
+        }
+        func appendLE16(_ v: UInt16, into data: inout Data) {
+            var le = v.littleEndian
+            data.append(Data(bytes: &le, count: 2))
+        }
+
+        func writePCMFrame(_ f: UnsafeMutablePointer<AVFrame>) {
+            let sr = max(8000, Int(f.pointee.sample_rate))
+            let srcCh = max(1, Int(f.pointee.ch_layout.nb_channels))
+            let nSamples = Int(f.pointee.nb_samples)
+            guard nSamples > 0 else { return }
+
+            if !wroteHeader {
+                outChannels = min(2, srcCh)
+                outSampleRate = sr
+                maxFrames = Int64(Double(sr) * maxSeconds)
+                var header = Data(capacity: 44)
+                header.append(contentsOf: [0x52, 0x49, 0x46, 0x46]) // "RIFF"
+                appendLE32(36, into: &header)
+                header.append(contentsOf: [0x57, 0x41, 0x56, 0x45]) // "WAVE"
+                header.append(contentsOf: [0x66, 0x6D, 0x74, 0x20]) // "fmt "
+                appendLE32(16, into: &header)
+                appendLE16(1, into: &header) // PCM
+                appendLE16(UInt16(outChannels), into: &header)
+                appendLE32(UInt32(outSampleRate), into: &header)
+                appendLE32(UInt32(outSampleRate * outChannels * 2), into: &header)
+                appendLE16(UInt16(outChannels * 2), into: &header)
+                appendLE16(16, into: &header)
+                header.append(contentsOf: [0x64, 0x61, 0x74, 0x61]) // "data"
+                appendLE32(0, into: &header)
+                fh.write(header)
+                wroteHeader = true
+            }
+
+            let remaining = Int(max(0, maxFrames - writtenFrames))
+            let count = min(nSamples, remaining)
+            guard count > 0, let extData = f.pointee.extended_data else { return }
+
+            @inline(__always)
+            func clampI16(_ x: Double) -> Int16 {
+                let c = max(-1.0, min(1.0, x))
+                return Int16((c * 32767.0).rounded())
+            }
+
+            let fmt = AVSampleFormat(rawValue: f.pointee.format)
+            var outI16 = [Int16](repeating: 0, count: count * outChannels)
+
+            switch fmt {
+            case AV_SAMPLE_FMT_FLTP:
+                let ch0 = UnsafeRawPointer(extData[0]!).assumingMemoryBound(to: Float.self)
+                let ch1 = (outChannels > 1 && srcCh > 1 && extData[1] != nil)
+                    ? UnsafeRawPointer(extData[1]!).assumingMemoryBound(to: Float.self)
+                    : ch0
+                for s in 0..<count {
+                    outI16[s * outChannels] = clampI16(Double(ch0[s]))
+                    if outChannels > 1 { outI16[s * outChannels + 1] = clampI16(Double(ch1[s])) }
+                }
+            case AV_SAMPLE_FMT_FLT:
+                let buf = UnsafeRawPointer(extData[0]!).assumingMemoryBound(to: Float.self)
+                for s in 0..<count {
+                    outI16[s * outChannels] = clampI16(Double(buf[s * srcCh]))
+                    if outChannels > 1 {
+                        let rIdx = srcCh > 1 ? s * srcCh + 1 : s * srcCh
+                        outI16[s * outChannels + 1] = clampI16(Double(buf[rIdx]))
+                    }
+                }
+            case AV_SAMPLE_FMT_S16P:
+                let ch0 = UnsafeRawPointer(extData[0]!).assumingMemoryBound(to: Int16.self)
+                let ch1 = (outChannels > 1 && srcCh > 1 && extData[1] != nil)
+                    ? UnsafeRawPointer(extData[1]!).assumingMemoryBound(to: Int16.self)
+                    : ch0
+                for s in 0..<count {
+                    outI16[s * outChannels] = ch0[s]
+                    if outChannels > 1 { outI16[s * outChannels + 1] = ch1[s] }
+                }
+            case AV_SAMPLE_FMT_S16:
+                let buf = UnsafeRawPointer(extData[0]!).assumingMemoryBound(to: Int16.self)
+                for s in 0..<count {
+                    outI16[s * outChannels] = buf[s * srcCh]
+                    if outChannels > 1 {
+                        let rIdx = srcCh > 1 ? s * srcCh + 1 : s * srcCh
+                        outI16[s * outChannels + 1] = buf[rIdx]
+                    }
+                }
+            case AV_SAMPLE_FMT_S32P:
+                let ch0 = UnsafeRawPointer(extData[0]!).assumingMemoryBound(to: Int32.self)
+                let ch1 = (outChannels > 1 && srcCh > 1 && extData[1] != nil)
+                    ? UnsafeRawPointer(extData[1]!).assumingMemoryBound(to: Int32.self)
+                    : ch0
+                for s in 0..<count {
+                    outI16[s * outChannels] = clampI16(Double(ch0[s]) / 2147483648.0)
+                    if outChannels > 1 { outI16[s * outChannels + 1] = clampI16(Double(ch1[s]) / 2147483648.0) }
+                }
+            case AV_SAMPLE_FMT_S32:
+                let buf = UnsafeRawPointer(extData[0]!).assumingMemoryBound(to: Int32.self)
+                for s in 0..<count {
+                    outI16[s * outChannels] = clampI16(Double(buf[s * srcCh]) / 2147483648.0)
+                    if outChannels > 1 {
+                        let rIdx = srcCh > 1 ? s * srcCh + 1 : s * srcCh
+                        outI16[s * outChannels + 1] = clampI16(Double(buf[rIdx]) / 2147483648.0)
+                    }
+                }
+            case AV_SAMPLE_FMT_DBLP:
+                let ch0 = UnsafeRawPointer(extData[0]!).assumingMemoryBound(to: Double.self)
+                let ch1 = (outChannels > 1 && srcCh > 1 && extData[1] != nil)
+                    ? UnsafeRawPointer(extData[1]!).assumingMemoryBound(to: Double.self)
+                    : ch0
+                for s in 0..<count {
+                    outI16[s * outChannels] = clampI16(ch0[s])
+                    if outChannels > 1 { outI16[s * outChannels + 1] = clampI16(ch1[s]) }
+                }
+            case AV_SAMPLE_FMT_DBL:
+                let buf = UnsafeRawPointer(extData[0]!).assumingMemoryBound(to: Double.self)
+                for s in 0..<count {
+                    outI16[s * outChannels] = clampI16(buf[s * srcCh])
+                    if outChannels > 1 {
+                        let rIdx = srcCh > 1 ? s * srcCh + 1 : s * srcCh
+                        outI16[s * outChannels + 1] = clampI16(buf[rIdx])
+                    }
+                }
+            case AV_SAMPLE_FMT_U8P:
+                let ch0 = UnsafeRawPointer(extData[0]!).assumingMemoryBound(to: UInt8.self)
+                let ch1 = (outChannels > 1 && srcCh > 1 && extData[1] != nil)
+                    ? UnsafeRawPointer(extData[1]!).assumingMemoryBound(to: UInt8.self)
+                    : ch0
+                for s in 0..<count {
+                    outI16[s * outChannels] = Int16(Int(ch0[s]) - 128) * 256
+                    if outChannels > 1 { outI16[s * outChannels + 1] = Int16(Int(ch1[s]) - 128) * 256 }
+                }
+            case AV_SAMPLE_FMT_U8:
+                let buf = UnsafeRawPointer(extData[0]!).assumingMemoryBound(to: UInt8.self)
+                for s in 0..<count {
+                    outI16[s * outChannels] = Int16(Int(buf[s * srcCh]) - 128) * 256
+                    if outChannels > 1 {
+                        let rIdx = srcCh > 1 ? s * srcCh + 1 : s * srcCh
+                        outI16[s * outChannels + 1] = Int16(Int(buf[rIdx]) - 128) * 256
+                    }
+                }
+            default:
+                return
+            }
+
+            outI16.withUnsafeBytes { rawBuf in
+                if let base = rawBuf.baseAddress {
+                    let bytesToWrite = rawBuf.count
+                    fh.write(Data(bytes: base, count: bytesToWrite))
+                    writtenBytes += UInt64(bytesToWrite)
+                    writtenFrames += Int64(count)
+                }
+            }
+        }
+
+        while av_read_frame(inputFmtCtx, pkt) >= 0 {
+            if pkt.pointee.stream_index == audioStreamIndex {
+                if avcodec_send_packet(allocatedCtx, pkt) >= 0 {
+                    while avcodec_receive_frame(allocatedCtx, frame) >= 0 {
+                        writePCMFrame(frame)
+                        av_frame_unref(frame)
+                        if writtenFrames >= maxFrames { break }
+                    }
+                }
+            }
+            av_packet_unref(pkt)
+            if writtenFrames >= maxFrames { break }
+        }
+        // Flush buffered decoder frames.
+        if writtenFrames < maxFrames && avcodec_send_packet(allocatedCtx, nil) >= 0 {
+            while avcodec_receive_frame(allocatedCtx, frame) >= 0 {
+                writePCMFrame(frame)
+                av_frame_unref(frame)
+                if writtenFrames >= maxFrames { break }
+            }
+        }
+
+        guard wroteHeader, writtenBytes > 0 else { return false }
+        let safeDataBytes = UInt32(min(writtenBytes, UInt64(UInt32.max - 36)))
+        let safeRiffSize = safeDataBytes &+ 36
+        var dSize = Data(); appendLE32(safeDataBytes, into: &dSize)
+        var rSize = Data(); appendLE32(safeRiffSize, into: &rSize)
+        try? fh.seek(toOffset: 4); fh.write(rSize)
+        try? fh.seek(toOffset: 40); fh.write(dSize)
+        succeeded = true
+        return true
+    }
+
     static func remuxAudioTrackToM4A(inputURL: URL, outputURL: URL) -> Bool {
         _ = networkInitOnce
         var inCtx: UnsafeMutablePointer<AVFormatContext>?

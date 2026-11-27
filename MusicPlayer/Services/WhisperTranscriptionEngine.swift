@@ -16,6 +16,13 @@ actor WhisperTranscriptionEngine {
         let endTime: Double
     }
 
+    struct TranscriptionSummary: Sendable {
+        let words: [TranscribedWord]
+        let detectedLanguage: String?
+        let avgNoSpeechProb: Double
+        let durationSeconds: Double
+    }
+
     private static let variantName = "openai_whisper-base"
     private static let savedFolderDefaultsKey = "musejrm.whisper.modelFolder.v1"
 
@@ -51,9 +58,28 @@ actor WhisperTranscriptionEngine {
         fileURL: URL,
         maxSeconds: Double = 15 * 60,
         allowDownload: Bool = false,
-        languageHint: String? = "en",
+        languageHint: String? = nil,
         onProgress: (@Sendable (Int, Int, Double) -> Void)? = nil
     ) async -> [TranscribedWord]? {
+        guard let summary = await transcribeWholeFileSummary(
+            fileURL: fileURL,
+            maxSeconds: maxSeconds,
+            allowDownload: allowDownload,
+            languageHint: languageHint,
+            onProgress: onProgress
+        ), !summary.words.isEmpty else {
+            return nil
+        }
+        return summary.words
+    }
+
+    func transcribeWholeFileSummary(
+        fileURL: URL,
+        maxSeconds: Double = 15 * 60,
+        allowDownload: Bool = false,
+        languageHint: String? = nil,
+        onProgress: (@Sendable (Int, Int, Double) -> Void)? = nil
+    ) async -> TranscriptionSummary? {
         guard let prepared = SongAudioListener.prepareReadableAudioFile(for: fileURL) else {
             return nil
         }
@@ -106,8 +132,19 @@ actor WhisperTranscriptionEngine {
 
         onProgress?(totalChunks, totalChunks, totalSec)
         var words: [TranscribedWord] = []
+        var langCounts: [String: Int] = [:]
+        var noSpeechSum = 0.0
+        var noSpeechWeight = 0.0
+
         for result in results {
+            let lang = result.language.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if !lang.isEmpty {
+                langCounts[lang, default: 0] += max(1, result.segments.count)
+            }
             for seg in result.segments {
+                let segDur = max(0.1, Double(seg.end - seg.start))
+                noSpeechSum += Double(seg.noSpeechProb) * segDur
+                noSpeechWeight += segDur
                 if seg.noSpeechProb > 0.85 { continue }
                 if let segWords = seg.words, !segWords.isEmpty {
                     for w in segWords {
@@ -146,7 +183,15 @@ actor WhisperTranscriptionEngine {
                 }
             }
         }
-        return words.isEmpty ? nil : words
+        let dominantLang = langCounts.max(by: { $0.value < $1.value })?.key
+        let avgNoSpeech = noSpeechWeight > 0 ? (noSpeechSum / noSpeechWeight) : 0.0
+        guard !words.isEmpty || avgNoSpeech >= 0.72 else { return nil }
+        return TranscriptionSummary(
+            words: words,
+            detectedLanguage: dominantLang,
+            avgNoSpeechProb: avgNoSpeech,
+            durationSeconds: totalSec
+        )
     }
 
     private func ensureLoaded(allowDownload: Bool) async -> WhisperKit? {

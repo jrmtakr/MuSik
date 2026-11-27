@@ -138,10 +138,11 @@ enum ArtistDatabase {
         let allArtists: [String]
         let albumHint: String?
         let isExplicitSingle: Bool
+        let alternatePair: (song: String, artist: String)?
     }
 
-    /// Parses filenames/tags like `"Always - Ye (Bully).mp4"` or `"Gods Test - Ye (ft. KayCyy & 2 Chainz) (Bully).mp4"`,
-    /// cleanly separating song title, canonical artist, featured artists, and project/album tags (while preserving version tags like Demo/Remix).
+    /// Parses filenames/tags like `"Always - Ye (Bully).mp4"`, `"Babe - HyunA.mp4"`, `"Crank That (Soulja Boy).webm"`,
+    /// or `"LOVE SCENARIO- iKON.mp4"`, cleanly separating song title, canonical artist, featured artists, and project tags.
     static func parseTrackHints(
         rawTitle: String,
         rawArtistTag: String? = nil,
@@ -153,135 +154,201 @@ enum ArtistDatabase {
             : rawTitle
         let trimmed = stripFileExtension(baseRaw).trimmingCharacters(in: .whitespacesAndNewlines)
         let (withoutNoise, featuredFromBrackets) = extractFeaturesAndStripNoise(from: trimmed)
-        let (wholeStripped, wholeAlbum, wholeExplicitSingle) = extractBracketedProjectTag(from: withoutNoise)
+        let (wholeStripped, wholeAlbum, wholeExplicitSingle, wholeParenArtist) = extractBracketedProjectTag(from: withoutNoise)
 
         let cleanedArtistTag = rawArtistTag.flatMap { cleanChannelOrTagNoise($0) }
         let tagIsChannel = cleanedArtistTag.map {
             isJunkArtistString($0) || looksLikeUploaderChannel($0, customIgnoredChannels: ignoredChannels)
         } ?? false
 
+        // Find last separator match (`" - "`, `" — "`, `" – "`, `" | "`, or tight `")- "` / `"word- "` when spaced right).
+        var matchedSplitRange: Range<String.Index>? = nil
         for separator in [" - ", " — ", " – ", " | "] {
-            if let range = withoutNoise.range(of: separator) {
-                let leftRaw = stripLeadingTrackNumber(String(withoutNoise[..<range.lowerBound]))
-                let rightRaw = String(withoutNoise[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
-                if !leftRaw.isEmpty && !rightRaw.isEmpty {
-                    let (left, leftAlbum, leftSingle) = extractBracketedProjectTag(from: leftRaw)
-                    let (right, rightAlbum, rightSingle) = extractBracketedProjectTag(from: rightRaw)
-                    let resolvedAlbum = rightAlbum ?? leftAlbum ?? wholeAlbum
-                    let explicitSingle = leftSingle || rightSingle || wholeExplicitSingle
+            if let r = withoutNoise.range(of: separator, options: .backwards) {
+                matchedSplitRange = r
+                break
+            }
+        }
+        if matchedSplitRange == nil,
+           let tightRegex = try? NSRegularExpression(pattern: #"(?<=[^\s\-])[-–—]\s+"#),
+           let lastMatch = tightRegex.matches(
+               in: withoutNoise,
+               range: NSRange(location: 0, length: (withoutNoise as NSString).length)
+           ).last,
+           let r = Range(lastMatch.range, in: withoutNoise) {
+            matchedSplitRange = r
+        }
 
-                    let leftIsChannel = looksLikeUploaderChannel(left, customIgnoredChannels: ignoredChannels) ||
-                        (cleanedArtistTag.map { normalizeLookupKey($0) == normalizeLookupKey(left) } ?? false)
-                    let rightIsChannel = looksLikeUploaderChannel(right, customIgnoredChannels: ignoredChannels) ||
-                        (cleanedArtistTag.map { normalizeLookupKey($0) == normalizeLookupKey(right) } ?? false)
+        // CJK corner-bracket split when no dash separator exists (e.g. `YOASOBI「アイドル」` or `米津玄師『Lemon』`).
+        if matchedSplitRange == nil,
+           let cjkRegex = try? NSRegularExpression(pattern: #"^([^\「\『]{2,40})[\「\『]([^\」\』]{1,80})[\」\』]"#),
+           let m = cjkRegex.firstMatch(in: withoutNoise, range: NSRange(location: 0, length: (withoutNoise as NSString).length)),
+           let r1 = Range(m.range(at: 1), in: withoutNoise),
+           let r2 = Range(m.range(at: 2), in: withoutNoise) {
+            let cjkArtist = canonicalizeSingle(String(withoutNoise[r1]).trimmingCharacters(in: .whitespacesAndNewlines))
+            let cjkSong = String(withoutNoise[r2]).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !cjkArtist.isEmpty && !cjkSong.isEmpty {
+                return ParsedTrackHints(
+                    songTitle: cjkSong,
+                    artistHint: cjkArtist,
+                    allArtists: mergeUniqueArtists([cjkArtist], featuredFromBrackets),
+                    albumHint: nil,
+                    isExplicitSingle: false,
+                    alternatePair: nil
+                )
+            }
+        }
 
-                    if leftIsChannel && !rightIsChannel {
-                        let tagArtists = (!tagIsChannel ? cleanedArtistTag.map { splitAndCanonicalize($0) } : nil) ?? []
-                        return ParsedTrackHints(
-                            songTitle: right,
-                            artistHint: tagArtists.first,
-                            allArtists: mergeUniqueArtists(tagArtists, featuredFromBrackets),
-                            albumHint: resolvedAlbum,
-                            isExplicitSingle: explicitSingle
-                        )
-                    }
-                    if rightIsChannel && !leftIsChannel {
-                        let tagArtists = (!tagIsChannel ? cleanedArtistTag.map { splitAndCanonicalize($0) } : nil) ?? []
-                        return ParsedTrackHints(
-                            songTitle: left,
-                            artistHint: tagArtists.first,
-                            allArtists: mergeUniqueArtists(tagArtists, featuredFromBrackets),
-                            albumHint: resolvedAlbum,
-                            isExplicitSingle: explicitSingle
-                        )
-                    }
+        if let range = matchedSplitRange {
+            let leftRaw = stripLeadingTrackNumber(String(withoutNoise[..<range.lowerBound]))
+            let rightRaw = String(withoutNoise[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !leftRaw.isEmpty && !rightRaw.isEmpty {
+                let (left, leftAlbum, leftSingle, _) = extractBracketedProjectTag(from: leftRaw)
+                let (right, rightAlbum, rightSingle, _) = extractBracketedProjectTag(from: rightRaw)
+                let resolvedAlbum = rightAlbum ?? leftAlbum ?? wholeAlbum
+                let explicitSingle = leftSingle || rightSingle || wholeExplicitSingle
 
-                    let leftArtists = splitAndCanonicalize(left)
-                    let rightArtists = splitAndCanonicalize(right)
-                    let leftKnown = !left.isEmpty && (lookup(left) != nil || leftArtists.contains { lookup($0) != nil })
-                    let rightKnown = !right.isEmpty && (lookup(right) != nil || rightArtists.contains { lookup($0) != nil })
+                let leftIsChannel = looksLikeUploaderChannel(left, customIgnoredChannels: ignoredChannels) ||
+                    (cleanedArtistTag.map { normalizeLookupKey($0) == normalizeLookupKey(left) } ?? false)
+                let rightIsChannel = looksLikeUploaderChannel(right, customIgnoredChannels: ignoredChannels) ||
+                    (cleanedArtistTag.map { normalizeLookupKey($0) == normalizeLookupKey(right) } ?? false)
 
-                    if rightKnown && !leftKnown {
-                        let all = mergeUniqueArtists(rightArtists, featuredFromBrackets)
-                        return ParsedTrackHints(
-                            songTitle: left,
-                            artistHint: all.first ?? right,
-                            allArtists: all,
-                            albumHint: resolvedAlbum,
-                            isExplicitSingle: explicitSingle
-                        )
-                    }
-                    if leftKnown && !rightKnown {
-                        let all = mergeUniqueArtists(leftArtists, featuredFromBrackets)
-                        return ParsedTrackHints(
-                            songTitle: right,
-                            artistHint: all.first ?? left,
-                            allArtists: all,
-                            albumHint: resolvedAlbum,
-                            isExplicitSingle: explicitSingle
-                        )
-                    }
-
-                    if let cleanedArtistTag, !tagIsChannel,
-                       normalizeLookupKey(cleanedArtistTag) == normalizeLookupKey(left) {
-                        let tagArtists = splitAndCanonicalize(cleanedArtistTag)
-                        let all = mergeUniqueArtists(tagArtists, featuredFromBrackets)
-                        return ParsedTrackHints(
-                            songTitle: right,
-                            artistHint: all.first ?? canonicalizeSingle(left),
-                            allArtists: all,
-                            albumHint: resolvedAlbum,
-                            isExplicitSingle: explicitSingle
-                        )
-                    }
-
-                    // Fallback on unknown indie filenames ("Artist - Song" or "Song - Unknown Artist"):
-                    // if no tag was supplied, preserve left as artist candidate unless right looks like an explicit artist list.
-                    let resolvedArtist: String?
-                    if let cleanedArtistTag, !tagIsChannel {
-                        resolvedArtist = canonicalizeSingle(cleanedArtistTag)
-                    } else if !left.isEmpty {
-                        resolvedArtist = leftArtists.first ?? canonicalizeSingle(left)
-                    } else {
-                        resolvedArtist = nil
-                    }
-                    let chosenSong = (cleanedArtistTag != nil && !tagIsChannel) ? right : (right.isEmpty ? left : right)
-                    let all = mergeUniqueArtists(resolvedArtist.map { [$0] } ?? [], featuredFromBrackets)
+                if leftIsChannel && !rightIsChannel {
+                    let tagArtists = (!tagIsChannel ? cleanedArtistTag.map { splitAndCanonicalize($0) } : nil) ?? []
                     return ParsedTrackHints(
-                        songTitle: chosenSong,
-                        artistHint: all.first ?? resolvedArtist,
-                        allArtists: all,
+                        songTitle: right,
+                        artistHint: tagArtists.first,
+                        allArtists: mergeUniqueArtists(tagArtists, featuredFromBrackets),
                         albumHint: resolvedAlbum,
-                        isExplicitSingle: explicitSingle
+                        isExplicitSingle: explicitSingle,
+                        alternatePair: nil
                     )
                 }
+                if rightIsChannel && !leftIsChannel {
+                    let tagArtists = (!tagIsChannel ? cleanedArtistTag.map { splitAndCanonicalize($0) } : nil) ?? []
+                    return ParsedTrackHints(
+                        songTitle: left,
+                        artistHint: tagArtists.first,
+                        allArtists: mergeUniqueArtists(tagArtists, featuredFromBrackets),
+                        albumHint: resolvedAlbum,
+                        isExplicitSingle: explicitSingle,
+                        alternatePair: nil
+                    )
+                }
+
+                let leftArtists = splitAndCanonicalize(left)
+                let rightArtists = splitAndCanonicalize(right)
+                let leftKnown = !left.isEmpty && (lookup(left) != nil || leftArtists.contains { lookup($0) != nil })
+                let rightKnown = !right.isEmpty && (lookup(right) != nil || rightArtists.contains { lookup($0) != nil })
+
+                if rightKnown && !leftKnown {
+                    let all = mergeUniqueArtists(rightArtists, featuredFromBrackets)
+                    return ParsedTrackHints(
+                        songTitle: left,
+                        artistHint: all.first ?? right,
+                        allArtists: all,
+                        albumHint: resolvedAlbum,
+                        isExplicitSingle: explicitSingle,
+                        alternatePair: (song: right, artist: left)
+                    )
+                }
+                if leftKnown && !rightKnown {
+                    let all = mergeUniqueArtists(leftArtists, featuredFromBrackets)
+                    return ParsedTrackHints(
+                        songTitle: right,
+                        artistHint: all.first ?? left,
+                        allArtists: all,
+                        albumHint: resolvedAlbum,
+                        isExplicitSingle: explicitSingle,
+                        alternatePair: (song: left, artist: right)
+                    )
+                }
+
+                if let cleanedArtistTag, !tagIsChannel,
+                   normalizeLookupKey(cleanedArtistTag) == normalizeLookupKey(left) {
+                    let tagArtists = splitAndCanonicalize(cleanedArtistTag)
+                    let all = mergeUniqueArtists(tagArtists, featuredFromBrackets)
+                    return ParsedTrackHints(
+                        songTitle: right,
+                        artistHint: all.first ?? canonicalizeSingle(left),
+                        allArtists: all,
+                        albumHint: resolvedAlbum,
+                        isExplicitSingle: explicitSingle,
+                        alternatePair: nil
+                    )
+                }
+
+                // When neither side matched the offline catalog cleanly (indie/SoundCloud/YouTube `"Song - Artist"`),
+                // keep left as Song Title and right as Artist (preserves unique song names when one artist has many tracks!)
+                // while storing the reversed pair in `alternatePair` for dual-orientation online verification.
+                let resolvedArtist: String
+                let resolvedSong: String
+                let alt: (song: String, artist: String)?
+                if let cleanedArtistTag, !tagIsChannel,
+                   normalizeLookupKey(cleanedArtistTag) == normalizeLookupKey(right) {
+                    resolvedSong = left
+                    resolvedArtist = rightArtists.first ?? canonicalizeSingle(cleanedArtistTag)
+                    alt = nil
+                } else {
+                    resolvedSong = left
+                    resolvedArtist = right.contains("&") || right.contains(",")
+                        ? right
+                        : (rightArtists.first ?? canonicalizeSingle(right))
+                    alt = (rightArtists.count <= 1 && featuredFromBrackets.isEmpty) ? (song: right, artist: left) : nil
+                }
+                let all = mergeUniqueArtists(rightArtists, featuredFromBrackets)
+                return ParsedTrackHints(
+                    songTitle: resolvedSong,
+                    artistHint: resolvedArtist,
+                    allArtists: all,
+                    albumHint: resolvedAlbum,
+                    isExplicitSingle: explicitSingle,
+                    alternatePair: alt
+                )
             }
         }
 
         let tagArtists = (!tagIsChannel ? cleanedArtistTag.map { splitAndCanonicalize($0) } : nil) ?? []
         let cleanTitle = stripLeadingTrackNumber(wholeStripped.isEmpty ? trimmed : wholeStripped)
+        if tagArtists.isEmpty, let wholeParenArtist, !wholeParenArtist.isEmpty {
+            let pArtists = splitAndCanonicalize(wholeParenArtist)
+            let knownParen = lookup(wholeParenArtist) != nil || pArtists.contains { lookup($0) != nil }
+            let primaryParen = pArtists.first ?? canonicalizeSingle(wholeParenArtist)
+            let allParen = mergeUniqueArtists(pArtists, featuredFromBrackets)
+            return ParsedTrackHints(
+                songTitle: cleanTitle.isEmpty ? trimmed : cleanTitle,
+                artistHint: knownParen ? primaryParen : nil,
+                allArtists: knownParen ? allParen : featuredFromBrackets,
+                albumHint: knownParen ? wholeAlbum : wholeParenArtist,
+                isExplicitSingle: wholeExplicitSingle,
+                alternatePair: (song: cleanTitle.isEmpty ? trimmed : cleanTitle, artist: primaryParen)
+            )
+        }
         let all = mergeUniqueArtists(tagArtists, featuredFromBrackets)
         return ParsedTrackHints(
             songTitle: cleanTitle.isEmpty ? trimmed : cleanTitle,
             artistHint: all.first ?? (tagIsChannel ? nil : cleanedArtistTag),
             allArtists: all,
             albumHint: wholeAlbum,
-            isExplicitSingle: wholeExplicitSingle
+            isExplicitSingle: wholeExplicitSingle,
+            alternatePair: nil
         )
     }
 
-    /// Separates trailing bracketed project/album tags like `(Bully)` or `(Single)` while preserving version markers like `(Demo)` or `(Remix)`.
-    private static func extractBracketedProjectTag(from raw: String) -> (cleaned: String, albumHint: String?, isExplicitSingle: Bool) {
+    /// Separates trailing bracketed project/album tags like `(Bully)`, `(Single)`, or `(Soulja Boy)` while preserving version markers.
+    private static func extractBracketedProjectTag(from raw: String) -> (cleaned: String, albumHint: String?, isExplicitSingle: Bool, bracketedArtistCandidate: String?) {
         var working = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         var detectedAlbum: String?
         var isSingle = false
+        var artistCandidate: String?
 
         let pattern = #"\s*[\(\[]([^\)\]]{2,48})[\)\]]\s*$"#
         let versionKeywords: [String] = [
             "remix", "live", "acoustic", "instrumental", "karaoke", "cover",
             "slowed", "reverb", "sped", "nightcore", "demo", "unplugged", "8d",
             "version", "edit", "mix", "part", "pt.", "intro", "outro", "interlude",
-            "skit", "explicit", "clean", "master", "leak", "v1", "v2", "v3", "v4", "v5"
+            "skit", "explicit", "clean", "master", "leak", "v1", "v2", "v3", "v4", "v5",
+            "produced by"
         ]
         let noiseOrQualityKeywords: [String] = [
             "official", "music video", "official video", "official audio", "visualizer",
@@ -313,13 +380,18 @@ enum ArtistDatabase {
                 if looksLikeVersion {
                     break
                 }
+                if lookup(inner) != nil || artistCandidate == nil && !inner.contains(" ") && !lower.contains("album") && !lower.contains("ep") && !lower.contains("playlist") {
+                    artistCandidate = inner
+                    working = before
+                    continue
+                }
                 if detectedAlbum == nil {
                     detectedAlbum = inner
                 }
                 working = before
             }
         }
-        return (working, detectedAlbum, isSingle)
+        return (working, detectedAlbum, isSingle, artistCandidate)
     }
 
     static func cleanSongTitleForSearch(
@@ -560,6 +632,8 @@ enum ArtistDatabase {
             (#"\b(r&b|rnb|neo[- ]?soul|slow jams)\b"#, "R&B"),
             (#"\b(lo[- ]?fi|lofi|chillhop)\b"#, "Lo-Fi"),
             (#"\b(k[- ]?pop|kpop)\b"#, "K-Pop"),
+            (#"\b(city\s+pop|j[- ]?pop|jpop|japanese|anime)\b"#, "J-Pop"),
+            (#"\b(soundtrack|minecraft|c418|ost|bgm)\b"#, "Soundtrack"),
             (#"\b(afrobeats?|afropop|amapiano)\b"#, "Afrobeats"),
             (#"\b(edm|house|techno|dubstep|trance|dnb|drum\s*&?\s*bass|electronic|synthwave)\b"#, "Electronic"),
             (#"\b(rock|metal|punk|grunge|indie\s+rock|alt\s+rock)\b"#, "Rock"),
@@ -597,7 +671,7 @@ enum ArtistDatabase {
         ) != nil
 
         let explicitComp = lower.range(
-            of: #"\b(compilation|comp|megamix|medley|mashup|mixtape|non[- ]?stop|full\s+album|all\s+songs|best\s+of|greatest\s+hits|top\s+\d+|dj\s+set|live\s+set|playlist|jukebox|\d+\s*(?:hr|hrs|hour|hours|min|mins|minute|minutes)\s*(?:of\s+)?(?:mix|music|songs|hits|beats)?)\b"#,
+            of: #"\b(compilation|comp|megamix|medley|mashup|mixtape|non[- ]?stop|full\s+album|full\s+ep|special\s+collection|collection|soundtrack\s+playlist|playlist|all\s+songs|best\s+of|greatest\s+hits|top\s+\d+|dj\s+set|live\s+set|jukebox|\d+\s*(?:hr|hrs|hour|hours|min|mins|minute|minutes)\s*(?:of\s+)?(?:mix|music|songs|hits|beats)?)\b"#,
             options: .regularExpression
         ) != nil
 
@@ -630,8 +704,10 @@ enum ArtistDatabase {
             addGenreVote(item.genre ?? genre(forArtist: item.artist), weight: 2)
         }
 
+        // Split tight dashes too (`Minecraft Soundtrack Playlist- C418`, `Vultures 2 (Full Album)- Ye & Ty Dolla $ign`).
+        let parsedHints = parseTrackHints(rawTitle: rawTitle, rawArtistTag: rawArtistTag, fileName: fileName)
         let extractedArtists = extractArtists(
-            rawArtistTag: rawArtistTag,
+            rawArtistTag: rawArtistTag ?? parsedHints.artistHint,
             rawTitle: rawTitle,
             fileName: fileName
         )
@@ -649,12 +725,21 @@ enum ArtistDatabase {
                 return sole
             }
             if ytDistinctArtists.count >= 2 {
-                return "Various Artists"
+                return ytDistinctArtists.count == 2
+                    ? ytDistinctArtists.sorted().joined(separator: " & ")
+                    : "Various Artists"
+            }
+            if let hintArtist = parsedHints.artistHint, !hintArtist.isEmpty,
+               !looksLikeUploaderChannel(hintArtist), !isJunkArtistString(hintArtist) {
+                return canonicalizeSingle(hintArtist)
             }
             if extractedArtists.matchedFromCatalog && extractedArtists.allArtists.count == 1 {
                 return extractedArtists.primaryArtist
             }
-            if extractedArtists.allArtists.count >= 2 {
+            if extractedArtists.allArtists.count == 2 {
+                return extractedArtists.allArtists.joined(separator: " & ")
+            }
+            if extractedArtists.allArtists.count >= 3 {
                 return "Various Artists"
             }
             if let tag = rawArtistTag?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -1233,7 +1318,7 @@ The Beatles|Rock & Alternative||beatles
 The Rolling Stones|Rock & Alternative||rolling stones
 Led Zeppelin|Rock & Alternative||
 Pink Floyd|Rock & Alternative||
-AC/DC|Rock & Alternative||acdc
+AC/DC|Rock & Alternative||acdc;ac dc;ac_dc
 Guns N' Roses|Rock & Alternative||guns n roses
 Aerosmith|Rock & Alternative||
 Bon Jovi|Rock & Alternative||
@@ -1660,5 +1745,20 @@ Rosé|K-Pop & J-Pop|S|
 Freddie Dredd|Hip-Hop & Rap||
 Ghostemane|Hip-Hop & Rap||
 Bones|Hip-Hop & Rap|S|teamsesh
+HyunA|K-Pop & J-Pop||hyuna
+iKON|K-Pop & J-Pop||
+Mika Nakashima|K-Pop & J-Pop||中島美嘉;中島 美嘉
+KAIWARE HUMMER|K-Pop & J-Pop||カイワレハンマー
+Yasuha|K-Pop & J-Pop||泰葉
+Yurie Kokubu|K-Pop & J-Pop||国分友里恵
+Pearl Brothers|K-Pop & J-Pop||パール兄弟
+ROUND TABLE|K-Pop & J-Pop|S|roundtable
+FLOW|K-Pop & J-Pop|S|
+Lacrim|Hip-Hop & Rap||
+Soulja Boy|Hip-Hop & Rap||soulja boy tell em
+DANGERDOOM|Hip-Hop & Rap||dangerdoom
+Kankan|Hip-Hop & Rap||
+Imogen Heap|Pop||
+C418|Soundtrack & Classical||
 """
 }
