@@ -1556,14 +1556,12 @@ struct BrowserTabView: View {
                     browser.pausePageMedia()
                     if songIDService.isBlockedPendingAI(cachedItem) {
                         songIDService.prioritize(cachedItem)
-                        awaitingAIAutoPlayItem = cachedItem
-                        cachingOverlayTitle = cachedItem.displayTitle
-                    } else {
-                        cachingOverlayTitle = nil
-                        offlineReadyItem = nil
-                        if mediaManager.play(cachedItem) {
-                            showPlayerSheet = true
-                        }
+                    }
+                    awaitingAIAutoPlayItem = nil
+                    cachingOverlayTitle = nil
+                    offlineReadyItem = nil
+                    if mediaManager.play(cachedItem) {
+                        showPlayerSheet = true
                     }
                 } else {
                     cachingOverlayTitle = nil
@@ -2131,13 +2129,10 @@ struct BrowserTabView: View {
         return Button {
             if isPendingAI {
                 songIDService.prioritize(item)
-                awaitingAIAutoPlayItem = item
-                cachingOverlayTitle = item.displayTitle
-            } else {
-                offlineReadyItem = nil
-                if mediaManager.play(item) {
-                    showPlayerSheet = true
-                }
+            }
+            offlineReadyItem = nil
+            if mediaManager.play(item) {
+                showPlayerSheet = true
             }
         } label: {
             HStack(spacing: 10) {
@@ -2618,13 +2613,11 @@ struct BrowserTabView: View {
             offlineReadyItem = existingItem
             if songIDService.isBlockedPendingAI(existingItem) {
                 songIDService.prioritize(existingItem)
-                awaitingAIAutoPlayItem = existingItem
-                cachingOverlayTitle = existingItem.displayTitle
-            } else {
-                cachingOverlayTitle = nil
-                if mediaManager.play(existingItem) {
-                    showPlayerSheet = true
-                }
+            }
+            awaitingAIAutoPlayItem = nil
+            cachingOverlayTitle = nil
+            if mediaManager.play(existingItem) {
+                showPlayerSheet = true
             }
             return
         }

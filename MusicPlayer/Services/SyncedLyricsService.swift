@@ -140,7 +140,7 @@ struct AIRecognizedTrackInfo: Equatable, Sendable {
 @Observable
 final class SyncedLyricsService {
     static let shared = SyncedLyricsService()
-    nonisolated static let currentAlignmentVersion = 6
+    nonisolated static let currentAlignmentVersion = 7
 
     var currentLyrics: ResolvedTrackLyrics?
     var currentLoadingKey: String?
@@ -169,7 +169,10 @@ final class SyncedLyricsService {
         let rawTitle = (titleOverride?.isEmpty == false ? titleOverride! : item.displayTitle)
         let rawArtist = (artistOverride?.isEmpty == false ? artistOverride! : (item.artist ?? ""))
         let cleaned = ArtistDatabase.cleanSongTitleForSearch(rawTitle: rawTitle, rawArtistTag: rawArtist)
-        let rawBase = "\(cleaned.artistHint ?? rawArtist)|\(cleaned.songOnly)|\(item.fileName)".lowercased()
+        let versionTag = Self.canonicalVersionGroups(in: rawTitle).sorted().joined(separator: ",")
+        let durTag = item.durationSeconds.map { String(Int(round($0))) } ?? "0"
+        let scopeTag = (titleOverride == nil && artistOverride == nil) ? item.relativePath : item.fileName
+        let rawBase = "\(cleaned.artistHint ?? rawArtist)|\(cleaned.songOnly)|v:\(versionTag)|d:\(durTag)|\(scopeTag)".lowercased()
         let keyBase = rawBase
             .replacingOccurrences(of: "[^a-z0-9]+", with: "_", options: .regularExpression)
             .trimmingCharacters(in: CharacterSet(charactersIn: "_"))
@@ -214,9 +217,26 @@ final class SyncedLyricsService {
                    !disk.sourceLabel.localizedCaseInsensitiveContains("Custom") {
                     activeFetchTask?.cancel()
                     activeFetchTask = Task {
-                        let heard = await SongAudioListener.listen(to: item.fileURL)
+                        let summary = await SongAudioListener.listenWithSummary(
+                            to: item.fileURL,
+                            titleHint: item.displayTitle,
+                            artistHint: item.artist
+                        )
                         guard !Task.isCancelled else { return }
-                        if disk.isTimeSynced || disk.lines.count >= 4 {
+                        let heard: [HeardWord]? = summary.words.isEmpty ? nil : summary.words
+                        let langCtx = SongAudioListener.detectLanguageContext(title: item.displayTitle, artist: item.artist)
+                        let isNonEnglish = langCtx.isNonEnglish || {
+                            guard let lang = summary.detectedLanguage?.lowercased(), !lang.isEmpty else { return false }
+                            return !lang.hasPrefix("en")
+                        }()
+                        let isContradicted: Bool = {
+                            guard let heard, !disk.sourceLabel.contains("Transcribed"), !isNonEnglish else { return false }
+                            if case .contradicted = SongAudioListener.verdict(heard: heard, lyrics: disk) {
+                                return true
+                            }
+                            return false
+                        }()
+                        if !isContradicted && (disk.isTimeSynced || disk.lines.count >= 4) {
                             let reAligned = await SongAudioListener.autoAlign(lyrics: disk, heard: heard, fileURL: item.fileURL)
                             storeAlignedLyrics(reAligned, for: item)
                         } else {
@@ -250,11 +270,12 @@ final class SyncedLyricsService {
         }
 
         activeFetchTask = Task {
+            let importAnalysisPending = SongIdentificationService.shared.isBlockedPendingAI(relativePath: item.relativePath)
             if !forceReload,
                customTitle == nil,
                customArtist == nil,
                !item.relativePath.hasPrefix("__remote__/"),
-               WholeSongAIService.shared.shouldDeferOnlineLyricsForFirstListen(item) {
+               (WholeSongAIService.shared.shouldDeferOnlineLyricsForFirstListen(item) || importAnalysisPending) {
                 let offline = await loadOfflineEmbeddedOrSidecarLyrics(
                     item: item,
                     cacheKey: key,
@@ -269,26 +290,104 @@ final class SyncedLyricsService {
                     currentLyrics = offline
                     lastError = nil
                 } else {
-                    WholeSongAIService.shared.triggerIfFirstTimeUnknown(item: item)
-                    lastError = "No lyrics for first time listen"
+                    if !importAnalysisPending {
+                        WholeSongAIService.shared.triggerIfFirstTimeUnknown(item: item)
+                    }
+                    lastError = importAnalysisPending ? nil : "No lyrics for first time listen"
                 }
                 return
             }
 
-            let resolved = await fetchBestLyrics(
-                item: item,
-                cacheKey: key,
-                customTitle: customTitle,
-                customArtist: customArtist
-            )
+            let rawTitle = (customTitle?.isEmpty == false ? customTitle! : item.displayTitle)
+            let rawArtist = (customArtist?.isEmpty == false ? customArtist! : (item.artist ?? ""))
+
+            if !item.relativePath.hasPrefix("__remote__/") {
+                let split = splitArtistAndSong(rawTitle: rawTitle, rawArtist: rawArtist)
+                if let offline = await loadOfflineEmbeddedOrSidecarLyrics(item: item, cacheKey: key, title: split.song, artist: split.artist) {
+                    guard !Task.isCancelled else { return }
+                    var alignedOffline = offline
+                    if !item.isHLS {
+                        let artistHintOrNil: String? = rawArtist.isEmpty ? nil : rawArtist
+                        let preHeard = await SongAudioListener.listen(to: item.fileURL, titleHint: rawTitle, artistHint: artistHintOrNil)
+                        guard !Task.isCancelled else { return }
+                        alignedOffline = await SongAudioListener.autoAlign(lyrics: offline, heard: preHeard, fileURL: item.fileURL)
+                        guard !Task.isCancelled else { return }
+                    }
+                    alignedOffline.alignmentVersion = Self.currentAlignmentVersion
+                    currentLoadingKey = nil
+                    memoryCache[key] = alignedOffline
+                    saveToDisk(alignedOffline)
+                    currentLyrics = alignedOffline
+                    lastError = nil
+                    return
+                }
+            }
+
+            let resolved: ResolvedTrackLyrics?
+            if !item.relativePath.hasPrefix("__remote__/") && !item.isHLS {
+                // Fetch all version candidates and listen to audio simultaneously for fast, version-safe alignment.
+                async let candidatesTask = collectAllCandidateLyrics(
+                    item: item,
+                    cacheKey: key,
+                    title: rawTitle,
+                    artist: rawArtist,
+                    duration: item.durationSeconds,
+                    rawTitleOverride: customTitle
+                )
+                async let listenTask = SongAudioListener.listenWithSummary(
+                    to: item.fileURL,
+                    titleHint: rawTitle,
+                    artistHint: rawArtist.isEmpty ? nil : rawArtist
+                )
+                let (candidates, summary) = await (candidatesTask, listenTask)
+                guard !Task.isCancelled else { return }
+
+                let heard: [HeardWord]? = summary.words.isEmpty ? nil : summary.words
+                let langCtx = SongAudioListener.detectLanguageContext(
+                    title: rawTitle,
+                    artist: rawArtist.isEmpty ? nil : rawArtist
+                )
+                let isNonEnglish = langCtx.isNonEnglish || {
+                    guard let lang = summary.detectedLanguage?.lowercased(), !lang.isEmpty else { return false }
+                    return !lang.hasPrefix("en")
+                }()
+                let englishASROnForeignTrack = isNonEnglish && (summary.detectedLanguage?.lowercased().hasPrefix("en") ?? false)
+
+                var chosen = selectVerifiedLyrics(
+                    from: candidates,
+                    targetTitle: rawTitle,
+                    targetArtist: rawArtist,
+                    targetDuration: item.durationSeconds,
+                    heard: heard,
+                    isNonEnglish: isNonEnglish,
+                    englishASROnForeignTrack: englishASROnForeignTrack
+                )
+                if var matched = chosen {
+                    matched = await SongAudioListener.autoAlign(lyrics: matched, heard: heard, fileURL: item.fileURL)
+                    guard !Task.isCancelled else { return }
+                    chosen = matched
+                } else if let heard, heard.count >= 4, !englishASROnForeignTrack {
+                    let split = splitArtistAndSong(rawTitle: rawTitle, rawArtist: rawArtist)
+                    chosen = SongAudioListener.buildSyncedLyricsFromHeard(
+                        heard,
+                        trackTitle: split.song.isEmpty ? item.displayTitle : split.song,
+                        artistName: split.artist.isEmpty ? (item.artist ?? "Unknown Artist") : split.artist,
+                        cacheKey: key,
+                        duration: item.durationSeconds
+                    )
+                }
+                resolved = chosen
+            } else {
+                resolved = await fetchBestLyrics(
+                    item: item,
+                    cacheKey: key,
+                    customTitle: customTitle,
+                    customArtist: customArtist
+                )
+            }
+
             guard !Task.isCancelled else { return }
             if var resolved {
-                // Automatically line synced or plain lyrics up into real-time word-timed lyrics against local audio.
-                if !item.relativePath.hasPrefix("__remote__/") && !item.isHLS {
-                    let preHeard = await SongAudioListener.listen(to: item.fileURL)
-                    resolved = await SongAudioListener.autoAlign(lyrics: resolved, heard: preHeard, fileURL: item.fileURL)
-                    guard !Task.isCancelled else { return }
-                }
                 resolved.alignmentVersion = Self.currentAlignmentVersion
                 currentLoadingKey = nil
                 memoryCache[key] = resolved
@@ -298,7 +397,7 @@ final class SyncedLyricsService {
             } else {
                 currentLoadingKey = nil
                 lastError = "No lyrics for first time listen"
-                if customTitle == nil && customArtist == nil && !item.relativePath.hasPrefix("__remote__/") {
+                if customTitle == nil && customArtist == nil && !item.relativePath.hasPrefix("__remote__/") && !importAnalysisPending {
                     WholeSongAIService.shared.triggerIfFirstTimeUnknown(item: item)
                 }
             }
@@ -574,7 +673,195 @@ final class SyncedLyricsService {
     /// Exact lyrics for a known song, used by import-time song ID to confirm the name by listening.
     /// Doesn't touch what's on screen.
     func fetchLyricsForVerification(title: String, artist: String, duration: Double?) async -> ResolvedTrackLyrics? {
-        await fetchFromLRCLIB(cacheKey: "verify", song: title, artist: artist, rawTitle: title, duration: duration)
+        let candidates = await fetchTopLRCLIBCandidates(
+            cacheKey: "verify",
+            song: title,
+            artist: artist,
+            rawTitle: title,
+            duration: duration,
+            maxResults: 3
+        )
+        let targetText = "\(title) \(artist)"
+        return candidates.first { cand in
+            Self.versionCompatibilityScore(
+                targetText: targetText,
+                candidateText: "\(cand.trackTitle) \(cand.artistName)",
+                targetDuration: duration,
+                candidateDuration: cand.expectedDurationSeconds
+            ) >= 0
+        } ?? candidates.first
+    }
+
+    /// Starts fetching version candidates from all lyrics providers simultaneously while audio analysis runs.
+    func prefetchCandidatesForImport(
+        item: MediaItem,
+        title: String,
+        artist: String,
+        duration: Double?
+    ) async -> [ResolvedTrackLyrics] {
+        let key = cacheKey(for: item, artistOverride: artist, titleOverride: title)
+        return await collectAllCandidateLyrics(
+            item: item,
+            cacheKey: key,
+            title: title,
+            artist: artist,
+            duration: duration,
+            rawTitleOverride: title
+        )
+    }
+
+    /// Concurrently collects candidate lyrics from Studio Karaoke, LRCLIB, Genius, and YouTube captions.
+    private func collectAllCandidateLyrics(
+        item: MediaItem,
+        cacheKey key: String,
+        title: String,
+        artist: String,
+        duration: Double?,
+        rawTitleOverride: String? = nil
+    ) async -> [ResolvedTrackLyrics] {
+        let split = splitArtistAndSong(rawTitle: title, rawArtist: artist)
+        let rawTitle = (rawTitleOverride?.isEmpty == false ? rawTitleOverride! : title)
+
+        async let studioTask = fetchStudioKaraokeCandidates(
+            cacheKey: key,
+            song: split.song,
+            artist: split.artist,
+            duration: duration
+        )
+        async let lrclibTask = fetchTopLRCLIBCandidates(
+            cacheKey: key,
+            song: split.song,
+            artist: split.artist,
+            rawTitle: rawTitle,
+            duration: duration,
+            maxResults: 4
+        )
+        async let geniusTask = fetchTopGeniusCandidates(
+            cacheKey: key,
+            song: split.song,
+            artist: split.artist,
+            maxResults: 2
+        )
+        async let ytTask = fetchFromYouTubeCreatorSubtitles(
+            item: item,
+            cacheKey: key,
+            song: split.song,
+            artist: split.artist
+        )
+
+        let (studio, lrclib, genius, ytCaptions) = await (studioTask, lrclibTask, geniusTask, ytTask)
+        var combined = studio + lrclib + genius
+        if let ytCaptions {
+            combined.append(ytCaptions)
+        }
+
+        var deduped: [ResolvedTrackLyrics] = []
+        var seen = Set<String>()
+        for cand in combined {
+            let sig = "\(Self.normalizeComparable(cand.trackTitle))|\(Self.normalizeComparable(cand.artistName))|\(cand.sourceLabel)|\(cand.lines.count)"
+            if seen.insert(sig).inserted {
+                deduped.append(cand)
+                if deduped.count >= 8 { break }
+            }
+        }
+        return deduped
+    }
+
+    nonisolated private static func containsNonLatinScript(_ lyrics: ResolvedTrackLyrics) -> Bool {
+        for line in lyrics.lines.prefix(12) {
+            for scalar in line.text.unicodeScalars {
+                let v = scalar.value
+                if (0x0400...0x04FF).contains(v) ||
+                    (0x0600...0x06FF).contains(v) ||
+                    (0x3040...0x30FF).contains(v) ||
+                    (0x4E00...0x9FFF).contains(v) ||
+                    (0xAC00...0xD7AF).contains(v) {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    /// Evaluates candidate versions against metadata compatibility AND symmetric heard-audio verification.
+    func selectVerifiedCandidateWithConfidence(
+        from candidates: [ResolvedTrackLyrics],
+        targetTitle: String,
+        targetArtist: String,
+        targetDuration: Double?,
+        heard: [HeardWord]?,
+        isNonEnglish: Bool,
+        englishASROnForeignTrack: Bool
+    ) -> (lyrics: ResolvedTrackLyrics, confirmedByAudio: Bool)? {
+        guard !candidates.isEmpty else { return nil }
+        let targetText = "\(targetTitle) \(targetArtist)"
+
+        var bestCandidate: ResolvedTrackLyrics?
+        var bestConfirmed = false
+        var bestScore = -Double.infinity
+
+        for cand in candidates {
+            let hasNativeWords = cand.lines.contains { $0.hasNativeWordTimings && !$0.words.isEmpty }
+            var score = hasNativeWords ? 0.45 : (cand.isTimeSynced ? 0.25 : 0.0)
+            let compat = Self.versionCompatibilityScore(
+                targetText: targetText,
+                candidateText: "\(cand.trackTitle) \(cand.artistName)",
+                targetDuration: targetDuration,
+                candidateDuration: cand.expectedDurationSeconds
+            )
+            score += Double(compat) * 0.015
+
+            var confirmed = false
+            var rejected = false
+
+            if let heard, !heard.isEmpty {
+                let report = SongAudioListener.versionAlignmentConfidence(heard: heard, lyrics: cand)
+                let foreignMismatch = englishASROnForeignTrack || (isNonEnglish && Self.containsNonLatinScript(cand))
+                switch report.verdict {
+                case .confirmed:
+                    confirmed = true
+                    score += 2.2 + report.compositeScore * 1.8
+                case .inconclusive:
+                    score += 0.1 + (foreignMismatch ? 0 : report.globalMatchRatio * 0.5)
+                case .contradicted:
+                    if foreignMismatch && compat >= 0 {
+                        score -= 0.1
+                    } else {
+                        rejected = true
+                        score -= 4.5
+                    }
+                }
+            }
+
+            if !rejected && score > bestScore {
+                bestScore = score
+                bestCandidate = cand
+                bestConfirmed = confirmed
+            }
+        }
+
+        guard let selected = bestCandidate, bestScore > -0.65 else { return nil }
+        return (selected, bestConfirmed)
+    }
+
+    private func selectVerifiedLyrics(
+        from candidates: [ResolvedTrackLyrics],
+        targetTitle: String,
+        targetArtist: String,
+        targetDuration: Double?,
+        heard: [HeardWord]?,
+        isNonEnglish: Bool,
+        englishASROnForeignTrack: Bool
+    ) -> ResolvedTrackLyrics? {
+        selectVerifiedCandidateWithConfidence(
+            from: candidates,
+            targetTitle: targetTitle,
+            targetArtist: targetArtist,
+            targetDuration: targetDuration,
+            heard: heard,
+            isNonEnglish: isNonEnglish,
+            englishASROnForeignTrack: englishASROnForeignTrack
+        )?.lyrics
     }
 
     /// Checks all candidate lyric sources during upload/import against the actual audio (heard words +
@@ -586,69 +873,54 @@ final class SyncedLyricsService {
         title: String,
         artist: String,
         duration: Double?,
-        heard: [HeardWord]?
+        heard: [HeardWord]?,
+        prefetchedCandidates: [ResolvedTrackLyrics]? = nil,
+        isNonEnglish: Bool = false,
+        englishASROnForeignTrack: Bool = false
     ) async -> Bool {
         let key = cacheKey(for: item, artistOverride: artist, titleOverride: title)
         let split = splitArtistAndSong(rawTitle: title, rawArtist: artist)
 
-        var candidates: [ResolvedTrackLyrics] = []
-        if let karaoke = await fetchFromStudioKaraoke(
-            cacheKey: key,
-            song: split.song,
-            artist: split.artist,
-            duration: duration
-        ) {
-            candidates.append(karaoke)
-        }
-        if let lrclib = await fetchFromLRCLIB(
-            cacheKey: key,
-            song: split.song,
-            artist: split.artist,
-            rawTitle: title,
-            duration: duration
-        ) {
-            candidates.append(lrclib)
-        }
-        if let genius = await fetchFromGenius(
-            cacheKey: key,
-            song: split.song,
-            artist: split.artist
-        ) {
-            candidates.append(genius)
-        }
-        if let ytCaptions = await fetchFromYouTubeCreatorSubtitles(
-            item: item,
-            cacheKey: key,
-            song: split.song,
-            artist: split.artist
-        ) {
-            candidates.append(ytCaptions)
+        let candidates: [ResolvedTrackLyrics]
+        if let prefetchedCandidates {
+            candidates = prefetchedCandidates.map { cand in
+                ResolvedTrackLyrics(
+                    cacheKey: key,
+                    trackTitle: cand.trackTitle,
+                    artistName: cand.artistName,
+                    isTimeSynced: cand.isTimeSynced,
+                    sourceLabel: cand.sourceLabel,
+                    attributionText: cand.attributionText,
+                    syncedOffsetSeconds: cand.syncedOffsetSeconds,
+                    tempoScale: cand.tempoScale,
+                    expectedDurationSeconds: cand.expectedDurationSeconds,
+                    alignmentVersion: cand.alignmentVersion,
+                    lines: cand.lines
+                )
+            }
+        } else {
+            candidates = await collectAllCandidateLyrics(
+                item: item,
+                cacheKey: key,
+                title: title,
+                artist: artist,
+                duration: duration,
+                rawTitleOverride: title
+            )
         }
 
-        // Verify candidate lyrics directly against what the AI heard in the actual audio file.
-        var bestCandidate: ResolvedTrackLyrics?
-        var bestScore = -Double.infinity
-        for cand in candidates {
-            let hasNativeWords = cand.lines.contains { $0.hasNativeWordTimings && !$0.words.isEmpty }
-            var score = hasNativeWords ? 0.50 : (cand.isTimeSynced ? 0.25 : 0.0)
-            if let heard, !heard.isEmpty {
-                switch SongAudioListener.verdict(heard: heard, lyrics: cand) {
-                case .confirmed(let ratio):
-                    score += 2.0 + ratio
-                case .inconclusive:
-                    score += 0.1
-                case .contradicted:
-                    score -= 2.0
-                }
-            }
-            if score > bestScore {
-                bestScore = score
-                bestCandidate = cand
-            }
-        }
+        let langHintNonEnglish = isNonEnglish || SongAudioListener.detectLanguageContext(title: title, artist: artist.isEmpty ? nil : artist).isNonEnglish
 
-        // Don't lock in clearly wrong lyrics if the audio contradicted the candidate.
-        if var selected = bestCandidate, bestScore > -0.5 {
+        // Don't lock in clearly wrong version lyrics if the audio contradicted all candidates.
+        if var selected = selectVerifiedLyrics(
+            from: candidates,
+            targetTitle: title,
+            targetArtist: artist,
+            targetDuration: duration,
+            heard: heard,
+            isNonEnglish: langHintNonEnglish,
+            englishASROnForeignTrack: englishASROnForeignTrack
+        ) {
             if !item.isHLS {
                 selected = await SongAudioListener.autoAlign(lyrics: selected, heard: heard, fileURL: item.fileURL)
             }
@@ -656,8 +928,8 @@ final class SyncedLyricsService {
             return true
         }
 
-        // Unreleased / offline-only song fallback: build real-time synced lyrics from whole-song AI Speech transcription.
-        if let heard, heard.count >= 4 {
+        // Unreleased / offline-only / alternate-version song fallback: build synced lyrics from speech transcription.
+        if let heard, heard.count >= 4, !englishASROnForeignTrack {
             let finalTitle = split.song.isEmpty ? item.displayTitle : split.song
             let finalArtist = split.artist.isEmpty ? (item.artist ?? "Unknown Artist") : split.artist
             if let transcribed = SongAudioListener.buildSyncedLyricsFromHeard(
@@ -694,8 +966,13 @@ final class SyncedLyricsService {
         memoryCache[key] = stored
         saveToDisk(stored)
         autoAttemptedKeys.insert(key)
-        if currentLyrics?.cacheKey == key {
+        let isCurrentlyPlayingItem = MediaManager.shared.currentItem?.relativePath == item.relativePath
+        if currentLyrics?.cacheKey == key || isCurrentlyPlayingItem {
             currentLyrics = stored
+            if currentLoadingKey == key {
+                currentLoadingKey = nil
+            }
+            lastError = nil
         }
     }
 
@@ -760,47 +1037,24 @@ final class SyncedLyricsService {
             }
         }
 
-        // 2. Studio Word-Level Karaoke (NetEase yrc / Kugou krc) for millisecond word timing
-        if let karaoke = await fetchFromStudioKaraoke(
-            cacheKey: cacheKey,
-            song: song,
-            artist: artist,
-            duration: duration
-        ) {
-            return karaoke
-        }
-
-        // 3. Online: LRCLIB Time-Synced & Plain LRC
-        if let lrclib = await fetchFromLRCLIB(
-            cacheKey: cacheKey,
-            song: song,
-            artist: artist,
-            rawTitle: rawTitle,
-            duration: duration
-        ) {
-            return lrclib
-        }
-
-        // 3. Fallback: Genius Native HTML Lyrics Extraction
-        if let genius = await fetchFromGenius(
-            cacheKey: cacheKey,
-            song: song,
-            artist: artist
-        ) {
-            return genius
-        }
-
-        // 4. Last-Resort Fallback: Creator-Uploaded Timed Captions from Source YouTube Video (non-ASR)
-        if let ytCaptions = await fetchFromYouTubeCreatorSubtitles(
+        // 2. Fetch Studio Karaoke, LRCLIB, Genius, and YouTube captions concurrently and rank by version/duration match.
+        let candidates = await collectAllCandidateLyrics(
             item: item,
             cacheKey: cacheKey,
-            song: song,
-            artist: artist
-        ) {
-            return ytCaptions
-        }
-
-        return nil
+            title: rawTitle,
+            artist: rawArtist,
+            duration: duration,
+            rawTitleOverride: customTitle
+        )
+        return selectVerifiedLyrics(
+            from: candidates,
+            targetTitle: rawTitle,
+            targetArtist: rawArtist,
+            targetDuration: duration,
+            heard: nil,
+            isNonEnglish: false,
+            englishASROnForeignTrack: false
+        )
     }
 
     private func loadOfflineEmbeddedOrSidecarLyrics(
@@ -868,11 +1122,33 @@ final class SyncedLyricsService {
         rawTitle: String,
         duration: Double?
     ) async -> ResolvedTrackLyrics? {
+        await fetchTopLRCLIBCandidates(
+            cacheKey: cacheKey,
+            song: song,
+            artist: artist,
+            rawTitle: rawTitle,
+            duration: duration,
+            maxResults: 1
+        ).first
+    }
+
+    private func fetchTopLRCLIBCandidates(
+        cacheKey: String,
+        song: String,
+        artist: String,
+        rawTitle: String,
+        duration: Double?,
+        maxResults: Int = 4
+    ) async -> [ResolvedTrackLyrics] {
         let querySong = Self.normalizeSmartPunctuation(song)
         let queryArtist = Self.normalizeSmartPunctuation(artist)
         let coreSong = Self.extractCoreSongTitle(querySong)
 
-        // Fast exact match endpoint first
+        var allCandidates: [LRCLIBCandidate] = []
+        var exactQuickMatch: ResolvedTrackLyrics?
+
+        // Run fast /api/get and primary /api/search queries concurrently instead of sequentially.
+        var getURL: URL?
         if !queryArtist.isEmpty, let dur = duration, dur > 5 {
             var comps = URLComponents(string: "https://lrclib.net/api/get")
             comps?.queryItems = [
@@ -880,17 +1156,10 @@ final class SyncedLyricsService {
                 URLQueryItem(name: "artist_name", value: queryArtist),
                 URLQueryItem(name: "duration", value: String(Int(round(dur))))
             ]
-            if let url = comps?.url,
-               let row = await fetchSingleLRCLIBObject(url: url),
-               let built = buildLyricsFromLRCLIBRow(row, cacheKey: cacheKey, duration: duration) {
-                return built
-            }
+            getURL = comps?.url
         }
 
-        // Primary search queries
-        var allCandidates: [LRCLIBCandidate] = []
         var primaryQueries: [URL] = []
-
         if !queryArtist.isEmpty {
             var c1 = URLComponents(string: "https://lrclib.net/api/search")
             c1?.queryItems = [
@@ -899,14 +1168,12 @@ final class SyncedLyricsService {
             ]
             if let u = c1?.url { primaryQueries.append(u) }
         }
-
         let combined = [queryArtist, querySong].filter { !$0.isEmpty }.joined(separator: " ")
         if !combined.isEmpty {
             var c2 = URLComponents(string: "https://lrclib.net/api/search")
             c2?.queryItems = [URLQueryItem(name: "q", value: combined)]
             if let u = c2?.url { primaryQueries.append(u) }
         }
-
         let cleanedRaw = Self.normalizeSmartPunctuation(Self.stripNoisyTitleTokens(rawTitle))
         if !cleanedRaw.isEmpty && cleanedRaw.lowercased() != combined.lowercased() {
             var c3 = URLComponents(string: "https://lrclib.net/api/search")
@@ -914,23 +1181,72 @@ final class SyncedLyricsService {
             if let u = c3?.url { primaryQueries.append(u) }
         }
 
-        for url in primaryQueries {
-            let rows = await fetchLRCLIBSearchArray(url: url)
-            for row in rows {
-                let candidate = scoreLRCLIBRow(
-                    row,
-                    targetSong: querySong,
-                    coreSong: coreSong,
-                    targetArtist: queryArtist,
-                    targetDuration: duration,
-                    strictArtistlessGuard: false
-                )
-                if candidate.score > 10 {
-                    allCandidates.append(candidate)
+        async let getRowTask: [String: Any]? = {
+            guard let getURL else { return nil }
+            return await fetchSingleLRCLIBObject(url: getURL)
+        }()
+        let capturedPrimary = primaryQueries
+        async let searchRowsTask: [[String: Any]] = withTaskGroup(of: [[String: Any]].self) { group in
+            for url in capturedPrimary {
+                group.addTask {
+                    await self.fetchLRCLIBSearchArray(url: url)
                 }
             }
-            if allCandidates.contains(where: { !($0.syncedLyrics?.isEmpty ?? true) && $0.score >= 70 }) {
-                break
+            var collected: [[String: Any]] = []
+            for await rows in group {
+                collected.append(contentsOf: rows)
+            }
+            return collected
+        }
+
+        let (getRow, searchRows) = await (getRowTask, searchRowsTask)
+
+        if let getRow {
+            let scoredGet = scoreLRCLIBRow(
+                getRow,
+                targetSong: querySong,
+                coreSong: coreSong,
+                targetArtist: queryArtist,
+                targetDuration: duration,
+                strictArtistlessGuard: false
+            )
+            let compat = Self.versionCompatibilityScore(
+                targetText: "\(rawTitle) \(querySong)",
+                candidateText: "\(scoredGet.trackName) \(scoredGet.albumName ?? "")",
+                targetDuration: duration,
+                candidateDuration: scoredGet.duration,
+                includeDurationScore: false
+            )
+            let durOK: Bool = {
+                guard let dur = duration, let cDur = scoredGet.duration, dur > 5 else { return true }
+                return abs(dur - cDur) <= 12.0
+            }()
+            if scoredGet.score >= 45 && compat >= 0 && durOK {
+                if maxResults == 1, scoredGet.score >= 85,
+                   let built = buildLyricsFromLRCLIBCandidate(scoredGet, cacheKey: cacheKey, duration: duration) {
+                    exactQuickMatch = built
+                } else {
+                    allCandidates.append(scoredGet)
+                }
+            } else if scoredGet.score > 10 {
+                allCandidates.append(scoredGet)
+            }
+        }
+        if let exactQuickMatch {
+            return [exactQuickMatch]
+        }
+
+        for row in searchRows {
+            let candidate = scoreLRCLIBRow(
+                row,
+                targetSong: querySong,
+                coreSong: coreSong,
+                targetArtist: queryArtist,
+                targetDuration: duration,
+                strictArtistlessGuard: false
+            )
+            if candidate.score > 10 {
+                allCandidates.append(candidate)
             }
         }
 
@@ -960,29 +1276,58 @@ final class SyncedLyricsService {
                 if let u = cTitleOnly?.url { fallbackQueries.append((u, true)) }
             }
 
-            for entry in fallbackQueries {
-                let rows = await fetchLRCLIBSearchArray(url: entry.url)
-                for row in rows {
+            let capturedFallback = fallbackQueries
+            let fallbackBatches: [(artistless: Bool, rows: [[String: Any]])] = await withTaskGroup(
+                of: (Bool, [[String: Any]]).self
+            ) { group in
+                for entry in capturedFallback {
+                    group.addTask {
+                        let rows = await self.fetchLRCLIBSearchArray(url: entry.url)
+                        return (entry.artistless, rows)
+                    }
+                }
+                var out: [(Bool, [[String: Any]])] = []
+                for await pair in group {
+                    out.append(pair)
+                }
+                return out
+            }
+            for batch in fallbackBatches {
+                for row in batch.rows {
                     let candidate = scoreLRCLIBRow(
                         row,
                         targetSong: querySong,
                         coreSong: coreSong,
                         targetArtist: queryArtist,
                         targetDuration: duration,
-                        strictArtistlessGuard: entry.artistless
+                        strictArtistlessGuard: batch.artistless
                     )
                     if candidate.score > 15 {
                         allCandidates.append(candidate)
                     }
                 }
-                if allCandidates.contains(where: { !($0.syncedLyrics?.isEmpty ?? true) && $0.score >= 70 }) {
-                    break
-                }
             }
         }
 
-        guard let best = allCandidates.max(by: { $0.score < $1.score }) else { return nil }
+        let sorted = allCandidates.sorted { $0.score > $1.score }
+        var builtResults: [ResolvedTrackLyrics] = []
+        var seenSignatures = Set<String>()
+        for cand in sorted {
+            let sig = "\(Self.normalizeComparable(cand.trackName))|\(Self.normalizeComparable(cand.artistName))|\(cand.duration.map { Int(round($0)) } ?? 0)|\(!(cand.syncedLyrics?.isEmpty ?? true))"
+            guard seenSignatures.insert(sig).inserted else { continue }
+            if let built = buildLyricsFromLRCLIBCandidate(cand, cacheKey: cacheKey, duration: duration) {
+                builtResults.append(built)
+                if builtResults.count >= maxResults { break }
+            }
+        }
+        return builtResults
+    }
 
+    private func buildLyricsFromLRCLIBCandidate(
+        _ best: LRCLIBCandidate,
+        cacheKey: String,
+        duration: Double?
+    ) -> ResolvedTrackLyrics? {
         if let synced = best.syncedLyrics, !synced.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             let parsed = Self.parseLRCOrPlain(text: synced, duration: duration ?? best.duration)
             if !parsed.lines.isEmpty {
@@ -1156,24 +1501,20 @@ final class SyncedLyricsService {
             } else if diff <= 7.0 {
                 score += 25
                 durationClose = true
-            } else if diff > 15.0 {
-                score -= diff > 30.0 ? 50 : 30
+            } else if diff > 12.0 {
+                score -= diff > 22.0 ? 60 : 35
             }
         }
 
-        // Penalize alternate edits/versions (remix, slowed, sped up, live, cover, karaoke) when the track isn't one.
-        let versionKeywords = [
-            "slowed", "sped up", "speed up", "nightcore", "remix",
-            "acoustic", "live", "instrumental", "karaoke", "8d", "cover"
-        ]
-        let hitCombined = (trackName + " " + ((row["albumName"] as? String) ?? "")).lowercased()
-        let targetCombined = (targetSong + " " + coreSong).lowercased()
-        for kw in versionKeywords {
-            if hitCombined.contains(kw) && !targetCombined.contains(kw) {
-                score -= 50
-                break
-            }
-        }
+        // Score bidirectional version compatibility (clean vs explicit, remix, live, slowed, demo, v1/v2, pt2, etc.)
+        let hitCombined = "\(trackName) \((row["albumName"] as? String) ?? "")"
+        score += Self.versionCompatibilityScore(
+            targetText: targetSong,
+            candidateText: hitCombined,
+            targetDuration: targetDuration,
+            candidateDuration: dur,
+            includeDurationScore: false
+        )
 
         // Prevent false positives when retrying title-only or mismatched uploader channel tags
         if strictArtistlessGuard && !artistMatched {
@@ -1202,30 +1543,42 @@ final class SyncedLyricsService {
         artist: String,
         duration: Double?
     ) async -> ResolvedTrackLyrics? {
+        await fetchStudioKaraokeCandidates(
+            cacheKey: cacheKey,
+            song: song,
+            artist: artist,
+            duration: duration
+        ).first
+    }
+
+    private func fetchStudioKaraokeCandidates(
+        cacheKey: String,
+        song: String,
+        artist: String,
+        duration: Double?
+    ) async -> [ResolvedTrackLyrics] {
         let querySong = Self.normalizeSmartPunctuation(song).trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !querySong.isEmpty else { return nil }
+        guard !querySong.isEmpty else { return [] }
         let rawArtist = Self.normalizeSmartPunctuation(artist)
         let canonArtist = ArtistDatabase.canonicalizeSingle(rawArtist)
         let queryArtist = canonArtist.isEmpty ? rawArtist : canonArtist
 
-        if let netease = await fetchFromNetEaseKaraoke(
+        async let neteaseTask = fetchTopNetEaseKaraokeCandidates(
             cacheKey: cacheKey,
             song: querySong,
             artist: queryArtist,
-            duration: duration
-        ) {
-            return netease
-        }
-
-        if let kugou = await fetchFromKugouKaraoke(
+            duration: duration,
+            maxResults: 2
+        )
+        async let kugouTask = fetchTopKugouKaraokeCandidates(
             cacheKey: cacheKey,
             song: querySong,
             artist: queryArtist,
-            duration: duration
-        ) {
-            return kugou
-        }
-        return nil
+            duration: duration,
+            maxResults: 2
+        )
+        let (netease, kugou) = await (neteaseTask, kugouTask)
+        return netease + kugou
     }
 
     private func fetchFromNetEaseKaraoke(
@@ -1234,35 +1587,62 @@ final class SyncedLyricsService {
         artist: String,
         duration: Double?
     ) async -> ResolvedTrackLyrics? {
-        guard let searchURL = URL(string: "https://music.163.com/api/search/get") else { return nil }
-        let query = [artist, Self.extractCoreSongTitle(song)].filter { !$0.isEmpty }.joined(separator: " ")
-        guard !query.isEmpty else { return nil }
+        await fetchTopNetEaseKaraokeCandidates(
+            cacheKey: cacheKey,
+            song: song,
+            artist: artist,
+            duration: duration,
+            maxResults: 1
+        ).first
+    }
 
-        var allowed = CharacterSet.alphanumerics
-        allowed.insert(charactersIn: "-._* ")
-        let encodedQuery = (query.addingPercentEncoding(withAllowedCharacters: allowed) ?? query)
-            .replacingOccurrences(of: " ", with: "+")
-        var req = URLRequest(url: searchURL)
-        req.httpMethod = "POST"
-        req.timeoutInterval = 10
-        req.httpBody = "s=\(encodedQuery)&type=1&limit=5".data(using: .utf8)
-        req.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X)", forHTTPHeaderField: "User-Agent")
-        req.setValue("https://music.163.com/", forHTTPHeaderField: "Referer")
-        req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+    private func fetchTopNetEaseKaraokeCandidates(
+        cacheKey: String,
+        song: String,
+        artist: String,
+        duration: Double?,
+        maxResults: Int = 2
+    ) async -> [ResolvedTrackLyrics] {
+        guard let searchURL = URL(string: "https://music.163.com/api/search/get") else { return [] }
+        let fullQuery = [artist, song].filter { !$0.isEmpty }.joined(separator: " ")
+        let coreSong = Self.extractCoreSongTitle(song)
+        let coreQuery = [artist, coreSong].filter { !$0.isEmpty }.joined(separator: " ")
 
-        guard let (data, resp) = try? await URLSession.shared.data(for: req),
-              let http = resp as? HTTPURLResponse, (200...299).contains(http.statusCode),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let resultObj = json["result"] as? [String: Any],
-              let songs = resultObj["songs"] as? [[String: Any]] else {
-            return nil
+        func searchSongs(query: String) async -> [[String: Any]] {
+            guard !query.isEmpty else { return [] }
+            var allowed = CharacterSet.alphanumerics
+            allowed.insert(charactersIn: "-._* ")
+            let encodedQuery = (query.addingPercentEncoding(withAllowedCharacters: allowed) ?? query)
+                .replacingOccurrences(of: " ", with: "+")
+            var req = URLRequest(url: searchURL)
+            req.httpMethod = "POST"
+            req.timeoutInterval = 10
+            req.httpBody = "s=\(encodedQuery)&type=1&limit=6".data(using: .utf8)
+            req.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X)", forHTTPHeaderField: "User-Agent")
+            req.setValue("https://music.163.com/", forHTTPHeaderField: "Referer")
+            req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+
+            guard let (data, resp) = try? await URLSession.shared.data(for: req),
+                  let http = resp as? HTTPURLResponse, (200...299).contains(http.statusCode),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let resultObj = json["result"] as? [String: Any],
+                  let songs = resultObj["songs"] as? [[String: Any]] else {
+                return []
+            }
+            return songs
         }
 
-        var bestHit: (id: Int, title: String, artist: String, durationSec: Double?, score: Int)?
+        var songs = await searchSongs(query: fullQuery)
+        if songs.isEmpty && !coreQuery.isEmpty && coreQuery.lowercased() != fullQuery.lowercased() {
+            songs = await searchSongs(query: coreQuery)
+        }
+        guard !songs.isEmpty else { return [] }
+
+        var scoredHits: [(id: Int, title: String, artist: String, durationSec: Double?, score: Int)] = []
         let normSong = Self.normalizeComparable(song)
-        let normCore = Self.normalizeComparable(Self.extractCoreSongTitle(song))
+        let normCore = Self.normalizeComparable(coreSong)
         let normArtist = Self.normalizeComparable(artist)
-        let targetCombined = "\(song) \(artist)".lowercased()
+        let targetText = "\(song) \(artist)"
 
         for row in songs {
             guard let sid = row["id"] as? Int,
@@ -1295,56 +1675,68 @@ final class SyncedLyricsService {
                 else if diff > 18.0 { score -= 45 }
             }
 
-            let titleLower = rTitle.lowercased()
-            for kw in ["slowed", "sped up", "nightcore", "remix", "instrumental", "karaoke", "live", "cover", "伴奏"] {
-                if titleLower.contains(kw) && !targetCombined.contains(kw) {
-                    score -= 55
-                    break
+            score += Self.versionCompatibilityScore(
+                targetText: targetText,
+                candidateText: "\(rTitle) \(rArtist)",
+                targetDuration: duration,
+                candidateDuration: rDur,
+                includeDurationScore: false
+            )
+
+            if score >= 50 {
+                scoredHits.append((sid, rTitle, rArtist, rDur, score))
+            }
+        }
+
+        let topHits = Array(scoredHits.sorted { $0.score > $1.score }.prefix(maxResults))
+        guard !topHits.isEmpty else { return [] }
+
+        return await withTaskGroup(of: ResolvedTrackLyrics?.self) { group in
+            for chosen in topHits {
+                group.addTask {
+                    guard let lyrURL = URL(string: "https://music.163.com/api/song/lyric/v1?id=\(chosen.id)&lv=1&kv=1&tv=-1&yv=1") else {
+                        return nil
+                    }
+                    var lyrReq = URLRequest(url: lyrURL)
+                    lyrReq.timeoutInterval = 10
+                    lyrReq.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X)", forHTTPHeaderField: "User-Agent")
+                    lyrReq.setValue("https://music.163.com/", forHTTPHeaderField: "Referer")
+
+                    guard let (lData, lResp) = try? await URLSession.shared.data(for: lyrReq),
+                          let lHttp = lResp as? HTTPURLResponse, (200...299).contains(lHttp.statusCode),
+                          let lJson = try? JSONSerialization.jsonObject(with: lData) as? [String: Any],
+                          let yrcObj = lJson["yrc"] as? [String: Any],
+                          let yrcText = yrcObj["lyric"] as? String, !yrcText.isEmpty else {
+                        return nil
+                    }
+
+                    let lines = Self.parseKaraokeTimedLines(
+                        text: yrcText,
+                        isKugouKRC: false,
+                        song: chosen.title,
+                        artist: chosen.artist,
+                        duration: duration ?? chosen.durationSec
+                    )
+                    guard lines.filter({ !$0.isInstrumentalBreak }).count >= 6 else { return nil }
+                    return ResolvedTrackLyrics(
+                        cacheKey: cacheKey,
+                        trackTitle: chosen.title,
+                        artistName: chosen.artist,
+                        isTimeSynced: true,
+                        sourceLabel: "Word-Synced Lyrics · Studio",
+                        attributionText: "Word-by-word karaoke sync via NetEase",
+                        syncedOffsetSeconds: 0,
+                        expectedDurationSeconds: chosen.durationSec ?? duration,
+                        lines: lines
+                    )
                 }
             }
-
-            if bestHit == nil || score > bestHit!.score {
-                bestHit = (sid, rTitle, rArtist, rDur, score)
+            var out: [ResolvedTrackLyrics] = []
+            for await item in group {
+                if let item { out.append(item) }
             }
+            return out
         }
-
-        guard let chosen = bestHit, chosen.score >= 55,
-              let lyrURL = URL(string: "https://music.163.com/api/song/lyric/v1?id=\(chosen.id)&lv=1&kv=1&tv=-1&yv=1") else {
-            return nil
-        }
-
-        var lyrReq = URLRequest(url: lyrURL)
-        lyrReq.timeoutInterval = 10
-        lyrReq.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X)", forHTTPHeaderField: "User-Agent")
-        lyrReq.setValue("https://music.163.com/", forHTTPHeaderField: "Referer")
-
-        guard let (lData, lResp) = try? await URLSession.shared.data(for: lyrReq),
-              let lHttp = lResp as? HTTPURLResponse, (200...299).contains(lHttp.statusCode),
-              let lJson = try? JSONSerialization.jsonObject(with: lData) as? [String: Any],
-              let yrcObj = lJson["yrc"] as? [String: Any],
-              let yrcText = yrcObj["lyric"] as? String, !yrcText.isEmpty else {
-            return nil
-        }
-
-        let lines = Self.parseKaraokeTimedLines(
-            text: yrcText,
-            isKugouKRC: false,
-            song: chosen.title,
-            artist: chosen.artist,
-            duration: duration ?? chosen.durationSec
-        )
-        guard lines.filter({ !$0.isInstrumentalBreak }).count >= 6 else { return nil }
-        return ResolvedTrackLyrics(
-            cacheKey: cacheKey,
-            trackTitle: chosen.title,
-            artistName: chosen.artist,
-            isTimeSynced: true,
-            sourceLabel: "Word-Synced Lyrics · Studio",
-            attributionText: "Word-by-word karaoke sync via NetEase",
-            syncedOffsetSeconds: 0,
-            expectedDurationSeconds: duration ?? chosen.durationSec,
-            lines: lines
-        )
     }
 
     private func fetchFromKugouKaraoke(
@@ -1353,38 +1745,67 @@ final class SyncedLyricsService {
         artist: String,
         duration: Double?
     ) async -> ResolvedTrackLyrics? {
-        let keyword = [artist, Self.extractCoreSongTitle(song)].filter { !$0.isEmpty }.joined(separator: " - ")
-        guard !keyword.isEmpty else { return nil }
-        var comps = URLComponents(string: "https://lyrics.kugou.com/search")
-        var items = [
-            URLQueryItem(name: "ver", value: "1"),
-            URLQueryItem(name: "man", value: "yes"),
-            URLQueryItem(name: "client", value: "pc"),
-            URLQueryItem(name: "keyword", value: keyword)
-        ]
-        if let duration, duration > 5 {
-            items.append(URLQueryItem(name: "duration", value: String(Int((duration * 1000.0).rounded()))))
-        }
-        comps?.queryItems = items
-        guard let searchURL = comps?.url else { return nil }
+        await fetchTopKugouKaraokeCandidates(
+            cacheKey: cacheKey,
+            song: song,
+            artist: artist,
+            duration: duration,
+            maxResults: 1
+        ).first
+    }
 
-        var req = URLRequest(url: searchURL)
-        req.timeoutInterval = 10
-        req.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X)", forHTTPHeaderField: "User-Agent")
+    private func fetchTopKugouKaraokeCandidates(
+        cacheKey: String,
+        song: String,
+        artist: String,
+        duration: Double?,
+        maxResults: Int = 2
+    ) async -> [ResolvedTrackLyrics] {
+        let fullKeyword = [artist, song].filter { !$0.isEmpty }.joined(separator: " - ")
+        let coreSong = Self.extractCoreSongTitle(song)
+        let coreKeyword = [artist, coreSong].filter { !$0.isEmpty }.joined(separator: " - ")
+        guard !fullKeyword.isEmpty else { return [] }
 
-        guard let (data, resp) = try? await URLSession.shared.data(for: req),
-              let http = resp as? HTTPURLResponse, (200...299).contains(http.statusCode),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let candidates = json["candidates"] as? [[String: Any]] else {
-            return nil
+        func searchKugou(keyword: String) async -> [[String: Any]] {
+            guard !keyword.isEmpty else { return [] }
+            var comps = URLComponents(string: "https://lyrics.kugou.com/search")
+            var items = [
+                URLQueryItem(name: "ver", value: "1"),
+                URLQueryItem(name: "man", value: "yes"),
+                URLQueryItem(name: "client", value: "pc"),
+                URLQueryItem(name: "keyword", value: keyword)
+            ]
+            if let duration, duration > 5 {
+                items.append(URLQueryItem(name: "duration", value: String(Int((duration * 1000.0).rounded()))))
+            }
+            comps?.queryItems = items
+            guard let searchURL = comps?.url else { return [] }
+
+            var req = URLRequest(url: searchURL)
+            req.timeoutInterval = 10
+            req.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X)", forHTTPHeaderField: "User-Agent")
+
+            guard let (data, resp) = try? await URLSession.shared.data(for: req),
+                  let http = resp as? HTTPURLResponse, (200...299).contains(http.statusCode),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let candidates = json["candidates"] as? [[String: Any]] else {
+                return []
+            }
+            return candidates
         }
+
+        var candidates = await searchKugou(keyword: fullKeyword)
+        if candidates.isEmpty && !coreKeyword.isEmpty && coreKeyword.lowercased() != fullKeyword.lowercased() {
+            candidates = await searchKugou(keyword: coreKeyword)
+        }
+        guard !candidates.isEmpty else { return [] }
 
         let normSong = Self.normalizeComparable(song)
-        let normCore = Self.normalizeComparable(Self.extractCoreSongTitle(song))
+        let normCore = Self.normalizeComparable(coreSong)
         let normArtist = Self.normalizeComparable(artist)
-        let targetCombined = "\(song) \(artist)".lowercased()
+        let targetText = "\(song) \(artist)"
 
-        var best: (id: String, accesskey: String, song: String, singer: String, durSec: Double?, score: Int)?
+        var scored: [(id: String, accesskey: String, song: String, singer: String, durSec: Double?, score: Int)] = []
         for cand in candidates.prefix(8) {
             guard let cid = cand["id"] as? String,
                   let key = cand["accesskey"] as? String,
@@ -1410,62 +1831,77 @@ final class SyncedLyricsService {
                 else if diff <= 9.0 { score += 18 }
                 else if diff > 18.0 { score -= 45 }
             }
-            let lower = cSong.lowercased()
-            for kw in ["slowed", "sped up", "nightcore", "remix", "instrumental", "karaoke", "live", "cover", "伴奏"] {
-                if lower.contains(kw) && !targetCombined.contains(kw) {
-                    score -= 55
-                    break
+
+            score += Self.versionCompatibilityScore(
+                targetText: targetText,
+                candidateText: "\(cSong) \(cSinger)",
+                targetDuration: duration,
+                candidateDuration: cDur,
+                includeDurationScore: false
+            )
+
+            if score >= 50 {
+                scored.append((cid, key, cSong, cSinger, cDur, score))
+            }
+        }
+
+        let topHits = Array(scored.sorted { $0.score > $1.score }.prefix(maxResults))
+        guard !topHits.isEmpty else { return [] }
+
+        return await withTaskGroup(of: ResolvedTrackLyrics?.self) { group in
+            for chosen in topHits {
+                group.addTask {
+                    var dlComps = URLComponents(string: "https://lyrics.kugou.com/download")
+                    dlComps?.queryItems = [
+                        URLQueryItem(name: "ver", value: "1"),
+                        URLQueryItem(name: "client", value: "pc"),
+                        URLQueryItem(name: "id", value: chosen.id),
+                        URLQueryItem(name: "accesskey", value: chosen.accesskey),
+                        URLQueryItem(name: "fmt", value: "krc"),
+                        URLQueryItem(name: "charset", value: "utf8")
+                    ]
+                    guard let dlURL = dlComps?.url else { return nil }
+
+                    var dlReq = URLRequest(url: dlURL)
+                    dlReq.timeoutInterval = 10
+                    dlReq.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X)", forHTTPHeaderField: "User-Agent")
+
+                    guard let (dlData, dlResp) = try? await URLSession.shared.data(for: dlReq),
+                          let dlHttp = dlResp as? HTTPURLResponse, (200...299).contains(dlHttp.statusCode),
+                          let dlJson = try? JSONSerialization.jsonObject(with: dlData) as? [String: Any],
+                          let b64 = dlJson["content"] as? String,
+                          let rawData = Data(base64Encoded: b64),
+                          let krcText = Self.decodeKugouKRC(rawData), !krcText.isEmpty else {
+                        return nil
+                    }
+
+                    let lines = Self.parseKaraokeTimedLines(
+                        text: krcText,
+                        isKugouKRC: true,
+                        song: chosen.song,
+                        artist: chosen.singer,
+                        duration: duration ?? chosen.durSec
+                    )
+                    guard lines.filter({ !$0.isInstrumentalBreak }).count >= 6 else { return nil }
+                    return ResolvedTrackLyrics(
+                        cacheKey: cacheKey,
+                        trackTitle: chosen.song,
+                        artistName: chosen.singer,
+                        isTimeSynced: true,
+                        sourceLabel: "Word-Synced Lyrics · Studio",
+                        attributionText: "Word-by-word karaoke sync via Kugou",
+                        syncedOffsetSeconds: 0,
+                        expectedDurationSeconds: chosen.durSec ?? duration,
+                        lines: lines
+                    )
                 }
             }
-            if best == nil || score > best!.score {
-                best = (cid, key, cSong, cSinger, cDur, score)
+            var out: [ResolvedTrackLyrics] = []
+            for await item in group {
+                if let item { out.append(item) }
             }
+            return out
         }
-
-        guard let chosen = best, chosen.score >= 55 else { return nil }
-        var dlComps = URLComponents(string: "https://lyrics.kugou.com/download")
-        dlComps?.queryItems = [
-            URLQueryItem(name: "ver", value: "1"),
-            URLQueryItem(name: "client", value: "pc"),
-            URLQueryItem(name: "id", value: chosen.id),
-            URLQueryItem(name: "accesskey", value: chosen.accesskey),
-            URLQueryItem(name: "fmt", value: "krc"),
-            URLQueryItem(name: "charset", value: "utf8")
-        ]
-        guard let dlURL = dlComps?.url else { return nil }
-
-        var dlReq = URLRequest(url: dlURL)
-        dlReq.timeoutInterval = 10
-        dlReq.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X)", forHTTPHeaderField: "User-Agent")
-
-        guard let (dlData, dlResp) = try? await URLSession.shared.data(for: dlReq),
-              let dlHttp = dlResp as? HTTPURLResponse, (200...299).contains(dlHttp.statusCode),
-              let dlJson = try? JSONSerialization.jsonObject(with: dlData) as? [String: Any],
-              let b64 = dlJson["content"] as? String,
-              let rawData = Data(base64Encoded: b64),
-              let krcText = Self.decodeKugouKRC(rawData), !krcText.isEmpty else {
-            return nil
-        }
-
-        let lines = Self.parseKaraokeTimedLines(
-            text: krcText,
-            isKugouKRC: true,
-            song: chosen.song,
-            artist: chosen.singer,
-            duration: duration ?? chosen.durSec
-        )
-        guard lines.filter({ !$0.isInstrumentalBreak }).count >= 6 else { return nil }
-        return ResolvedTrackLyrics(
-            cacheKey: cacheKey,
-            trackTitle: chosen.song,
-            artistName: chosen.singer,
-            isTimeSynced: true,
-            sourceLabel: "Word-Synced Lyrics · Studio",
-            attributionText: "Word-by-word karaoke sync via Kugou",
-            syncedOffsetSeconds: 0,
-            expectedDurationSeconds: duration ?? chosen.durSec,
-            lines: lines
-        )
     }
 
     nonisolated private static func decodeKugouKRC(_ data: Data) -> String? {
@@ -1643,6 +2079,55 @@ final class SyncedLyricsService {
         await fetchGeniusTrackDetails(cacheKey: cacheKey, song: song, artist: artist)?.lyrics
     }
 
+    private func fetchTopGeniusCandidates(
+        cacheKey: String,
+        song: String,
+        artist: String,
+        maxResults: Int = 2
+    ) async -> [ResolvedTrackLyrics] {
+        let querySong = Self.normalizeSmartPunctuation(song)
+        let rawArtist = Self.normalizeSmartPunctuation(artist)
+        let canonicalArtist = ArtistDatabase.canonicalizeSingle(rawArtist)
+        let queryArtist = canonicalArtist.isEmpty ? rawArtist : canonicalArtist
+        let coreSong = Self.extractCoreSongTitle(querySong)
+
+        let combined = [queryArtist, querySong].filter { !$0.isEmpty }.joined(separator: " ")
+        var hits = await findTopGeniusHits(
+            query: combined,
+            targetSong: querySong,
+            coreSong: coreSong,
+            targetArtist: queryArtist,
+            maxResults: maxResults
+        ).filter { $0.score >= 35 }
+
+        if hits.isEmpty {
+            let titleQuery = coreSong.isEmpty ? querySong : coreSong
+            if !queryArtist.isEmpty, !titleQuery.isEmpty, titleQuery.lowercased() != combined.lowercased() {
+                hits = await findTopGeniusHits(
+                    query: titleQuery,
+                    targetSong: querySong,
+                    coreSong: coreSong,
+                    targetArtist: queryArtist,
+                    maxResults: maxResults
+                ).filter { $0.score >= 42 }
+            }
+        }
+        guard !hits.isEmpty else { return [] }
+
+        return await withTaskGroup(of: ResolvedTrackLyrics?.self) { group in
+            for hit in hits {
+                group.addTask {
+                    await self.loadGeniusPage(hit: hit, cacheKey: cacheKey)
+                }
+            }
+            var out: [ResolvedTrackLyrics] = []
+            for await item in group {
+                if let item { out.append(item) }
+            }
+            return out
+        }
+    }
+
     func fetchGeniusTrackDetails(
         cacheKey: String = "genius_lookup",
         song: String,
@@ -1681,10 +2166,26 @@ final class SyncedLyricsService {
         coreSong: String,
         targetArtist: String
     ) async -> (url: URL, title: String, artist: String, score: Int)? {
+        await findTopGeniusHits(
+            query: query,
+            targetSong: targetSong,
+            coreSong: coreSong,
+            targetArtist: targetArtist,
+            maxResults: 1
+        ).first
+    }
+
+    private func findTopGeniusHits(
+        query: String,
+        targetSong: String,
+        coreSong: String,
+        targetArtist: String,
+        maxResults: Int = 2
+    ) async -> [(url: URL, title: String, artist: String, score: Int)] {
         guard !query.isEmpty,
               let encoded = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
-              let searchURL = URL(string: "https://genius.com/api/search/multi?q=\(encoded)&per_page=5") else {
-            return nil
+              let searchURL = URL(string: "https://genius.com/api/search/multi?q=\(encoded)&per_page=6") else {
+            return []
         }
 
         var req = URLRequest(url: searchURL)
@@ -1696,13 +2197,15 @@ final class SyncedLyricsService {
               (200...299).contains(http.statusCode),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let sections = (json["response"] as? [String: Any])?["sections"] as? [[String: Any]] else {
-            return nil
+            return []
         }
 
-        var bestHit: (url: URL, title: String, artist: String, score: Int)?
+        var scoredHits: [(url: URL, title: String, artist: String, score: Int)] = []
+        var seenURLs = Set<URL>()
         let normSong = Self.normalizeComparable(targetSong)
         let normCore = Self.normalizeComparable(coreSong)
         let normArtist = Self.normalizeComparable(targetArtist)
+        let targetText = "\(targetSong) \(targetArtist)"
 
         for section in sections {
             let sType = (section["type"] as? String) ?? ""
@@ -1712,7 +2215,8 @@ final class SyncedLyricsService {
                 guard (hit["type"] as? String) == "song",
                       let result = hit["result"] as? [String: Any],
                       let urlStr = result["url"] as? String,
-                      let url = URL(string: urlStr) else { continue }
+                      let url = URL(string: urlStr),
+                      seenURLs.insert(url).inserted else { continue }
                 let hTitle = (result["title"] as? String) ?? ""
                 let hArtist = (result["artist_names"] as? String) ?? ""
                 let normHitSong = Self.normalizeComparable(hTitle)
@@ -1729,13 +2233,16 @@ final class SyncedLyricsService {
                     if normHitArtist == normArtist { s += 40 }
                     else if normHitArtist.contains(normArtist) || normArtist.contains(normHitArtist) { s += 28 }
                 }
-                if bestHit == nil || s > bestHit!.score {
-                    bestHit = (url, hTitle, hArtist, s)
-                }
+                s += Self.versionCompatibilityScore(
+                    targetText: targetText,
+                    candidateText: "\(hTitle) \(hArtist)",
+                    includeDurationScore: false
+                )
+                scoredHits.append((url, hTitle, hArtist, s))
             }
         }
 
-        return bestHit
+        return Array(scoredHits.sorted { $0.score > $1.score }.prefix(maxResults))
     }
 
     private func loadGeniusPage(
@@ -2199,16 +2706,137 @@ final class SyncedLyricsService {
     private static func extractCoreSongTitle(_ title: String) -> String {
         var s = normalizeSmartPunctuation(title)
         s = s.replacingOccurrences(
-            of: #"\s*[\(\[]\s*(?:slowed(?:\s*(?:\+|&|and)?\s*reverb)?|sped\s*up|nightcore|reverb|bass\s*boosted|acoustic(?:\s*version)?|live(?:\s*at\s*[^\)\]]*)?|remix|edit|version|radio\s*edit|clean|explicit|8d(?:\s*audio)?|cover)[^\)\]]*[\)\]]"#,
+            of: #"\s*[\(\[]\s*(?:slowed(?:\s*(?:\+|&|and)?\s*reverb)?|sped\s*up|speed\s*up|nightcore|reverb|bass\s*boosted|acoustic(?:\s*version)?|unplugged|live(?:\s*at\s*[^\)\]]*)?|remix|rework|vip|edit|version|radio\s*edit|clean|explicit|dirty|uncensored|demo|og|extended|alternate|alt\.?\s*version|v\d+|part\s*\w+|pt\.?\s*\w+|8d(?:\s*audio)?|cover)[^\)\]]*[\)\]]"#,
             with: "",
             options: [.regularExpression, .caseInsensitive]
         )
         s = s.replacingOccurrences(
-            of: #"\s*[-–—]\s*(?:slowed(?:\s*(?:\+|&|and)?\s*reverb)?|sped\s*up|nightcore|acoustic|live|remix|radio\s*edit)\s*$"#,
+            of: #"\s*[-–—]\s*(?:slowed(?:\s*(?:\+|&|and)?\s*reverb)?|sped\s*up|speed\s*up|nightcore|acoustic|unplugged|live|remix|radio\s*edit|clean|explicit|demo|extended)\s*$"#,
             with: "",
             options: [.regularExpression, .caseInsensitive]
         )
         return s.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private nonisolated static let versionTagRegexes: [(regex: NSRegularExpression, tag: String)] = {
+        let specs: [(String, String)] = [
+            (#"\b(?:clean(?:\s+version)?|edited\s+version)\b|(?:[\(\[\-–—]\s*edited\b)"#, "clean"),
+            (#"\b(?:explicit|dirty|uncensored)\b"#, "explicit"),
+            (#"\b(?:remix|rework|bootleg|flip)\b"#, "remix"),
+            (#"\bvip\b"#, "vip"),
+            (#"\b(?:radio\s+edit|studio\s+edit)\b|(?:[\(\[\-–—]\s*edit\b)"#, "edit"),
+            (#"\blive\s+(?:at|in|from|version|session|performance|recording)\b|(?:[\(\[\-–—]\s*live\b)"#, "live"),
+            (#"\b(?:acoustic|unplugged)\b"#, "acoustic"),
+            (#"\bslowed\b"#, "slowed"),
+            (#"\b(?:sped\s*up|speed\s*up|nightcore)\b"#, "sped_up"),
+            (#"\b(?:instrumental|karaoke|8d(?:\s*audio)?)\b|伴奏"#, "instrumental"),
+            (#"\bdemo\b"#, "demo"),
+            (#"(?:[\(\[\-–—]\s*(?:og|original)\b)|\b(?:og\s+version|original\s+version)\b"#, "og"),
+            (#"\bextended\b"#, "extended"),
+            (#"\b(?:alternate|alt\.?\s+version)\b"#, "alternate"),
+            (#"\bcover\s+version\b|(?:[\(\[\-–—]\s*cover\b)"#, "cover")
+        ]
+        return specs.compactMap { pattern, tag in
+            guard let rx = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return nil }
+            return (rx, tag)
+        }
+    }()
+
+    private nonisolated static let numberedVersionRegex = try? NSRegularExpression(
+        pattern: #"\bv(?:er(?:sion)?)?[\s._-]*([1-9])\b"#,
+        options: [.caseInsensitive]
+    )
+
+    private nonisolated static let numberedPartRegex = try? NSRegularExpression(
+        pattern: #"\b(?:part|pt\.?)[\s._-]*([1-9]|ii|iii|iv)\b"#,
+        options: [.caseInsensitive]
+    )
+
+    /// Extracts canonical version tags (clean, explicit, remix, live, acoustic, slowed, sped_up, demo, v1/v2, pt2, etc.)
+    /// so different editions/versions of the same song title never silently substitute for one another.
+    nonisolated static func canonicalVersionGroups(in text: String) -> Set<String> {
+        let normalized = normalizeSmartPunctuation(text).lowercased()
+        guard !normalized.isEmpty else { return [] }
+        let range = NSRange(normalized.startIndex..., in: normalized)
+        var tags = Set<String>()
+
+        for entry in versionTagRegexes {
+            if entry.regex.firstMatch(in: normalized, options: [], range: range) != nil {
+                tags.insert(entry.tag)
+            }
+        }
+        if let numberedVersionRegex {
+            for match in numberedVersionRegex.matches(in: normalized, options: [], range: range) {
+                if match.numberOfRanges >= 2, let r = Range(match.range(at: 1), in: normalized) {
+                    tags.insert("v\(normalized[r])")
+                }
+            }
+        }
+        if let numberedPartRegex {
+            for match in numberedPartRegex.matches(in: normalized, options: [], range: range) {
+                if match.numberOfRanges >= 2, let r = Range(match.range(at: 1), in: normalized) {
+                    let raw = String(normalized[r])
+                    let mapped: String
+                    switch raw {
+                    case "ii": mapped = "2"
+                    case "iii": mapped = "3"
+                    case "iv": mapped = "4"
+                    default: mapped = raw
+                    }
+                    tags.insert("pt\(mapped)")
+                }
+            }
+        }
+        return tags
+    }
+
+    /// Computes bidirectional version & duration compatibility between the target track metadata and a lyric candidate.
+    nonisolated static func versionCompatibilityScore(
+        targetText: String,
+        candidateText: String,
+        targetDuration: Double? = nil,
+        candidateDuration: Double? = nil,
+        includeDurationScore: Bool = true
+    ) -> Int {
+        let targetTags = canonicalVersionGroups(in: targetText)
+        let candTags = canonicalVersionGroups(in: candidateText)
+        var score = 0
+
+        if (targetTags.contains("clean") && candTags.contains("explicit")) ||
+            (targetTags.contains("explicit") && candTags.contains("clean")) {
+            score -= 75
+        }
+
+        let matched = targetTags.intersection(candTags)
+        score += min(60, matched.count * 35)
+
+        // Penalize alternate version tags present on the candidate that the target track doesn't have
+        // (normal unmarked tracks allow `[Explicit]` metadata on album entries).
+        for tag in candTags where !targetTags.contains(tag) {
+            if tag == "explicit" && !targetTags.contains("clean") { continue }
+            score -= 55
+        }
+
+        // Penalize missing required version modifiers when the target track specifically asks for one.
+        for tag in targetTags where !candTags.contains(tag) {
+            if tag == "explicit" && !candTags.contains("clean") { continue }
+            score -= 50
+        }
+
+        if includeDurationScore, let targetDuration, let candidateDuration, targetDuration > 5, candidateDuration > 5 {
+            let diff = abs(targetDuration - candidateDuration)
+            if diff <= 3.0 {
+                score += 35
+            } else if diff <= 7.0 {
+                score += 18
+            } else if diff > 22.0 {
+                score -= 60
+            } else if diff > 12.0 {
+                score -= 35
+            }
+        }
+
+        return score
     }
 
     nonisolated private static func normalizeComparable(_ text: String) -> String {

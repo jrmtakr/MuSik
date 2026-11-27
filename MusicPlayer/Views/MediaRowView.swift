@@ -35,11 +35,8 @@ struct MediaRowView: View {
             Button {
                 if isPendingAIAnalysis {
                     songIDService.prioritize(item)
-                    mediaManager.statusMessage = songIDService.analysisStatusText(for: item)
-                        ?? "Listening to whole song before playback..."
-                } else {
-                    onPlay()
                 }
+                onPlay()
             } label: {
                 HStack(spacing: 14) {
                     ZStack {

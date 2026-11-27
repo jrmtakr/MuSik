@@ -288,68 +288,73 @@ enum YouTubeStreamResolver {
                 sts = nil
             }
 
-            async let iosTask = fetchInnerTube(
-                videoID: videoID,
-                sourcePageURL: url,
-                clientName: "IOS",
-                clientHeaderID: "5",
-                clientVersion: iosClientVersion,
-                userAgent: iosClientUserAgent,
-                extraClientFields: [
-                    "deviceMake": "Apple",
-                    "deviceModel": "iPhone16,2",
-                    "osName": "iPhone",
-                    "osVersion": "18.3.2"
-                ],
-                visitorData: visitorDataForRequests,
-                cookiesHeader: nil
-            )
-            async let mwebTask = fetchInnerTube(
-                videoID: videoID,
-                sourcePageURL: url,
-                clientName: "MWEB",
-                clientHeaderID: "2",
-                clientVersion: "2.20250311.00.00",
-                userAgent: WebMediaDownloader.browserUserAgent,
-                extraClientFields: [
-                    "platform": "MOBILE"
-                ],
-                visitorData: visitorDataForRequests,
-                cookiesHeader: resolvedCookies,
-                signatureTimestamp: sts
-            )
-            async let webAuthTask = fetchInnerTubeIfEnabled(
-                signedIn,
-                videoID: videoID,
-                sourcePageURL: url,
-                clientName: "WEB",
-                clientHeaderID: "1",
-                clientVersion: "2.20250311.00.00",
-                userAgent: desktopBrowserUserAgent,
-                extraClientFields: [:],
-                visitorData: visitorDataForRequests,
-                cookiesHeader: resolvedCookies,
-                signatureTimestamp: sts
-            )
-            async let tvAuthTask = fetchInnerTubeIfEnabled(
-                signedIn,
-                videoID: videoID,
-                sourcePageURL: url,
-                clientName: "TVHTML5",
-                clientHeaderID: "7",
-                clientVersion: "7.20250311.13.00",
-                userAgent: "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/Version",
-                extraClientFields: [:],
-                visitorData: visitorDataForRequests,
-                cookiesHeader: resolvedCookies,
-                signatureTimestamp: sts
-            )
-
-            let (iosResult, mwebResult, webAuthResult, tvAuthResult) = await (iosTask, mwebTask, webAuthTask, tvAuthTask)
-            if !(await evaluateCandidate(iosResult)) {
-                if !(await evaluateCandidate(mwebResult)) {
-                    if !(await evaluateCandidate(webAuthResult)) {
-                        _ = await evaluateCandidate(tvAuthResult)
+            await withTaskGroup(of: YouTubeResolvedResult?.self) { group in
+                group.addTask {
+                    await fetchInnerTube(
+                        videoID: videoID,
+                        sourcePageURL: url,
+                        clientName: "IOS",
+                        clientHeaderID: "5",
+                        clientVersion: iosClientVersion,
+                        userAgent: iosClientUserAgent,
+                        extraClientFields: [
+                            "deviceMake": "Apple",
+                            "deviceModel": "iPhone16,2",
+                            "osName": "iPhone",
+                            "osVersion": "18.3.2"
+                        ],
+                        visitorData: visitorDataForRequests,
+                        cookiesHeader: nil
+                    )
+                }
+                group.addTask {
+                    await fetchInnerTube(
+                        videoID: videoID,
+                        sourcePageURL: url,
+                        clientName: "MWEB",
+                        clientHeaderID: "2",
+                        clientVersion: "2.20250311.00.00",
+                        userAgent: WebMediaDownloader.browserUserAgent,
+                        extraClientFields: ["platform": "MOBILE"],
+                        visitorData: visitorDataForRequests,
+                        cookiesHeader: resolvedCookies,
+                        signatureTimestamp: sts
+                    )
+                }
+                if signedIn {
+                    group.addTask {
+                        await fetchInnerTube(
+                            videoID: videoID,
+                            sourcePageURL: url,
+                            clientName: "WEB",
+                            clientHeaderID: "1",
+                            clientVersion: "2.20250311.00.00",
+                            userAgent: desktopBrowserUserAgent,
+                            extraClientFields: [:],
+                            visitorData: visitorDataForRequests,
+                            cookiesHeader: resolvedCookies,
+                            signatureTimestamp: sts
+                        )
+                    }
+                    group.addTask {
+                        await fetchInnerTube(
+                            videoID: videoID,
+                            sourcePageURL: url,
+                            clientName: "TVHTML5",
+                            clientHeaderID: "7",
+                            clientVersion: "7.20250311.13.00",
+                            userAgent: "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/Version",
+                            extraClientFields: [:],
+                            visitorData: visitorDataForRequests,
+                            cookiesHeader: resolvedCookies,
+                            signatureTimestamp: sts
+                        )
+                    }
+                }
+                for await candidate in group {
+                    if await evaluateCandidate(candidate) {
+                        group.cancelAll()
+                        break
                     }
                 }
             }

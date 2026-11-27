@@ -226,31 +226,80 @@ enum SongAudioListener {
         }
 
         let total = min(duration, maxSeconds)
-        let totalChunks = max(1, Int(ceil(total / chunkStepSeconds)))
-        var heard: [HeardWord] = []
-        var start: Double = 0
-        var chunkIdx = 0
-        while start < total {
-            if Task.isCancelled { break }
-            let length = min(chunkSeconds, total - start)
+        var windows: [(idx: Int, start: Double, length: Double)] = []
+        var cursor: Double = 0
+        var idxCounter = 0
+        while cursor < total {
+            let length = min(chunkSeconds, total - cursor)
             if length < 2 { break }
-            chunkIdx += 1
-            onProgress?(chunkIdx, totalChunks, total)
-            if let chunkURL = await exportAudioChunk(asset: asset, start: start, length: length) {
-                let words = await recognize(url: chunkURL, recognizer: recognizer, offset: start)
-                for w in words {
-                    if let prev = heard.last, abs(w.time - prev.time) < 0.30, w.token == prev.token {
-                        continue
+            idxCounter += 1
+            windows.append((idxCounter, cursor, length))
+            if cursor + length >= total { break }
+            cursor += chunkStepSeconds
+        }
+        let totalChunks = max(1, windows.count)
+        let hasVideoTrack = !asset.tracks(withMediaType: .video).isEmpty
+        let preparedAudioURL = prepared.url
+        var chunkWords = Array<[HeardWord]>(repeating: [], count: windows.count)
+        var completedChunks = 0
+        var nextWindowIdx = 0
+        let concurrency = min(3, windows.count)
+
+        await withTaskGroup(of: (Int, [HeardWord]).self) { group in
+            while nextWindowIdx < concurrency {
+                let win = windows[nextWindowIdx]
+                nextWindowIdx += 1
+                group.addTask {
+                    guard !Task.isCancelled else { return (win.idx - 1, []) }
+                    guard let chunkURL = await exportAudioChunk(
+                        fileURL: preparedAudioURL,
+                        start: win.start,
+                        length: win.length,
+                        preferDirectPCM: hasVideoTrack
+                    ) else {
+                        return (win.idx - 1, [])
                     }
-                    if let prev = heard.last, w.time < prev.time - 0.05 {
-                        continue
-                    }
-                    heard.append(w)
+                    defer { try? FileManager.default.removeItem(at: chunkURL) }
+                    let words = await recognize(url: chunkURL, recognizer: recognizer, offset: win.start)
+                    return (win.idx - 1, words)
                 }
-                try? FileManager.default.removeItem(at: chunkURL)
             }
-            if start + length >= total { break }
-            start += chunkStepSeconds
+            for await (slotIdx, words) in group {
+                chunkWords[slotIdx] = words
+                completedChunks += 1
+                onProgress?(completedChunks, totalChunks, total)
+                if !Task.isCancelled && nextWindowIdx < windows.count {
+                    let win = windows[nextWindowIdx]
+                    nextWindowIdx += 1
+                    group.addTask {
+                        guard !Task.isCancelled else { return (win.idx - 1, []) }
+                        guard let chunkURL = await exportAudioChunk(
+                            fileURL: preparedAudioURL,
+                            start: win.start,
+                            length: win.length,
+                            preferDirectPCM: hasVideoTrack
+                        ) else {
+                            return (win.idx - 1, [])
+                        }
+                        defer { try? FileManager.default.removeItem(at: chunkURL) }
+                        let words = await recognize(url: chunkURL, recognizer: recognizer, offset: win.start)
+                        return (win.idx - 1, words)
+                    }
+                }
+            }
+        }
+
+        var heard: [HeardWord] = []
+        for words in chunkWords {
+            for w in words {
+                if let prev = heard.last, abs(w.time - prev.time) < 0.30, w.token == prev.token {
+                    continue
+                }
+                if let prev = heard.last, w.time < prev.time - 0.05 {
+                    continue
+                }
+                heard.append(w)
+            }
         }
         let meaningfulCount = heard.filter { $0.token.count >= 3 && !stopWords.contains($0.token) }.count
         let wpm = Double(heard.count) / max(0.5, total / 60.0)
@@ -277,8 +326,22 @@ enum SongAudioListener {
         return summary.words.isEmpty ? nil : summary.words
     }
 
-    private static func exportAudioChunk(asset: AVAsset, start: Double, length: Double) async -> URL? {
-        if let session = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetAppleM4A) {
+    private static func exportAudioChunk(
+        fileURL: URL,
+        start: Double,
+        length: Double,
+        preferDirectPCM: Bool = false
+    ) async -> URL? {
+        if preferDirectPCM {
+            if let wav = await Task.detached(priority: .userInitiated, operation: {
+                let readerAsset = AVURLAsset(url: fileURL)
+                return exportWAVChunkWithAssetReader(asset: readerAsset, start: start, length: length)
+            }).value {
+                return wav
+            }
+        }
+        let sessionAsset = AVURLAsset(url: fileURL)
+        if let session = AVAssetExportSession(asset: sessionAsset, presetName: AVAssetExportPresetAppleM4A) {
             let out = FileManager.default.temporaryDirectory.appendingPathComponent("listen_\(UUID().uuidString).m4a")
             session.outputURL = out
             session.outputFileType = .m4a
@@ -300,7 +363,8 @@ enum SongAudioListener {
         // Video containers (.mp4/.mov) and non-standard audio tracks frequently fail AVAssetExportPresetAppleM4A;
         // fall back to direct AVAssetReader 16 kHz mono PCM WAV decoding which SFSpeechURLRecognitionRequest accepts natively.
         return await Task.detached(priority: .utility) {
-            exportWAVChunkWithAssetReader(asset: asset, start: start, length: length)
+            let fallbackAsset = AVURLAsset(url: fileURL)
+            return exportWAVChunkWithAssetReader(asset: fallbackAsset, start: start, length: length)
         }.value
     }
 
@@ -441,28 +505,168 @@ enum SongAudioListener {
         }
     }
 
-    // MARK: - Confirming the song name
+    // MARK: - Confirming the song name & exact version
 
-    /// Compares what was heard with the lyrics of the proposed song.
-    static func verdict(heard: [HeardWord], lyrics: ResolvedTrackLyrics) -> ListeningVerdict {
+    struct VersionAlignmentReport: Sendable {
+        let globalMatchRatio: Double
+        let sungSectionCoverage: Double
+        let lyricStanzaCoverage: Double
+        let anchorsCount: Int
+        let unmatchedActiveWindows: Int
+        let totalActiveWindows: Int
+        let unheardStanzas: Int
+        let totalStanzas: Int
+        let verdict: ListeningVerdict
+
+        /// Combined confidence score favoring candidates where sung sections and lyric stanzas agree in both directions.
+        var compositeScore: Double {
+            (globalMatchRatio * 0.40)
+                + (sungSectionCoverage * 0.30)
+                + (lyricStanzaCoverage * 0.30)
+                + min(0.25, Double(anchorsCount) * 0.025)
+                - (Double(unmatchedActiveWindows) * 0.08)
+                - (Double(unheardStanzas) * 0.08)
+        }
+    }
+
+    /// Compares heard audio against lyrics symmetrically: verifies both that active sung sections
+    /// match words in the lyrics AND that the lyrics' stanzas actually occur in the audio.
+    static func versionAlignmentConfidence(heard: [HeardWord], lyrics: ResolvedTrackLyrics) -> VersionAlignmentReport {
         let meaningfulHeard = heard.filter { $0.token.count >= 3 && !stopWords.contains($0.token) }
-        guard meaningfulHeard.count >= 25 else { return .inconclusive }
+        guard meaningfulHeard.count >= 25 else {
+            return VersionAlignmentReport(
+                globalMatchRatio: 0,
+                sungSectionCoverage: 0,
+                lyricStanzaCoverage: 0,
+                anchorsCount: 0,
+                unmatchedActiveWindows: 0,
+                totalActiveWindows: 0,
+                unheardStanzas: 0,
+                totalStanzas: 0,
+                verdict: .inconclusive
+            )
+        }
 
         var lyricVocabulary = Set<String>()
-        for line in lyrics.lines {
+        for line in lyrics.lines where !line.isInstrumentalBreak && !line.isSpokenDialogue {
             for token in tokens(line.text) where token.count >= 3 && !stopWords.contains(token) {
                 lyricVocabulary.insert(token)
             }
         }
-        guard lyricVocabulary.count >= 15 else { return .inconclusive }
+        guard lyricVocabulary.count >= 15 else {
+            return VersionAlignmentReport(
+                globalMatchRatio: 0,
+                sungSectionCoverage: 0,
+                lyricStanzaCoverage: 0,
+                anchorsCount: 0,
+                unmatchedActiveWindows: 0,
+                totalActiveWindows: 0,
+                unheardStanzas: 0,
+                totalStanzas: 0,
+                verdict: .inconclusive
+            )
+        }
 
         let matched = meaningfulHeard.filter { lyricVocabulary.contains($0.token) }.count
         let ratio = Double(matched) / Double(meaningfulHeard.count)
         let anchors = lyrics.isTimeSynced ? alignmentAnchors(heard: heard, lines: lyrics.lines).count : 0
 
-        if ratio >= 0.3 || anchors >= 4 { return .confirmed(matchRatio: ratio) }
-        if ratio < 0.1 && anchors == 0 && meaningfulHeard.count >= 60 { return .contradicted(matchRatio: ratio) }
-        return .inconclusive
+        // 1. Forward check: 30s active vocal windows in the audio must be represented in the candidate lyrics.
+        var windowBuckets: [Int: [String]] = [:]
+        var maxHeardTime: Double = 0
+        for w in meaningfulHeard {
+            if w.time > maxHeardTime { maxHeardTime = w.time }
+            let bucket = max(0, Int(floor(w.time / 30.0)))
+            windowBuckets[bucket, default: []].append(w.token)
+        }
+        let activeWindows = windowBuckets.keys.sorted().compactMap { key -> [String]? in
+            let toks = windowBuckets[key] ?? []
+            return toks.count >= 8 ? toks : nil
+        }
+        var coveredWindows = 0
+        for toks in activeWindows {
+            let hits = toks.filter { lyricVocabulary.contains($0) }.count
+            let distinctHits = Set(toks).intersection(lyricVocabulary).count
+            let windowRatio = Double(hits) / Double(toks.count)
+            if windowRatio >= 0.16 && distinctHits >= 2 {
+                coveredWindows += 1
+            }
+        }
+        let totalActiveWindows = activeWindows.count
+        let unmatchedActiveWindows = totalActiveWindows - coveredWindows
+        let sungSectionCoverage = totalActiveWindows > 0
+            ? Double(coveredWindows) / Double(totalActiveWindows)
+            : ratio
+
+        // 2. Reverse check: 4-line vocal stanzas in candidate lyrics must actually appear in the audio.
+        let heardVocab = Set(meaningfulHeard.map(\.token))
+        let vocalLines = lyrics.lines.filter { !$0.isInstrumentalBreak && !$0.isSpokenDialogue }
+        var stanzas: [Set<String>] = []
+        var idx = 0
+        while idx < vocalLines.count {
+            let end = min(vocalLines.count, idx + 4)
+            let chunk = Array(vocalLines[idx..<end])
+            idx = end
+            // Only evaluate stanzas inside the transcribed span when maxSeconds (900s) truncated long audio.
+            if maxHeardTime > 850, let firstStart = chunk.first?.startTime, firstStart > maxHeardTime + 15 {
+                continue
+            }
+            var chunkTokens = Set<String>()
+            for line in chunk {
+                for t in tokens(line.text) where t.count >= 3 && !stopWords.contains(t) {
+                    chunkTokens.insert(t)
+                }
+            }
+            if chunkTokens.count >= 6 {
+                stanzas.append(chunkTokens)
+            }
+        }
+        var coveredStanzas = 0
+        for stanza in stanzas {
+            let hits = stanza.intersection(heardVocab).count
+            let stanzaRatio = Double(hits) / Double(stanza.count)
+            if stanzaRatio >= 0.18 && hits >= 2 {
+                coveredStanzas += 1
+            }
+        }
+        let totalStanzas = stanzas.count
+        let unheardStanzas = totalStanzas - coveredStanzas
+        let lyricStanzaCoverage = totalStanzas > 0
+            ? Double(coveredStanzas) / Double(totalStanzas)
+            : ratio
+
+        let verdict: ListeningVerdict
+        if ratio < 0.10 && anchors == 0 && meaningfulHeard.count >= 60 {
+            verdict = .contradicted(matchRatio: ratio)
+        } else if totalActiveWindows >= 3 && unmatchedActiveWindows >= 2 && sungSectionCoverage < 0.58 {
+            verdict = .contradicted(matchRatio: ratio)
+        } else if totalStanzas >= 3 && unheardStanzas >= 2 && lyricStanzaCoverage < 0.58 && meaningfulHeard.count >= 45 {
+            verdict = .contradicted(matchRatio: ratio)
+        } else if totalActiveWindows >= 3 && unmatchedActiveWindows >= 1 && unheardStanzas >= 1 &&
+                    (sungSectionCoverage < 0.72 || lyricStanzaCoverage < 0.72) && ratio < 0.42 {
+            verdict = .contradicted(matchRatio: ratio)
+        } else if ratio >= 0.3 || anchors >= 4 {
+            verdict = .confirmed(matchRatio: ratio)
+        } else {
+            verdict = .inconclusive
+        }
+
+        return VersionAlignmentReport(
+            globalMatchRatio: ratio,
+            sungSectionCoverage: sungSectionCoverage,
+            lyricStanzaCoverage: lyricStanzaCoverage,
+            anchorsCount: anchors,
+            unmatchedActiveWindows: unmatchedActiveWindows,
+            totalActiveWindows: totalActiveWindows,
+            unheardStanzas: unheardStanzas,
+            totalStanzas: totalStanzas,
+            verdict: verdict
+        )
+    }
+
+    /// Compares what was heard with the lyrics of the proposed song.
+    static func verdict(heard: [HeardWord], lyrics: ResolvedTrackLyrics) -> ListeningVerdict {
+        versionAlignmentConfidence(heard: heard, lyrics: lyrics).verdict
     }
 
     /// Returns true when `heard` shares a real ordered phrase or >= 3 monotonic lyric anchors (prevents bag-of-words mislabels).

@@ -376,12 +376,13 @@ final class SongIdentificationService {
         updateTrackStep(path: request.relativePath, progress: 0.08, label: "Reading track tags & metadata...")
         lastStatus = "Analyzing \"\(request.hintTitle)\"..."
 
-        let embedded = await Self.readEmbeddedMetadata(from: request.fileURL)
+        async let embeddedTask = Self.readEmbeddedMetadata(from: request.fileURL)
+        async let ytCardsTask = (request.sourceVideoID?.isEmpty == false)
+            ? Self.youtubeMusicCardsInVideo(videoID: request.sourceVideoID!)
+            : []
+        let (embedded, ytCards) = await (embeddedTask, ytCardsTask)
         let seedTitle = (embedded.title?.isEmpty == false ? embedded.title! : request.hintTitle)
         let seedArtist = (embedded.artist?.isEmpty == false ? embedded.artist! : request.hintArtist)
-        let ytCards = (request.sourceVideoID?.isEmpty == false)
-            ? await Self.youtubeMusicCardsInVideo(videoID: request.sourceVideoID!)
-            : []
 
         if let earlyComp = ArtistDatabase.detectCompilation(
             rawTitle: seedTitle,
@@ -444,11 +445,18 @@ final class SongIdentificationService {
             song = nil
         }
 
-        // Listen to the whole song: confirm the name from the sung lyrics, identify unknown uploads
-        // with Shazam acoustic matching, and align lyrics with this exact recording before playback.
+        // Listen to the whole song AND prefetch lyric version candidates simultaneously so analysis completes fast.
         await Self.ensureSpeechPermissionIfPossible()
         updateTrackStep(path: request.relativePath, progress: 0.15, label: "Listening to whole song...")
         lastStatus = "Listening to whole song: \"\(song?.title ?? bestSeedTitle)\"..."
+
+        let prefetchSeedSong = song
+        let prefetchItem = MediaManager.shared.items.first(where: { $0.relativePath == request.relativePath })
+        async let prefetchedLyricsTask: [ResolvedTrackLyrics]? = prefetchLyricsIfReady(
+            item: prefetchItem,
+            candidate: prefetchSeedSong,
+            fallbackDuration: request.durationSeconds
+        )
 
         let capturedPath = request.relativePath
         let capturedLabelTitle = song?.title ?? bestSeedTitle
@@ -466,6 +474,7 @@ final class SongIdentificationService {
                 self?.lastStatus = "Listening to whole song (\(chunkIdx)/\(totalChunks)): \"\(capturedLabelTitle)\""
             }
         }
+        let prefetchedCandidates = await prefetchedLyricsTask
         let heard: [HeardWord]? = listenSummary.words.isEmpty ? nil : listenSummary.words
         let langCtx = SongAudioListener.detectLanguageContext(
             title: bestSeedTitle,
@@ -479,17 +488,37 @@ final class SongIdentificationService {
             || SongAudioListener.hasInstrumentalFilenameHint(seedTitle)
             || SongAudioListener.hasInstrumentalFilenameHint(bareFileTitle)
         let blockEnglishAudioGuess = listenSummary.isMostlyInstrumental || titleHasInstrumentalHint || isNonEnglishTrack
+        let englishASROnForeignTrack = isNonEnglishTrack
+            && (listenSummary.detectedLanguage?.lowercased().hasPrefix("en") ?? false)
         var lyricsToAlign: ResolvedTrackLyrics?
 
         if var candidate = song, let heard, !listenSummary.isMostlyInstrumental, !titleHasInstrumentalHint {
-            if let lyrics = await SyncedLyricsService.shared.fetchLyricsForVerification(
+            if let prefetchedCandidates, !prefetchedCandidates.isEmpty {
+                let titleMatched = prefetchedCandidates.filter { cand in
+                    Self.similarity(Self.stripVersionNoise(cand.trackTitle, keepVersionTags: false),
+                                    Self.stripVersionNoise(candidate.title, keepVersionTags: false)) >= 0.8
+                }
+                if let verified = SyncedLyricsService.shared.selectVerifiedCandidateWithConfidence(
+                    from: titleMatched.isEmpty ? prefetchedCandidates : titleMatched,
+                    targetTitle: candidate.title,
+                    targetArtist: candidate.artist,
+                    targetDuration: candidate.durationSeconds ?? request.durationSeconds,
+                    heard: heard,
+                    isNonEnglish: isNonEnglishTrack,
+                    englishASROnForeignTrack: englishASROnForeignTrack
+                ) {
+                    if verified.confirmedByAudio {
+                        candidate.source += " + heard lyrics match"
+                    }
+                    lyricsToAlign = verified.lyrics
+                    song = candidate
+                }
+            } else if let lyrics = await SyncedLyricsService.shared.fetchLyricsForVerification(
                 title: candidate.title,
                 artist: candidate.artist,
                 duration: candidate.durationSeconds ?? request.durationSeconds
             ), Self.similarity(Self.stripVersionNoise(lyrics.trackTitle, keepVersionTags: false),
                                 Self.stripVersionNoise(candidate.title, keepVersionTags: false)) >= 0.8 {
-                let englishASROnForeignTrack = isNonEnglishTrack
-                    && (listenSummary.detectedLanguage?.lowercased().hasPrefix("en") ?? false)
                 switch SongAudioListener.verdict(heard: heard, lyrics: lyrics) {
                 case .confirmed:
                     candidate.source += " + heard lyrics match"
@@ -732,12 +761,24 @@ final class SongIdentificationService {
                 SyncedLyricsService.shared.storeAlignedLyrics(aligned, for: item)
                 hasFinalLyrics = true
             } else {
+                let reusablePrefetch: [ResolvedTrackLyrics]? = {
+                    guard let prefetchedCandidates,
+                          let seeded = prefetchSeedSong,
+                          finalSong.title.caseInsensitiveCompare(seeded.title) == .orderedSame,
+                          finalSong.artist.caseInsensitiveCompare(seeded.artist) == .orderedSame else {
+                        return nil
+                    }
+                    return prefetchedCandidates
+                }()
                 hasFinalLyrics = await SyncedLyricsService.shared.fetchAndAlignDuringImport(
                     item: item,
                     title: finalSong.title,
                     artist: finalSong.artist,
                     duration: finalSong.durationSeconds ?? request.durationSeconds,
-                    heard: heard
+                    heard: heard,
+                    prefetchedCandidates: reusablePrefetch,
+                    isNonEnglish: isNonEnglishTrack,
+                    englishASROnForeignTrack: englishASROnForeignTrack
                 )
             }
         }
@@ -753,6 +794,20 @@ final class SongIdentificationService {
         )
         progressByPath[request.relativePath] = 1.0
         return applied ? finalSong : nil
+    }
+
+    private func prefetchLyricsIfReady(
+        item: MediaItem?,
+        candidate: IdentifiedSong?,
+        fallbackDuration: Double?
+    ) async -> [ResolvedTrackLyrics]? {
+        guard let item, let candidate else { return nil }
+        return await SyncedLyricsService.shared.prefetchCandidatesForImport(
+            item: item,
+            title: candidate.title,
+            artist: candidate.artist,
+            duration: candidate.durationSeconds ?? fallbackDuration
+        )
     }
 
     private func finalizeCompilation(

@@ -535,6 +535,83 @@ final class WebMediaDownloader {
         return total
     }
 
+    private final class LockedRangeFileWriter: @unchecked Sendable {
+        private let lock = NSLock()
+        private let handle: FileHandle
+        private var bytesWritten: Int64 = 0
+
+        nonisolated init(handle: FileHandle, initialBytes: Int64) {
+            self.handle = handle
+            self.bytesWritten = initialBytes
+        }
+
+        nonisolated func write(_ data: Data, at offset: Int64) throws -> Int64 {
+            lock.lock()
+            defer { lock.unlock() }
+            try handle.seek(toOffset: UInt64(offset))
+            try handle.write(contentsOf: data)
+            bytesWritten += Int64(data.count)
+            return bytesWritten
+        }
+    }
+
+    nonisolated private static func fetchRangeSliceWithRetry(
+        from url: URL,
+        start: Int64,
+        end: Int64,
+        isGooglevideo: Bool,
+        headers: [String: String],
+        using session: URLSession
+    ) async -> Data? {
+        @Sendable
+        func fetchSingle(_ s: Int64, _ e: Int64) async -> (data: Data?, status: Int) {
+            for attempt in 0..<3 {
+                if Task.isCancelled { return (nil, 0) }
+                var req = URLRequest(url: url)
+                headers.forEach { req.setValue($0.value, forHTTPHeaderField: $0.key) }
+                req.timeoutInterval = 22
+                req.setValue("bytes=\(s)-\(e)", forHTTPHeaderField: "Range")
+                do {
+                    let (data, resp) = try await session.data(for: req)
+                    guard let http = resp as? HTTPURLResponse else { continue }
+                    if http.statusCode == 206 || http.statusCode == 200 {
+                        return (data, http.statusCode)
+                    }
+                    if http.statusCode == 403 || http.statusCode == 404 || http.statusCode == 416 {
+                        return (nil, http.statusCode)
+                    }
+                } catch {
+                    if attempt < 2 {
+                        try? await Task.sleep(for: .milliseconds(250 * (attempt + 1)))
+                    }
+                }
+            }
+            return (nil, 0)
+        }
+
+        let res = await fetchSingle(start, end)
+        if let d = res.data, !d.isEmpty {
+            return d
+        }
+        // If YouTube CDN throttled a 512 KB range with 403, split into smaller 192 KB slices and retry sequentially.
+        if res.status == 403 && isGooglevideo && (end - start + 1) > 200_000 {
+            var combined = Data()
+            combined.reserveCapacity(Int(end - start + 1))
+            var cur = start
+            let subSize: Int64 = 196_608
+            while cur <= end {
+                if Task.isCancelled { return nil }
+                let subEnd = min(cur + subSize - 1, end)
+                let sub = await fetchSingle(cur, subEnd)
+                guard let sd = sub.data, !sd.isEmpty else { return nil }
+                combined.append(sd)
+                cur += Int64(sd.count)
+            }
+            return combined
+        }
+        return nil
+    }
+
     nonisolated private func performTempDownload(
         from url: URL,
         ext: String,
@@ -542,9 +619,9 @@ final class WebMediaDownloader {
         using session: URLSession,
         onProgress: (@Sendable (Double) -> Void)? = nil
     ) async -> URL? {
-        // Keep Range chunks <= 256 KB to stay cleanly under YouTube CDN burst/Range caps without 403 retries.
-        var chunkSize: Int64 = 262_144
+        // Keep parallel chunks <= 512 KB on googlevideo.com to stay under YouTube CDN burst limits while removing serial latency.
         let isGooglevideo = url.host?.lowercased().contains("googlevideo.com") == true
+        var chunkSize: Int64 = isGooglevideo ? 524_288 : 1_048_576
         var expectedTotal: Int64? = Self.queryContentLength(from: url)
 
         let dest = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString).\(ext)")
@@ -659,7 +736,83 @@ final class WebMediaDownloader {
             return nil
         }
 
-        // Fetch remaining chunks sequentially with per-chunk retry & real progress.
+        // Concurrent Range worker pool when total length is known (~4x faster on multi-MB videos/tracks).
+        if let expectedTotal, expectedTotal > offset {
+            let writer = LockedRangeFileWriter(handle: handle, initialBytes: offset)
+            var slices: [(start: Int64, end: Int64)] = []
+            var cursor = offset
+            while cursor < expectedTotal {
+                let end = min(cursor + chunkSize - 1, expectedTotal - 1)
+                slices.append((cursor, end))
+                cursor = end + 1
+            }
+
+            let concurrency = min(4, slices.count)
+            var nextSliceIndex = 0
+            var allSucceeded = true
+
+            await withTaskGroup(of: Bool.self) { group in
+                while nextSliceIndex < concurrency {
+                    let slice = slices[nextSliceIndex]
+                    nextSliceIndex += 1
+                    group.addTask {
+                        guard let chunkData = await Self.fetchRangeSliceWithRetry(
+                            from: url,
+                            start: slice.start,
+                            end: slice.end,
+                            isGooglevideo: isGooglevideo,
+                            headers: headers,
+                            using: session
+                        ), !chunkData.isEmpty else {
+                            return false
+                        }
+                        guard let totalWritten = try? writer.write(chunkData, at: slice.start) else {
+                            return false
+                        }
+                        onProgress?(min(0.99, Double(totalWritten) / Double(expectedTotal)))
+                        return true
+                    }
+                }
+                for await ok in group {
+                    if !ok {
+                        allSucceeded = false
+                        group.cancelAll()
+                        break
+                    }
+                    if !Task.isCancelled && nextSliceIndex < slices.count {
+                        let slice = slices[nextSliceIndex]
+                        nextSliceIndex += 1
+                        group.addTask {
+                            guard let chunkData = await Self.fetchRangeSliceWithRetry(
+                                from: url,
+                                start: slice.start,
+                                end: slice.end,
+                                isGooglevideo: isGooglevideo,
+                                headers: headers,
+                                using: session
+                            ), !chunkData.isEmpty else {
+                                return false
+                            }
+                            guard let totalWritten = try? writer.write(chunkData, at: slice.start) else {
+                                return false
+                            }
+                            onProgress?(min(0.99, Double(totalWritten) / Double(expectedTotal)))
+                            return true
+                        }
+                    }
+                }
+            }
+
+            if allSucceeded {
+                onProgress?(1.0)
+                succeeded = true
+                return dest
+            }
+            return nil
+        }
+
+        // Fetch remaining chunks sequentially when total length is unknown, with per-chunk retry & real progress.
+        var seqChunkSize: Int64 = isGooglevideo ? 262_144 : chunkSize
         while true {
             if Task.isCancelled { return nil }
             if let expectedTotal, offset >= expectedTotal {
@@ -672,9 +825,9 @@ final class WebMediaDownloader {
                 if Task.isCancelled { return nil }
                 let endByte: Int64
                 if let expectedTotal {
-                    endByte = min(offset + chunkSize - 1, expectedTotal - 1)
+                    endByte = min(offset + seqChunkSize - 1, expectedTotal - 1)
                 } else {
-                    endByte = offset + chunkSize - 1
+                    endByte = offset + seqChunkSize - 1
                 }
                 if endByte < offset {
                     hitEOF = true
@@ -695,8 +848,8 @@ final class WebMediaDownloader {
                         break
                     }
                     guard http.statusCode == 206 || http.statusCode == 200 else {
-                        if http.statusCode == 403 && isGooglevideo && chunkSize > 131_072 {
-                            chunkSize = max(131_072, chunkSize / 2)
+                        if http.statusCode == 403 && isGooglevideo && seqChunkSize > 131_072 {
+                            seqChunkSize = max(131_072, seqChunkSize / 2)
                             continue
                         }
                         if http.statusCode == 403 || http.statusCode == 404 {
@@ -1398,6 +1551,57 @@ final class WebMediaDownloader {
         return (moved, videoJoined.ext, false)
     }
 
+    nonisolated private static func downloadSingleHLSSegment(
+        index i: Int,
+        seg: ParsedHLSMedia.Segment,
+        keyData: Data?,
+        workDir: URL,
+        filePrefix: String,
+        headers: [String: String],
+        session: URLSession,
+        fallbackPageURL: URL?
+    ) async -> (Int, URL?) {
+        for attempt in 0..<2 {
+            var req = URLRequest(url: seg.url)
+            headers.forEach { req.setValue($0.value, forHTTPHeaderField: $0.key) }
+            req.timeoutInterval = 22
+            var fetchedData: Data?
+            if let (data, resp) = try? await session.data(for: req),
+               let http = resp as? HTTPURLResponse,
+               (200...299).contains(http.statusCode),
+               !data.isEmpty {
+                fetchedData = data
+            } else if seg.url.host?.lowercased().contains("googlevideo.com") == true {
+                fetchedData = await BrowserYouTubeResolver.shared.fetchDataInBrowser(url: seg.url, pageURL: fallbackPageURL)
+            }
+            guard let rawData = fetchedData, !rawData.isEmpty else {
+                if attempt == 0 {
+                    try? await Task.sleep(for: .milliseconds(200))
+                    continue
+                }
+                return (i, nil)
+            }
+            let plainData: Data
+            if seg.keyMethod == "AES-128", let keyData {
+                let iv = seg.ivData ?? Self.defaultHLSIV(sequence: seg.sequence)
+                guard let decrypted = Self.decryptAES128CBC(rawData, key: keyData, iv: iv) else {
+                    return (i, nil)
+                }
+                plainData = decrypted
+            } else {
+                plainData = rawData
+            }
+            let partURL = workDir.appendingPathComponent(String(format: "%@_seg_%05d.bin", filePrefix, i))
+            do {
+                try plainData.write(to: partURL, options: [.atomic])
+                return (i, partURL)
+            } catch {
+                return (i, nil)
+            }
+        }
+        return (i, nil)
+    }
+
     private func downloadHLSSegmentSet(
         parsed: ParsedHLSMedia,
         workDir: URL,
@@ -1430,77 +1634,71 @@ final class WebMediaDownloader {
         var completedCount = 0
         let session = ephemeralDataSession
 
-        let batchSize = 4
+        let concurrency = min(6, totalCount)
+        var nextIdx = 0
+        var lastReportedCompleted = 0
         let fallbackPageURL = headers["Referer"].flatMap(URL.init(string:))
-        for startIdx in stride(from: 0, to: totalCount, by: batchSize) {
-            if Task.isCancelled {
-                activeDownloads.removeAll { $0.id == downloadID }
-                return nil
+
+        let allSegmentsOK = await withTaskGroup(of: (Int, URL?).self) { group -> Bool in
+            while nextIdx < concurrency {
+                let i = nextIdx
+                nextIdx += 1
+                let seg = segments[i]
+                let keyData = seg.keyURI.flatMap { keyCache[$0] }
+                group.addTask {
+                    await Self.downloadSingleHLSSegment(
+                        index: i,
+                        seg: seg,
+                        keyData: keyData,
+                        workDir: workDir,
+                        filePrefix: filePrefix,
+                        headers: headers,
+                        session: session,
+                        fallbackPageURL: fallbackPageURL
+                    )
+                }
             }
-            let endIdx = min(startIdx + batchSize, totalCount)
-            let ok = await withTaskGroup(of: (Int, URL?).self) { group -> Bool in
-                for i in startIdx..<endIdx {
+            for await (idx, fileURL) in group {
+                if Task.isCancelled {
+                    activeDownloads.removeAll { $0.id == downloadID }
+                    group.cancelAll()
+                    return false
+                }
+                guard let fileURL else {
+                    group.cancelAll()
+                    return false
+                }
+                segmentFiles[idx] = fileURL
+                completedCount += 1
+                if completedCount - lastReportedCompleted >= 2 || completedCount == totalCount {
+                    lastReportedCompleted = completedCount
+                    let frac = progressBase + (Double(completedCount) / Double(max(1, totalCount))) * progressSpan
+                    updateProgress(downloadID: downloadID, fraction: frac)
+                }
+                if !Task.isCancelled && nextIdx < totalCount {
+                    let i = nextIdx
+                    nextIdx += 1
                     let seg = segments[i]
                     let keyData = seg.keyURI.flatMap { keyCache[$0] }
                     group.addTask {
-                        for attempt in 0..<2 {
-                            var req = URLRequest(url: seg.url)
-                            headers.forEach { req.setValue($0.value, forHTTPHeaderField: $0.key) }
-                            req.timeoutInterval = 25
-                            var fetchedData: Data?
-                            if let (data, resp) = try? await session.data(for: req),
-                               let http = resp as? HTTPURLResponse,
-                               (200...299).contains(http.statusCode),
-                               !data.isEmpty {
-                                fetchedData = data
-                            } else if seg.url.host?.lowercased().contains("googlevideo.com") == true {
-                                fetchedData = await BrowserYouTubeResolver.shared.fetchDataInBrowser(url: seg.url, pageURL: fallbackPageURL)
-                            }
-                            guard let rawData = fetchedData, !rawData.isEmpty else {
-                                if attempt == 0 {
-                                    try? await Task.sleep(for: .milliseconds(250))
-                                    continue
-                                }
-                                return (i, nil)
-                            }
-                            let plainData: Data
-                            if seg.keyMethod == "AES-128", let keyData {
-                                let iv = seg.ivData ?? Self.defaultHLSIV(sequence: seg.sequence)
-                                guard let decrypted = Self.decryptAES128CBC(rawData, key: keyData, iv: iv) else {
-                                    return (i, nil)
-                                }
-                                plainData = decrypted
-                            } else {
-                                plainData = rawData
-                            }
-                            let partURL = workDir.appendingPathComponent(String(format: "%@_seg_%05d.bin", filePrefix, i))
-                            do {
-                                try plainData.write(to: partURL, options: [.atomic])
-                                return (i, partURL)
-                            } catch {
-                                return (i, nil)
-                            }
-                        }
-                        return (i, nil)
+                        await Self.downloadSingleHLSSegment(
+                            index: i,
+                            seg: seg,
+                            keyData: keyData,
+                            workDir: workDir,
+                            filePrefix: filePrefix,
+                            headers: headers,
+                            session: session,
+                            fallbackPageURL: fallbackPageURL
+                        )
                     }
                 }
-                var batchOK = true
-                for await (idx, fileURL) in group {
-                    if let fileURL {
-                        segmentFiles[idx] = fileURL
-                        completedCount += 1
-                    } else {
-                        batchOK = false
-                    }
-                }
-                return batchOK
             }
+            return true
+        }
 
-            if !ok {
-                return nil
-            }
-            let frac = progressBase + (Double(completedCount) / Double(max(1, totalCount))) * progressSpan
-            updateProgress(downloadID: downloadID, fraction: frac)
+        if !allSegmentsOK {
+            return nil
         }
 
         let orderedParts = segmentFiles.compactMap { $0 }

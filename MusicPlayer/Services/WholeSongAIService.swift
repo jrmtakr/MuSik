@@ -123,7 +123,8 @@ final class WholeSongAIService {
             cancelActiveListen()
         }
 
-        if isUnknownSongNeedingFirstListen(item) {
+        if isUnknownSongNeedingFirstListen(item),
+           !SongIdentificationService.shared.isBlockedPendingAI(relativePath: item.relativePath) {
             startWholeSongListen(for: item, force: false)
         }
     }
@@ -131,7 +132,8 @@ final class WholeSongAIService {
     func triggerIfFirstTimeUnknown(item: MediaItem) {
         guard !item.relativePath.hasPrefix("__remote__/"),
               !hasCompletedFirstListen(for: item),
-              activeTrackPath != item.relativePath else {
+              activeTrackPath != item.relativePath,
+              !SongIdentificationService.shared.isBlockedPendingAI(relativePath: item.relativePath) else {
             return
         }
         if let dur = item.durationSeconds, dur > 1800 {
@@ -142,7 +144,9 @@ final class WholeSongAIService {
 
     func startWholeSongListen(for item: MediaItem, force: Bool = true) {
         guard !item.relativePath.hasPrefix("__remote__/") else { return }
-        if !force && (hasCompletedFirstListen(for: item) || activeTrackPath == item.relativePath) {
+        if !force && (hasCompletedFirstListen(for: item) ||
+                       activeTrackPath == item.relativePath ||
+                       SongIdentificationService.shared.isBlockedPendingAI(relativePath: item.relativePath)) {
             return
         }
 
