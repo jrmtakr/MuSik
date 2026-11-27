@@ -22,7 +22,7 @@ final class BrowserYouTubeResolver: NSObject, WKNavigationDelegate, WKScriptMess
     private var webView: WKWebView?
     private weak var hostContainerView: UIView?
     private var isBusy = false
-    private var waiters: [CheckedContinuation<Void, Never>] = []
+    private var waiters: [(id: UUID, continuation: CheckedContinuation<Bool, Never>)] = []
 
     private var activeVideoID: String?
     private var activeWatchURL: URL?
@@ -39,29 +39,48 @@ final class BrowserYouTubeResolver: NSObject, WKNavigationDelegate, WKScriptMess
 
     private static var cachedCookieState: (value: String?, fetchedAt: Date)?
 
+    static func cachedYouTubeCookieHeader() -> String? {
+        cachedCookieState?.value
+    }
+
     /// Reads current YouTube & Google session cookies from the shared built-in browser data store,
-    /// caching in memory for 60s to avoid thousands of WebKit IPC round-trips during large batch imports.
-    static func youtubeCookieHeader(forceRefresh: Bool = false) async -> String? {
+    /// caching in memory for 60s and bounding WebKit IPC wait so interactive taps never hang.
+    static func youtubeCookieHeader(forceRefresh: Bool = false, timeoutSeconds: Double = 1.0) async -> String? {
         if !forceRefresh,
            let cached = cachedCookieState,
            Date().timeIntervalSince(cached.fetchedAt) < 60 {
             return cached.value
         }
-        let cookies = await WKWebsiteDataStore.default().httpCookieStore.allCookies()
-        let now = Date()
-        let pairs = cookies.compactMap { cookie -> String? in
-            let domain = cookie.domain.lowercased()
-            let matchesYouTube = domain.hasSuffix("youtube.com")
-                || domain.hasSuffix("youtu.be")
-                || domain.hasSuffix("google.com")
-                || domain == "youtube.com"
-            guard matchesYouTube else { return nil }
-            if let exp = cookie.expiresDate, exp <= now { return nil }
-            return "\(cookie.name)=\(cookie.value)"
+        let fallback = cachedCookieState?.value
+        let gate = ResumeOnceGate()
+        return await withCheckedContinuation { continuation in
+            Task { @MainActor in
+                let cookies = await WKWebsiteDataStore.default().httpCookieStore.allCookies()
+                let now = Date()
+                let pairs = cookies.compactMap { cookie -> String? in
+                    let domain = cookie.domain.lowercased()
+                    let matchesYouTube = domain.hasSuffix("youtube.com")
+                        || domain.hasSuffix("youtu.be")
+                        || domain.hasSuffix("google.com")
+                        || domain == "youtube.com"
+                    guard matchesYouTube else { return nil }
+                    if let exp = cookie.expiresDate, exp <= now { return nil }
+                    return "\(cookie.name)=\(cookie.value)"
+                }
+                let header = pairs.isEmpty ? nil : pairs.joined(separator: "; ")
+                cachedCookieState = (header, now)
+                if gate.claim() {
+                    continuation.resume(returning: header)
+                }
+            }
+            Task { @MainActor in
+                let ns = UInt64(max(0.2, timeoutSeconds) * 1_000_000_000)
+                try? await Task.sleep(nanoseconds: ns)
+                if gate.claim() {
+                    continuation.resume(returning: fallback)
+                }
+            }
         }
-        let result = pairs.isEmpty ? nil : pairs.joined(separator: "; ")
-        cachedCookieState = (result, now)
-        return result
     }
 
     /// Releases the internal offscreen WKWebView once a batch queue finishes to reclaim memory.
@@ -95,7 +114,7 @@ final class BrowserYouTubeResolver: NSObject, WKNavigationDelegate, WKScriptMess
             return nil
         }
 
-        await acquireLock()
+        guard await acquireLock(timeoutSeconds: 15.0) else { return nil }
         defer { releaseLock() }
 
         guard let wv = ensureWebView() else { return nil }
@@ -121,18 +140,21 @@ final class BrowserYouTubeResolver: NSObject, WKNavigationDelegate, WKScriptMess
 
     /// Resolves playable streams for a YouTube video inside the built-in browser WKWebView,
     /// capturing `ytInitialPlayerResponse`, `/youtubei/v1/player`, and `#movie_player.getPlayerResponse()`.
-    func resolveStreamsInBrowser(videoID: String) async -> (result: YouTubeResolvedResult, cookiesHeader: String?)? {
+    func resolveStreamsInBrowser(
+        videoID: String,
+        priorityLockTimeout: Double = 3.0
+    ) async -> (result: YouTubeResolvedResult, cookiesHeader: String?)? {
         let cleanID = videoID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleanID.isEmpty,
               let watchURL = URL(string: "https://m.youtube.com/watch?v=\(cleanID)") else {
             return nil
         }
 
-        await acquireLock()
+        guard await acquireLock(timeoutSeconds: priorityLockTimeout) else { return nil }
         defer { releaseLock() }
 
         guard let wv = ensureWebView() else { return nil }
-        let cookiesHeader = await Self.youtubeCookieHeader()
+        let cookiesHeader = await Self.youtubeCookieHeader(timeoutSeconds: 0.8)
 
         activeVideoID = cleanID
         activeWatchURL = watchURL
@@ -141,7 +163,7 @@ final class BrowserYouTubeResolver: NSObject, WKNavigationDelegate, WKScriptMess
         let result: YouTubeResolvedResult? = await withCheckedContinuation { continuation in
             self.activeResolveContinuation = continuation
             let isBackground = UIApplication.shared.applicationState == .background
-            let maxWaitMs = isBackground ? 6_500 : 10_500
+            let maxWaitMs = isBackground ? 5_500 : 8_000
             let stepMs = 250
             let steps = max(1, maxWaitMs / stepMs)
 
@@ -160,6 +182,14 @@ final class BrowserYouTubeResolver: NSObject, WKNavigationDelegate, WKScriptMess
                 await self?.finishActiveResolveWithFallback()
             }
 
+            // Outer failsafe if evaluateJS in pollPlayerResponseFromDOM stalls past the deadline.
+            Task { @MainActor [weak self] in
+                let failsafeNs = UInt64(maxWaitMs + 1_500) * 1_000_000
+                try? await Task.sleep(nanoseconds: failsafeNs)
+                guard let self, self.activeResolveContinuation != nil else { return }
+                self.resumeActiveResolve(with: nil)
+            }
+
             wv.load(URLRequest(url: watchURL))
         }
 
@@ -174,7 +204,7 @@ final class BrowserYouTubeResolver: NSObject, WKNavigationDelegate, WKScriptMess
         wv.loadHTMLString("", baseURL: nil)
 
         guard let result, !result.streams.isEmpty else { return nil }
-        let updatedCookies = await Self.youtubeCookieHeader(forceRefresh: true) ?? cookiesHeader
+        let updatedCookies = await Self.youtubeCookieHeader(forceRefresh: true, timeoutSeconds: 0.6) ?? cookiesHeader
         let patchedStreams = result.streams.map { stream -> DetectedBrowserMedia in
             var mergedHeaders = stream.customHeaders ?? [:]
             if let updatedCookies, !updatedCookies.isEmpty, mergedHeaders["Cookie"] == nil {
@@ -214,7 +244,7 @@ final class BrowserYouTubeResolver: NSObject, WKNavigationDelegate, WKScriptMess
     /// Loads a YouTube playlist URL in the built-in browser and extracts `window.ytInitialData`
     /// (supports private / Watch Later / Liked Music / age-restricted playlists when logged into the browser).
     func extractPlaylistInitialDataInBrowser(url: URL) async -> (json: [String: Any], cookiesHeader: String?)? {
-        await acquireLock()
+        guard await acquireLock(timeoutSeconds: 15.0) else { return nil }
         defer { releaseLock() }
 
         guard let wv = ensureWebView() else { return nil }
@@ -336,22 +366,35 @@ final class BrowserYouTubeResolver: NSObject, WKNavigationDelegate, WKScriptMess
 
     // MARK: - Lock & WebView Setup
 
-    private func acquireLock() async {
+    @discardableResult
+    private func acquireLock(timeoutSeconds: Double? = nil) async -> Bool {
         if !isBusy {
             isBusy = true
-            return
+            return true
         }
-        await withCheckedContinuation { continuation in
-            waiters.append(continuation)
+        let waiterID = UUID()
+        return await withCheckedContinuation { continuation in
+            waiters.append((id: waiterID, continuation: continuation))
+            if let timeoutSeconds {
+                Task { @MainActor [weak self] in
+                    let ns = UInt64(max(0.2, timeoutSeconds) * 1_000_000_000)
+                    try? await Task.sleep(nanoseconds: ns)
+                    guard let self else { return }
+                    if let idx = self.waiters.firstIndex(where: { $0.id == waiterID }) {
+                        let expired = self.waiters.remove(at: idx)
+                        expired.continuation.resume(returning: false)
+                    }
+                }
+            }
         }
-        isBusy = true
     }
 
     private func releaseLock() {
         isBusy = false
         if !waiters.isEmpty {
             let next = waiters.removeFirst()
-            next.resume()
+            isBusy = true
+            next.continuation.resume(returning: true)
         }
     }
 

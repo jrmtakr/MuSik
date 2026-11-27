@@ -123,29 +123,62 @@ enum YouTubeStreamResolver {
     ) async -> YouTubeResolvedResult? {
         guard let videoID = extractVideoID(from: url) else { return nil }
 
+        enum ResolveRaceOutcome {
+            case resolved(YouTubeResolvedResult?)
+            case timedOut
+        }
+
+        return await withTaskGroup(of: ResolveRaceOutcome.self) { group in
+            group.addTask {
+                let result = await performResolveStreams(
+                    videoID: videoID,
+                    url: url,
+                    cookiesHeader: cookiesHeader,
+                    referer: referer,
+                    visitorData: visitorData,
+                    skipReachabilityProbe: skipReachabilityProbe
+                )
+                return .resolved(result)
+            }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: 14_000_000_000)
+                return .timedOut
+            }
+            while let outcome = await group.next() {
+                switch outcome {
+                case .resolved(let res):
+                    group.cancelAll()
+                    return res
+                case .timedOut:
+                    group.cancelAll()
+                    return YouTubeResolvedResult(
+                        videoID: videoID,
+                        title: "YouTube Video",
+                        author: nil,
+                        durationSeconds: nil,
+                        streams: [],
+                        errorReason: "Timed out resolving YouTube stream."
+                    )
+                }
+            }
+            return nil
+        }
+    }
+
+    private static func performResolveStreams(
+        videoID: String,
+        url: URL,
+        cookiesHeader: String?,
+        referer: String?,
+        visitorData: String?,
+        skipReachabilityProbe: Bool
+    ) async -> YouTubeResolvedResult? {
         var resolvedVisitorData: String?
         if let visitorData, !visitorData.isEmpty {
             resolvedVisitorData = visitorData
+            await visitorCache.store(visitorData)
         } else {
             resolvedVisitorData = await visitorCache.current()
-        }
-        var mobilePrefetchResult: YouTubeResolvedResult?
-
-        // Bootstrap visitorData once from mobile HTML when missing so iOS/Android InnerTube calls avoid HTTP 400 / LOGIN_REQUIRED.
-        if resolvedVisitorData?.isEmpty != false {
-            let mobileHTML = await fetchMobileWebHTML(
-                videoID: videoID,
-                sourcePageURL: url,
-                cookiesHeader: cookiesHeader,
-                referer: referer
-            )
-            mobilePrefetchResult = mobileHTML.result
-            if let vd = mobileHTML.visitorData, !vd.isEmpty {
-                resolvedVisitorData = vd
-                await visitorCache.store(vd)
-            }
-        } else if let visitorData, !visitorData.isEmpty {
-            await visitorCache.store(visitorData)
         }
 
         let visitorDataForRequests = resolvedVisitorData
@@ -156,7 +189,7 @@ enum YouTubeStreamResolver {
 
         @Sendable
         func evaluateCandidate(_ candidate: YouTubeResolvedResult?) async -> Bool {
-            guard let candidate else { return false }
+            guard !Task.isCancelled, let candidate else { return false }
             if fallbackMeta == nil { fallbackMeta = candidate }
             if let reason = candidate.errorReason, !reason.isEmpty { lastErrorReason = reason }
             guard !candidate.streams.isEmpty else { return false }
@@ -183,7 +216,7 @@ enum YouTubeStreamResolver {
             return false
         }
 
-        // 1. ANDROID client first (native Android headers, NO browser cookies so InnerTube doesn't reject session).
+        // 1. ANDROID client first (fast without blocking upfront HTML fetch or cookies).
         let androidResult = await fetchInnerTube(
             videoID: videoID,
             sourcePageURL: url,
@@ -201,9 +234,35 @@ enum YouTubeStreamResolver {
         )
         _ = await evaluateCandidate(androidResult)
 
-        // 2. IOS client fallback (only if ANDROID yielded no working streams; ANDROID already includes HD adaptive & progressive MP4).
-        if workingResults.isEmpty {
-            let iosResult = await fetchInnerTube(
+        // If Web visitorData caused ANDROID to fail/require login, retry cleanly without visitorData.
+        if workingResults.isEmpty, !Task.isCancelled, visitorDataForRequests != nil {
+            let cleanAndroid = await fetchInnerTube(
+                videoID: videoID,
+                sourcePageURL: url,
+                clientName: "ANDROID",
+                clientHeaderID: "3",
+                clientVersion: androidClientVersion,
+                userAgent: androidClientUserAgent,
+                extraClientFields: [
+                    "osName": "Android",
+                    "osVersion": "14",
+                    "androidSdkVersion": 34
+                ],
+                visitorData: nil,
+                cookiesHeader: nil
+            )
+            _ = await evaluateCandidate(cleanAndroid)
+        }
+
+        // 2. IOS + MWEB fallbacks concurrently when ANDROID yields no reachable streams.
+        if workingResults.isEmpty, !Task.isCancelled {
+            let resolvedCookies: String?
+            if let cookiesHeader, !cookiesHeader.isEmpty {
+                resolvedCookies = cookiesHeader
+            } else {
+                resolvedCookies = await BrowserYouTubeResolver.youtubeCookieHeader(timeoutSeconds: 0.7)
+            }
+            async let iosTask = fetchInnerTube(
                 videoID: videoID,
                 sourcePageURL: url,
                 clientName: "IOS",
@@ -219,12 +278,7 @@ enum YouTubeStreamResolver {
                 visitorData: visitorDataForRequests,
                 cookiesHeader: nil
             )
-            _ = await evaluateCandidate(iosResult)
-        }
-
-        // 3. MWEB client fallback (uses user browser cookies when logged in / age-gated).
-        if workingResults.isEmpty {
-            let mwebResult = await fetchInnerTube(
+            async let mwebTask = fetchInnerTube(
                 videoID: videoID,
                 sourcePageURL: url,
                 clientName: "MWEB",
@@ -235,20 +289,20 @@ enum YouTubeStreamResolver {
                     "platform": "MOBILE"
                 ],
                 visitorData: visitorDataForRequests,
-                cookiesHeader: cookiesHeader
+                cookiesHeader: resolvedCookies
             )
-            _ = await evaluateCandidate(mwebResult)
-        }
+            let iosResult = await iosTask
+            let mwebResult = await mwebTask
+            if !(await evaluateCandidate(iosResult)) {
+                _ = await evaluateCandidate(mwebResult)
+            }
 
-        // 4. Mobile web watch HTML fallback
-        if workingResults.isEmpty {
-            if let prefetched = mobilePrefetchResult, !prefetched.streams.isEmpty {
-                _ = await evaluateCandidate(prefetched)
-            } else {
+            // 3. Mobile web watch HTML fallback (also seeds visitorData cache for future requests).
+            if workingResults.isEmpty, !Task.isCancelled {
                 let mobileHTML = await fetchMobileWebHTML(
                     videoID: videoID,
                     sourcePageURL: url,
-                    cookiesHeader: cookiesHeader,
+                    cookiesHeader: resolvedCookies,
                     referer: referer
                 )
                 if let vd = mobileHTML.visitorData, !vd.isEmpty {
@@ -295,20 +349,32 @@ enum YouTubeStreamResolver {
 
         let probes = Array(representativeByBucket)
         var allowedBuckets = Set<ProbeBucket>()
-        await withTaskGroup(of: (ProbeBucket, Bool).self) { group in
+        await withTaskGroup(of: (ProbeBucket, Bool)?.self) { group in
             for (bucket, sample) in probes {
                 group.addTask {
-                    let mainOK = await isURLReachable(sample.url, headers: sample.customHeaders)
-                    guard mainOK else { return (bucket, false) }
                     if let paired = sample.pairedAudioURL {
-                        let audioOK = await isURLReachable(paired, headers: sample.customHeaders)
-                        return (bucket, audioOK)
+                        async let mainTask = isURLReachable(sample.url, headers: sample.customHeaders)
+                        async let audioTask = isURLReachable(paired, headers: sample.customHeaders)
+                        let mainOK = await mainTask
+                        let audioOK = await audioTask
+                        return (bucket, mainOK && audioOK)
                     }
-                    return (bucket, true)
+                    let mainOK = await isURLReachable(sample.url, headers: sample.customHeaders)
+                    return (bucket, mainOK)
                 }
             }
-            for await (bucket, ok) in group where ok {
-                allowedBuckets.insert(bucket)
+            group.addTask {
+                try? await Task.sleep(nanoseconds: 5_500_000_000)
+                return nil
+            }
+            for await probeResult in group {
+                guard let (bucket, ok) = probeResult else {
+                    group.cancelAll()
+                    break
+                }
+                if ok {
+                    allowedBuckets.insert(bucket)
+                }
             }
         }
 
@@ -347,45 +413,40 @@ enum YouTubeStreamResolver {
 
     private static let ephemeralProbeSession: URLSession = {
         let config = URLSessionConfiguration.ephemeral
-        config.timeoutIntervalForRequest = 6
-        config.timeoutIntervalForResource = 8
+        config.timeoutIntervalForRequest = 4.5
+        config.timeoutIntervalForResource = 5.5
         config.waitsForConnectivity = false
         return URLSession(configuration: config)
     }()
 
     private static func isURLReachable(_ url: URL, headers: [String: String]?) async -> Bool {
-        // Probe both byte 0 and a mid-stream offset (1.8 MB when clen allows) with tiny 1 KB Range requests:
+        // Probe both byte 0 and a mid-stream offset (1.8 MB when clen allows) with bounded 1 KB Range requests:
         // YouTube CDN lets un-tokened adaptive streams read the first ~500-800 KB (206) then blocks later chunks (403),
         // while progressive MP4s (e.g. itag=18) and valid streams stay 206 through EOF.
         let lower = url.absoluteString.lowercased()
         let isPlaylist = url.pathExtension.lowercased() == "m3u8" || lower.contains(".m3u8")
 
+        @Sendable
         func probeRange(_ rangeHeader: String?) async -> Bool {
             var req = URLRequest(url: url)
             req.httpMethod = "GET"
-            req.timeoutInterval = 6
+            req.timeoutInterval = 4.5
             headers?.forEach { req.setValue($0.value, forHTTPHeaderField: $0.key) }
             if let rangeHeader {
                 req.setValue(rangeHeader, forHTTPHeaderField: "Range")
             }
             do {
-                let (bytes, resp) = try await ephemeralProbeSession.bytes(for: req)
+                let (data, resp) = try await ephemeralProbeSession.data(for: req)
                 guard let http = resp as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
                     return false
                 }
-                var iter = bytes.makeAsyncIterator()
-                let firstByte = try? await iter.next()
-                return firstByte != nil
+                return !data.isEmpty
             } catch {
                 return false
             }
         }
 
         let initialRange: String? = isPlaylist ? nil : "bytes=0-1023"
-        guard await probeRange(initialRange) else {
-            return false
-        }
-
         if !isPlaylist,
            url.host?.lowercased().contains("googlevideo.com") == true,
            let comps = URLComponents(url: url, resolvingAgainstBaseURL: false),
@@ -394,13 +455,15 @@ enum YouTubeStreamResolver {
            clen > 1_500_000 {
             let midOffset = min(1_800_000, max(900_000, clen / 2))
             if midOffset + 1023 < clen {
-                guard await probeRange("bytes=\(midOffset)-\(midOffset + 1023)") else {
-                    return false
-                }
+                async let firstOK = probeRange(initialRange)
+                async let midOK = probeRange("bytes=\(midOffset)-\(midOffset + 1023)")
+                let head = await firstOK
+                let mid = await midOK
+                return head && mid
             }
         }
 
-        return true
+        return await probeRange(initialRange)
     }
 
     static func parsePlayerResponseJSON(
@@ -492,7 +555,7 @@ enum YouTubeStreamResolver {
         var req = URLRequest(url: apiURL)
         req.httpMethod = "POST"
         req.httpBody = bodyData
-        req.timeoutInterval = 15
+        req.timeoutInterval = 8
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.setValue(userAgent, forHTTPHeaderField: "User-Agent")
         req.setValue("https://www.youtube.com", forHTTPHeaderField: "Origin")
@@ -592,7 +655,7 @@ enum YouTubeStreamResolver {
             return (nil, nil)
         }
         var req = URLRequest(url: watchURL)
-        req.timeoutInterval = 15
+        req.timeoutInterval = 8
         req.setValue(WebMediaDownloader.browserUserAgent, forHTTPHeaderField: "User-Agent")
         let effectiveCookies: String
         if let cookiesHeader, !cookiesHeader.isEmpty {
