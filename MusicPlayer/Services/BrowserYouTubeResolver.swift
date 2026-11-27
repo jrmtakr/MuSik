@@ -29,6 +29,8 @@ final class BrowserYouTubeResolver: NSObject, WKNavigationDelegate, WKScriptMess
     private var activeResolveContinuation: CheckedContinuation<YouTubeResolvedResult?, Never>?
     private var activeTimeoutTask: Task<Void, Never>?
     private var fallbackStreamURLs: [DetectedBrowserMedia] = []
+    private var pendingJSONResult: YouTubeResolvedResult?
+    private var activeResolveGeneration: UUID = UUID()
 
     private var activePageFinishContinuation: CheckedContinuation<Void, Never>?
     private var activePageFinishToken: UUID?
@@ -159,6 +161,8 @@ final class BrowserYouTubeResolver: NSObject, WKNavigationDelegate, WKScriptMess
         activeVideoID = cleanID
         activeWatchURL = watchURL
         fallbackStreamURLs = []
+        pendingJSONResult = nil
+        activeResolveGeneration = UUID()
 
         let result: YouTubeResolvedResult? = await withCheckedContinuation { continuation in
             self.activeResolveContinuation = continuation
@@ -183,10 +187,11 @@ final class BrowserYouTubeResolver: NSObject, WKNavigationDelegate, WKScriptMess
             }
 
             // Outer failsafe if evaluateJS in pollPlayerResponseFromDOM stalls past the deadline.
+            let gen = self.activeResolveGeneration
             Task { @MainActor [weak self] in
                 let failsafeNs = UInt64(maxWaitMs + 1_500) * 1_000_000
                 try? await Task.sleep(nanoseconds: failsafeNs)
-                guard let self, self.activeResolveContinuation != nil else { return }
+                guard let self, self.activeResolveGeneration == gen, self.activeResolveContinuation != nil else { return }
                 self.resumeActiveResolve(with: nil)
             }
 
@@ -198,6 +203,7 @@ final class BrowserYouTubeResolver: NSObject, WKNavigationDelegate, WKScriptMess
         activeVideoID = nil
         activeWatchURL = nil
         fallbackStreamURLs = []
+        pendingJSONResult = nil
 
         // Blank out the heavy YouTube watch DOM immediately so multi-thousand track queues don't retain SPA memory.
         wv.stopLoading()
@@ -506,6 +512,14 @@ final class BrowserYouTubeResolver: NSObject, WKNavigationDelegate, WKScriptMess
                     var pPromise = v.play();
                     if (pPromise && typeof pPromise.catch === 'function') pPromise.catch(function(){});
                 }
+                if (v && v.paused && !(v.currentSrc || v.src)) {
+                    try {
+                        v.muted = true;
+                        v.volume = 0;
+                        var prPlay = v.play();
+                        if (prPlay && prPlay.catch) prPlay.catch(function() {});
+                    } catch (e) {}
+                }
                 if (v && (v.currentSrc || v.src)) {
                     var src = v.currentSrc || v.src;
                     if (src.indexOf('googlevideo.com/videoplayback') !== -1 || src.indexOf('.m3u8') !== -1) {
@@ -555,7 +569,31 @@ final class BrowserYouTubeResolver: NSObject, WKNavigationDelegate, WKScriptMess
            let respVD = vd["visitorData"] as? String {
             Task { await YouTubeStreamResolver.cacheVisitorData(respVD) }
         }
-        resumeActiveResolve(with: parsed)
+
+        // Store immediately as fallback, but verify reachability before resolving early so un-PO-tokened
+        // `m.youtube.com` 403 URLs don't pre-empt real <video> / .m3u8 / &pot= streams captured a moment later.
+        self.pendingJSONResult = parsed
+        let gen = self.activeResolveGeneration
+        Task { @MainActor [weak self] in
+            let reachable = await YouTubeStreamResolver.filterReachableStreams(parsed.streams)
+            guard let self,
+                  self.activeResolveGeneration == gen,
+                  self.activeVideoID == videoID,
+                  self.activeResolveContinuation != nil else {
+                return
+            }
+            if !reachable.isEmpty {
+                let verified = YouTubeResolvedResult(
+                    videoID: parsed.videoID,
+                    title: parsed.title,
+                    author: parsed.author,
+                    durationSeconds: parsed.durationSeconds,
+                    streams: reachable,
+                    errorReason: parsed.errorReason
+                )
+                self.resumeActiveResolve(with: verified)
+            }
+        }
     }
 
     private func resumeActiveResolve(with result: YouTubeResolvedResult?) {
@@ -569,10 +607,25 @@ final class BrowserYouTubeResolver: NSObject, WKNavigationDelegate, WKScriptMess
     private func finishActiveResolveWithFallback() async {
         await pollPlayerResponseFromDOM()
         guard activeResolveContinuation != nil else { return }
+        let jsonMeta = pendingJSONResult
         if !fallbackStreamURLs.isEmpty, let vid = activeVideoID {
-            var enriched = fallbackStreamURLs
-            if let audioCandidate = fallbackStreamURLs.first(where: { $0.isAudio && !$0.isHLS }),
-               let videoCandidate = fallbackStreamURLs.first(where: { !$0.isAudio && !$0.isHLS }) {
+            var enriched = fallbackStreamURLs.map { stream in
+                DetectedBrowserMedia(
+                    url: stream.url,
+                    pairedAudioURL: stream.pairedAudioURL,
+                    isHLS: stream.isHLS,
+                    isAudio: stream.isAudio,
+                    title: stream.title ?? jsonMeta?.title,
+                    author: stream.author ?? jsonMeta?.author,
+                    qualityLabel: stream.qualityLabel,
+                    referer: stream.referer,
+                    customHeaders: stream.customHeaders,
+                    durationSeconds: stream.durationSeconds ?? jsonMeta?.durationSeconds,
+                    isActivelyPlaying: stream.isActivelyPlaying
+                )
+            }
+            if let audioCandidate = enriched.first(where: { $0.isAudio && !$0.isHLS }),
+               let videoCandidate = enriched.first(where: { !$0.isAudio && !$0.isHLS }) {
                 let paired = DetectedBrowserMedia(
                     url: videoCandidate.url,
                     pairedAudioURL: audioCandidate.url,
@@ -588,22 +641,242 @@ final class BrowserYouTubeResolver: NSObject, WKNavigationDelegate, WKScriptMess
                 )
                 enriched.insert(paired, at: 0)
             }
+            if let extraJSON = jsonMeta?.streams {
+                for s in extraJSON where !enriched.contains(where: { $0.url == s.url }) {
+                    enriched.append(s)
+                }
+            }
             let rawTitle = webView?.title?
                 .replacingOccurrences(of: " - YouTube", with: "")
                 .trimmingCharacters(in: .whitespacesAndNewlines)
-            let title = (rawTitle?.isEmpty == false) ? rawTitle! : "YouTube Video"
+            let fallbackTitle = (rawTitle?.isEmpty == false) ? rawTitle! : "YouTube Video"
+            let title = jsonMeta?.title ?? fallbackTitle
             let fallback = YouTubeResolvedResult(
                 videoID: vid,
                 title: title,
-                author: nil,
-                durationSeconds: nil,
+                author: jsonMeta?.author,
+                durationSeconds: jsonMeta?.durationSeconds,
                 streams: enriched,
                 errorReason: nil
             )
             resumeActiveResolve(with: fallback)
+        } else if let jsonMeta, !jsonMeta.streams.isEmpty {
+            resumeActiveResolve(with: jsonMeta)
         } else {
             resumeActiveResolve(with: nil)
         }
+    }
+
+    /// Downloads a media stream inside the built-in logged-in `WKWebView` origin when external `URLSession`
+    /// gets HTTP 403 on age-restricted, BotGuard, or cookie-bound videos (such as `m.youtube.com` streams).
+    func downloadMediaInBrowser(
+        url: URL,
+        pageURL: URL?,
+        ext: String = "mp4",
+        onProgress: (@Sendable (Double) -> Void)? = nil
+    ) async -> URL? {
+        guard !Task.isCancelled else { return nil }
+        guard await acquireLock(timeoutSeconds: 6.0) else { return nil }
+        defer { releaseLock() }
+
+        guard let wv = ensureWebView() else { return nil }
+        let contextURL: URL? = {
+            if let pageURL, let scheme = pageURL.scheme?.lowercased(), scheme == "http" || scheme == "https" {
+                return pageURL
+            }
+            if url.host?.lowercased().contains("googlevideo.com") == true {
+                return URL(string: "https://m.youtube.com/")
+            }
+            return nil
+        }()
+
+        if let contextURL {
+            let needsLoad = wv.url?.host?.lowercased() != contextURL.host?.lowercased()
+                || (YouTubeStreamResolver.extractVideoID(from: contextURL) != nil && wv.url?.absoluteString != contextURL.absoluteString)
+            if needsLoad {
+                await loadAndWait(url: contextURL, in: wv, timeoutSeconds: 8)
+                try? await Task.sleep(nanoseconds: 500_000_000)
+            }
+        }
+
+        guard !Task.isCancelled else { return nil }
+
+        let dest = FileManager.default.temporaryDirectory.appendingPathComponent("wv_dl_\(UUID().uuidString).\(ext)")
+        FileManager.default.createFile(atPath: dest.path, contents: nil)
+        guard let handle = try? FileHandle(forWritingTo: dest) else {
+            try? FileManager.default.removeItem(at: dest)
+            return nil
+        }
+        var succeeded = false
+        defer {
+            try? handle.close()
+            wv.stopLoading()
+            wv.loadHTMLString("", baseURL: nil)
+            if !succeeded {
+                try? FileManager.default.removeItem(at: dest)
+            }
+        }
+
+        let fetchChunkJS = """
+        const res = await (async function() {
+            const headers = {};
+            if (rangeHeader) headers['Range'] = rangeHeader;
+            async function doFetch(cred) {
+                const controller = new AbortController();
+                const timer = setTimeout(() => controller.abort(), 18000);
+                try {
+                    const r = await fetch(targetUrl, { headers, credentials: cred, signal: controller.signal });
+                    clearTimeout(timer);
+                    return r;
+                } catch (e) {
+                    clearTimeout(timer);
+                    throw e;
+                }
+            }
+            let r = null;
+            const credMode = useCred ? 'include' : 'omit';
+            try {
+                r = await doFetch(credMode);
+            } catch (e) {
+                r = await doFetch('include');
+            }
+            if (!r) return { ok: false, status: 0 };
+            if (!r.ok && r.status !== 206) {
+                return { ok: false, status: r.status, contentType: (r.headers.get('content-type') || '') };
+            }
+            const ct = (r.headers.get('content-type') || '').toLowerCase();
+            if (ct.indexOf('html') !== -1 || ct.indexOf('json') !== -1 || ct.indexOf('yt-ump') !== -1) {
+                return { ok: false, status: 415, contentType: ct };
+            }
+            const cr = r.headers.get('content-range') || '';
+            const cl = r.headers.get('content-length') || '';
+            const buf = await r.arrayBuffer();
+            const bytes = new Uint8Array(buf);
+            if (bytes.length === 0) {
+                return { ok: true, status: r.status, contentRange: cr, contentLength: cl, b64: '', count: 0 };
+            }
+            let bin = '';
+            const slice = 0x8000;
+            for (let i = 0; i < bytes.length; i += slice) {
+                bin += String.fromCharCode.apply(null, bytes.subarray(i, i + slice));
+            }
+            return { ok: true, status: r.status, contentRange: cr, contentLength: cl, b64: btoa(bin), count: bytes.length };
+        })();
+        return res;
+        """
+
+        // Also allow discovering a fresh in-page <video> / PerformanceObserver URL if initial URL was 403/expired.
+        var activeURL = url
+        var useCred = true
+        var offset: Int64 = 0
+        let chunkSize: Int64 = 262_144
+        var expectedTotal: Int64? = nil
+        if let comps = URLComponents(url: activeURL, resolvingAgainstBaseURL: false),
+           let clenStr = comps.queryItems?.first(where: { $0.name.lowercased() == "clen" })?.value,
+           let clen = Int64(clenStr), clen > 0 {
+            expectedTotal = clen
+        }
+
+        if contextURL.flatMap({ YouTubeStreamResolver.extractVideoID(from: $0) }) != nil {
+            self.fallbackStreamURLs = []
+            self.activeVideoID = contextURL.flatMap { YouTubeStreamResolver.extractVideoID(from: $0) }
+            self.activeWatchURL = contextURL
+            await pollPlayerResponseFromDOM()
+        }
+        defer {
+            self.activeVideoID = nil
+            self.activeWatchURL = nil
+            self.fallbackStreamURLs = []
+        }
+
+        var swappedToLiveVideoURL = false
+        while true {
+            if Task.isCancelled { return nil }
+            if let expectedTotal, offset >= expectedTotal { break }
+            let endByte: Int64 = expectedTotal.map { min(offset + chunkSize - 1, $0 - 1) } ?? (offset + chunkSize - 1)
+            if endByte < offset { break }
+
+            let args: [String: Any] = [
+                "targetUrl": activeURL.absoluteString,
+                "rangeHeader": "bytes=\(offset)-\(endByte)",
+                "useCred": useCred
+            ]
+            let rawDict = (try? await wv.callAsyncJavaScript(
+                fetchChunkJS,
+                arguments: args,
+                in: nil,
+                contentWorld: .page
+            )) as? [String: Any]
+
+            guard let dict = rawDict else { return nil }
+            let ok = dict["ok"] as? Bool ?? false
+            let status = dict["status"] as? Int ?? 0
+
+            if !ok {
+                if offset == 0 && useCred {
+                    useCred = false
+                    continue
+                }
+                if offset == 0 && !swappedToLiveVideoURL && contextURL != nil {
+                    swappedToLiveVideoURL = true
+                    for _ in 0..<8 {
+                        try? await Task.sleep(nanoseconds: 350_000_000)
+                        if Task.isCancelled { return nil }
+                        await pollPlayerResponseFromDOM()
+                        if let liveStream = self.fallbackStreamURLs.first(where: { !$0.isHLS && !$0.isAudio })
+                            ?? self.fallbackStreamURLs.first(where: { !$0.isHLS }) {
+                            activeURL = liveStream.url
+                            expectedTotal = nil
+                            useCred = true
+                            break
+                        }
+                    }
+                    if activeURL != url { continue }
+                }
+                if status == 416 && offset > 0 { break }
+                return nil
+            }
+
+            let count = dict["count"] as? Int ?? 0
+            if count == 0 {
+                if offset > 0 { break }
+                return nil
+            }
+            guard let b64 = dict["b64"] as? String,
+                  let chunkData = Data(base64Encoded: b64),
+                  !chunkData.isEmpty else {
+                return nil
+            }
+
+            if expectedTotal == nil, let cr = dict["contentRange"] as? String, let slash = cr.lastIndex(of: "/") {
+                let tail = cr[cr.index(after: slash)...].trimmingCharacters(in: .whitespacesAndNewlines)
+                if let totalParsed = Int64(tail), totalParsed > 0 {
+                    expectedTotal = totalParsed
+                }
+            }
+            try? handle.write(contentsOf: chunkData)
+            offset += Int64(chunkData.count)
+
+            if let expectedTotal, expectedTotal > 0 {
+                onProgress?(min(0.99, Double(offset) / Double(expectedTotal)))
+            } else {
+                let mb = Double(offset) / (1024.0 * 1024.0)
+                onProgress?(min(0.92, mb / (mb + 8.0)))
+            }
+
+            if status == 200 {
+                // Server ignored Range and returned the full payload in one response.
+                break
+            }
+            if expectedTotal == nil && Int64(chunkData.count) < (endByte - (offset - Int64(chunkData.count)) + 1) {
+                break
+            }
+        }
+
+        guard offset > 0 else { return nil }
+        onProgress?(1.0)
+        succeeded = true
+        return dest
     }
 
     // MARK: - WKNavigationDelegate & WKScriptMessageHandler

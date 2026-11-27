@@ -410,7 +410,30 @@ enum LiveAudioLyricsAI {
             )
         }
 
-        // If Shazam at least identified the song metadata even with no LRCLIB entry, return metadata cleanly
+        if !fullHeard.isEmpty,
+           let synthesized = SongAudioListener.buildSyncedLyricsFromHeard(
+               fullHeard,
+               trackTitle: shazamMatch?.title ?? item.displayTitle,
+               artistName: shazamMatch?.artist ?? (item.artist ?? "Unknown Artist"),
+               cacheKey: cacheKey,
+               duration: item.durationSeconds
+           ) {
+            return LiveLyricsSyncOutcome(
+                identifiedTitle: shazamMatch?.title,
+                identifiedArtist: shazamMatch?.artist,
+                identifiedAlbum: shazamMatch?.album,
+                identifiedGenre: shazamMatch?.genre,
+                isHighConfidence: shazamMatch != nil,
+                transcriptSnippet: cleanSnippet,
+                alignedLyrics: synthesized,
+                computedOffsetSeconds: 0,
+                alignedLineText: synthesized.lines.first(where: { !$0.isInstrumentalBreak })?.text,
+                statusMessage: "AI transcribed & synced \(synthesized.lines.count) lines from audio",
+                errorMessage: nil
+            )
+        }
+
+        // If Shazam at least identified the song metadata even with no LRCLIB entry and too little speech, return metadata cleanly
         if let shazamMatch {
             return LiveLyricsSyncOutcome(
                 identifiedTitle: shazamMatch.title,

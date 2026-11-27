@@ -377,13 +377,14 @@ final class WebMediaDownloader {
             }
 
             let tracker = AdaptiveProgressTracker()
-            async let videoData = fetchTempFile(from: cleanVideo, ext: "mp4", headers: mergedHeaders, using: session) { frac in
+            let pageRef = headers?["Referer"].flatMap(URL.init(string:))
+            async let videoData = fetchTempFile(from: cleanVideo, ext: "mp4", headers: mergedHeaders, using: session, pageURL: pageRef) { frac in
                 let combined = tracker.update(video: frac)
                 Task { @MainActor [weak self] in
                     self?.updateProgress(downloadID: downloadID, fraction: combined)
                 }
             }
-            async let audioData = fetchTempFile(from: cleanAudio, ext: "m4a", headers: mergedHeaders, using: session) { frac in
+            async let audioData = fetchTempFile(from: cleanAudio, ext: "m4a", headers: mergedHeaders, using: session, pageURL: pageRef) { frac in
                 let combined = tracker.update(audio: frac)
                 Task { @MainActor [weak self] in
                     self?.updateProgress(downloadID: downloadID, fraction: combined)
@@ -485,6 +486,7 @@ final class WebMediaDownloader {
         ext: String,
         headers: [String: String],
         using session: URLSession,
+        pageURL: URL? = nil,
         onProgress: (@Sendable (Double) -> Void)? = nil
     ) async -> URL? {
         if let first = await performTempDownload(from: url, ext: ext, headers: headers, using: session, onProgress: onProgress) {
@@ -495,7 +497,17 @@ final class WebMediaDownloader {
             "Accept": "*/*"
         ]
         if minimalHeaders != headers {
-            return await performTempDownload(from: url, ext: ext, headers: minimalHeaders, using: session, onProgress: onProgress)
+            if let second = await performTempDownload(from: url, ext: ext, headers: minimalHeaders, using: session, onProgress: onProgress) {
+                return second
+            }
+        }
+        if url.host?.lowercased().contains("googlevideo.com") == true || pageURL != nil {
+            return await BrowserYouTubeResolver.shared.downloadMediaInBrowser(
+                url: url,
+                pageURL: pageURL ?? headers["Referer"].flatMap(URL.init(string:)),
+                ext: ext,
+                onProgress: onProgress
+            )
         }
         return nil
     }
@@ -556,7 +568,7 @@ final class WebMediaDownloader {
             let (firstBytes, firstResp) = try await session.bytes(for: firstReq)
             guard let http = firstResp as? HTTPURLResponse else { return nil }
             let mime = firstResp.mimeType?.lowercased() ?? ""
-            if mime.contains("html") { return nil }
+            if mime.contains("html") || mime.contains("json") || mime.contains("yt-ump") { return nil }
 
             if http.statusCode == 200 {
                 // Server ignored Range and is streaming the full body directly: stream to disk with live progress.
@@ -598,8 +610,8 @@ final class WebMediaDownloader {
             }
 
             guard http.statusCode == 206 else {
-                // Retry once without Range header if a non-YouTube server rejected Range probes.
-                guard !isGooglevideo else { return nil }
+                // Retry once without Range header if server rejected Range probes (for non-googlevideo or non-403/404 status).
+                guard !isGooglevideo || (http.statusCode != 403 && http.statusCode != 404) else { return nil }
                 var fullReq = URLRequest(url: url)
                 headers.forEach { fullReq.setValue($0.value, forHTTPHeaderField: $0.key) }
                 fullReq.timeoutInterval = 30
@@ -790,7 +802,8 @@ final class WebMediaDownloader {
                     activeAsyncTasks.removeValue(forKey: downloadID)
                     activeDownloads.removeAll { $0.id == downloadID }
                 }
-                guard let tempFile = await fetchTempFile(from: normalizedURL, ext: inferredExt, headers: mergedHeaders, using: session, onProgress: { frac in
+                let pageRef = headers?["Referer"].flatMap(URL.init(string:))
+                guard let tempFile = await fetchTempFile(from: normalizedURL, ext: inferredExt, headers: mergedHeaders, using: session, pageURL: pageRef, onProgress: { frac in
                     Task { @MainActor [weak self] in
                         self?.updateProgress(downloadID: downloadID, fraction: min(0.95, 0.02 + frac * 0.93))
                     }

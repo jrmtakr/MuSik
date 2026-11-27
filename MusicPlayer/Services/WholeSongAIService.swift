@@ -38,11 +38,6 @@ final class WholeSongAIService {
         let endTime: Double
     }
 
-    private struct ChunkTranscription: Sendable {
-        let words: [TimedHeardWord]
-        let formattedText: String
-    }
-
     private static var stateFileURL: URL {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -246,41 +241,48 @@ final class WholeSongAIService {
             }
         }
 
-        let authStatus = await Self.requestSpeechPermission()
+        if SFSpeechRecognizer.authorizationStatus() == .notDetermined {
+            _ = await Self.requestSpeechPermission()
+        }
         guard !Task.isCancelled else { return }
-        guard authStatus == .authorized else {
-            lastError = "Speech Recognition permission is required for AI listening."
-            statusMessage = nil
-            progressFraction = 0
-            return
-        }
 
-        guard let recognizer = Self.makeRecognizer(), recognizer.isAvailable else {
-            lastError = "Speech Recognition is currently unavailable on this device."
-            statusMessage = nil
-            progressFraction = 0
-            return
-        }
-
-        let asset = AVURLAsset(url: item.fileURL)
-        let audioTracks = (try? await asset.loadTracks(withMediaType: .audio)) ?? []
-        guard !audioTracks.isEmpty else {
-            lastError = "No decodable audio track found for AI listening."
-            statusMessage = nil
-            progressFraction = 0
-            return
-        }
-
+        let sourceFileURL = item.fileURL
+        let asset = AVURLAsset(url: sourceFileURL)
         let loadedDur = (try? await asset.load(.duration)).map { CMTimeGetSeconds($0) }
-        let totalSec: Double
+        var totalSec: Double = 0
         if let loadedDur, loadedDur.isFinite, loadedDur > 1.0 {
             totalSec = loadedDur
         } else if let knownDur = item.durationSeconds, knownDur.isFinite, knownDur > 1.0 {
             totalSec = knownDur
-        } else {
-            totalSec = 0
+        } else if let infoDur = await Task.detached(priority: .utility, operation: {
+            FFmpegMediaService.probeMetadata(for: sourceFileURL)?.durationSeconds
+        }).value, infoDur.isFinite, infoDur > 1.0 {
+            totalSec = infoDur
         }
 
+        // Step 1: Listen across the entire audio/video (WhisperKit first -> FFmpeg + overlapping SFSpeech fallback).
+        progressFraction = 0.04
+        statusMessage = "AI listening to whole song..."
+
+        let targetPath = item.relativePath
+        let summary = await SongAudioListener.listenWithSummary(
+            to: sourceFileURL,
+            titleHint: item.displayTitle,
+            artistHint: item.artist,
+            maxSeconds: 1800.0
+        ) { [weak self] chunkIdx, totalChunks, _ in
+            Task { @MainActor [weak self] in
+                guard let self, self.activeTrackPath == targetPath else { return }
+                let denom = Double(max(1, totalChunks))
+                self.progressFraction = max(0.04, (Double(max(0, chunkIdx - 1)) / denom) * 0.82)
+                self.statusMessage = "AI listening to whole song (\(chunkIdx)/\(totalChunks))..."
+            }
+        }
+        if Task.isCancelled { return }
+
+        if totalSec <= 1.0, let lastHeardEnd = summary.words.map(\.endTime).max(), lastHeardEnd > 1.0 {
+            totalSec = lastHeardEnd + 1.0
+        }
         guard totalSec > 1.0 else {
             lastError = "Song duration could not be read."
             statusMessage = nil
@@ -288,57 +290,23 @@ final class WholeSongAIService {
             return
         }
 
-        // Listen across the whole song in clean 24s chunks so iOS speech limits never truncate it.
-        let effectiveSpan = min(totalSec, 1800.0)
-        let chunkSize = 24.0
-        var windows: [(start: Double, duration: Double)] = []
-        var cursor = 0.0
-        while cursor < effectiveSpan {
-            let remaining = effectiveSpan - cursor
-            if remaining < 1.5 && !windows.isEmpty {
-                let prev = windows.removeLast()
-                windows.append((prev.start, prev.duration + remaining))
-                break
-            }
-            let len = min(chunkSize, remaining)
-            windows.append((cursor, len))
-            cursor += chunkSize
+        if summary.words.isEmpty && !summary.isMostlyInstrumental && SFSpeechRecognizer.authorizationStatus() != .authorized {
+            lastError = "Speech Recognition permission is required for AI listening."
+            statusMessage = nil
+            progressFraction = 0
+            return
         }
 
-        var allWords: [TimedHeardWord] = []
-        var transcriptChunks: [String] = []
-        let sourceFileURL = item.fileURL
-
-        for (idx, window) in windows.enumerated() {
-            if Task.isCancelled { return }
-
-            progressFraction = max(0.03, (Double(idx) / Double(max(1, windows.count))) * 0.82)
-            statusMessage = "AI listening to whole song (\(idx + 1)/\(windows.count))..."
-
-            let chunkResult = await Self.exportAndTranscribeChunk(
-                sourceFileURL: sourceFileURL,
-                startSeconds: window.start,
-                durationSeconds: window.duration,
-                recognizer: recognizer
-            )
-            if Task.isCancelled { return }
-
-            if let chunkResult {
-                allWords.append(contentsOf: chunkResult.words)
-                let cleaned = chunkResult.formattedText.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !cleaned.isEmpty {
-                    transcriptChunks.append(cleaned)
-                }
-            }
+        let heardWordsForAlign = summary.words
+        let allWords: [TimedHeardWord] = summary.words.map {
+            TimedHeardWord(text: $0.rawText, startTime: $0.time, endTime: $0.endTime)
         }
-
-        if Task.isCancelled { return }
 
         // Step 2: Create full-song lyrics after listening to the entire song
         progressFraction = 0.86
         statusMessage = "Creating lyrics from full song..."
 
-        let fullTranscript = transcriptChunks.joined(separator: " ")
+        let fullTranscript = allWords.map(\.text).joined(separator: " ")
             .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
             .trimmingCharacters(in: .whitespacesAndNewlines)
 
@@ -440,8 +408,12 @@ final class WholeSongAIService {
                     fullTranscript.isEmpty ||
                     TrackVerificationService.lyricsOverlapTranscript(officialPlain, transcript: fullTranscript)
 
-                if official.isTimeSynced && overlapsHeard {
-                    finalResolvedLyrics = official
+                if !official.lines.isEmpty && overlapsHeard {
+                    finalResolvedLyrics = await SongAudioListener.autoAlign(
+                        lyrics: official,
+                        heard: heardWordsForAlign.isEmpty ? nil : heardWordsForAlign,
+                        fileURL: refreshedItem.fileURL
+                    )
                 } else if !aiGeneratedLines.isEmpty {
                     finalResolvedLyrics = ResolvedTrackLyrics(
                         cacheKey: targetKey,
@@ -454,7 +426,11 @@ final class WholeSongAIService {
                         lines: aiGeneratedLines
                     )
                 } else if overlapsHeard {
-                    finalResolvedLyrics = official
+                    finalResolvedLyrics = await SongAudioListener.autoAlign(
+                        lyrics: official,
+                        heard: heardWordsForAlign.isEmpty ? nil : heardWordsForAlign,
+                        fileURL: refreshedItem.fileURL
+                    )
                 }
             }
         }
@@ -520,108 +496,6 @@ final class WholeSongAIService {
         return await withCheckedContinuation { cont in
             SFSpeechRecognizer.requestAuthorization { status in
                 cont.resume(returning: status)
-            }
-        }
-    }
-
-    nonisolated private static func makeRecognizer() -> SFSpeechRecognizer? {
-        if let local = SFSpeechRecognizer(locale: Locale.current), local.isAvailable {
-            return local
-        }
-        if let enUS = SFSpeechRecognizer(locale: Locale(identifier: "en-US")), enUS.isAvailable {
-            return enUS
-        }
-        return SFSpeechRecognizer()
-    }
-
-    nonisolated private static func exportAndTranscribeChunk(
-        sourceFileURL: URL,
-        startSeconds: Double,
-        durationSeconds: Double,
-        recognizer: SFSpeechRecognizer
-    ) async -> ChunkTranscription? {
-        let tempChunkURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("ai_whole_song_\(UUID().uuidString).m4a")
-        defer { try? FileManager.default.removeItem(at: tempChunkURL) }
-
-        let asset = AVURLAsset(url: sourceFileURL)
-        guard let exportSession = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetAppleM4A) else {
-            return nil
-        }
-        exportSession.outputURL = tempChunkURL
-        exportSession.outputFileType = .m4a
-        exportSession.timeRange = CMTimeRange(
-            start: CMTime(seconds: max(0, startSeconds), preferredTimescale: 600),
-            duration: CMTime(seconds: max(0.5, durationSeconds), preferredTimescale: 600)
-        )
-
-        await withTaskCancellationHandler {
-            await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-                exportSession.exportAsynchronously {
-                    cont.resume()
-                }
-            }
-        } onCancel: {
-            exportSession.cancelExport()
-        }
-
-        guard !Task.isCancelled,
-              exportSession.status == .completed,
-              FileManager.default.fileExists(atPath: tempChunkURL.path) else {
-            return nil
-        }
-
-        return await transcribeChunk(
-            at: tempChunkURL,
-            recognizer: recognizer,
-            chunkStartOffset: startSeconds,
-            chunkDuration: durationSeconds
-        )
-    }
-
-    nonisolated private static func transcribeChunk(
-        at url: URL,
-        recognizer: SFSpeechRecognizer,
-        chunkStartOffset: Double,
-        chunkDuration: Double
-    ) async -> ChunkTranscription? {
-        let request = SFSpeechURLRecognitionRequest(url: url)
-        request.shouldReportPartialResults = true
-        request.taskHint = .dictation
-        if #available(iOS 16.0, *) {
-            request.addsPunctuation = true
-        }
-
-        let box = TranscriptionBox()
-        let timeoutSec = max(20.0, chunkDuration + 10.0)
-
-        return await withCheckedContinuation { (cont: CheckedContinuation<ChunkTranscription?, Never>) in
-            let task = recognizer.recognitionTask(with: request) { result, error in
-                if let result {
-                    let words: [TimedHeardWord] = result.bestTranscription.segments.compactMap { seg in
-                        let token = seg.substring.trimmingCharacters(in: .whitespacesAndNewlines)
-                        guard !token.isEmpty else { return nil }
-                        let absStart = max(0, chunkStartOffset + seg.timestamp)
-                        let absEnd = max(absStart + 0.08, absStart + seg.duration)
-                        return TimedHeardWord(text: token, startTime: absStart, endTime: absEnd)
-                    }
-                    box.update(ChunkTranscription(words: words, formattedText: result.bestTranscription.formattedString))
-                }
-                if result?.isFinal == true || error != nil {
-                    if let done = box.finishOnce() {
-                        cont.resume(returning: done)
-                    }
-                }
-            }
-
-            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeoutSec) {
-                task.finish()
-                DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 2.0) {
-                    if let done = box.finishOnce() {
-                        task.cancel()
-                        cont.resume(returning: done)
-                    }
-                }
             }
         }
     }
@@ -797,28 +671,6 @@ final class WholeSongAIService {
                     try? data.write(to: url, options: [.atomic])
                 }
             }
-        }
-    }
-
-    private final class TranscriptionBox: @unchecked Sendable {
-        private let lock = NSLock()
-        private var finished = false
-        private var latest: ChunkTranscription?
-
-        func update(_ value: ChunkTranscription) {
-            lock.lock()
-            if !value.formattedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                latest = value
-            }
-            lock.unlock()
-        }
-
-        func finishOnce() -> ChunkTranscription? {
-            lock.lock()
-            defer { lock.unlock() }
-            if finished { return nil }
-            finished = true
-            return latest
         }
     }
 }

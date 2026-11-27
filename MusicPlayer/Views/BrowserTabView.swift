@@ -1451,7 +1451,10 @@ struct BrowserTabView: View {
                 }
             }
             .onChange(of: downloader.lastFailedCacheEvent) { _, event in
-                guard event != nil else { return }
+                guard let event else { return }
+                if let failedURL = event.sourceURL?.absoluteString {
+                    autoCachedURLs.remove(failedURL)
+                }
                 if downloader.activeDownloads.isEmpty {
                     let failedVideoID = activeCacheVideoID ?? currentYouTubeVideoID
                     if let failedVideoID {

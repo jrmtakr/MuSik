@@ -140,7 +140,7 @@ struct AIRecognizedTrackInfo: Equatable, Sendable {
 @Observable
 final class SyncedLyricsService {
     static let shared = SyncedLyricsService()
-    nonisolated static let currentAlignmentVersion = 5
+    nonisolated static let currentAlignmentVersion = 6
 
     var currentLyrics: ResolvedTrackLyrics?
     var currentLoadingKey: String?
@@ -315,6 +315,9 @@ final class SyncedLyricsService {
             sourceLabel: lyrics.sourceLabel,
             attributionText: lyrics.attributionText,
             syncedOffsetSeconds: lyrics.syncedOffsetSeconds,
+            tempoScale: lyrics.tempoScale,
+            expectedDurationSeconds: lyrics.expectedDurationSeconds,
+            alignmentVersion: Self.currentAlignmentVersion,
             lines: lyrics.lines
         )
         memoryCache[key] = normalized
@@ -682,8 +685,8 @@ final class SyncedLyricsService {
             isTimeSynced: lyrics.isTimeSynced,
             sourceLabel: lyrics.sourceLabel,
             attributionText: lyrics.attributionText,
-            syncedOffsetSeconds: 0,
-            tempoScale: 1.0,
+            syncedOffsetSeconds: lyrics.syncedOffsetSeconds,
+            tempoScale: lyrics.tempoScale,
             expectedDurationSeconds: item.durationSeconds,
             alignmentVersion: Self.currentAlignmentVersion,
             lines: lyrics.lines

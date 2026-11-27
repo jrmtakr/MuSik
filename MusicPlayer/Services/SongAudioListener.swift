@@ -836,7 +836,13 @@ enum SongAudioListener {
         heard: [HeardWord]?,
         curve: VocalEnvelope?
     ) -> ResolvedTrackLyrics {
-        let nonEmptyLines = lyrics.lines.filter { !$0.isInstrumentalBreak && !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        let nonEmptyLines = lyrics.lines.filter { line in
+            guard !line.isInstrumentalBreak else { return false }
+            let t = line.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !t.isEmpty else { return false }
+            if t.hasPrefix("[") && t.hasSuffix("]") { return false }
+            return true
+        }
         guard !nonEmptyLines.isEmpty else { return lyrics }
 
         let totalDuration = curve.map { Double($0.envelope.count) * $0.frameDurationSeconds } ?? lyrics.expectedDurationSeconds ?? 180.0
@@ -882,7 +888,20 @@ enum SongAudioListener {
         if let heardFirst = heard?.first(where: { $0.time > 0.4 }),
            heardFirst.time < totalDuration * 0.45,
            heardFirst.time > firstVocalSec {
-            firstVocalSec = max(0, heardFirst.time - 0.35)
+            // Only push `firstVocalSec` later when there isn't already sustained singing between `firstVocalSec`
+            // and `heardFirst.time` (so ASR missing a quiet/distorted Verse 1 doesn't shift the whole song late).
+            var sustainedBeforeHeard = 0
+            if let curve, let singingEnv, singingEnv.count >= 40 {
+                let dt = curve.frameDurationSeconds
+                let sIdx = max(0, Int((firstVocalSec + 0.3) / dt))
+                let eIdx = min(singingEnv.count, Int((heardFirst.time - 0.5) / dt))
+                if eIdx > sIdx {
+                    sustainedBeforeHeard = singingEnv[sIdx..<eIdx].filter { $0 > 0.08 }.count
+                }
+            }
+            if sustainedBeforeHeard < 8 {
+                firstVocalSec = max(0, heardFirst.time - 0.35)
+            }
         }
 
         // Find monotonic anchors between line indices and multi-peak heard vocal timestamps (supporting repeated choruses).
@@ -1102,12 +1121,12 @@ enum SongAudioListener {
             let wordTimings = group.enumerated().map { wIdx, w in
                 let wNext = (wIdx + 1 < group.count) ? group[wIdx + 1].time : lineEnd
                 let wEnd = max(w.time + 0.08, min(lineEnd, wNext))
-                return LyricWordTiming(text: w.token, startTime: w.time, endTime: wEnd)
+                return LyricWordTiming(text: w.rawText, startTime: w.time, endTime: wEnd)
             }
             lines.append(SyncedLyricLine(
                 startTime: first.time,
                 endTime: lineEnd,
-                text: group.map(\.token).joined(separator: " "),
+                text: group.map(\.rawText).joined(separator: " "),
                 words: wordTimings,
                 isInstrumentalBreak: false,
                 hasNativeWordTimings: true
@@ -1385,12 +1404,12 @@ enum SongAudioListener {
         let lastLyricTime = lyrics.lines.map { max($0.endTime, $0.startTime) }.max() ?? 0
         guard lastLyricTime > 12 else { return lyrics }
 
-        // Test natural tempo (1.0) and mild stretch ratio if official LRC length differs by 1.5%-7%.
+        // Test natural tempo (1.0) plus stretched/sped-up edits (0.78x..1.32x for slowed+reverb, nightcore, live cuts).
         var candidateScales: [Double] = [1.0]
         if let expectedDur = lyrics.expectedDurationSeconds,
            expectedDur > 20, actualDuration > 20 {
             let ratio = actualDuration / expectedDur
-            if ratio >= 0.93 && ratio <= 1.07 && abs(ratio - 1.0) >= 0.015 {
+            if ratio >= 0.78 && ratio <= 1.32 && abs(ratio - 1.0) >= 0.015 {
                 candidateScales.append(ratio)
             }
         }
@@ -1405,8 +1424,11 @@ enum SongAudioListener {
         // Convert LRC vocal intervals into expected activity markers once per scale.
         var bestScore = -Double.infinity
         var zeroOffsetScore = -Double.infinity
+        var scale1BestScore = -Double.infinity
         var bestOffset: Double = 0
         var bestScale: Double = 1.0
+
+        let maxSweepOffset = min(210.0, max(110.0, actualDuration * 0.55))
 
         for scale in candidateScales {
             let sampleTimes: [(time: Double, isSing: Bool)] = lyrics.lines.flatMap { line -> [(Double, Bool)] in
@@ -1433,6 +1455,8 @@ enum SongAudioListener {
                 return (t1, t2, fCount)
             }
 
+            let tempoPrior = abs(scale - 1.0) * 0.08
+
             func scoreShift(_ offset: Double) -> Double {
                 var sum = 0.0
                 var count = 0
@@ -1446,8 +1470,8 @@ enum SongAudioListener {
                     count += 1
                 }
                 guard count > 0 else { return -Double.infinity }
-                // Tiny prior preferring smaller shifts when scores tie.
-                var finalScore = (sum / Double(count)) - min(0.08, abs(offset) * 0.0012)
+                // Tiny prior preferring smaller shifts and natural 1.0 tempo when scores tie.
+                var finalScore = (sum / Double(count)) - min(0.08, abs(offset) * 0.0010) - tempoPrior
                 if !chorusTimePairs.isEmpty, !curve.spectralBands.isEmpty, curve.spectralFrameDuration > 0.05 {
                     var cSum = 0.0
                     var cCnt = 0
@@ -1470,32 +1494,57 @@ enum SongAudioListener {
 
             let zScore = scoreShift(0)
             if scale == 1.0 { zeroOffsetScore = zScore }
+            if scale == 1.0 && zScore > scale1BestScore { scale1BestScore = zScore }
             if zScore > bestScore {
                 bestScore = zScore
                 bestOffset = 0
                 bestScale = scale
             }
 
-            // Sweep -30s...+95s in 0.25s steps (covers long music-video intros, skits, and trimmed starts).
-            var offset = -30.0
-            while offset <= 95.0 {
+            // Sweep -45s..+maxSweepOffset (0.25s steps across -35..110s, 0.5s outside for long intros & trimmed edits).
+            var offset = -45.0
+            while offset <= maxSweepOffset {
                 let s = scoreShift(offset)
+                if scale == 1.0 && s > scale1BestScore { scale1BestScore = s }
                 if s > bestScore {
                     bestScore = s
                     bestOffset = offset
                     bestScale = scale
                 }
-                offset += 0.25
+                offset += (offset >= -35.0 && offset <= 110.0) ? 0.25 : 0.5
             }
         }
+
+        // Apply discovered tempo scale before Section-DTW when slowed/sped-up upload beats 1.0 tempo cleanly.
+        let useTempoScaling = abs(bestScale - 1.0) >= 0.025 && bestScore > scale1BestScore + 0.05
+        let effectiveLyricsForDTW: ResolvedTrackLyrics = {
+            guard useTempoScaling else { return lyrics }
+            let scaledLines = lyrics.lines.map { line in
+                SyncedLyricLine(
+                    id: line.id,
+                    startTime: line.startTime * bestScale,
+                    endTime: line.endTime * bestScale,
+                    text: line.text,
+                    words: line.words.map {
+                        LyricWordTiming(id: $0.id, text: $0.text, startTime: $0.startTime * bestScale, endTime: $0.endTime * bestScale)
+                    },
+                    isInstrumentalBreak: line.isInstrumentalBreak,
+                    hasNativeWordTimings: line.hasNativeWordTimings,
+                    isSpokenDialogue: line.isSpokenDialogue
+                )
+            }
+            var copy = lyrics
+            copy.lines = scaledLines
+            return copy
+        }()
 
         // Also check Piecewise Section-DTW (Viterbi) across >= 4s LRC singing gaps so mid-video skits or extra pauses
         // shift Verse 2 / Chorus 2 independently without disturbing Verse 1 or introducing false jumps on studio songs.
         if let piecewise = alignSectionsWithViterbi(
-            lyrics: lyrics,
+            lyrics: effectiveLyricsForDTW,
             curve: curve,
             singingEnv: singingEnv,
-            lrcNonBreakLines: lrcNonBreakLines,
+            lrcNonBreakLines: effectiveLyricsForDTW.lines.filter { !$0.isInstrumentalBreak },
             lrcChorusPairs: lrcChorusPairs
         ) {
             return piecewise
@@ -1503,7 +1552,7 @@ enum SongAudioListener {
 
         // Require a genuine correlation improvement before shifting timestamps away from 0.
         let meaningfulImprovement = abs(bestOffset) >= 0.4 && bestScore > zeroOffsetScore + 0.06 && bestScore > 0.08
-        guard meaningfulImprovement || abs(bestScale - 1.0) >= 0.015 else {
+        guard meaningfulImprovement || useTempoScaling || abs(bestScale - 1.0) >= 0.015 else {
             return lyrics
         }
 
@@ -1665,11 +1714,12 @@ enum SongAudioListener {
             return (sum / usedWeight) - min(0.05, abs(offset) * 0.0005)
         }
 
+        let maxDtwOffset = min(210.0, max(110.0, actualDuration * 0.55))
         var offsets: [Double] = []
-        var oVal = -12.0
-        while oVal <= 95.0 {
+        var oVal = -40.0
+        while oVal <= maxDtwOffset {
             offsets.append(oVal)
-            oVal += 0.5
+            oVal += (oVal >= -25.0 && oVal <= 105.0) ? 0.5 : 1.0
         }
         guard let zeroIdx = offsets.firstIndex(where: { abs($0) < 0.01 }) else { return nil }
         let kCount = sections.count
@@ -1735,7 +1785,7 @@ enum SongAudioListener {
                     guard prevDp > -Double.infinity else { continue }
                     let prevOff = offsets[pi]
                     let delta = currOff - prevOff
-                    guard abs(delta) < 0.01 || (delta >= -12.0 && delta <= 75.0 && abs(delta) >= 2.0) else { continue }
+                    guard abs(delta) < 0.01 || (delta >= -25.0 && delta <= 120.0 && abs(delta) >= 2.0) else { continue }
                     guard sections[s].startTime + currOff >= sections[s - 1].endTime + prevOff - 0.6 else { continue }
                     let penalty = abs(delta) < 0.01 ? 0.0 : (0.085 + 0.0015 * abs(delta))
                     let cand = prevDp + currEmit - penalty
@@ -2566,10 +2616,12 @@ enum SongAudioListener {
         var candidates: [CandidatePeak] = []
         for item in items {
             let lineTokens = tokens(item.text).filter { !$0.isEmpty }
-            guard lineTokens.count >= 3 else { continue }
             let needed = Set(lineTokens)
-            guard needed.count >= 3 else { continue }
-            let window = lineTokens.count + 3
+            let isTwoWordDistinctiveHook = lineTokens.count == 2
+                && needed.count == 2
+                && lineTokens.allSatisfy { $0.count >= 4 && !stopWords.contains($0) }
+            guard (lineTokens.count >= 3 && needed.count >= 3) || isTwoWordDistinctiveHook else { continue }
+            let window = isTwoWordDistinctiveHook ? 3 : (lineTokens.count + 3)
 
             var allMatches: [(time: Double, score: Double)] = []
             var i = 0
@@ -2595,8 +2647,10 @@ enum SongAudioListener {
                 }
                 let bagScore = Double(hits.count) / Double(needed.count)
                 let ordScore = Double(orderedHits) / Double(lineTokens.count)
-                let combinedScore = 0.55 * bagScore + 0.45 * ordScore
-                if bagScore >= minScore && ordScore >= 0.50 && nonStopHits >= 2, let firstHit {
+                let combinedScore = isTwoWordDistinctiveHook ? 0.84 : (0.55 * bagScore + 0.45 * ordScore)
+                let passesTwoWord = isTwoWordDistinctiveHook && orderedHits == 2 && nonStopHits == 2
+                let passesMultiWord = !isTwoWordDistinctiveHook && bagScore >= minScore && ordScore >= 0.50 && nonStopHits >= 2
+                if (passesTwoWord || passesMultiWord), let firstHit {
                     allMatches.append((max(0, heard[firstHit].time - 0.10), combinedScore))
                 }
                 i += 1
