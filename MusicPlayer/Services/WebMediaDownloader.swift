@@ -111,14 +111,24 @@ struct FailedCacheEvent: Equatable {
 @Observable
 final class WebMediaDownloader {
     private(set) var activeDownloads: [BrowserDownloadItem] = []
+    private(set) var isResolvingFallback: Bool = false
     var lastCompletedMediaItem: MediaItem?
     var lastCompletedCacheEvent: CompletedCacheEvent?
     var lastFailedCacheEvent: FailedCacheEvent?
+
+    private struct YouTubeFallbackContext {
+        let videoID: String
+        let title: String?
+        let author: String?
+        let durationSeconds: Double?
+        var didTryAlternate: Bool = false
+    }
 
     @ObservationIgnored private var taskToDownloadID: [Int: UUID] = [:]
     @ObservationIgnored private var downloadMeta: [UUID: DownloadMeta] = [:]
     @ObservationIgnored private var activeURLTasks: [UUID: URLSessionTask] = [:]
     @ObservationIgnored private var activeAsyncTasks: [UUID: Task<Void, Never>] = [:]
+    @ObservationIgnored private var youtubeFallbackContextByURL: [URL: YouTubeFallbackContext] = [:]
 
     @ObservationIgnored private lazy var delegateProxy = DownloadDelegateProxy(owner: self)
 
@@ -234,8 +244,25 @@ final class WebMediaDownloader {
         _ media: DetectedBrowserMedia,
         fallbackStreams: [DetectedBrowserMedia] = [],
         maxDurationMinutes: Int = 0,
-        destinationFolder: String = ""
+        destinationFolder: String = "",
+        youTubeVideoID: String? = nil
     ) {
+        let cleanMainURL = cleanedStreamURLIfRangeFragment(media.url)
+        let extractedID = youTubeVideoID
+            ?? media.referer.flatMap(URL.init(string:)).flatMap { YouTubeStreamResolver.extractVideoID(from: $0) }
+        if let vid = extractedID, !vid.isEmpty,
+           youtubeFallbackContextByURL[media.url] == nil,
+           youtubeFallbackContextByURL[cleanMainURL] == nil {
+            let ctx = YouTubeFallbackContext(
+                videoID: vid,
+                title: media.title,
+                author: media.author,
+                durationSeconds: media.durationSeconds,
+                didTryAlternate: false
+            )
+            youtubeFallbackContextByURL[media.url] = ctx
+            youtubeFallbackContextByURL[cleanMainURL] = ctx
+        }
         var reqHeaders = media.customHeaders ?? [:]
         let isNativeGoogleClient = reqHeaders["User-Agent"]?.hasPrefix("com.google.") ?? false
         if !isNativeGoogleClient, let ref = media.referer, !ref.isEmpty, reqHeaders["Referer"] == nil {
@@ -2181,11 +2208,17 @@ final class WebMediaDownloader {
     }
 
     private func recordCompletedDownload(_ item: MediaItem, sourceURL: URL) {
+        youtubeFallbackContextByURL.removeValue(forKey: sourceURL)
+        youtubeFallbackContextByURL.removeValue(forKey: cleanedStreamURLIfRangeFragment(sourceURL))
         lastCompletedMediaItem = item
         lastCompletedCacheEvent = CompletedCacheEvent(eventID: UUID(), item: item, sourceURL: sourceURL)
     }
 
     private func recordFailedDownload(sourceURL: URL?, message: String) {
+        if let sourceURL {
+            youtubeFallbackContextByURL.removeValue(forKey: sourceURL)
+            youtubeFallbackContextByURL.removeValue(forKey: cleanedStreamURLIfRangeFragment(sourceURL))
+        }
         MediaManager.shared.errorMessage = message
         lastFailedCacheEvent = FailedCacheEvent(eventID: UUID(), sourceURL: sourceURL, message: message)
     }
@@ -2197,8 +2230,18 @@ final class WebMediaDownloader {
         sourceURL: URL?,
         failureMessage: String
     ) {
+        let ctx: YouTubeFallbackContext? = sourceURL.flatMap { url in
+            let clean = cleanedStreamURLIfRangeFragment(url)
+            return youtubeFallbackContextByURL.removeValue(forKey: url)
+                ?? youtubeFallbackContextByURL.removeValue(forKey: clean)
+        }
         if let next = fallbacks.first {
             let rest = Array(fallbacks.dropFirst())
+            if let ctx {
+                let cleanNext = cleanedStreamURLIfRangeFragment(next.url)
+                youtubeFallbackContextByURL[next.url] = ctx
+                youtubeFallbackContextByURL[cleanNext] = ctx
+            }
             MediaManager.shared.statusMessage = "Trying alternate stream for \(next.title ?? "video")..."
             cacheMediaStream(
                 next,
@@ -2206,6 +2249,40 @@ final class WebMediaDownloader {
                 maxDurationMinutes: maxDurationMinutes,
                 destinationFolder: destinationFolder
             )
+            return
+        }
+        if let ctx, !ctx.didTryAlternate {
+            isResolvingFallback = true
+            Task { @MainActor in
+                defer { self.isResolvingFallback = false }
+                MediaManager.shared.statusMessage = "Finding unrestricted match for \(ctx.title ?? "video")..."
+                if let alt = await YouTubeStreamResolver.resolveAgeRestrictedFallback(
+                    videoID: ctx.videoID,
+                    title: ctx.title,
+                    author: ctx.author,
+                    durationSeconds: ctx.durationSeconds
+                ), let firstAlt = alt.streams.first {
+                    let cleanAlt = self.cleanedStreamURLIfRangeFragment(firstAlt.url)
+                    let marked = YouTubeFallbackContext(
+                        videoID: ctx.videoID,
+                        title: alt.title,
+                        author: alt.author ?? ctx.author,
+                        durationSeconds: alt.durationSeconds ?? ctx.durationSeconds,
+                        didTryAlternate: true
+                    )
+                    self.youtubeFallbackContextByURL[firstAlt.url] = marked
+                    self.youtubeFallbackContextByURL[cleanAlt] = marked
+                    self.cacheMediaStream(
+                        firstAlt,
+                        fallbackStreams: Array(alt.streams.dropFirst()),
+                        maxDurationMinutes: maxDurationMinutes,
+                        destinationFolder: destinationFolder,
+                        youTubeVideoID: ctx.videoID
+                    )
+                    return
+                }
+                self.recordFailedDownload(sourceURL: sourceURL, message: failureMessage)
+            }
             return
         }
         recordFailedDownload(sourceURL: sourceURL, message: failureMessage)
@@ -2422,8 +2499,8 @@ final class WebMediaDownloader {
             activeDownloads.removeAll { $0.id == downloadID }
         }
 
-        for candidate in candidates {
-            if Task.isCancelled { return nil }
+        func attemptCandidate(_ candidate: DetectedBrowserMedia) async -> (item: MediaItem?, exceedMax: Bool) {
+            if Task.isCancelled { return (nil, false) }
             let primaryHeaders = enrichedHeaders(candidate.customHeaders, for: candidate.url)
             let minimalHeaders = [
                 "User-Agent": primaryHeaders["User-Agent"] ?? Self.browserUserAgent,
@@ -2445,7 +2522,7 @@ final class WebMediaDownloader {
                         preferredFileName: "\(cleanTitle).\(hlsOut.ext)"
                     ) {
                         LocalMediaCacheProxy.shared.refreshCacheSize()
-                        return MediaManager.shared.applyDownloadedMetadataAndPlaylist(
+                        let item = MediaManager.shared.applyDownloadedMetadataAndPlaylist(
                             for: saved,
                             title: candidate.title ?? cleanTitle,
                             artist: candidate.author,
@@ -2453,10 +2530,11 @@ final class WebMediaDownloader {
                             appendOrder: true,
                             sourceVideoID: sourceVideoID
                         )
+                        return (item, false)
                     }
                     try? FileManager.default.removeItem(at: tempURL)
                 }
-                continue
+                return (nil, false)
             }
 
             let pageRef = candidate.referer.flatMap(URL.init(string:))
@@ -2467,16 +2545,14 @@ final class WebMediaDownloader {
                     if tempAudio == nil && !Task.isCancelled {
                         tempAudio = await fetchTempFile(from: cleanAudio, ext: "m4a", headers: minimalHeaders, using: ephemeralDataSession, pageURL: pageRef)
                     }
-                    guard let aURL = tempAudio else {
-                        continue
-                    }
+                    guard let aURL = tempAudio else { return (nil, false) }
                     if let maxSec, let dur = await resolveLocalDuration(at: aURL), dur > maxSec {
                         try? FileManager.default.removeItem(at: aURL)
-                        return nil
+                        return (nil, true)
                     }
                     if let saved = MediaManager.shared.importTemporaryFile(from: aURL, preferredFileName: "\(cleanTitle).m4a") {
                         LocalMediaCacheProxy.shared.refreshCacheSize()
-                        return MediaManager.shared.applyDownloadedMetadataAndPlaylist(
+                        let item = MediaManager.shared.applyDownloadedMetadataAndPlaylist(
                             for: saved,
                             title: candidate.title ?? cleanTitle,
                             artist: candidate.author,
@@ -2484,22 +2560,21 @@ final class WebMediaDownloader {
                             appendOrder: true,
                             sourceVideoID: sourceVideoID
                         )
+                        return (item, false)
                     }
-                    continue
+                    return (nil, false)
                 }
 
                 let cleanVideo = cleanedStreamURLIfRangeFragment(candidate.url)
                 let cleanAudio = cleanedStreamURLIfRangeFragment(pairedAudio)
                 async let videoTemp = fetchTempFile(from: cleanVideo, ext: "mp4", headers: primaryHeaders, using: ephemeralDataSession, pageURL: pageRef)
                 async let audioTemp = fetchTempFile(from: cleanAudio, ext: "m4a", headers: primaryHeaders, using: ephemeralDataSession, pageURL: pageRef)
-                guard let vURL = await videoTemp, let aURL = await audioTemp else {
-                    continue
-                }
+                guard let vURL = await videoTemp, let aURL = await audioTemp else { return (nil, false) }
                 defer {
                     try? FileManager.default.removeItem(at: vURL)
                     try? FileManager.default.removeItem(at: aURL)
                 }
-                if Task.isCancelled { return nil }
+                if Task.isCancelled { return (nil, false) }
                 updateProgress(downloadID: downloadID, fraction: 0.75)
 
                 let muxedTemp = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString).mp4")
@@ -2508,12 +2583,12 @@ final class WebMediaDownloader {
                 }.value
                 guard muxOK else {
                     try? FileManager.default.removeItem(at: muxedTemp)
-                    continue
+                    return (nil, false)
                 }
 
                 if let maxSec, let dur = await resolveLocalDuration(at: muxedTemp), dur > maxSec {
                     try? FileManager.default.removeItem(at: muxedTemp)
-                    return nil
+                    return (nil, true)
                 }
                 updateProgress(downloadID: downloadID, fraction: 0.95)
                 if let saved = MediaManager.shared.importTemporaryFile(
@@ -2521,7 +2596,7 @@ final class WebMediaDownloader {
                     preferredFileName: "\(cleanTitle).mp4"
                 ) {
                     LocalMediaCacheProxy.shared.refreshCacheSize()
-                    return MediaManager.shared.applyDownloadedMetadataAndPlaylist(
+                    let item = MediaManager.shared.applyDownloadedMetadataAndPlaylist(
                         for: saved,
                         title: candidate.title ?? cleanTitle,
                         artist: candidate.author,
@@ -2529,6 +2604,7 @@ final class WebMediaDownloader {
                         appendOrder: true,
                         sourceVideoID: sourceVideoID
                     )
+                    return (item, false)
                 }
             } else {
                 let cleanURL = cleanedStreamURLIfRangeFragment(candidate.url)
@@ -2537,14 +2613,14 @@ final class WebMediaDownloader {
                 if tempURL == nil && !Task.isCancelled {
                     tempURL = await fetchTempFile(from: cleanURL, ext: ext, headers: minimalHeaders, using: ephemeralDataSession, pageURL: pageRef)
                 }
-                guard let downloadedURL = tempURL else { continue }
+                guard let downloadedURL = tempURL else { return (nil, false) }
                 if Task.isCancelled {
                     try? FileManager.default.removeItem(at: downloadedURL)
-                    return nil
+                    return (nil, false)
                 }
                 if let maxSec, let dur = await resolveLocalDuration(at: downloadedURL), dur > maxSec {
                     try? FileManager.default.removeItem(at: downloadedURL)
-                    return nil
+                    return (nil, true)
                 }
 
                 var finalTemp = downloadedURL
@@ -2569,7 +2645,7 @@ final class WebMediaDownloader {
                     preferredFileName: "\(cleanTitle).\(finalExt)"
                 ) {
                     LocalMediaCacheProxy.shared.refreshCacheSize()
-                    return MediaManager.shared.applyDownloadedMetadataAndPlaylist(
+                    let item = MediaManager.shared.applyDownloadedMetadataAndPlaylist(
                         for: saved,
                         title: candidate.title ?? cleanTitle,
                         artist: candidate.author,
@@ -2577,7 +2653,29 @@ final class WebMediaDownloader {
                         appendOrder: true,
                         sourceVideoID: sourceVideoID
                     )
+                    return (item, false)
                 }
+            }
+            return (nil, false)
+        }
+
+        for candidate in candidates {
+            let outcome = await attemptCandidate(candidate)
+            if outcome.exceedMax || Task.isCancelled { return nil }
+            if let item = outcome.item { return item }
+        }
+
+        if let resolvedVideoID = sourceVideoID, !resolvedVideoID.isEmpty, !Task.isCancelled,
+           let alt = await YouTubeStreamResolver.resolveAgeRestrictedFallback(
+               videoID: resolvedVideoID,
+               title: media.title,
+               author: media.author,
+               durationSeconds: media.durationSeconds
+           ) {
+            for altCandidate in alt.streams {
+                let outcome = await attemptCandidate(altCandidate)
+                if outcome.exceedMax || Task.isCancelled { return nil }
+                if let item = outcome.item { return item }
             }
         }
         return nil

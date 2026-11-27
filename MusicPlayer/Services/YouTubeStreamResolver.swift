@@ -313,7 +313,7 @@ enum YouTubeStreamResolver {
                         sourcePageURL: url,
                         clientName: "MWEB",
                         clientHeaderID: "2",
-                        clientVersion: "2.20250311.00.00",
+                        clientVersion: "2.20260301.01.00",
                         userAgent: WebMediaDownloader.browserUserAgent,
                         extraClientFields: ["platform": "MOBILE"],
                         visitorData: visitorDataForRequests,
@@ -328,7 +328,21 @@ enum YouTubeStreamResolver {
                             sourcePageURL: url,
                             clientName: "WEB",
                             clientHeaderID: "1",
-                            clientVersion: "2.20250311.00.00",
+                            clientVersion: "2.20260301.01.00",
+                            userAgent: desktopBrowserUserAgent,
+                            extraClientFields: [:],
+                            visitorData: visitorDataForRequests,
+                            cookiesHeader: resolvedCookies,
+                            signatureTimestamp: sts
+                        )
+                    }
+                    group.addTask {
+                        await fetchInnerTube(
+                            videoID: videoID,
+                            sourcePageURL: url,
+                            clientName: "WEB_CREATOR",
+                            clientHeaderID: "62",
+                            clientVersion: "1.20260301.01.00",
                             userAgent: desktopBrowserUserAgent,
                             extraClientFields: [:],
                             visitorData: visitorDataForRequests,
@@ -359,8 +373,10 @@ enum YouTubeStreamResolver {
                 }
             }
 
-            // 3. Mobile web watch HTML fallback (also seeds visitorData cache & extracts age-gated metadata).
-            if workingResults.isEmpty, !Task.isCancelled {
+            // 3. Mobile web watch HTML fallback (skip when signed-out age-gate already confirmed so fallback runs fast).
+            if workingResults.isEmpty,
+               !Task.isCancelled,
+               (signedIn || !isAgeOrLoginRestrictedReason(lastErrorReason)) {
                 let mobileHTML = await fetchMobileWebHTML(
                     videoID: videoID,
                     sourcePageURL: url,
@@ -1202,13 +1218,21 @@ enum YouTubeStreamResolver {
         let searchQuery = cleanSearchText(effectiveTitle, author: effectiveAuthor)
         guard !searchQuery.isEmpty else { return nil }
 
-        // 1. Check non-age-restricted YouTube reuploads with matching title + duration first.
-        if let altYT = await resolveNonRestrictedYouTubeAlternative(
+        // Race unrestricted YouTube reuploads & SoundCloud catalog concurrently for speed.
+        async let altYTTask = resolveNonRestrictedYouTubeAlternative(
             excludingVideoID: videoID,
             query: searchQuery,
             targetTitle: effectiveTitle,
             targetDuration: effectiveDuration
-        ) {
+        )
+        async let scTask = resolveSoundCloudAlternateStream(
+            query: searchQuery,
+            targetTitle: effectiveTitle,
+            targetAuthor: effectiveAuthor,
+            targetDuration: effectiveDuration
+        )
+
+        if let altYT = await altYTTask, !altYT.streams.isEmpty {
             return YouTubeResolvedResult(
                 videoID: videoID,
                 title: effectiveTitle,
@@ -1219,13 +1243,7 @@ enum YouTubeStreamResolver {
             )
         }
 
-        // 2. Check SoundCloud public catalog with strict title + duration verification.
-        if let scStreams = await resolveSoundCloudAlternateStream(
-            query: searchQuery,
-            targetTitle: effectiveTitle,
-            targetAuthor: effectiveAuthor,
-            targetDuration: effectiveDuration
-        ), !scStreams.isEmpty {
+        if let scStreams = await scTask, !scStreams.isEmpty {
             return YouTubeResolvedResult(
                 videoID: videoID,
                 title: effectiveTitle,
@@ -1240,51 +1258,57 @@ enum YouTubeStreamResolver {
     }
 
     private static func fetchPublicVideoMetadata(videoID: String) async -> (title: String?, author: String?, durationSeconds: Double?) {
-        var resolvedTitle: String?
-        var resolvedAuthor: String?
-        var resolvedDuration: Double?
-
-        if let oembedURL = URL(string: "https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=\(videoID)&format=json") {
+        async let oembedTask: (title: String?, author: String?) = {
+            guard let oembedURL = URL(string: "https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=\(videoID)&format=json") else {
+                return (nil, nil)
+            }
             var req = URLRequest(url: oembedURL)
             req.timeoutInterval = 4.0
             req.setValue(desktopBrowserUserAgent, forHTTPHeaderField: "User-Agent")
-            if let (data, resp) = try? await URLSession.shared.data(for: req),
-               let http = resp as? HTTPURLResponse,
-               (200...299).contains(http.statusCode),
-               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                resolvedTitle = (obj["title"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
-                resolvedAuthor = (obj["author_name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let (data, resp) = try? await URLSession.shared.data(for: req),
+                  let http = resp as? HTTPURLResponse,
+                  (200...299).contains(http.statusCode),
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                return (nil, nil)
             }
-        }
+            let t = (obj["title"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let a = (obj["author_name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            return (t, a)
+        }()
 
-        if resolvedDuration == nil,
-           let watchURL = URL(string: "https://www.youtube.com/watch?v=\(videoID)") {
+        async let htmlTask: (title: String?, durationSeconds: Double?) = {
+            guard let watchURL = URL(string: "https://www.youtube.com/watch?v=\(videoID)") else {
+                return (nil, nil)
+            }
             var req = URLRequest(url: watchURL)
             req.timeoutInterval = 4.5
             req.setValue(desktopBrowserUserAgent, forHTTPHeaderField: "User-Agent")
             req.setValue("CONSENT=YES+cb.20210328-17-p0.en+FX+299", forHTTPHeaderField: "Cookie")
-            if let (data, _) = try? await URLSession.shared.data(for: req),
-               let html = String(data: data, encoding: .utf8) {
-                if let match = html.range(of: #""lengthSeconds"\s*:\s*"(\d+)""#, options: .regularExpression) {
-                    let digits = html[match].components(separatedBy: CharacterSet.decimalDigits.inverted).joined()
-                    if let sec = Double(digits), sec > 0 {
-                        resolvedDuration = sec
-                    }
-                }
-                if (resolvedTitle == nil || resolvedTitle?.isEmpty == true),
-                   let tRange = html.range(of: #""title"\s*:\s*"([^"]+)""#, options: .regularExpression) {
-                    let raw = String(html[tRange])
-                    if let firstQ = raw.lastIndex(of: "\"") {
-                        let sub = raw[..<firstQ]
-                        if let prevQ = sub.lastIndex(of: "\"") {
-                            resolvedTitle = String(sub[sub.index(after: prevQ)...])
-                        }
+            guard let (data, _) = try? await URLSession.shared.data(for: req),
+                  let html = String(data: data, encoding: .utf8) else {
+                return (nil, nil)
+            }
+            var dur: Double?
+            if let match = html.range(of: #""lengthSeconds"\s*:\s*"(\d+)""#, options: .regularExpression) {
+                let digits = html[match].components(separatedBy: CharacterSet.decimalDigits.inverted).joined()
+                if let sec = Double(digits), sec > 0 { dur = sec }
+            }
+            var fallbackTitle: String?
+            if let tRange = html.range(of: #""title"\s*:\s*"([^"]+)""#, options: .regularExpression) {
+                let raw = String(html[tRange])
+                if let firstQ = raw.lastIndex(of: "\"") {
+                    let sub = raw[..<firstQ]
+                    if let prevQ = sub.lastIndex(of: "\"") {
+                        fallbackTitle = String(sub[sub.index(after: prevQ)...])
                     }
                 }
             }
-        }
+            return (fallbackTitle, dur)
+        }()
 
-        return (resolvedTitle, resolvedAuthor, resolvedDuration)
+        let (oe, hm) = await (oembedTask, htmlTask)
+        let title = (oe.title?.isEmpty == false) ? oe.title : hm.title
+        return (title, oe.author, hm.durationSeconds)
     }
 
     private static func normalizedWordTokens(_ text: String) -> [String] {
@@ -1324,43 +1348,91 @@ enum YouTubeStreamResolver {
         return cleaned
     }
 
+    private static let alternateExcludeNoiseTokens: Set<String> = [
+        "reaction", "review", "parody", "tutorial", "karaoke", "instrumental",
+        "slowed", "sped", "nightcore", "8d", "cover", "remix", "teaser", "trailer"
+    ]
+
+    private static func hasDisallowedNoiseTokens(targetTitle: String, candidateTitle: String) -> Bool {
+        let targetSet = Set(normalizedWordTokens(targetTitle))
+        let candSet = Set(normalizedWordTokens(candidateTitle))
+        return !candSet.intersection(alternateExcludeNoiseTokens).subtracting(targetSet).isEmpty
+    }
+
+    private static func matchesDurationOrStudioAudio(
+        candidateDuration: Double?,
+        targetDuration: Double?,
+        overlap: Double,
+        strictTier: Bool
+    ) -> Bool {
+        if strictTier {
+            guard overlap >= 0.72 else { return false }
+            if let targetDuration, targetDuration > 15,
+               let candDur = candidateDuration, candDur > 0 {
+                let tol = max(12.0, targetDuration * 0.08)
+                return abs(candDur - targetDuration) <= tol
+            }
+            return true
+        } else {
+            // Tier 2: cinematic Music Video (e.g. 7-min film cut) matched to its exact unrestricted studio audio/lyrics upload.
+            guard overlap >= 0.85, let candDur = candidateDuration else { return false }
+            return candDur >= 90 && candDur <= 600
+        }
+    }
+
     private static func resolveNonRestrictedYouTubeAlternative(
         excludingVideoID: String,
         query: String,
         targetTitle: String,
         targetDuration: Double?
     ) async -> YouTubeResolvedResult? {
-        let hits = await PlaylistURLImporter.searchYouTubeTracks(query: query, limit: 6)
-        for hit in hits {
-            guard hit.videoID != excludingVideoID else { continue }
-            if let targetDuration, targetDuration > 15,
-               let hitDur = hit.durationSeconds, hitDur > 0 {
-                let tol = max(8.0, targetDuration * 0.05)
-                guard abs(hitDur - targetDuration) <= tol else { continue }
-            }
-            let overlap = titleTokenOverlap(targetTitle, hit.title)
-            guard overlap >= 0.72 else { continue }
-            guard let altURL = URL(string: "https://www.youtube.com/watch?v=\(hit.videoID)") else { continue }
+        let hits = await PlaylistURLImporter.searchYouTubeTracks(query: query, limit: 10)
+        for strictTier in [true, false] {
+            for hit in hits {
+                if Task.isCancelled { return nil }
+                guard hit.videoID != excludingVideoID else { continue }
+                guard !hasDisallowedNoiseTokens(targetTitle: targetTitle, candidateTitle: hit.title) else { continue }
+                let overlap = titleTokenOverlap(targetTitle, hit.title)
+                guard matchesDurationOrStudioAudio(
+                    candidateDuration: hit.durationSeconds,
+                    targetDuration: targetDuration,
+                    overlap: overlap,
+                    strictTier: strictTier
+                ) else {
+                    continue
+                }
+                guard let altURL = URL(string: "https://www.youtube.com/watch?v=\(hit.videoID)") else { continue }
 
-            let android = await fetchInnerTube(
-                videoID: hit.videoID,
-                sourcePageURL: altURL,
-                clientName: "ANDROID",
-                clientHeaderID: "3",
-                clientVersion: androidClientVersion,
-                userAgent: androidClientUserAgent,
-                extraClientFields: ["osName": "Android", "osVersion": "14", "androidSdkVersion": 34],
-                visitorData: nil,
-                cookiesHeader: nil
-            )
-            if let streams = android?.streams, !streams.isEmpty {
-                let reachable = await filterReachableStreams(streams)
+                let android = await fetchInnerTube(
+                    videoID: hit.videoID,
+                    sourcePageURL: altURL,
+                    clientName: "ANDROID",
+                    clientHeaderID: "3",
+                    clientVersion: androidClientVersion,
+                    userAgent: androidClientUserAgent,
+                    extraClientFields: ["osName": "Android", "osVersion": "14", "androidSdkVersion": 34],
+                    visitorData: nil,
+                    cookiesHeader: nil
+                )
+                guard let android else { continue }
+                let realOverlap = max(overlap, titleTokenOverlap(targetTitle, android.title))
+                guard !hasDisallowedNoiseTokens(targetTitle: targetTitle, candidateTitle: android.title),
+                      matchesDurationOrStudioAudio(
+                          candidateDuration: android.durationSeconds ?? hit.durationSeconds,
+                          targetDuration: targetDuration,
+                          overlap: realOverlap,
+                          strictTier: strictTier
+                      ),
+                      !android.streams.isEmpty else {
+                    continue
+                }
+                let reachable = await filterReachableStreams(android.streams)
                 if !reachable.isEmpty {
                     return YouTubeResolvedResult(
                         videoID: hit.videoID,
-                        title: hit.title,
-                        author: android?.author ?? hit.artist,
-                        durationSeconds: android?.durationSeconds ?? hit.durationSeconds,
+                        title: android.title != "YouTube Video" ? android.title : hit.title,
+                        author: android.author ?? hit.artist,
+                        durationSeconds: android.durationSeconds ?? hit.durationSeconds,
                         streams: reachable,
                         errorReason: nil
                     )
@@ -1414,15 +1486,20 @@ enum YouTubeStreamResolver {
                   let fullURL = URL(string: "https://soundcloud.com\(path)") else {
                 continue
             }
-            let slugOverlap = titleTokenOverlap(targetTitle, parts[1].replacingOccurrences(of: "-", with: " "))
+            let slugText = parts[1].replacingOccurrences(of: "-", with: " ")
+            if hasDisallowedNoiseTokens(targetTitle: targetTitle, candidateTitle: slugText) {
+                continue
+            }
+            let slugOverlap = titleTokenOverlap(targetTitle, slugText)
             candidateURLs.append((fullURL, slugOverlap))
         }
         candidateURLs.sort { $0.slugScore > $1.slugScore }
 
-        for entry in candidateURLs.prefix(4) {
+        var fetchedTracks: [(entry: (url: URL, slugScore: Double), html: String, fullDur: Double?, pageTitle: String, overlap: Double)] = []
+        for entry in candidateURLs.prefix(8) {
             if Task.isCancelled { return nil }
             var tReq = URLRequest(url: entry.url)
-            tReq.timeoutInterval = 5.0
+            tReq.timeoutInterval = 4.5
             tReq.setValue(desktopBrowserUserAgent, forHTTPHeaderField: "User-Agent")
             guard let (tData, tResp) = try? await URLSession.shared.data(for: tReq),
                   let tHTTP = tResp as? HTTPURLResponse,
@@ -1430,8 +1507,9 @@ enum YouTubeStreamResolver {
                   let html = String(data: tData, encoding: .utf8) else {
                 continue
             }
+            // Skip 30-second Go+ SNIP preview snippets so we never cache a truncated clip.
+            if html.contains("\"policy\":\"SNIP\"") { continue }
 
-            // Extract track duration & title to guard strictly against wrong clips.
             var trackDur: Double?
             if let dRange = html.range(of: #""full_duration"\s*:\s*(\d+)"#, options: .regularExpression) {
                 let digits = html[dRange].components(separatedBy: CharacterSet.decimalDigits.inverted).joined()
@@ -1439,10 +1517,12 @@ enum YouTubeStreamResolver {
                     trackDur = ms / 1000.0
                 }
             }
-            if let targetDuration, targetDuration > 15 {
-                guard let td = trackDur, td > 15 else { continue }
-                let tol = max(6.0, targetDuration * 0.04)
-                guard abs(td - targetDuration) <= tol else { continue }
+            if let fullD = trackDur,
+               let actualRange = html.range(of: #""duration"\s*:\s*(\d+)"#, options: .regularExpression) {
+                let digits = html[actualRange].components(separatedBy: CharacterSet.decimalDigits.inverted).joined()
+                if let ms = Double(digits), ms > 0, abs((ms / 1000.0) - fullD) > 5.0 {
+                    continue
+                }
             }
 
             var pageTitle = ""
@@ -1456,10 +1536,30 @@ enum YouTubeStreamResolver {
                     .replacingOccurrences(of: "&#x27;", with: "'")
                     .replacingOccurrences(of: "&quot;", with: "\"")
             }
+            guard !hasDisallowedNoiseTokens(targetTitle: targetTitle, candidateTitle: pageTitle) else {
+                continue
+            }
             let overlap = max(entry.slugScore, titleTokenOverlap(targetTitle, pageTitle))
             guard overlap >= 0.50 || targetTokens.isSubset(of: Set(normalizedWordTokens(pageTitle))) else {
                 continue
             }
+            fetchedTracks.append((entry, html, trackDur, pageTitle, overlap))
+        }
+
+        for strictTier in [true, false] {
+            for item in fetchedTracks {
+                if Task.isCancelled { return nil }
+                let html = item.html
+                guard matchesDurationOrStudioAudio(
+                    candidateDuration: item.fullDur,
+                    targetDuration: targetDuration,
+                    overlap: item.overlap,
+                    strictTier: strictTier
+                ) else {
+                    continue
+                }
+                let entry = item.entry
+                let trackDur = item.fullDur
 
             var trackAuth = ""
             if let taRange = html.range(of: #""track_authorization"\s*:\s*"([^"]+)""#, options: .regularExpression) {
@@ -1526,6 +1626,7 @@ enum YouTubeStreamResolver {
                     isActivelyPlaying: true
                 )
                 return [candidate]
+            }
             }
         }
         return nil

@@ -210,10 +210,10 @@ final class BrowserYouTubeResolver: NSObject, WKNavigationDelegate, WKScriptMess
                     if Date() >= deadline { break }
                     await self?.pollPlayerResponseFromDOM()
                     if self?.activeResolveContinuation == nil { return }
-                    // If DOM confirmed a hard login/ID gate with zero playable streams after >= 3.25s, stop waiting early.
+                    // If DOM confirmed a hard login/ID gate with zero playable streams after >= 2.25s, stop waiting early.
                     if let self,
-                       stepIdx >= 12,
-                       self.domAuthGateConfirmCount >= 3,
+                       stepIdx >= 8,
+                       self.domAuthGateConfirmCount >= 2,
                        self.fallbackStreamURLs.isEmpty,
                        (self.pendingJSONResult?.streams.isEmpty ?? true) {
                         break
@@ -565,15 +565,15 @@ final class BrowserYouTubeResolver: NSObject, WKNavigationDelegate, WKScriptMess
         (function() {
             try {
                 // 1. Auto-confirm viewer-discretion / content-warning / consent dialogs ("I understand and wish to proceed"),
-                //    strictly skipping account "Sign in" prompts so auth flows are never clicked accidentally.
+                //    strictly skipping account "Sign in" or identity verification prompts so auth flows are never clicked.
                 var proceedRe = /understand|wish to proceed|proceed|confirm your age|continue watching|accept all|i agree/i;
-                var errScopes = document.querySelectorAll('ytm-player-error-message-renderer, #player-error-message-renderer, yt-player-error-message-renderer, .ytp-error-content-wrap, .ytm-player-error-message-renderer, tp-yt-paper-dialog, ytd-player-error-message-renderer');
+                var errScopes = document.querySelectorAll('ytm-player-error-message-renderer, #player-error-message-renderer, yt-player-error-message-renderer, .ytp-error-content-wrap, .ytm-player-error-message-renderer, ytm-confirm-dialog-renderer, yt-confirm-dialog-renderer, .yt-spec-dialog-layout, #player-container-id, tp-yt-paper-dialog, ytd-player-error-message-renderer');
                 for (var s = 0; s < errScopes.length; s++) {
                     var btns = errScopes[s].querySelectorAll('button, [role="button"], a');
                     for (var b = 0; b < btns.length; b++) {
                         var btn = btns[b];
                         var btxt = ((btn.innerText || btn.textContent || btn.getAttribute('aria-label') || '') + '').trim();
-                        if (btxt && proceedRe.test(btxt) && !/sign\\s*in|log\\s*in/i.test(btxt)) {
+                        if (btxt && proceedRe.test(btxt) && !/sign\\s*in|log\\s*in|create\\s*account|switch\\s*account|verify\\s*your\\s*identity/i.test(btxt)) {
                             try { btn.click(); } catch (err) {}
                         }
                     }

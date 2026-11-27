@@ -1610,7 +1610,7 @@ enum PlaylistURLImporter {
         var req = URLRequest(url: searchURL)
         req.httpMethod = "POST"
         req.httpBody = bodyData
-        req.timeoutInterval = 15
+        req.timeoutInterval = 7
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36", forHTTPHeaderField: "User-Agent")
         req.setValue("https://www.youtube.com", forHTTPHeaderField: "Origin")
@@ -1618,50 +1618,48 @@ enum PlaylistURLImporter {
         req.setValue("1", forHTTPHeaderField: "X-YouTube-Client-Name")
         req.setValue(webClientVersion, forHTTPHeaderField: "X-YouTube-Client-Version")
 
-        guard let (data, resp) = try? await URLSession.shared.data(for: req),
-              let http = resp as? HTTPURLResponse,
-              (200...299).contains(http.statusCode),
-              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return []
-        }
-
         var results: [(videoID: String, title: String, artist: String, durationSeconds: Double?)] = []
         var seen = Set<String>()
 
-        func walk(_ node: Any, depth: Int) {
-            guard depth < 22, results.count < limit else { return }
-            if let arr = node as? [Any] {
-                for item in arr { walk(item, depth: depth + 1) }
-                return
-            }
-            guard let dict = node as? [String: Any] else { return }
-            if let vr = dict["videoRenderer"] as? [String: Any],
-               let vid = vr["videoId"] as? String,
-               !vid.isEmpty,
-               let rawTitle = ytText(vr["title"]),
-               seen.insert(vid).inserted {
-                let owner = (ytText(vr["ownerText"]) ?? ytText(vr["longBylineText"]) ?? "")
-                    .replacingOccurrences(of: " - Topic", with: "")
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                let durSec = parseDurationSeconds(ytText(vr["lengthText"]) ?? "").map { Double($0) }
-                results.append((vid, cleanTitle(rawTitle), owner, durSec))
-                return
-            }
-            for (_, val) in dict {
-                if val is [String: Any] || val is [Any] {
-                    walk(val, depth: depth + 1)
+        if let (data, resp) = try? await URLSession.shared.data(for: req),
+           let http = resp as? HTTPURLResponse,
+           (200...299).contains(http.statusCode),
+           let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            func walk(_ node: Any, depth: Int) {
+                guard depth < 22, results.count < limit else { return }
+                if let arr = node as? [Any] {
+                    for item in arr { walk(item, depth: depth + 1) }
+                    return
+                }
+                guard let dict = node as? [String: Any] else { return }
+                if let vr = dict["videoRenderer"] as? [String: Any],
+                   let vid = vr["videoId"] as? String,
+                   !vid.isEmpty,
+                   let rawTitle = ytText(vr["title"]),
+                   seen.insert(vid).inserted {
+                    let owner = (ytText(vr["ownerText"]) ?? ytText(vr["longBylineText"]) ?? "")
+                        .replacingOccurrences(of: " - Topic", with: "")
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    let durSec = parseDurationSeconds(ytText(vr["lengthText"]) ?? "").map { Double($0) }
+                    results.append((vid, cleanTitle(rawTitle), owner, durSec))
+                    return
+                }
+                for (_, val) in dict {
+                    if val is [String: Any] || val is [Any] {
+                        walk(val, depth: depth + 1)
+                    }
                 }
             }
+            walk(root, depth: 0)
         }
 
-        walk(root, depth: 0)
-        if !results.isEmpty {
+        if results.count >= min(limit, 5) {
             return results
         }
 
-        // Fallback to YouTube Music WEB_REMIX search when main WEB search returns empty (e.g. restricted/explicit queries).
+        // Also query YouTube Music WEB_REMIX when WEB returns few or zero results (explicit/restricted queries).
         guard let remixURL = URL(string: "https://music.youtube.com/youtubei/v1/search?prettyPrint=false") else {
-            return []
+            return results
         }
         let remixBody: [String: Any] = [
             "context": [
@@ -1674,11 +1672,11 @@ enum PlaylistURLImporter {
             ],
             "query": trimmed
         ]
-        guard let remixData = try? JSONSerialization.data(withJSONObject: remixBody) else { return [] }
+        guard let remixData = try? JSONSerialization.data(withJSONObject: remixBody) else { return results }
         var remixReq = URLRequest(url: remixURL)
         remixReq.httpMethod = "POST"
         remixReq.httpBody = remixData
-        remixReq.timeoutInterval = 12
+        remixReq.timeoutInterval = 7
         remixReq.setValue("application/json", forHTTPHeaderField: "Content-Type")
         remixReq.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36", forHTTPHeaderField: "User-Agent")
         remixReq.setValue("https://music.youtube.com", forHTTPHeaderField: "Origin")
@@ -1689,7 +1687,7 @@ enum PlaylistURLImporter {
               let rHTTP = rResp as? HTTPURLResponse,
               (200...299).contains(rHTTP.statusCode),
               let rRoot = try? JSONSerialization.jsonObject(with: rData) as? [String: Any] else {
-            return []
+            return results
         }
 
         func walkRemix(_ node: Any, depth: Int) {

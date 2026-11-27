@@ -1581,7 +1581,7 @@ struct BrowserTabView: View {
                 }
             }
             .onChange(of: downloader.activeDownloads.isEmpty) { _, isEmpty in
-                if isEmpty && !isResolvingYouTubeCache && awaitingAIAutoPlayItem == nil && cachingOverlayTitle != nil {
+                if isEmpty && !isResolvingYouTubeCache && !downloader.isResolvingFallback && awaitingAIAutoPlayItem == nil && cachingOverlayTitle != nil {
                     cachingOverlayTitle = nil
                     awaitingAutoOpenPlayer = false
                 }
@@ -2645,7 +2645,7 @@ struct BrowserTabView: View {
         }
 
         // If already downloading or actively resolving this exact clicked video, keep the overlay active.
-        if activeCacheVideoID == videoID && !downloader.activeDownloads.isEmpty {
+        if activeCacheVideoID == videoID && (!downloader.activeDownloads.isEmpty || downloader.isResolvingFallback) {
             isResolvingYouTubeCache = false
             awaitingAutoOpenPlayer = true
             if cachingOverlayTitle == nil {
@@ -2682,7 +2682,7 @@ struct BrowserTabView: View {
         cachingOverlayTitle = hintTitle ?? (browser.pageTitle.isEmpty ? "Loading Video..." : browser.pageTitle)
 
         let watchdogTask = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 38_000_000_000)
+            try? await Task.sleep(nanoseconds: 65_000_000_000)
             guard !Task.isCancelled, activeYouTubeResolveToken == resolveToken else { return }
             activeYouTubeResolveTask?.cancel()
             activeYouTubeResolveTask = nil
@@ -2727,7 +2727,12 @@ struct BrowserTabView: View {
                 }
             }
 
-            let cachedCookies = BrowserYouTubeResolver.cachedYouTubeCookieHeader()
+            let cachedCookies: String?
+            if let memCookies = BrowserYouTubeResolver.cachedYouTubeCookieHeader(), !memCookies.isEmpty {
+                cachedCookies = memCookies
+            } else {
+                cachedCookies = await BrowserYouTubeResolver.youtubeCookieHeader(forceRefresh: true, timeoutSeconds: 0.4)
+            }
             var resolved = await YouTubeStreamResolver.resolveStreams(
                 for: url,
                 cookiesHeader: cachedCookies,
@@ -2739,7 +2744,10 @@ struct BrowserTabView: View {
                activeYouTubeResolveToken == resolveToken,
                (resolved == nil || resolved?.streams.isEmpty == true) {
                 let hasSignedCookies = await BrowserYouTubeResolver.hasSignedInYouTubeCookies(timeoutSeconds: 0.4)
-                let skipBrowserLoginWall = !hasSignedCookies && YouTubeStreamResolver.isLoginOrAgeGateReason(resolved?.errorReason)
+                let skipBrowserLoginWall = !hasSignedCookies && (
+                    YouTubeStreamResolver.isLoginOrAgeGateReason(resolved?.errorReason) ||
+                    YouTubeStreamResolver.isAgeOrLoginRestrictedReason(resolved?.errorReason)
+                )
                 if !skipBrowserLoginWall {
                     resolvingStepLabel = "Trying in-app resolver..."
                     if let browserResolved = await BrowserYouTubeResolver.shared.resolveStreamsInBrowser(
@@ -2941,9 +2949,10 @@ struct BrowserTabView: View {
             downloader.cacheMediaStream(
                 primary,
                 fallbackStreams: Array(ordered.dropFirst()),
-                maxDurationMinutes: settings.maxCacheDurationMinutes
+                maxDurationMinutes: settings.maxCacheDurationMinutes,
+                youTubeVideoID: videoID
             )
-            if downloader.activeDownloads.isEmpty && awaitingAIAutoPlayItem == nil {
+            if downloader.activeDownloads.isEmpty && !downloader.isResolvingFallback && awaitingAIAutoPlayItem == nil {
                 cachingOverlayTitle = nil
                 awaitingAutoOpenPlayer = false
                 activeCacheVideoID = nil
