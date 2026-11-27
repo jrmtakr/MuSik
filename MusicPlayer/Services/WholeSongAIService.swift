@@ -398,44 +398,42 @@ final class WholeSongAIService {
         var finalResolvedLyrics: ResolvedTrackLyrics?
 
         if isConfidentMatch {
-            if let official = await SyncedLyricsService.shared.fetchOfficialLyricsCandidate(
-                cacheKey: targetKey,
-                song: decidedTitle,
-                artist: cleanFinalArtist,
-                duration: totalSec
-            ) {
-                let officialPlain = official.lines
-                    .filter { !$0.isInstrumentalBreak }
-                    .map(\.text)
-                    .joined(separator: " ")
-                let overlapsHeard = allWords.count < 8 ||
-                    fullTranscript.isEmpty ||
-                    TrackVerificationService.lyricsOverlapTranscript(officialPlain, transcript: fullTranscript)
+            let langCtx = SongAudioListener.detectLanguageContext(
+                title: decidedTitle,
+                artist: cleanFinalArtist.isEmpty ? nil : cleanFinalArtist
+            )
+            let isNonEnglishTrack = langCtx.isNonEnglish || {
+                guard let lang = summary.detectedLanguage?.lowercased(), !lang.isEmpty else { return false }
+                return !lang.hasPrefix("en")
+            }()
+            let englishASROnForeignTrack = isNonEnglishTrack
+                && (summary.detectedLanguage?.lowercased().hasPrefix("en") ?? false)
 
-                if !official.lines.isEmpty && overlapsHeard {
-                    finalResolvedLyrics = await SongAudioListener.autoAlign(
-                        lyrics: official,
-                        heard: heardWordsForAlign.isEmpty ? nil : heardWordsForAlign,
-                        fileURL: refreshedItem.fileURL
-                    )
-                } else if !aiGeneratedLines.isEmpty {
-                    finalResolvedLyrics = ResolvedTrackLyrics(
-                        cacheKey: targetKey,
-                        trackTitle: decidedTitle,
-                        artistName: cleanFinalArtist,
-                        isTimeSynced: true,
-                        sourceLabel: "Full-Song Lyrics",
-                        attributionText: "Listened to full song • Auto-Matched",
-                        syncedOffsetSeconds: 0,
-                        lines: aiGeneratedLines
-                    )
-                } else if overlapsHeard {
-                    finalResolvedLyrics = await SongAudioListener.autoAlign(
-                        lyrics: official,
-                        heard: heardWordsForAlign.isEmpty ? nil : heardWordsForAlign,
-                        fileURL: refreshedItem.fileURL
-                    )
-                }
+            if let verified = await SyncedLyricsService.shared.fetchVerifiedLyricsCandidate(
+                item: refreshedItem,
+                title: decidedTitle,
+                artist: cleanFinalArtist,
+                duration: totalSec,
+                heard: heardWordsForAlign.isEmpty ? nil : heardWordsForAlign,
+                isNonEnglish: isNonEnglishTrack,
+                englishASROnForeignTrack: englishASROnForeignTrack
+            ) {
+                finalResolvedLyrics = await SongAudioListener.autoAlign(
+                    lyrics: verified.lyrics,
+                    heard: heardWordsForAlign.isEmpty ? nil : heardWordsForAlign,
+                    fileURL: refreshedItem.fileURL
+                )
+            } else if !aiGeneratedLines.isEmpty {
+                finalResolvedLyrics = ResolvedTrackLyrics(
+                    cacheKey: targetKey,
+                    trackTitle: decidedTitle,
+                    artistName: cleanFinalArtist,
+                    isTimeSynced: true,
+                    sourceLabel: "Full-Song Lyrics",
+                    attributionText: "Listened to full song • Auto-Matched",
+                    syncedOffsetSeconds: 0,
+                    lines: aiGeneratedLines
+                )
             }
         }
 

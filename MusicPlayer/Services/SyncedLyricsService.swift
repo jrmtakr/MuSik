@@ -140,7 +140,7 @@ struct AIRecognizedTrackInfo: Equatable, Sendable {
 @Observable
 final class SyncedLyricsService {
     static let shared = SyncedLyricsService()
-    nonisolated static let currentAlignmentVersion = 7
+    nonisolated static let currentAlignmentVersion = 8
 
     var currentLyrics: ResolvedTrackLyrics?
     var currentLoadingKey: String?
@@ -430,6 +430,34 @@ final class SyncedLyricsService {
             currentLyrics = normalized
             lastError = nil
         }
+    }
+
+    /// Collects candidates from all lyrics sources and picks the version-verified match for this audio.
+    func fetchVerifiedLyricsCandidate(
+        item: MediaItem,
+        title: String,
+        artist: String,
+        duration: Double?,
+        heard: [HeardWord]?,
+        isNonEnglish: Bool = false,
+        englishASROnForeignTrack: Bool = false
+    ) async -> (lyrics: ResolvedTrackLyrics, confirmedByAudio: Bool)? {
+        let candidates = await prefetchCandidatesForImport(
+            item: item,
+            title: title,
+            artist: artist,
+            duration: duration
+        )
+        guard !candidates.isEmpty else { return nil }
+        return selectVerifiedCandidateWithConfidence(
+            from: candidates,
+            targetTitle: title,
+            targetArtist: artist,
+            targetDuration: duration,
+            heard: heard,
+            isNonEnglish: isNonEnglish,
+            englishASROnForeignTrack: englishASROnForeignTrack
+        )
     }
 
     func fetchOfficialLyricsCandidate(

@@ -23,8 +23,9 @@ actor WhisperTranscriptionEngine {
         let durationSeconds: Double
     }
 
-    private static let variantName = "openai_whisper-base"
-    private static let savedFolderDefaultsKey = "musejrm.whisper.modelFolder.v1"
+    private static let primaryVariantName = "openai_whisper-small"
+    private static let fallbackVariantName = "openai_whisper-base"
+    private static let savedFolderDefaultsKey = "musejrm.whisper.modelFolder.v2"
 
     private var whisperKit: WhisperKit?
     private var initTask: Task<WhisperKit?, Never>?
@@ -217,9 +218,9 @@ actor WhisperTranscriptionEngine {
         }
 
         let task = Task<WhisperKit?, Never> {
-            let config: WhisperKitConfig
+            var loadedKit: WhisperKit?
             if let cachedPath {
-                config = WhisperKitConfig(
+                let cachedConfig = WhisperKitConfig(
                     modelFolder: cachedPath,
                     verbose: false,
                     logLevel: .none,
@@ -227,9 +228,14 @@ actor WhisperTranscriptionEngine {
                     load: true,
                     download: false
                 )
-            } else {
-                config = WhisperKitConfig(
-                    model: Self.variantName,
+                loadedKit = try? await WhisperKit(cachedConfig)
+                if loadedKit == nil {
+                    UserDefaults.standard.removeObject(forKey: Self.savedFolderDefaultsKey)
+                }
+            }
+            if loadedKit == nil, allowDownload {
+                let primaryConfig = WhisperKitConfig(
+                    model: Self.primaryVariantName,
                     downloadBase: Self.modelsBaseURL,
                     verbose: false,
                     logLevel: .none,
@@ -237,8 +243,21 @@ actor WhisperTranscriptionEngine {
                     load: true,
                     download: true
                 )
+                loadedKit = try? await WhisperKit(primaryConfig)
+                if loadedKit == nil {
+                    let fallbackConfig = WhisperKitConfig(
+                        model: Self.fallbackVariantName,
+                        downloadBase: Self.modelsBaseURL,
+                        verbose: false,
+                        logLevel: .none,
+                        prewarm: false,
+                        load: true,
+                        download: true
+                    )
+                    loadedKit = try? await WhisperKit(fallbackConfig)
+                }
             }
-            guard let kit = try? await WhisperKit(config) else {
+            guard let kit = loadedKit else {
                 return nil
             }
             if let folderPath = kit.modelFolder?.path, !folderPath.isEmpty {

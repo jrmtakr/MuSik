@@ -171,7 +171,7 @@ enum SongAudioListener {
         if let summary = await WhisperTranscriptionEngine.shared.transcribeWholeFileSummary(
             fileURL: fileURL,
             maxSeconds: maxSeconds,
-            allowDownload: false,
+            allowDownload: true,
             languageHint: effectiveHint,
             onProgress: onProgress
         ) {
@@ -893,6 +893,7 @@ enum SongAudioListener {
         } else {
             working = alignPlainLyricsIntoRealTimeSync(lyrics: working, heard: heard, curve: curve)
         }
+        working = reconcileLyricsWithAudio(in: working, heard: heard, curve: curve)
         working = withRealTimeWordTimings(in: working, heard: heard, curve: curve)
         working = insertSpokenDialogueAndBreaks(in: working, heard: heard, curve: curve)
         working.alignmentVersion = SyncedLyricsService.currentAlignmentVersion
@@ -1270,24 +1271,19 @@ enum SongAudioListener {
         )
     }
 
-    /// Generates time-synced lyrics directly from the whole-song AI Speech transcription when
-    /// an unreleased or local song does not exist in any online lyrics database.
-    static func buildSyncedLyricsFromHeard(
-        _ heard: [HeardWord],
-        trackTitle: String,
-        artistName: String,
-        cacheKey: String,
-        duration: Double?
-    ) -> ResolvedTrackLyrics? {
-        let words = heard
-            .filter { !$0.token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-            .sorted { $0.time < $1.time }
-        guard words.count >= 4 else { return nil }
-
-        let totalDur = max(duration ?? 0, (words.last?.time ?? 0) + 4.0)
+    /// Builds synced lyric lines with word-level timings from a sorted slice of transcribed words.
+    private static func buildSyncedLines(
+        from sortedWords: [HeardWord],
+        totalDuration: Double,
+        includeLeadingBreak: Bool,
+        includeGapBreaks: Bool,
+        maxEndTime: Double? = nil
+    ) -> [SyncedLyricLine] {
+        guard !sortedWords.isEmpty else { return [] }
+        let capEnd = maxEndTime ?? totalDuration
         var groups: [[HeardWord]] = []
         var cur: [HeardWord] = []
-        for w in words {
+        for w in sortedWords {
             if let prev = cur.last {
                 let gap = w.time - prev.time
                 if gap >= 0.95 || cur.count >= 8 {
@@ -1303,7 +1299,7 @@ enum SongAudioListener {
         if !cur.isEmpty { groups.append(cur) }
 
         var lines: [SyncedLyricLine] = []
-        if let firstTime = groups.first?.first?.time, firstTime > 5.5 {
+        if includeLeadingBreak, let firstTime = groups.first?.first?.time, firstTime > 5.5 {
             lines.append(SyncedLyricLine(
                 startTime: 0.4,
                 endTime: max(1.0, firstTime - 0.35),
@@ -1319,9 +1315,9 @@ enum SongAudioListener {
                 if idx + 1 < groups.count, let nf = groups[idx + 1].first {
                     return nf.time
                 }
-                return min(totalDur, last.time + 2.5)
+                return min(capEnd, last.time + 2.5)
             }()
-            let lineEnd = min(totalDur, max(first.time + 0.35, min(last.time + 0.45, nextStart - 0.08)))
+            let lineEnd = min(capEnd, max(first.time + 0.35, min(last.time + 0.45, nextStart - 0.08)))
             let wordTimings = group.enumerated().map { wIdx, w in
                 let wNext = (wIdx + 1 < group.count) ? group[wIdx + 1].time : lineEnd
                 let wEnd = max(w.time + 0.08, min(lineEnd, wNext))
@@ -1336,7 +1332,7 @@ enum SongAudioListener {
                 hasNativeWordTimings: true
             ))
             let gap = nextStart - lineEnd
-            if idx + 1 < groups.count && gap >= 7.0 {
+            if includeGapBreaks && idx + 1 < groups.count && gap >= 7.0 {
                 lines.append(SyncedLyricLine(
                     startTime: lineEnd + 0.35,
                     endTime: max(lineEnd + 1.0, nextStart - 0.35),
@@ -1346,6 +1342,385 @@ enum SongAudioListener {
                 ))
             }
         }
+        return lines
+    }
+
+    /// Reconciles online synced lines against actual heard vocals and the harmonic singing envelope
+    /// so phantom alternate-version intros/ad-libs are removed, swapped verses are replaced with
+    /// what this audio actually sings, and unambiguous censored masks reflect heard vocals.
+    private static func reconcileLyricsWithAudio(
+        in lyrics: ResolvedTrackLyrics,
+        heard: [HeardWord]?,
+        curve: VocalEnvelope?
+    ) -> ResolvedTrackLyrics {
+        guard lyrics.isTimeSynced, !lyrics.lines.isEmpty else { return lyrics }
+
+        let sortedHeard = (heard ?? [])
+            .filter { !$0.token.isEmpty }
+            .sorted { $0.time < $1.time }
+        guard !sortedHeard.isEmpty || curve != nil else { return lyrics }
+
+        func tokensMatch(_ a: String, _ b: String) -> Bool {
+            if a == b { return true }
+            if a.count >= 4 && b.count >= 4 && a.prefix(4) == b.prefix(4) { return true }
+            return false
+        }
+
+        func heardSlice(from start: Double, to end: Double) -> [HeardWord] {
+            sortedHeard.filter { $0.time >= start && $0.time <= end }
+        }
+
+        func isQuietInCurve(from start: Double, to end: Double) -> Bool {
+            guard let curve else { return false }
+            let env = curve.singingEnvelope.isEmpty ? curve.envelope : curve.singingEnvelope
+            guard !env.isEmpty else { return false }
+            let dt = curve.frameDurationSeconds
+            let i0 = max(0, min(env.count - 1, Int(floor(max(0, start) / dt))))
+            let i1 = max(i0 + 1, min(env.count, Int(ceil(max(start + 0.3, end) / dt))))
+            guard i1 > i0 else { return false }
+            let slice = env[i0..<i1]
+            let mean = slice.reduce(0, +) / Double(slice.count)
+            let activeCount = slice.filter { $0 > 0.08 }.count
+            let activeFrac = Double(activeCount) / Double(slice.count)
+            let peak = slice.max() ?? -1.0
+            return mean <= -0.03 && activeFrac < 0.22 && peak < 0.28
+        }
+
+        func hasCoOccurringPhraseAnywhere(_ contentTokens: [String], windowSeconds: Double = 6.0) -> Bool {
+            guard !contentTokens.isEmpty, !sortedHeard.isEmpty else { return false }
+            let uniqueTargets = Array(Set(contentTokens))
+            let needed = uniqueTargets.count <= 1 ? 1 : min(uniqueTargets.count, 2)
+            for idx in 0..<sortedHeard.count {
+                let winEnd = sortedHeard[idx].time + windowSeconds
+                var matchedTargets = 0
+                for target in uniqueTargets {
+                    var j = idx
+                    var hit = false
+                    while j < sortedHeard.count && sortedHeard[j].time <= winEnd {
+                        if tokensMatch(target, sortedHeard[j].token) {
+                            hit = true
+                            break
+                        }
+                        j += 1
+                    }
+                    if hit { matchedTargets += 1 }
+                }
+                if matchedTargets >= needed { return true }
+            }
+            return false
+        }
+
+        // Guard against English ASR mis-transcribing non-English tracks.
+        let nonBreakTexts = lyrics.lines.filter { !$0.isInstrumentalBreak }.map(\.text)
+        let joinedLyrics = nonBreakTexts.joined(separator: " ")
+        let hasNonLatin = joinedLyrics.unicodeScalars.contains { scalar in
+            (0x0400...0x04FF).contains(scalar.value) ||
+            (0x0600...0x06FF).contains(scalar.value) ||
+            (0x0900...0x097F).contains(scalar.value) ||
+            (0x3040...0x30FF).contains(scalar.value) ||
+            (0x4E00...0x9FFF).contains(scalar.value) ||
+            (0xAC00...0xD7AF).contains(scalar.value)
+        }
+        let foreignStopWords: Set<String> = [
+            "que", "para", "como", "pero", "donde", "amor", "corazon", "por", "con", "una", "las", "los",
+            "dans", "pour", "avec", "nous", "vous", "est", "pas", "une", "ich", "und", "der", "die", "das", "nicht",
+            "che", "non", "per", "sono"
+        ]
+        let lyricTokensAll = tokens(joinedLyrics)
+        let foreignStopHits = lyricTokensAll.filter { foreignStopWords.contains($0) }.count
+        let isForeignLyrics = hasNonLatin || foreignStopHits >= 6 || detectLanguageContext(
+            title: lyrics.trackTitle,
+            artist: lyrics.artistName.isEmpty ? nil : lyrics.artistName
+        ).isNonEnglish
+        let heardVocab = Set(sortedHeard.map(\.token))
+        let meaningfulLyricToks = lyricTokensAll.filter { $0.count >= 3 && !stopWords.contains($0) }
+        let globalLyricOverlap: Double = {
+            guard !meaningfulLyricToks.isEmpty else { return 0 }
+            let hits = meaningfulLyricToks.filter { lt in
+                heardVocab.contains(where: { tokensMatch(lt, $0) })
+            }.count
+            return Double(hits) / Double(meaningfulLyricToks.count)
+        }()
+        let englishASROnForeign = isForeignLyrics && sortedHeard.count >= 15 && globalLyricOverlap < 0.12
+        let canUseWordReconciliation = !englishASROnForeign && sortedHeard.count >= 12
+
+        // Pass 1: Clean phantom parentheticals, drop strictly silent phantom intro/outro/parenthetical lines,
+        // and restore unambiguous asterisk-censored words that were actually spoken/sung cleanly.
+        let parenRegex = try? NSRegularExpression(pattern: #"\(([^()]+)\)"#)
+        let maskRegex = try? NSRegularExpression(pattern: #"\b([A-Za-z]{1,2}\*{1,}[A-Za-z]*)(?![A-Za-z0-9*])"#)
+
+        var pass1Lines: [SyncedLyricLine] = []
+        for idx in 0..<lyrics.lines.count {
+            var line = lyrics.lines[idx]
+            if line.isInstrumentalBreak {
+                pass1Lines.append(line)
+                continue
+            }
+
+            let winStart = line.startTime - 2.5
+            let winEnd = max(line.endTime, line.startTime + 2.0) + 3.5
+            let localHeard = heardSlice(from: winStart, to: winEnd)
+            let quietHere = isQuietInCurve(from: line.startTime, to: max(line.startTime + 0.8, line.endTime))
+
+            // Strip any parenthetical ad-lib / sample `( ... )` absent locally and across the track.
+            var textAfterParens = line.text
+            if let parenRegex {
+                let ns = textAfterParens as NSString
+                let matches = parenRegex.matches(in: textAfterParens, range: NSRange(location: 0, length: ns.length))
+                if !matches.isEmpty {
+                    let mutable = NSMutableString(string: textAfterParens)
+                    for match in matches.reversed() {
+                        guard match.numberOfRanges >= 2 else { continue }
+                        let inner = ns.substring(with: match.range(at: 1))
+                        let pToks = tokens(inner)
+                        let pContent = pToks.filter { $0.count >= 3 && !stopWords.contains($0) }
+                        let localHits = pContent.filter { pt in
+                            localHeard.contains(where: { tokensMatch(pt, $0.token) })
+                        }.count
+
+                        let fullAfterStripping = mutable
+                            .replacingCharacters(in: match.range, with: "")
+                            .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(.punctuationCharacters))
+                        let isStandaloneParen = fullAfterStripping.isEmpty && matches.count == 1
+
+                        var shouldStrip = false
+                        if !pContent.isEmpty && canUseWordReconciliation {
+                            if localHits == 0 && !hasCoOccurringPhraseAnywhere(pContent) {
+                                shouldStrip = true
+                            } else if localHits == 0 && pContent.count >= 2 && quietHere {
+                                shouldStrip = true
+                            }
+                        } else if isStandaloneParen && localHits == 0 && quietHere {
+                            shouldStrip = true
+                        }
+
+                        if shouldStrip {
+                            mutable.replaceCharacters(in: match.range, with: "")
+                        }
+                    }
+                    textAfterParens = (mutable as String)
+                        .replacingOccurrences(of: #"\s{2,}"#, with: " ", options: .regularExpression)
+                        .replacingOccurrences(of: #"\s+([,.;!?])"#, with: "$1", options: .regularExpression)
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    if textAfterParens.hasPrefix(",") {
+                        textAfterParens = textAfterParens.dropFirst().trimmingCharacters(in: .whitespacesAndNewlines)
+                    }
+                    if textAfterParens.hasSuffix(",") && !line.text.trimmingCharacters(in: .whitespaces).hasSuffix(",") {
+                        textAfterParens = String(textAfterParens.dropLast()).trimmingCharacters(in: .whitespacesAndNewlines)
+                    }
+                }
+            }
+
+            let bareAfterParens = textAfterParens.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(.punctuationCharacters))
+            if bareAfterParens.isEmpty {
+                // Entire line was an unsung phantom parenthetical -> drop it.
+                continue
+            }
+
+            // Drop strictly silent edge intro/outro lines when curve has zero singing AND local heard has 0 hits.
+            let lineToks = tokens(textAfterParens)
+            let lineContent = lineToks.filter { $0.count >= 3 && !stopWords.contains($0) }
+            let localContentHits = lineContent.filter { lt in
+                localHeard.contains(where: { tokensMatch(lt, $0.token) })
+            }.count
+            let isNearStartOrEnd = line.startTime < 20.0 || idx <= 1 || idx >= lyrics.lines.count - 2
+            if quietHere && localContentHits == 0 && isNearStartOrEnd && (!lineContent.isEmpty || (idx == 0 && line.startTime < 12.0)) {
+                continue
+            }
+
+            // Uncensor exact-length masked words (`F***` -> `Fuck`) only when local heard literally sings the word.
+            var finalText = textAfterParens
+            if canUseWordReconciliation, let maskRegex, finalText.contains("*") {
+                let ns = finalText as NSString
+                let maskMatches = maskRegex.matches(in: finalText, range: NSRange(location: 0, length: ns.length))
+                if !maskMatches.isEmpty {
+                    let mutable = NSMutableString(string: finalText)
+                    for match in maskMatches.reversed() {
+                        let rawMask = ns.substring(with: match.range(at: 1))
+                        let lowerMask = rawMask.lowercased()
+                        let maskChars = Array(lowerMask)
+                        guard maskChars.count >= 3 else { continue }
+                        if let matchedHeard = localHeard.first(where: { hw in
+                            let cand = Array(hw.token.lowercased())
+                            guard cand.count == maskChars.count else { return false }
+                            for (mc, cc) in zip(maskChars, cand) where mc != "*" {
+                                if mc != cc { return false }
+                            }
+                            return true
+                        }) {
+                            var restored = matchedHeard.token
+                            if let firstOrig = rawMask.first, firstOrig.isUppercase {
+                                restored = String(restored.prefix(1)).uppercased() + String(restored.dropFirst())
+                            }
+                            mutable.replaceCharacters(in: match.range(at: 1), with: restored)
+                        }
+                    }
+                    finalText = mutable as String
+                }
+            }
+
+            if finalText != line.text {
+                line = SyncedLyricLine(
+                    id: line.id,
+                    startTime: line.startTime,
+                    endTime: line.endTime,
+                    text: finalText,
+                    words: [],
+                    isInstrumentalBreak: false,
+                    hasNativeWordTimings: false,
+                    isSpokenDialogue: line.isSpokenDialogue
+                )
+            }
+            pass1Lines.append(line)
+        }
+
+        // Pass 2: Replace contiguous mismatched alternate-version verse runs (>= 3 lines with zero/minimal overlap)
+        // using what THIS audio actually sings (`sortedHeard`), or mark silent extended runs as instrumental breaks.
+        guard canUseWordReconciliation else {
+            return ResolvedTrackLyrics(
+                cacheKey: lyrics.cacheKey,
+                trackTitle: lyrics.trackTitle,
+                artistName: lyrics.artistName,
+                isTimeSynced: lyrics.isTimeSynced,
+                sourceLabel: lyrics.sourceLabel,
+                attributionText: lyrics.attributionText,
+                syncedOffsetSeconds: lyrics.syncedOffsetSeconds,
+                tempoScale: lyrics.tempoScale,
+                expectedDurationSeconds: lyrics.expectedDurationSeconds,
+                alignmentVersion: lyrics.alignmentVersion,
+                lines: pass1Lines
+            )
+        }
+
+        func isLineLocallyGrounded(_ line: SyncedLyricLine) -> Bool {
+            let lineToks = tokens(line.text)
+            let content = lineToks.filter { $0.count >= 3 && !stopWords.contains($0) }
+            guard !content.isEmpty else { return true }
+            let localHeard = heardSlice(from: line.startTime - 3.0, to: max(line.endTime, line.startTime + 2.0) + 3.0)
+            let hits = content.filter { lt in
+                localHeard.contains(where: { tokensMatch(lt, $0.token) })
+            }.count
+            return hits >= 1 && (Double(hits) / Double(content.count)) >= 0.25
+        }
+
+        var reconciledLines: [SyncedLyricLine] = []
+        var cursor = 0
+        let totalDuration = max(
+            lyrics.expectedDurationSeconds ?? 0,
+            (sortedHeard.last?.time ?? 0) + 4.0
+        )
+
+        while cursor < pass1Lines.count {
+            let line = pass1Lines[cursor]
+            if line.isInstrumentalBreak || isLineLocallyGrounded(line) {
+                reconciledLines.append(line)
+                cursor += 1
+                continue
+            }
+
+            // Collect contiguous ungrounded non-break lines.
+            var runEndIdx = cursor
+            while runEndIdx < pass1Lines.count,
+                  !pass1Lines[runEndIdx].isInstrumentalBreak,
+                  !isLineLocallyGrounded(pass1Lines[runEndIdx]) {
+                runEndIdx += 1
+            }
+            let runCount = runEndIdx - cursor
+            let run = Array(pass1Lines[cursor..<runEndIdx])
+            let meaningfulLineCount = run.filter {
+                tokens($0.text).filter { $0.count >= 3 && !stopWords.contains($0) }.count >= 2
+            }.count
+
+            if runCount >= 3 && meaningfulLineCount >= 2 {
+                let prevBoundEnd = reconciledLines.last?.endTime ?? 0
+                let nextBoundStart = (runEndIdx < pass1Lines.count) ? pass1Lines[runEndIdx].startTime : totalDuration
+                let spanStart = max(prevBoundEnd + 0.02, (run.first?.startTime ?? prevBoundEnd) - 1.5)
+                let spanEnd = min(nextBoundStart - 0.05, max(run.last?.endTime ?? spanStart + 3.0, spanStart + 3.0) + 1.5)
+                let spanHeard = heardSlice(from: spanStart, to: spanEnd)
+                    .filter { $0.time > prevBoundEnd + 0.01 && $0.time < nextBoundStart - 0.1 }
+
+                let runVocab = Set(run.flatMap { tokens($0.text) }.filter { $0.count >= 3 && !stopWords.contains($0) })
+                let spanMeaningful = spanHeard.filter { $0.token.count >= 3 && !stopWords.contains($0.token) }
+                let spanOverlap = spanMeaningful.isEmpty ? 0.0 :
+                    Double(spanMeaningful.filter { sw in runVocab.contains(where: { tokensMatch($0, sw.token) }) }.count) / Double(spanMeaningful.count)
+
+                if spanHeard.count >= 6 && spanOverlap < 0.18 {
+                    let synthesized = buildSyncedLines(
+                        from: spanHeard,
+                        totalDuration: totalDuration,
+                        includeLeadingBreak: false,
+                        includeGapBreaks: true,
+                        maxEndTime: nextBoundStart - 0.05
+                    )
+                    if !synthesized.isEmpty {
+                        reconciledLines.append(contentsOf: synthesized)
+                        cursor = runEndIdx
+                        continue
+                    }
+                } else if spanHeard.count <= 1 && isQuietInCurve(from: spanStart, to: spanEnd) {
+                    if spanEnd - spanStart >= 5.0 {
+                        reconciledLines.append(SyncedLyricLine(
+                            startTime: max(prevBoundEnd + 0.1, run.first?.startTime ?? spanStart),
+                            endTime: max((run.first?.startTime ?? spanStart) + 1.0, min(nextBoundStart - 0.1, run.last?.endTime ?? spanEnd)),
+                            text: "",
+                            words: [],
+                            isInstrumentalBreak: true
+                        ))
+                    }
+                    cursor = runEndIdx
+                    continue
+                }
+            }
+
+            reconciledLines.append(contentsOf: run)
+            cursor = runEndIdx
+        }
+
+        if !reconciledLines.contains(where: { !$0.isInstrumentalBreak }) && sortedHeard.count >= 6 {
+            reconciledLines = buildSyncedLines(
+                from: sortedHeard,
+                totalDuration: totalDuration,
+                includeLeadingBreak: true,
+                includeGapBreaks: true
+            )
+        }
+
+        return ResolvedTrackLyrics(
+            cacheKey: lyrics.cacheKey,
+            trackTitle: lyrics.trackTitle,
+            artistName: lyrics.artistName,
+            isTimeSynced: lyrics.isTimeSynced,
+            sourceLabel: lyrics.sourceLabel,
+            attributionText: lyrics.attributionText,
+            syncedOffsetSeconds: lyrics.syncedOffsetSeconds,
+            tempoScale: lyrics.tempoScale,
+            expectedDurationSeconds: lyrics.expectedDurationSeconds,
+            alignmentVersion: lyrics.alignmentVersion,
+            lines: reconciledLines
+        )
+    }
+
+    /// Generates time-synced lyrics directly from the whole-song AI Speech transcription when
+    /// an unreleased or local song does not exist in any online lyrics database.
+    static func buildSyncedLyricsFromHeard(
+        _ heard: [HeardWord],
+        trackTitle: String,
+        artistName: String,
+        cacheKey: String,
+        duration: Double?
+    ) -> ResolvedTrackLyrics? {
+        let words = heard
+            .filter { !$0.token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            .sorted { $0.time < $1.time }
+        guard words.count >= 4 else { return nil }
+
+        let totalDur = max(duration ?? 0, (words.last?.time ?? 0) + 4.0)
+        let lines = buildSyncedLines(
+            from: words,
+            totalDuration: totalDur,
+            includeLeadingBreak: true,
+            includeGapBreaks: true
+        )
 
         guard !lines.isEmpty else { return nil }
         return ResolvedTrackLyrics(

@@ -123,28 +123,33 @@ enum LiveAudioLyricsAI {
         // 1. Listen across the ENTIRE song or music video (not a single 18s clip that can fail in 1s).
         var fullHeard: [HeardWord] = []
         var heardWords: [SpokenLyricWord] = []
+        var detectedListenLang: String?
 
         if isLocalPlayableFile {
-            if let recognizer, recognizer.isAvailable {
-                await onProgress("Listening to full track...")
-                let listened = await SongAudioListener.listen(to: item.fileURL, maxSeconds: 15 * 60) { chunkIdx, totalChunks, totalSeconds in
-                    Task { @MainActor in
-                        let mins = Int(totalSeconds) / 60
-                        let secs = Int(totalSeconds) % 60
-                        onProgress("Listening across full song (\(chunkIdx)/\(totalChunks) • \(mins):\(String(format: "%02d", secs)))...")
-                    }
+            await onProgress("Listening to full track...")
+            let summary = await SongAudioListener.listenWithSummary(
+                to: item.fileURL,
+                titleHint: item.displayTitle,
+                artistHint: item.artist,
+                maxSeconds: 15 * 60
+            ) { chunkIdx, totalChunks, totalSeconds in
+                Task { @MainActor in
+                    let mins = Int(totalSeconds) / 60
+                    let secs = Int(totalSeconds) % 60
+                    onProgress("Listening across full song (\(chunkIdx)/\(totalChunks) • \(mins):\(String(format: "%02d", secs)))...")
                 }
-                if let listened, !listened.isEmpty {
-                    fullHeard = listened
-                    heardWords = listened.map {
-                        SpokenLyricWord(
-                            rawWord: $0.token,
-                            normalized: normalizeWord($0.token),
-                            songTime: $0.time,
-                            confidence: 1.0
-                        )
-                    }.filter { !$0.normalized.isEmpty }
-                }
+            }
+            detectedListenLang = summary.detectedLanguage
+            if !summary.words.isEmpty {
+                fullHeard = summary.words
+                heardWords = summary.words.map {
+                    SpokenLyricWord(
+                        rawWord: $0.rawText.isEmpty ? $0.token : $0.rawText,
+                        normalized: normalizeWord($0.token),
+                        songTime: $0.time,
+                        confidence: 1.0
+                    )
+                }.filter { !$0.normalized.isEmpty }
             }
 
             // Fallback live tap if file Speech failed while EQ audio happens to be playing
@@ -317,19 +322,58 @@ enum LiveAudioLyricsAI {
             }
         }
 
-        if candidateLyrics == nil || !(candidateLyrics?.isTimeSynced ?? false),
-           let shazam = shazamMatch {
-            let shazamLyrics = await SyncedLyricsService.shared.fetchOfficialLyricsCandidate(
-                cacheKey: cacheKey,
-                song: shazam.title,
+        let langCtxForVerify = SongAudioListener.detectLanguageContext(
+            title: shazamMatch?.title ?? resolvedTitle,
+            artist: (shazamMatch?.artist ?? resolvedArtist).isEmpty ? nil : (shazamMatch?.artist ?? resolvedArtist)
+        )
+        let isNonEnglishVerify = langCtxForVerify.isNonEnglish || {
+            guard let lang = detectedListenLang?.lowercased(), !lang.isEmpty else { return false }
+            return !lang.hasPrefix("en")
+        }()
+        let englishASROnForeignVerify = isNonEnglishVerify
+            && (detectedListenLang?.lowercased().hasPrefix("en") ?? false)
+
+        if let existingCand = candidateLyrics, !fullHeard.isEmpty, !englishASROnForeignVerify {
+            if case .contradicted = SongAudioListener.verdict(heard: fullHeard, lyrics: existingCand) {
+                candidateLyrics = nil
+            }
+        }
+
+        if let shazam = shazamMatch {
+            if let verifiedShazam = await SyncedLyricsService.shared.fetchVerifiedLyricsCandidate(
+                item: item,
+                title: shazam.title,
                 artist: shazam.artist,
-                duration: item.durationSeconds ?? shazam.durationSeconds
-            )
-            if let shazamLyrics, shazamLyrics.isTimeSynced || candidateLyrics == nil {
-                candidateLyrics = shazamLyrics
-                resolvedTitle = shazam.title
-                resolvedArtist = shazam.artist
-                resolvedGenre = shazam.genre ?? resolvedGenre
+                duration: item.durationSeconds ?? shazam.durationSeconds,
+                heard: fullHeard.isEmpty ? nil : fullHeard,
+                isNonEnglish: isNonEnglishVerify,
+                englishASROnForeignTrack: englishASROnForeignVerify
+            ) {
+                let replaceExisting = candidateLyrics == nil
+                    || verifiedShazam.confirmedByAudio
+                    || (verifiedShazam.lyrics.isTimeSynced && !(candidateLyrics?.isTimeSynced ?? false))
+                if replaceExisting {
+                    candidateLyrics = verifiedShazam.lyrics
+                    resolvedTitle = shazam.title
+                    resolvedArtist = shazam.artist
+                    resolvedGenre = shazam.genre ?? resolvedGenre
+                }
+            } else if let existingCand = candidateLyrics, !fullHeard.isEmpty, !englishASROnForeignVerify {
+                if case .contradicted = SongAudioListener.verdict(heard: fullHeard, lyrics: existingCand) {
+                    candidateLyrics = nil
+                }
+            }
+        } else if !fullHeard.isEmpty && !resolvedTitle.isEmpty && !englishASROnForeignVerify {
+            if let verifiedMatch = await SyncedLyricsService.shared.fetchVerifiedLyricsCandidate(
+                item: item,
+                title: resolvedTitle,
+                artist: resolvedArtist,
+                duration: item.durationSeconds ?? recognized?.durationSeconds,
+                heard: fullHeard,
+                isNonEnglish: isNonEnglishVerify,
+                englishASROnForeignTrack: englishASROnForeignVerify
+            ), (candidateLyrics == nil || verifiedMatch.confirmedByAudio || (verifiedMatch.lyrics.isTimeSynced && !(candidateLyrics?.isTimeSynced ?? false))) {
+                candidateLyrics = verifiedMatch.lyrics
             }
         }
 
