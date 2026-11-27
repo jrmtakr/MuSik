@@ -953,7 +953,7 @@ struct TrendingArtistsHubView: View {
 
     private func refreshStatusSection(autoToggle: Binding<Bool>) -> some View {
         Section {
-            Toggle("Auto-Refresh Every Month", isOn: autoToggle)
+            Toggle("Auto-Refresh Daily (12:00 AM)", isOn: autoToggle)
 
             Button {
                 Task { await trendingService.refreshTrendingArtists(force: true) }
@@ -962,7 +962,7 @@ struct TrendingArtistsHubView: View {
                     if trendingService.isRefreshing {
                         ProgressView()
                             .padding(.trailing, 6)
-                        Text(trendingService.lastStatusMessage ?? "Refreshing from TikTok, Reels & Charts...")
+                        Text(trendingService.lastStatusMessage ?? "Refreshing from Viral Hits, Indie & Charts...")
                     } else {
                         Label("Refresh Trending Artists Now", systemImage: "arrow.triangle.2.circlepath")
                             .fontWeight(.semibold)
@@ -975,9 +975,9 @@ struct TrendingArtistsHubView: View {
                 "Last updated \($0.formatted(date: .abbreviated, time: .shortened))."
             } ?? "Waiting for first sync."
             let nextText = trendingService.nextScheduledRefreshDate.map {
-                " Next auto-refresh: \($0.formatted(date: .abbreviated, time: .omitted))."
+                " Next auto-refresh: 12:00 AM (\($0.formatted(date: .abbreviated, time: .omitted)))."
             } ?? ""
-            Text("\(lastText)\(nextText) New artists discovered on TikTok, Instagram Reels & Charts are automatically added to your Artist Database & Profiles.")
+            Text("\(lastText)\(nextText) Big chart stars and emerging indie/underground artists discovered daily at 12:00 AM are automatically added to your Artist Database (\(ArtistDatabase.totalCatalogCount) total).")
         }
     }
 }

@@ -1,3 +1,4 @@
+import BackgroundTasks
 import Foundation
 import Observation
 import SwiftUI
@@ -7,6 +8,7 @@ enum TrendSourceTag: String, Codable, CaseIterable, Hashable {
     case instagram = "Instagram Reels"
     case appleCharts = "Apple Charts"
     case deezerCharts = "Top Charts"
+    case indieUnderground = "Indie & Rising"
 
     var badgeColor: Color {
         switch self {
@@ -14,6 +16,7 @@ enum TrendSourceTag: String, Codable, CaseIterable, Hashable {
         case .instagram: return .purple
         case .appleCharts: return .red
         case .deezerCharts: return .blue
+        case .indieUnderground: return .indigo
         }
     }
 
@@ -23,6 +26,7 @@ enum TrendSourceTag: String, Codable, CaseIterable, Hashable {
         case .instagram: return "sparkles.tv.fill"
         case .appleCharts: return "chart.line.uptrend.xyaxis"
         case .deezerCharts: return "flame.fill"
+        case .indieUnderground: return "waveform.badge.magnifyingglass"
         }
     }
 }
@@ -84,6 +88,8 @@ private struct TrendingArtistsPersistedState: Codable {
     var artists: [DiscoveredArtistRecord] = []
     var lastRefreshedAt: Date?
     var autoMonthlyRefresh: Bool = true
+    var autoDailyRefresh: Bool? = nil
+    var artistImageURLByKey: [String: String]? = [:]
     var trendingSongs: [TrendingSongItem]? = nil
     var lastSongsRefreshedAt: Date? = nil
 }
@@ -157,6 +163,7 @@ struct ArtistProfileBundle {
 @Observable
 final class TrendingArtistsService {
     static let shared = TrendingArtistsService()
+    static let dailyRefreshTaskIdentifier = "com.personal.musicplayer.artistdb.daily"
 
     private static let safariUA =
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 Safari/605.1.15"
@@ -166,6 +173,11 @@ final class TrendingArtistsService {
     var isLoadingSongs = false
     var resolvingSongID: String?
     var lastStatusMessage: String?
+    var artistPhotoVersion: Int = 0
+
+    @ObservationIgnored private var midnightRefreshTimer: Timer?
+    @ObservationIgnored private var didRegisterBGTask = false
+    @ObservationIgnored private var inFlightPhotoKeys: Set<String> = []
 
     var trendingSongs: [TrendingSongItem] {
         state.trendingSongs ?? []
@@ -189,38 +201,99 @@ final class TrendingArtistsService {
         state.lastRefreshedAt
     }
 
-    var autoMonthlyRefresh: Bool {
-        get { state.autoMonthlyRefresh }
+    var autoDailyRefresh: Bool {
+        get { state.autoDailyRefresh ?? state.autoMonthlyRefresh }
         set {
+            state.autoDailyRefresh = newValue
             state.autoMonthlyRefresh = newValue
             saveToDisk()
+            Task { @MainActor [weak self] in
+                if newValue {
+                    self?.scheduleDailyMidnightRefresh()
+                } else {
+                    self?.midnightRefreshTimer?.invalidate()
+                    self?.midnightRefreshTimer = nil
+                }
+            }
         }
+    }
+
+    var autoMonthlyRefresh: Bool {
+        get { autoDailyRefresh }
+        set { autoDailyRefresh = newValue }
+    }
+
+    /// True once each calendar day has passed 12:00 AM local time since the previous catalog refresh.
+    var needsDailyRefresh: Bool {
+        guard autoDailyRefresh else { return false }
+        guard let last = state.lastRefreshedAt else { return true }
+        let todayMidnight = Calendar.current.startOfDay(for: .now)
+        return last < todayMidnight
     }
 
     var needsMonthlyRefresh: Bool {
-        guard state.autoMonthlyRefresh else { return false }
-        guard let last = state.lastRefreshedAt else { return true }
-        let cal = Calendar.current
-        let lastYear = cal.component(.year, from: last)
-        let lastMonth = cal.component(.month, from: last)
-        let nowYear = cal.component(.year, from: .now)
-        let nowMonth = cal.component(.month, from: .now)
-        if lastYear != nowYear || lastMonth != nowMonth {
-            return true
-        }
-        return Date().timeIntervalSince(last) >= 28 * 86_400
+        needsDailyRefresh
     }
 
     var nextScheduledRefreshDate: Date? {
-        guard let last = state.lastRefreshedAt else { return nil }
-        let cal = Calendar.current
-        guard let nextMonth = cal.date(byAdding: .month, value: 1, to: last) else { return nil }
-        return cal.date(from: cal.dateComponents([.year, .month], from: nextMonth))
+        guard autoDailyRefresh else { return nil }
+        let todayMidnight = Calendar.current.startOfDay(for: .now)
+        return Calendar.current.date(byAdding: .day, value: 1, to: todayMidnight)
     }
 
     private init() {
         loadFromDisk()
         registerDiscoveredIntoDatabase()
+        Task { @MainActor [weak self] in
+            self?.scheduleDailyMidnightRefresh()
+        }
+    }
+
+    func registerBackgroundRefresh() {
+        guard !didRegisterBGTask else { return }
+        didRegisterBGTask = true
+        BGTaskScheduler.shared.register(forTaskWithIdentifier: Self.dailyRefreshTaskIdentifier, using: nil) { task in
+            guard let refreshTask = task as? BGAppRefreshTask else {
+                task.setTaskCompleted(success: false)
+                return
+            }
+            let bgWorker = Task {
+                await TrendingArtistsService.shared.refreshIfDue()
+                await MainActor.run {
+                    TrendingArtistsService.shared.scheduleDailyMidnightRefresh()
+                    refreshTask.setTaskCompleted(success: true)
+                }
+            }
+            refreshTask.expirationHandler = {
+                bgWorker.cancel()
+                refreshTask.setTaskCompleted(success: false)
+            }
+        }
+        Task { @MainActor [weak self] in
+            self?.scheduleDailyMidnightRefresh()
+        }
+    }
+
+    @MainActor
+    func scheduleDailyMidnightRefresh() {
+        midnightRefreshTimer?.invalidate()
+        midnightRefreshTimer = nil
+        guard autoDailyRefresh else { return }
+
+        let todayMidnight = Calendar.current.startOfDay(for: .now)
+        guard let nextMidnight = Calendar.current.date(byAdding: .day, value: 1, to: todayMidnight) else { return }
+        let delay = max(15.0, nextMidnight.timeIntervalSinceNow + 2.0)
+
+        midnightRefreshTimer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                await self?.refreshIfDue()
+                self?.scheduleDailyMidnightRefresh()
+            }
+        }
+
+        let request = BGAppRefreshTaskRequest(identifier: Self.dailyRefreshTaskIdentifier)
+        request.earliestBeginDate = nextMidnight
+        try? BGTaskScheduler.shared.submit(request)
     }
 
     func record(forArtistName name: String) -> DiscoveredArtistRecord? {
@@ -229,41 +302,156 @@ final class TrendingArtistsService {
         return state.artists.first(where: { $0.normalizedKey == key })
     }
 
-    // MARK: - Monthly Social & Chart Refresh
+    // MARK: - Wrapped & Catalog Artist Artwork Cache
+
+    func cachedArtistImageURL(for artistName: String) -> URL? {
+        let key = ArtistDatabase.normalizeLookupKey(artistName)
+        guard !key.isEmpty, key != "unknown artist" else { return nil }
+        if let str = state.artistImageURLByKey?[key], let url = URL(string: str) {
+            return url
+        }
+        return record(forArtistName: artistName)?.imageURL
+    }
+
+    func ensureArtistPhotos(for artistNames: [String]) async {
+        var pending: [(key: String, name: String)] = []
+        var seenKeys = Set<String>()
+
+        for raw in artistNames {
+            let trimmed = ArtistDatabase.canonicalizeSingle(raw).trimmingCharacters(in: .whitespacesAndNewlines)
+            let key = ArtistDatabase.normalizeLookupKey(trimmed)
+            guard !key.isEmpty,
+                  key != "unknown artist",
+                  seenKeys.insert(key).inserted,
+                  cachedArtistImageURL(for: trimmed) == nil,
+                  !inFlightPhotoKeys.contains(key) else {
+                continue
+            }
+            inFlightPhotoKeys.insert(key)
+            pending.append((key, trimmed))
+        }
+        guard !pending.isEmpty else { return }
+
+        var resolvedAny = false
+        var map = state.artistImageURLByKey ?? [:]
+
+        // Process in batches of up to 4 concurrent lookups so Wrapped cards fill quickly.
+        for batchStart in stride(from: 0, to: pending.count, by: 4) {
+            let slice = Array(pending[batchStart..<min(pending.count, batchStart + 4)])
+            await withTaskGroup(of: (key: String, urlStr: String?).self) { group in
+                for target in slice {
+                    group.addTask {
+                        let dz = await Self.fetchDeezerArtistInfo(name: target.name, knownID: nil)
+                        if let urlStr = dz.imageURL?.absoluteString, !urlStr.isEmpty {
+                            return (target.key, urlStr)
+                        }
+                        // Fallback for small / independent artists not yet on Deezer: iTunes top track artwork.
+                        let it = await Self.fetchITunesArtistInfo(name: target.name, knownID: nil)
+                        let songs = await Self.fetchITunesArtistTopSongs(artistId: it.artistId, fallbackName: target.name)
+                        if let artURL = songs.first?.artworkURL?.absoluteString {
+                            return (target.key, artURL)
+                        }
+                        return (target.key, nil)
+                    }
+                }
+                for await res in group {
+                    inFlightPhotoKeys.remove(res.key)
+                    if let urlStr = res.urlStr, !urlStr.isEmpty {
+                        map[res.key] = urlStr
+                        resolvedAny = true
+                    }
+                }
+            }
+        }
+
+        if resolvedAny {
+            state.artistImageURLByKey = map
+            artistPhotoVersion &+= 1
+            saveToDisk()
+        }
+    }
+
+    // MARK: - Daily 12:00 AM Social, Underground & Chart Refresh
 
     func refreshIfDue() async {
-        guard needsMonthlyRefresh else { return }
+        guard needsDailyRefresh else { return }
         await refreshTrendingArtists(force: false)
     }
 
     @discardableResult
     func refreshTrendingArtists(force: Bool = false) async -> Int {
         guard !isRefreshing else { return 0 }
-        if !force && !needsMonthlyRefresh {
+        if !force && !needsDailyRefresh {
             return 0
         }
 
         await MainActor.run {
             self.isRefreshing = true
-            self.lastStatusMessage = "Scanning TikTok, Instagram Reels & Charts..."
+            self.lastStatusMessage = "Scanning viral hits, charts & emerging indie artists..."
         }
 
-        let year = Calendar.current.component(.year, from: .now)
+        let cal = Calendar.current
+        let year = cal.component(.year, from: .now)
+        let dayOfYear = cal.ordinality(of: .day, in: .year, for: .now) ?? 1
+
+        // Daily rotating pockets discover small, indie, SoundCloud, and underground scenes alongside major charts.
+        let risingQueries = [
+            "Underground Rap", "Bedroom Pop", "Hyperpop", "SoundCloud Rap",
+            "Phonk Viral", "Fresh Finds Indie", "Alt R&B Rising", "Afrobeats Rising",
+            "Latin Urbana", "UK Underground", "PluggnB", "Indie Pop",
+            "Electronic Rising", "J-Pop Indie", "K-R&B", "Shoegaze & Dream Pop"
+        ]
+        let qRising1 = risingQueries[dayOfYear % risingQueries.count]
+        let qRising2 = risingQueries[(dayOfYear + 5) % risingQueries.count]
+        let qRising3 = risingQueries[(dayOfYear + 11) % risingQueries.count]
+
+        let chartCountries = ["us", "gb", "ca", "au", "jp", "kr", "br", "fr", "de", "ng"]
+        let altCountry = chartCountries[dayOfYear % chartCountries.count]
 
         async let tiktokTask1 = fetchDeezerViralPlaylistArtists(query: "TikTok Trending \(year)", tag: .tiktok)
         async let tiktokTask2 = fetchDeezerViralPlaylistArtists(query: "Viral TikTok Hits \(year)", tag: .tiktok)
         async let reelsTask1 = fetchDeezerViralPlaylistArtists(query: "Instagram Reels \(year)", tag: .instagram)
-        async let reelsTask2 = fetchDeezerViralPlaylistArtists(query: "Instagram Reels Hits", tag: .instagram)
-        async let appleTask = fetchAppleTopSongsArtists()
+        async let risingTask1 = fetchDeezerViralPlaylistArtists(query: qRising1, tag: .indieUnderground)
+        async let risingTask2 = fetchDeezerViralPlaylistArtists(query: qRising2, tag: .indieUnderground)
+        async let risingTask3 = fetchDeezerViralPlaylistArtists(query: qRising3, tag: .indieUnderground)
+        async let appleUSTask = fetchAppleTopSongsArtists(country: "us", limit: 100)
+        async let appleAltTask = fetchAppleTopSongsArtists(country: altCountry, limit: 50)
         async let deezerChartTask = fetchDeezerTopChartArtists()
 
         var rawDiscoveries: [RawDiscoveredCandidate] = []
         rawDiscoveries.append(contentsOf: await tiktokTask1)
         rawDiscoveries.append(contentsOf: await tiktokTask2)
         rawDiscoveries.append(contentsOf: await reelsTask1)
-        rawDiscoveries.append(contentsOf: await reelsTask2)
-        rawDiscoveries.append(contentsOf: await appleTask)
+        rawDiscoveries.append(contentsOf: await risingTask1)
+        rawDiscoveries.append(contentsOf: await risingTask2)
+        rawDiscoveries.append(contentsOf: await risingTask3)
+        rawDiscoveries.append(contentsOf: await appleUSTask)
+        rawDiscoveries.append(contentsOf: await appleAltTask)
         rawDiscoveries.append(contentsOf: await deezerChartTask)
+
+        // Also include verified & library artists (especially niche/small artists imported by the user).
+        let libraryItems = await MainActor.run { MediaManager.shared.items }
+        let ignoredChannels = await MainActor.run { ListeningWrappedService.shared.ignoredChannels }
+        for item in libraryItems {
+            let extracted = ArtistDatabase.extractArtists(
+                rawArtistTag: item.artist,
+                rawTitle: item.displayTitle,
+                fileName: item.fileName,
+                ignoredChannels: ignoredChannels
+            )
+            for name in extracted.allArtists where !ArtistDatabase.looksLikeUploaderChannel(name, customIgnoredChannels: ignoredChannels) {
+                rawDiscoveries.append(
+                    RawDiscoveredCandidate(
+                        artistName: name,
+                        trackTitle: item.displayTitle,
+                        source: .indieUnderground,
+                        imageURLString: nil,
+                        iTunesArtistID: nil,
+                        deezerArtistID: nil
+                    )
+                )
+            }
+        }
 
         var existingByKey: [String: DiscoveredArtistRecord] = Dictionary(
             state.artists.map { ($0.normalizedKey, $0) },
@@ -340,7 +528,7 @@ final class TrendingArtistsService {
                 }
                 return lhs.trendSources.count > rhs.trendSources.count
             }
-            .prefix(36)
+            .prefix(60)
 
         await withTaskGroup(of: (key: String, genre: String?, imageURL: String?, iTunesID: Int?, deezerID: Int?).self) { group in
             for item in hydrationTargets {
@@ -377,14 +565,23 @@ final class TrendingArtistsService {
         }
 
         await MainActor.run {
-            self.state.artists = Array(sortedFinal.prefix(400))
+            self.state.artists = Array(sortedFinal.prefix(2500))
+            var imgMap = self.state.artistImageURLByKey ?? [:]
+            for rec in self.state.artists {
+                if let img = rec.imageURLString, !img.isEmpty, imgMap[rec.normalizedKey] == nil {
+                    imgMap[rec.normalizedKey] = img
+                }
+            }
+            self.state.artistImageURLByKey = imgMap
+            self.artistPhotoVersion &+= 1
             self.state.lastRefreshedAt = .now
             self.isRefreshing = false
             self.lastStatusMessage = newDiscoveryCount > 0
-                ? "Added \(newDiscoveryCount) trending new \(newDiscoveryCount == 1 ? "artist" : "artists") from TikTok, Reels & Charts"
-                : "Trending artists catalog refreshed (\(self.state.artists.count) profiles)"
+                ? "Added \(newDiscoveryCount) new \(newDiscoveryCount == 1 ? "artist" : "artists") (big charts & indie/rising)"
+                : "Artist database refreshed (\(ArtistDatabase.totalCatalogCount) total artists)"
             self.saveToDisk()
             self.registerDiscoveredIntoDatabase()
+            self.scheduleDailyMidnightRefresh()
         }
 
         return newDiscoveryCount
@@ -613,7 +810,7 @@ final class TrendingArtistsService {
             }
 
         var collected: [RawDiscoveredCandidate] = []
-        for pl in sorted.prefix(2) {
+        for pl in sorted.prefix(3) {
             guard let pid = pl["id"] as? Int,
                   let tracksURL = URL(string: "https://api.deezer.com/playlist/\(pid)/tracks?limit=50"),
                   let tJSON = await Self.getJSON(url: tracksURL) as? [String: Any],
@@ -643,8 +840,8 @@ final class TrendingArtistsService {
         return collected
     }
 
-    private func fetchAppleTopSongsArtists() async -> [RawDiscoveredCandidate] {
-        guard let url = URL(string: "https://rss.marketingtools.apple.com/api/v2/us/music/most-played/50/songs.json"),
+    private func fetchAppleTopSongsArtists(country: String = "us", limit: Int = 100) async -> [RawDiscoveredCandidate] {
+        guard let url = URL(string: "https://rss.marketingtools.apple.com/api/v2/\(country)/music/most-played/\(limit)/songs.json"),
               let json = await Self.getJSON(url: url) as? [String: Any],
               let feed = json["feed"] as? [String: Any],
               let results = feed["results"] as? [[String: Any]] else {
@@ -669,7 +866,7 @@ final class TrendingArtistsService {
     }
 
     private func fetchDeezerTopChartArtists() async -> [RawDiscoveredCandidate] {
-        guard let url = URL(string: "https://api.deezer.com/chart/0"),
+        guard let url = URL(string: "https://api.deezer.com/chart/0?limit=100"),
               let json = await Self.getJSON(url: url) as? [String: Any] else {
             return []
         }
@@ -727,7 +924,12 @@ final class TrendingArtistsService {
 
         let it = await itTask
         let dz = await dzTask
-        return (it.genre, dz.imageURL?.absoluteString, it.artistId, dz.id)
+        var imageStr = dz.imageURL?.absoluteString
+        if needsImage && (imageStr?.isEmpty ?? true) {
+            let songs = await fetchITunesArtistTopSongs(artistId: it.artistId, fallbackName: name)
+            imageStr = songs.first?.artworkURL?.absoluteString
+        }
+        return (it.genre, imageStr, it.artistId, dz.id)
     }
 
     // MARK: - Artist Profile Network Helpers

@@ -3,6 +3,7 @@ import SwiftUI
 struct WrappedDashboardSheet: View {
     @Environment(MediaManager.self) private var mediaManager
     @Environment(ListeningWrappedService.self) private var wrapped
+    @Environment(TrendingArtistsService.self) private var trendingService
     @Environment(\.dismiss) private var dismiss
 
     var initialStartStory: Bool = false
@@ -372,9 +373,9 @@ struct WrappedDashboardSheet: View {
                 TrendingArtistsHubView()
             } label: {
                 HStack {
-                    Label("Trending Artists (TikTok & Reels)", systemImage: "flame.fill")
+                    Label("Trending & Rising Artists", systemImage: "flame.fill")
                     Spacer()
-                    Text("Monthly")
+                    Text("Daily 12 AM")
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(.pink)
                 }
@@ -413,16 +414,27 @@ private struct WrappedHeroCardView: View {
             .foregroundStyle(.white)
 
             if let hero = report.heroTopArtist {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(isDecRevealActive ? "Your #1 Most Listened Artist" : "Currently #1 This Year")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.white.opacity(0.85))
-                    Text(hero.canonicalName)
-                        .font(.title.weight(.black))
-                        .foregroundStyle(.white)
-                    Text("\(ListeningWrappedService.formatHoursMinutes(hero.totalSeconds)) • \(hero.playCount) streams • \(Int(hero.sharePercentage.rounded()))% of your listening")
-                        .font(.caption.weight(.medium))
-                        .foregroundStyle(.white.opacity(0.92))
+                HStack(spacing: 14) {
+                    WrappedArtistAvatarView(
+                        artistName: hero.canonicalName,
+                        trackPaths: hero.trackEntries.compactMap(\.relativePath),
+                        size: 64,
+                        borderColor: .white.opacity(0.45)
+                    )
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(isDecRevealActive ? "Your #1 Most Listened Artist" : "Currently #1 This Year")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.white.opacity(0.85))
+                        Text(hero.canonicalName)
+                            .font(.title.weight(.black))
+                            .foregroundStyle(.white)
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.75)
+                        Text("\(ListeningWrappedService.formatHoursMinutes(hero.totalSeconds)) • \(hero.playCount) streams • \(Int(hero.sharePercentage.rounded()))% of your listening")
+                            .font(.caption.weight(.medium))
+                            .foregroundStyle(.white.opacity(0.92))
+                    }
                 }
             } else {
                 VStack(alignment: .leading, spacing: 4) {
@@ -497,6 +509,88 @@ private struct WrappedStatTile: View {
     }
 }
 
+private struct WrappedArtistAvatarView: View {
+    @Environment(MediaManager.self) private var mediaManager
+    @Environment(TrendingArtistsService.self) private var trendingService
+
+    let artistName: String
+    var trackPaths: [String] = []
+    var size: CGFloat = 46
+    var borderColor: Color = .white.opacity(0.28)
+    var placeholderImage: UIImage? = nil
+
+    private var remoteURL: URL? {
+        _ = trendingService.artistPhotoVersion
+        return trendingService.cachedArtistImageURL(for: artistName)
+    }
+
+    private var fallbackLocalArt: UIImage? {
+        if let placeholderImage { return placeholderImage }
+        for path in trackPaths {
+            if let img = mediaManager.thumbnails[path] {
+                return img
+            }
+        }
+        return nil
+    }
+
+    private var initials: String {
+        let parts = artistName.split(whereSeparator: { $0.isWhitespace })
+        let letters = parts.prefix(2).compactMap(\.first).map { String($0).uppercased() }.joined()
+        return letters.isEmpty ? "♫" : letters
+    }
+
+    var body: some View {
+        ZStack {
+            if let placeholderImage {
+                Image(uiImage: placeholderImage)
+                    .resizable()
+                    .scaledToFill()
+            } else if let remoteURL {
+                AsyncImage(url: remoteURL) { phase in
+                    switch phase {
+                    case .success(let image):
+                        image.resizable().scaledToFill()
+                    default:
+                        fallbackContent
+                    }
+                }
+            } else {
+                fallbackContent
+            }
+        }
+        .frame(width: size, height: size)
+        .clipShape(Circle())
+        .overlay(
+            Circle().strokeBorder(borderColor, lineWidth: max(1.0, size * 0.035))
+        )
+        .shadow(color: .black.opacity(0.22), radius: 5, y: 2)
+    }
+
+    @ViewBuilder
+    private var fallbackContent: some View {
+        if let fallbackLocalArt {
+            Image(uiImage: fallbackLocalArt)
+                .resizable()
+                .scaledToFill()
+        } else {
+            Circle()
+                .fill(
+                    LinearGradient(
+                        colors: [Color(red: 0.45, green: 0.16, blue: 0.80), Color(red: 0.90, green: 0.22, blue: 0.52)],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                )
+                .overlay {
+                    Text(initials)
+                        .font(.system(size: max(11, size * 0.36), weight: .heavy, design: .rounded))
+                        .foregroundStyle(.white)
+                }
+        }
+    }
+}
+
 private struct WrappedArtistRowView: View {
     let rank: Int
     let artist: WrappedArtistRanking
@@ -508,7 +602,14 @@ private struct WrappedArtistRowView: View {
                 Text("#\(rank)")
                     .font(.headline.weight(.heavy).monospacedDigit())
                     .foregroundStyle(rankColor)
-                    .frame(width: 32, alignment: .leading)
+                    .frame(width: 30, alignment: .leading)
+
+                WrappedArtistAvatarView(
+                    artistName: artist.canonicalName,
+                    trackPaths: artist.trackEntries.compactMap(\.relativePath),
+                    size: 46,
+                    borderColor: rankColor.opacity(0.45)
+                )
 
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(spacing: 6) {
@@ -598,6 +699,7 @@ private struct WrappedMonthlyBarChart: View {
 private struct WrappedArtistDetailView: View {
     @Environment(MediaManager.self) private var mediaManager
     @Environment(ListeningWrappedService.self) private var wrapped
+    @Environment(TrendingArtistsService.self) private var trendingService
     @Environment(\.dismiss) private var dismiss
 
     let artist: WrappedArtistRanking
@@ -610,22 +712,34 @@ private struct WrappedArtistDetailView: View {
     var body: some View {
         List {
             Section {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text(artist.canonicalName)
-                        .font(.title2.weight(.heavy))
-                    if let genre = artist.genre {
-                        Text(genre)
-                            .font(.caption.weight(.bold))
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 3)
-                            .background(Color.purple.opacity(0.16), in: Capsule())
-                            .foregroundStyle(.purple)
+                HStack(spacing: 14) {
+                    WrappedArtistAvatarView(
+                        artistName: artist.canonicalName,
+                        trackPaths: artist.trackEntries.compactMap(\.relativePath),
+                        size: 72,
+                        borderColor: Color.accentColor.opacity(0.45)
+                    )
+
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(artist.canonicalName)
+                            .font(.title2.weight(.heavy))
+                        if let genre = artist.genre {
+                            Text(genre)
+                                .font(.caption.weight(.bold))
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 3)
+                                .background(Color.purple.opacity(0.16), in: Capsule())
+                                .foregroundStyle(.purple)
+                        }
+                        Text("\(ListeningWrappedService.formatHoursMinutes(artist.totalSeconds)) across \(artist.playCount) streams in \(yearLabel)")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
                     }
-                    Text("\(ListeningWrappedService.formatHoursMinutes(artist.totalSeconds)) across \(artist.playCount) streams in \(yearLabel)")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
                 }
                 .padding(.vertical, 4)
+                .task(id: artist.canonicalName) {
+                    await trendingService.ensureArtistPhotos(for: [artist.canonicalName])
+                }
 
                 if artist.normalizedKey != "unknown artist" {
                     NavigationLink {
@@ -738,7 +852,13 @@ private struct ArtistCatalogBrowserView: View {
                     seedImageURL: dynRec?.imageURL
                 )
             } label: {
-                HStack {
+                HStack(spacing: 12) {
+                    WrappedArtistAvatarView(
+                        artistName: entry.canonicalName,
+                        size: 40,
+                        borderColor: Color.accentColor.opacity(0.28)
+                    )
+
                     VStack(alignment: .leading, spacing: 2) {
                         HStack(spacing: 6) {
                             Text(entry.canonicalName)
@@ -774,6 +894,9 @@ private struct ArtistCatalogBrowserView: View {
         .navigationTitle("Artist Catalog (\(ArtistDatabase.totalCatalogCount))")
         .navigationBarTitleDisplayMode(.inline)
         .searchable(text: $query, prompt: "Search artists or genres")
+        .task(id: query) {
+            await trendingService.ensureArtistPhotos(for: Array(entries.prefix(40)).map(\.canonicalName))
+        }
     }
 }
 
@@ -781,6 +904,7 @@ private struct ArtistCatalogBrowserView: View {
 
 struct WrappedStoryView: View {
     @Environment(ListeningWrappedService.self) private var wrapped
+    @Environment(TrendingArtistsService.self) private var trendingService
 
     let year: Int?
     let isDecemberPremiere: Bool
@@ -788,6 +912,7 @@ struct WrappedStoryView: View {
 
     @State private var currentSlide = 0
     @State private var sharePosterURL: URL?
+    @State private var posterArtistImages: [String: UIImage] = [:]
 
     private let slideCount = 6
 
@@ -877,7 +1002,13 @@ struct WrappedStoryView: View {
             }
         }
         .onAppear {
-            sharePosterURL = WrappedPosterExporter.renderPosterURL(for: report)
+            sharePosterURL = WrappedPosterExporter.renderPosterURL(for: report, artistImages: posterArtistImages)
+        }
+        .task {
+            await trendingService.ensureArtistPhotos(for: report.allArtists.map(\.canonicalName))
+            let imgs = await WrappedPosterExporter.loadArtistImages(for: report)
+            posterArtistImages = imgs
+            sharePosterURL = WrappedPosterExporter.renderPosterURL(for: report, artistImages: imgs)
         }
     }
 
@@ -919,11 +1050,21 @@ struct WrappedStoryView: View {
     private var topArtistCrownSlide: some View {
         VStack(spacing: 18) {
             Spacer()
-            Image(systemName: "crown.fill")
-                .font(.system(size: 54))
-                .foregroundStyle(.yellow)
-
             if let hero = report.heroTopArtist {
+                ZStack(alignment: .topTrailing) {
+                    WrappedArtistAvatarView(
+                        artistName: hero.canonicalName,
+                        trackPaths: hero.trackEntries.compactMap(\.relativePath),
+                        size: 132,
+                        borderColor: .yellow
+                    )
+                    Image(systemName: "crown.fill")
+                        .font(.system(size: 32))
+                        .foregroundStyle(.yellow)
+                        .shadow(color: .black.opacity(0.45), radius: 6, y: 2)
+                        .offset(x: 6, y: -12)
+                }
+
                 Text("YOUR #1 ARTIST OF THE YEAR")
                     .font(.caption.weight(.black))
                     .tracking(1.6)
@@ -986,8 +1127,15 @@ struct WrappedStoryView: View {
                 let topList = Array(report.namedArtists.prefix(5))
                 let maxSec = max(1, topList.first?.totalSeconds ?? 1)
                 ForEach(Array(topList.enumerated()), id: \.element.id) { idx, artist in
-                    VStack(alignment: .leading, spacing: 4) {
-                        HStack {
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack(spacing: 12) {
+                            WrappedArtistAvatarView(
+                                artistName: artist.canonicalName,
+                                trackPaths: artist.trackEntries.compactMap(\.relativePath),
+                                size: 42,
+                                borderColor: .white.opacity(0.42)
+                            )
+
                             Text("\(idx + 1). \(artist.canonicalName)")
                                 .font(.title3.weight(.heavy))
                                 .foregroundStyle(.white)
@@ -1099,7 +1247,7 @@ struct WrappedStoryView: View {
 
     private var finalPosterSlide: some View {
         VStack(spacing: 16) {
-            WrappedPosterRenderCard(report: report)
+            WrappedPosterRenderCard(report: report, artistImages: posterArtistImages)
                 .scaleEffect(0.76)
                 .frame(height: 410)
 
@@ -1146,6 +1294,34 @@ struct WrappedStoryView: View {
 
 private struct WrappedPosterRenderCard: View {
     let report: WrappedSummaryReport
+    var artistImages: [String: UIImage] = [:]
+
+    @ViewBuilder
+    private func posterAvatar(for artist: WrappedArtistRanking, size: CGFloat) -> some View {
+        if let uiImg = artistImages[artist.normalizedKey] {
+            Image(uiImage: uiImg)
+                .resizable()
+                .scaledToFill()
+                .frame(width: size, height: size)
+                .clipShape(Circle())
+                .overlay(Circle().strokeBorder(.white.opacity(0.42), lineWidth: 1))
+        } else {
+            let initials = artist.canonicalName
+                .split(whereSeparator: { $0.isWhitespace })
+                .prefix(2)
+                .compactMap(\.first)
+                .map { String($0).uppercased() }
+                .joined()
+            Circle()
+                .fill(.white.opacity(0.22))
+                .frame(width: size, height: size)
+                .overlay {
+                    Text(initials.isEmpty ? "♫" : initials)
+                        .font(.system(size: max(8, size * 0.40), weight: .bold))
+                        .foregroundStyle(.white)
+                }
+        }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -1161,27 +1337,34 @@ private struct WrappedPosterRenderCard: View {
             }
 
             if let hero = report.heroTopArtist {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("#1 TOP ARTIST")
-                        .font(.caption2.weight(.bold))
-                        .foregroundStyle(.white.opacity(0.75))
-                    Text(hero.canonicalName)
-                        .font(.title.weight(.black))
-                        .foregroundStyle(.white)
-                        .lineLimit(1)
+                HStack(spacing: 12) {
+                    posterAvatar(for: hero, size: 52)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("#1 TOP ARTIST")
+                            .font(.caption2.weight(.bold))
+                            .foregroundStyle(.white.opacity(0.75))
+                        Text(hero.canonicalName)
+                            .font(.title.weight(.black))
+                            .foregroundStyle(.white)
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.75)
+                    }
                 }
             }
 
             HStack(alignment: .top, spacing: 18) {
-                VStack(alignment: .leading, spacing: 5) {
+                VStack(alignment: .leading, spacing: 6) {
                     Text("TOP ARTISTS")
                         .font(.caption2.weight(.black))
                         .foregroundStyle(.yellow)
                     ForEach(Array(report.namedArtists.prefix(5).enumerated()), id: \.element.id) { idx, a in
-                        Text("\(idx + 1). \(a.canonicalName)")
-                            .font(.caption.weight(.bold))
-                            .foregroundStyle(.white)
-                            .lineLimit(1)
+                        HStack(spacing: 6) {
+                            posterAvatar(for: a, size: 18)
+                            Text("\(idx + 1). \(a.canonicalName)")
+                                .font(.caption.weight(.bold))
+                                .foregroundStyle(.white)
+                                .lineLimit(1)
+                        }
                     }
                     if report.namedArtists.isEmpty {
                         Text("Press play to track")
@@ -1253,8 +1436,62 @@ private struct WrappedPosterRenderCard: View {
 
 private enum WrappedPosterExporter {
     @MainActor
-    static func renderPosterURL(for report: WrappedSummaryReport) -> URL? {
-        let poster = WrappedPosterRenderCard(report: report)
+    static func loadArtistImages(for report: WrappedSummaryReport) async -> [String: UIImage] {
+        var targets: [WrappedArtistRanking] = []
+        if let hero = report.heroTopArtist { targets.append(hero) }
+        for a in report.namedArtists.prefix(5) {
+            if !targets.contains(where: { $0.normalizedKey == a.normalizedKey }) {
+                targets.append(a)
+            }
+        }
+
+        var result: [String: UIImage] = [:]
+        var remotePairs: [(key: String, url: URL)] = []
+
+        for artist in targets {
+            if let url = TrendingArtistsService.shared.cachedArtistImageURL(for: artist.canonicalName) {
+                remotePairs.append((artist.normalizedKey, url))
+            } else {
+                for relPath in artist.trackEntries.compactMap(\.relativePath) {
+                    if let localImg = MediaManager.shared.thumbnails[relPath] {
+                        result[artist.normalizedKey] = localImg
+                        break
+                    }
+                }
+            }
+        }
+
+        if !remotePairs.isEmpty {
+            let downloaded = await withTaskGroup(of: (String, UIImage?).self) { group in
+                for pair in remotePairs {
+                    group.addTask {
+                        var req = URLRequest(url: pair.url)
+                        req.timeoutInterval = 8
+                        guard let (data, resp) = try? await URLSession.shared.data(for: req),
+                              let http = resp as? HTTPURLResponse,
+                              (200...299).contains(http.statusCode),
+                              let img = UIImage(data: data) else {
+                            return (pair.key, nil)
+                        }
+                        return (pair.key, img)
+                    }
+                }
+                var dict: [String: UIImage] = [:]
+                for await (k, img) in group {
+                    if let img { dict[k] = img }
+                }
+                return dict
+            }
+            for (k, img) in downloaded {
+                result[k] = img
+            }
+        }
+        return result
+    }
+
+    @MainActor
+    static func renderPosterURL(for report: WrappedSummaryReport, artistImages: [String: UIImage] = [:]) -> URL? {
+        let poster = WrappedPosterRenderCard(report: report, artistImages: artistImages)
         let renderer = ImageRenderer(content: poster)
         renderer.scale = 3.0
         guard let image = renderer.uiImage,
@@ -1270,6 +1507,7 @@ private enum WrappedPosterExporter {
 
 private struct WrappedDashboardPresentationModifier: ViewModifier {
     @Environment(ListeningWrappedService.self) private var wrapped
+    @Environment(TrendingArtistsService.self) private var trendingService
 
     @Binding var selectedYear: Int?
     @Binding var showStoryPresentation: Bool
@@ -1291,6 +1529,11 @@ private struct WrappedDashboardPresentationModifier: ViewModifier {
                     isPremiereMode = ListeningWrappedService.isDecemberRevealActive()
                     showStoryPresentation = true
                 }
+            }
+            .task(id: "\(selectedYear.map(String.init) ?? "all")-\(report.allArtists.count)") {
+                await trendingService.ensureArtistPhotos(for: report.allArtists.map(\.canonicalName))
+                let imgs = await WrappedPosterExporter.loadArtistImages(for: report)
+                sharePosterURL = WrappedPosterExporter.renderPosterURL(for: report, artistImages: imgs)
             }
             .onChange(of: selectedYear) { _, _ in
                 sharePosterURL = WrappedPosterExporter.renderPosterURL(for: report)

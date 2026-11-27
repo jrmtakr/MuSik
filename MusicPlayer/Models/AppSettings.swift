@@ -58,21 +58,34 @@ enum AppearanceMode: String, CaseIterable, Identifiable {
 }
 
 enum SearchEngineOption: String, CaseIterable, Identifiable {
+    case youtube = "YouTube"
     case google = "Google"
+    case brave = "Brave"
     case duckDuckGo = "DuckDuckGo"
     case bing = "Bing"
     case yahoo = "Yahoo"
-    case brave = "Brave"
 
     var id: String { rawValue }
 
     var shortBadge: String {
         switch self {
+        case .youtube: return "YT"
         case .google: return "G"
+        case .brave: return "Br"
         case .duckDuckGo: return "D"
         case .bing: return "B"
         case .yahoo: return "Y!"
-        case .brave: return "Br"
+        }
+    }
+
+    var systemIcon: String {
+        switch self {
+        case .youtube: return "play.rectangle.fill"
+        case .google: return "magnifyingglass"
+        case .brave: return "shield.fill"
+        case .duckDuckGo: return "globe"
+        case .bing: return "sparkle.magnifyingglass"
+        case .yahoo: return "sparkles"
         }
     }
 
@@ -81,11 +94,12 @@ enum SearchEngineOption: String, CaseIterable, Identifiable {
             return nil
         }
         switch self {
+        case .youtube: return URL(string: "https://www.youtube.com/results?search_query=\(encoded)")
         case .google: return URL(string: "https://www.google.com/search?q=\(encoded)")
+        case .brave: return URL(string: "https://search.brave.com/search?q=\(encoded)")
         case .duckDuckGo: return URL(string: "https://duckduckgo.com/?q=\(encoded)")
         case .bing: return URL(string: "https://www.bing.com/search?q=\(encoded)")
         case .yahoo: return URL(string: "https://search.yahoo.com/search?p=\(encoded)")
-        case .brave: return URL(string: "https://search.brave.com/search?q=\(encoded)")
         }
     }
 }

@@ -1,4 +1,7 @@
 import CoreSpotlight
+import Network
+import Photos
+import Speech
 import SwiftUI
 import UIKit
 import UserNotifications
@@ -11,6 +14,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         UNUserNotificationCenter.current().delegate = self
         SystemActionRouter.registerHomeQuickActions()
         PlaylistImportManager.shared.registerBackgroundTasks()
+        TrendingArtistsService.shared.registerBackgroundRefresh()
         return true
     }
 
@@ -128,7 +132,7 @@ struct MusicPlayerApp: App {
                 .task {
                     LocalMediaCacheProxy.shared.start()
                     SystemActionRouter.registerHomeQuickActions()
-                    await wrappedService.requestPermissionAndScheduleDecemberDrop()
+                    await requestAllStartupPermissionsIfNeeded()
                     await trendingService.refreshIfDue()
                     Task.detached(priority: .utility) {
                         await WhisperTranscriptionEngine.shared.warmUpInBackground()
@@ -141,9 +145,15 @@ struct MusicPlayerApp: App {
                     }
                 }
                 .onChange(of: scenePhase) { _, phase in
-                    if phase == .background || phase == .inactive {
+                    if phase == .active {
+                        Task {
+                            await trendingService.refreshIfDue()
+                            trendingService.scheduleDailyMidnightRefresh()
+                        }
+                    } else if phase == .background || phase == .inactive {
                         wrappedService.flushDiskSave()
                         timeMachine.flushDiskSave()
+                        trendingService.scheduleDailyMidnightRefresh()
                     }
                 }
                 .onOpenURL { url in
@@ -185,6 +195,39 @@ struct MusicPlayerApp: App {
                     )
                     actionRouter.requestedTab = nextTab
                 }
+        }
+    }
+
+    @MainActor
+    private func requestAllStartupPermissionsIfNeeded() async {
+        // 1. Notifications (Wrapped Dec 1 reminder & background import completion)
+        await wrappedService.requestPermissionAndScheduleDecemberDrop()
+
+        // 2. Speech Recognition (on-device audio lyrics & track identification)
+        if SFSpeechRecognizer.authorizationStatus() == .notDetermined {
+            await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                SFSpeechRecognizer.requestAuthorization { _ in
+                    cont.resume()
+                }
+            }
+        }
+
+        // 3. Photo Library (video import & custom cover art selection)
+        let photoStatus = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+        if photoStatus == .notDetermined {
+            _ = await PHPhotoLibrary.requestAuthorization(for: .readWrite)
+        }
+
+        // 4. Local Network (Wi-Fi transfer & nearby MuseJRM Jam discovery) on first launch
+        let localNetKey = "musicplayer.didRequestLocalNetworkStartup"
+        if !UserDefaults.standard.bool(forKey: localNetKey) {
+            UserDefaults.standard.set(true, forKey: localNetKey)
+            let params = NWParameters()
+            params.includePeerToPeer = true
+            let browser = NWBrowser(for: .bonjour(type: "_musejrm-jam._tcp", domain: nil), using: params)
+            browser.start(queue: .global(qos: .utility))
+            try? await Task.sleep(for: .milliseconds(1200))
+            browser.cancel()
         }
     }
 }

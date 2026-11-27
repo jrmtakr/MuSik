@@ -2322,11 +2322,33 @@ struct BrowserTabView: View {
     private var addressBar: some View {
         HStack(spacing: 8) {
             HStack(spacing: 6) {
-                Image(systemName: browserStore.activeTab.isPrivate ? "eye.slash.fill" : "globe")
-                    .font(.footnote)
-                    .foregroundStyle(browserStore.activeTab.isPrivate ? .purple : .secondary)
+                Menu {
+                    Picker("Search Engine", selection: Bindable(settings).searchEngine) {
+                        ForEach(SearchEngineOption.allCases) { engine in
+                            Label(engine.rawValue, systemImage: engine.systemIcon).tag(engine)
+                        }
+                    }
+                } label: {
+                    HStack(spacing: 3) {
+                        Image(systemName: browserStore.activeTab.isPrivate ? "eye.slash.fill" : settings.searchEngine.systemIcon)
+                            .font(.caption2.weight(.bold))
+                        Text(settings.searchEngine.shortBadge)
+                            .font(.caption2.weight(.heavy))
+                    }
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 4)
+                    .background(
+                        (browserStore.activeTab.isPrivate ? Color.purple : (settings.searchEngine == .youtube ? Color.red : Color.accentColor)).opacity(0.16),
+                        in: Capsule()
+                    )
+                    .foregroundStyle(
+                        browserStore.activeTab.isPrivate
+                            ? Color.purple
+                            : (settings.searchEngine == .youtube ? Color.red : Color.accentColor)
+                    )
+                }
 
-                TextField("Search or enter web address", text: $urlString)
+                TextField("Search \(settings.searchEngine.rawValue) or enter web address", text: $urlString)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
                     .keyboardType(.URL)

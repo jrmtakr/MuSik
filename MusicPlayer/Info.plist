@@ -46,6 +46,7 @@
 	<key>BGTaskSchedulerPermittedIdentifiers</key>
 	<array>
 		<string>com.personal.musicplayer.playlist.sync</string>
+		<string>com.personal.musicplayer.artistdb.daily</string>
 	</array>
 	<key>UIFileSharingEnabled</key>
 	<true/>

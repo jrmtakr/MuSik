@@ -186,35 +186,107 @@ struct DiscoveryView: View {
     }
 
     private var searchBarSection: some View {
-        HStack(spacing: 10) {
-            Menu {
-                Picker("Search Engine", selection: Bindable(settings).searchEngine) {
-                    ForEach(SearchEngineOption.allCases) { engine in
-                        Text(engine.rawValue).tag(engine)
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 10) {
+                Menu {
+                    Picker("Search Engine", selection: Bindable(settings).searchEngine) {
+                        ForEach(SearchEngineOption.allCases) { engine in
+                            Label(engine.rawValue, systemImage: engine.systemIcon).tag(engine)
+                        }
+                    }
+                } label: {
+                    Text(settings.searchEngine.shortBadge)
+                        .font(.caption.weight(.bold))
+                        .frame(width: 28, height: 28)
+                        .background(
+                            (settings.searchEngine == .youtube ? Color.red : Color.accentColor).opacity(0.18),
+                            in: Circle()
+                        )
+                        .foregroundStyle(settings.searchEngine == .youtube ? Color.red : Color.accentColor)
+                }
+
+                TextField("Search \(settings.searchEngine.rawValue) or enter web address", text: $searchInput)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .submitLabel(.go)
+                    .onSubmit(submitSearch)
+
+                Button(action: submitSearch) {
+                    Image(systemName: "magnifyingglass")
+                        .foregroundStyle(searchInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? .secondary : Color.accentColor)
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    let featuredEngines: [SearchEngineOption] = [.youtube, .google, .brave]
+                    ForEach(featuredEngines) { engine in
+                        let selected = settings.searchEngine == engine
+                        Button {
+                            AppHaptics.selection()
+                            settings.searchEngine = engine
+                        } label: {
+                            HStack(spacing: 5) {
+                                Image(systemName: engine.systemIcon)
+                                    .font(.caption2.weight(.bold))
+                                Text(engine.rawValue)
+                                    .font(.caption.weight(.semibold))
+                            }
+                            .padding(.horizontal, 11)
+                            .padding(.vertical, 6)
+                            .background(
+                                selected
+                                    ? (engine == .youtube ? Color.red.opacity(0.20) : Color.accentColor.opacity(0.20))
+                                    : Color(.secondarySystemBackground),
+                                in: Capsule()
+                            )
+                            .overlay(
+                                Capsule().strokeBorder(
+                                    selected
+                                        ? (engine == .youtube ? Color.red.opacity(0.55) : Color.accentColor.opacity(0.55))
+                                        : Color.clear,
+                                    lineWidth: 1
+                                )
+                            )
+                            .foregroundStyle(
+                                selected
+                                    ? (engine == .youtube ? Color.red : Color.accentColor)
+                                    : Color.primary
+                            )
+                        }
+                        .buttonStyle(.plain)
+                    }
+
+                    Menu {
+                        ForEach(SearchEngineOption.allCases) { engine in
+                            Button {
+                                settings.searchEngine = engine
+                            } label: {
+                                Label(engine.rawValue, systemImage: settings.searchEngine == engine ? "checkmark" : engine.systemIcon)
+                            }
+                        }
+                    } label: {
+                        let extraSelected = !featuredEngines.contains(settings.searchEngine)
+                        HStack(spacing: 4) {
+                            Text(extraSelected ? settings.searchEngine.rawValue : "More")
+                                .font(.caption.weight(.semibold))
+                            Image(systemName: "chevron.down")
+                                .font(.caption2.weight(.bold))
+                        }
+                        .padding(.horizontal, 11)
+                        .padding(.vertical, 6)
+                        .background(
+                            extraSelected ? Color.accentColor.opacity(0.20) : Color(.secondarySystemBackground),
+                            in: Capsule()
+                        )
+                        .foregroundStyle(extraSelected ? Color.accentColor : .secondary)
                     }
                 }
-            } label: {
-                Text(settings.searchEngine.shortBadge)
-                    .font(.caption.weight(.bold))
-                    .frame(width: 28, height: 28)
-                    .background(Color.accentColor.opacity(0.18), in: Circle())
-                    .foregroundStyle(Color.accentColor)
-            }
-
-            TextField("Search or enter web address", text: $searchInput)
-                .textInputAutocapitalization(.never)
-                .autocorrectionDisabled()
-                .submitLabel(.go)
-                .onSubmit(submitSearch)
-
-            Button(action: submitSearch) {
-                Image(systemName: "magnifyingglass")
-                    .foregroundStyle(searchInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? .secondary : Color.accentColor)
             }
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 10)
-        .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
     }
 
     private var wrappedBannerCard: some View {
@@ -280,7 +352,7 @@ struct DiscoveryView: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Trending New Artists")
                         .font(.headline)
-                    Text("TikTok • IG Reels • Monthly Auto-Refresh")
+                    Text("TikTok • IG Reels • Daily 12 AM Auto-Refresh")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }

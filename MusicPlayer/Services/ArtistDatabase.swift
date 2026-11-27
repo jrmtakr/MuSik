@@ -1760,5 +1760,304 @@ DANGERDOOM|Hip-Hop & Rap||dangerdoom
 Kankan|Hip-Hop & Rap||
 Imogen Heap|Pop||
 C418|Soundtrack & Classical||
+# Expanded Big, Underground, Indie & Global Catalog
+Lazer Dim 700|Hip-Hop & Rap||lazerdim700
+1oneam|Hip-Hop & Rap|S|
+Joeyy|Hip-Hop & Rap|S|
+Molly Santana|Hip-Hop & Rap||
+Fakemink|Hip-Hop & Rap||
+EsDeeKid|Hip-Hop & Rap||esdeekid
+Smokedope2016|Hip-Hop & Rap||smokedope
+Glokk40Spaz|Hip-Hop & Rap||
+Dom Corleo|Hip-Hop & Rap||
+Rich Amiri|Hip-Hop & Rap||
+Tana|Hip-Hop & Rap|S|babysantana
+Hardrock|Hip-Hop & Rap|S|
+Sematary|Hip-Hop & Rap||haunted mound
+Bladee|Hip-Hop & Rap||drain gang
+Ecco2k|Hip-Hop & Rap||
+Thaiboy Digital|Hip-Hop & Rap||
+Yung Lean|Hip-Hop & Rap||jonatan leandoer
+Xaviersobased|Hip-Hop & Rap||xavier so based
+phreshboyswag|Hip-Hop & Rap||
+2hollis|Electronic & Hyperpop||
+glaive|Electronic & Hyperpop|S|
+ericdoa|Electronic & Hyperpop||eric doa
+jane remover|Electronic & Hyperpop||
+underscores|Electronic & Hyperpop|S|
+brakence|Electronic & Hyperpop||
+100 gecs|Electronic & Hyperpop||laura les;dylan brady
+SOPHIE|Electronic & Hyperpop|S|
+A. G. Cook|Electronic & Hyperpop||ag cook
+Oklou|Electronic & Hyperpop||
+Nine Vicious|Hip-Hop & Rap||
+Yhapojj|Hip-Hop & Rap||
+Iayze|Hip-Hop & Rap||jace
+Summrs|Hip-Hop & Rap|S|
+Autumn!|Hip-Hop & Rap|S|twinuzis
+Izaya Tiji|Hip-Hop & Rap||
+SoFaygo|Hip-Hop & Rap||faygo
+Homixide Gang|Hip-Hop & Rap||
+bktherula|Hip-Hop & Rap||
+TiaCorine|Hip-Hop & Rap||
+Cochise|Hip-Hop & Rap|S|
+BabyTron|Hip-Hop & Rap||shittyboyz
+Rio Da Yung OG|Hip-Hop & Rap||
+RMC Mike|Hip-Hop & Rap||
+Skilla Baby|Hip-Hop & Rap||
+BossMan Dlow|Hip-Hop & Rap||
+BigXthaPlug|Hip-Hop & Rap||bigx
+That Mexican OT|Hip-Hop & Rap||mexican ot
+Luh Tyler|Hip-Hop & Rap||
+Anycia|Hip-Hop & Rap|S|
+Karrahbooo|Hip-Hop & Rap||
+Tierra Whack|Hip-Hop & Rap||
+Samara Cyn|Hip-Hop & Rap||
+MIKE|Hip-Hop & Rap|S|
+billy woods|Hip-Hop & Rap||armand hammer
+Mach-Hommy|Hip-Hop & Rap||
+Westside Gunn|Hip-Hop & Rap||griselda
+Conway the Machine|Hip-Hop & Rap||
+Benny the Butcher|Hip-Hop & Rap||
+Boldy James|Hip-Hop & Rap||
+Roc Marciano|Hip-Hop & Rap||
+Larry June|Hip-Hop & Rap||good job larry
+Payroll Giovanni|Hip-Hop & Rap||
+Curren$y|Hip-Hop & Rap||currensy;spitta
+Action Bronson|Hip-Hop & Rap||
+The Alchemist|Hip-Hop & Rap||alchemist
+Madlib|Hip-Hop & Rap||quasimoto;lord quas
+J Dilla|Hip-Hop & Rap||jay dee
+KnXWLEDGE|Hip-Hop & Rap||knx
+EarthGang|Hip-Hop & Rap||
+Kenny Mason|Hip-Hop & Rap||
+Redveil|Hip-Hop & Rap||
+J Hus|Hip-Hop & Rap||
+Headie One|Hip-Hop & Rap||
+Knucks|Hip-Hop & Rap||
+Nemzzz|Hip-Hop & Rap||
+Pozer|Hip-Hop & Rap|S|
+Faye Webster|Rock & Alternative||
+Men I Trust|Rock & Alternative||
+TV Girl|Rock & Alternative||
+Alex G|Rock & Alternative||sandy alex g
+Rex Orange County|Rock & Alternative||
+Boygenius|Rock & Alternative||phoebe bridgers;julien baker;lucy dacus
+Laufey|Jazz & Acoustic||
+wave to earth|Rock & Alternative||wavetoearth
+Malcolm Todd|Pop||
+Role Model|Pop|S|
+Sonder|R&B & Soul|S|
+4batz|R&B & Soul||
+Mariah the Scientist|R&B & Soul||
+FLO|R&B & Soul|S|
+Coco Jones|R&B & Soul||
+Leon Thomas|R&B & Soul||
+Destin Conrad|R&B & Soul||
+Tinashe|R&B & Soul||
+Victoria Monét|R&B & Soul||victoria monet
+Snoh Aalegra|R&B & Soul||
+Cleo Sol|R&B & Soul||
+SiR|R&B & Soul|S|
+Blood Orange|R&B & Soul||dev hynes
+Sampha|R&B & Soul||
+RAYE|Pop|S|
+Gigi Perez|Pop||
+Reneé Rapp|Pop||renee rapp
+The Marías|Rock & Alternative||the marias
+Alvvays|Rock & Alternative||
+Magdalena Bay|Electronic & Hyperpop||
+Title Fight|Rock & Alternative||
+Whirr|Rock & Alternative|S|
+Wisp|Rock & Alternative|S|
+Julie|Rock & Alternative|S|
+Fontaines D.C.|Rock & Alternative||fontaines dc
+IDLES|Rock & Alternative|S|
+Turnstile|Rock & Alternative|S|
+Wallows|Rock & Alternative||
+Overmono|Electronic & Hyperpop||
+Bicep|Electronic & Hyperpop|S|
+Amelie Lens|Electronic & Hyperpop||
+Anyma|Electronic & Hyperpop|S|
+Knock2|Electronic & Hyperpop||
+ISOxo|Electronic & Hyperpop||isoxo
+RL Grime|Electronic & Hyperpop||
+Nia Archives|Electronic & Hyperpop||
+Machine Girl|Electronic & Hyperpop||
+Kordhell|Electronic & Hyperpop||
+DVRST|Electronic & Hyperpop||
+interworld|Electronic & Hyperpop|S|
+MC Orsen|Electronic & Hyperpop||
+Uncle Waffles|Afrobeats||
+Olamide|Afrobeats||
+Gabito Ballesteros|Latin & Reggaeton||
+Tito Double P|Latin & Reggaeton||
+Neton Vega|Latin & Reggaeton||
+Oscar Maydon|Latin & Reggaeton||
+Xavi|Latin & Reggaeton|S|
+Cris Mj|Latin & Reggaeton||
+FloyyMenor|Latin & Reggaeton||floyymenor
+Young Miko|Latin & Reggaeton||
+Eladio Carrión|Latin & Reggaeton||eladio carrion
+ROSALÍA|Latin & Reggaeton||rosalia
+Tokischa|Latin & Reggaeton||
+Ichiko Aoba|Rock & Alternative||青葉市子
+Lamp|Rock & Alternative|S|
+Tatsuro Yamashita|K-Pop & J-Pop||山下達郎
+Mariya Takeuchi|K-Pop & J-Pop||竹内まりや
+Anri|K-Pop & J-Pop|S|杏里
+Miki Matsubara|K-Pop & J-Pop||松原みき
+Masayoshi Takanaka|Rock & Alternative||高中正義
+Natori|K-Pop & J-Pop||なとり
+imase|K-Pop & J-Pop|S|
+XG|K-Pop & J-Pop|S|
+KISS OF LIFE|K-Pop & J-Pop||
+RIIZE|K-Pop & J-Pop||
+BOYNEXTDOOR|K-Pop & J-Pop||
+ITZY|K-Pop & J-Pop||
+(G)I-DLE|K-Pop & J-Pop||gidle
+NMIXX|K-Pop & J-Pop||
+BIBI|K-Pop & J-Pop|S|
+DEAN|R&B & Soul|S|
+DPR IAN|K-Pop & J-Pop||dpr live
+keshi|R&B & Soul||
+Tyler Childers|Country||
+Sturgill Simpson|Country||
+Megan Moroney|Country||
+Ella Langley|Country||
+Riley Green|Country||
+Sierra Ferrell|Country||
+Billy Strings|Country||
+Wyatt Flores|Country||
+Treaty Oak Revival|Country||
+cheRomani|Hip-Hop & Rap||
+Protect|Hip-Hop & Rap|S|
+Duwap Kaine|Hip-Hop & Rap||
+Black Kray|Hip-Hop & Rap||sickboyrari
+Spaceghostpurrp|Hip-Hop & Rap||sgp
+Lil Shine|Hip-Hop & Rap||
+Desire|Hip-Hop & Rap|S|
+Jace!|Hip-Hop & Rap|S|
+TDF|Hip-Hop & Rap|S|
+Boolymon|Hip-Hop & Rap||
+Jaydes|Hip-Hop & Rap||
+Wifiskeleton|Hip-Hop & Rap||
+Untiljapan|Hip-Hop & Rap||
+Southsidesilhouette|Hip-Hop & Rap||
+Ohsxnta|Hip-Hop & Rap||
+Fluhkunxhkos|Hip-Hop & Rap||
+Yung Bans|Hip-Hop & Rap||
+Thouxanbanfauni|Hip-Hop & Rap||fauni
+Unotheactivist|Hip-Hop & Rap||uno the activist
+Madeintyo|Hip-Hop & Rap||
+Maxo Kream|Hip-Hop & Rap||
+Key!|Hip-Hop & Rap|S|
+Mick Jenkins|Hip-Hop & Rap||
+Jay Rock|Hip-Hop & Rap||
+Reason|Hip-Hop & Rap|S|
+Lancey Foux|Hip-Hop & Rap||
+Fimi Guerrero|Hip-Hop & Rap||fimiguerrero
+Len|Hip-Hop & Rap|S|
+Yt|Hip-Hop & Rap|S|
+Kyle Richh|Hip-Hop & Rap||41
+Jenn Carter|Hip-Hop & Rap||
+Tata|Hip-Hop & Rap|S|
+DThang|Hip-Hop & Rap||dthang gz
+Kay Flock|Hip-Hop & Rap||
+Sha Ek|Hip-Hop & Rap||
+Sugarhill Ddot|Hip-Hop & Rap||
+Mabu|Hip-Hop & Rap|S|lil mabu
+Dd Osama|Hip-Hop & Rap||
+Notti Osama|Hip-Hop & Rap||
+41|Hip-Hop & Rap|S|
+Cash Cobain|Hip-Hop & Rap||slizzy
+Chow Lee|Hip-Hop & Rap||
+Bay Swag|Hip-Hop & Rap||
+Vonte*|Hip-Hop & Rap|S|
+Vonoff1700|Hip-Hop & Rap||
+Chuckyy|Hip-Hop & Rap||
+Screwly G|Hip-Hop & Rap||
+Q50|Hip-Hop & Rap|S|
+Lil Jeff|Hip-Hop & Rap||
+Bloodhound Q50|Hip-Hop & Rap||
+G Herbo|Hip-Hop & Rap||lil herb
+Peejy|Hip-Hop & Rap||
+Icewear Vezzo|Hip-Hop & Rap||
+Krispylife Kidd|Hip-Hop & Rap||
+YN Jay|Hip-Hop & Rap||
+Louie Ray|Hip-Hop & Rap||
+Enrgy Beats|Hip-Hop & Rap||
+Ohgeesy|Hip-Hop & Rap||shoreline mafia
+Fenix Flexin|Hip-Hop & Rap||
+Blxst|R&B & Soul||
+Bino Rideaux|Hip-Hop & Rap||
+Kalan.FrFr|Hip-Hop & Rap||kalan frfr
+Buddha Lovas|Hip-Hop & Rap||
+YG|Hip-Hop & Rap|S|
+Dom Kennedy|Hip-Hop & Rap||
+Nipsey Hussle|Hip-Hop & Rap||
+Mozzy|Hip-Hop & Rap||
+EBK Jaaybo|Hip-Hop & Rap||
+Remble|Hip-Hop & Rap|S|
+Bluebucksclan|Hip-Hop & Rap||
+Dxrt3all|Hip-Hop & Rap||
+Mazzy Star|Rock & Alternative||hope sandoval
+Cocteau Twins|Rock & Alternative||
+Jeff Buckley|Rock & Alternative||
+Elliott Smith|Rock & Alternative||
+Fiona Apple|Rock & Alternative||
+Björk|Electronic & Hyperpop||björk
+Portishead|Electronic & Hyperpop||
+Massive Attack|Electronic & Hyperpop||
+Amaarae|R&B & Soul||
+Sudan Archives|R&B & Soul||
+Yves Tumor|Rock & Alternative||
+King Krule|Rock & Alternative||
+Panchiko|Rock & Alternative||
+Duster|Rock & Alternative|S|
+American Football|Rock & Alternative||
+Sunny Day Real Estate|Rock & Alternative||
+Lush|Rock & Alternative|S|
+Ride|Rock & Alternative|S|
+Julien Baker|Rock & Alternative||
+Lucy Dacus|Rock & Alternative||
+Adrianne Lenker|Rock & Alternative||big thief
+Big Thief|Rock & Alternative||
+Japanese Breakfast|Rock & Alternative||michelle zauner
+Soccer Mommy|Rock & Alternative||
+Snail Mail|Rock & Alternative||
+Mk.gee|Rock & Alternative||mkgee
+Dijon|R&B & Soul|S|
+Jai Paul|Electronic & Hyperpop||
+Dean Blunt|Electronic & Hyperpop||babyfather
+Bar Italia|Rock & Alternative||
+Channel Tres|Electronic & Hyperpop||
+Sam Gellaitry|Electronic & Hyperpop||
+Montell Fish|R&B & Soul||
+Sewerslvt|Electronic & Hyperpop||cynthoni
+Femtanyl|Electronic & Hyperpop||
+Snow Strippers|Electronic & Hyperpop||
+Damon R|Electronic & Hyperpop||
+Brothel|Electronic & Hyperpop||
+Sidewalks And Skeletons|Electronic & Hyperpop||
+Pastel Ghost|Electronic & Hyperpop||
+Crystal Castles|Electronic & Hyperpop||
+Salem|Electronic & Hyperpop|S|
+White Ring|Electronic & Hyperpop||
+Kamasi Washington|Jazz & Acoustic||
+Robert Glasper|Jazz & Acoustic||
+Thundercat|Jazz & Acoustic||stephen bruner
+Flying Lotus|Electronic & Hyperpop||flylo;captain murphy
+BADBADNOTGOOD|Jazz & Acoustic||bbng
+Yussef Dayes|Jazz & Acoustic||
+DOMi & JD BECK|Jazz & Acoustic||domi and jd beck
+Tom Misch|R&B & Soul||
+FKJ|Electronic & Hyperpop|S|french kiwi juice
+Hiatus Kaiyote|R&B & Soul||
+Free Nationals|R&B & Soul||
+Masego|R&B & Soul||
+Raveena|R&B & Soul||
+Sabrina Claudio|R&B & Soul||
+Alina Baraz|R&B & Soul||
 """
 }
