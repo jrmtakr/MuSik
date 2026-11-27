@@ -1356,6 +1356,9 @@ final class MediaManager {
     }
 
     func playQueuedItem(at queueIndex: Int) {
+        if DiscoverQueueService.shared.isPlayingFromDiscoverQueue {
+            DiscoverQueueService.shared.switchToPersonalQueue(playNextNow: false)
+        }
         let currentUpNext = upNextItems
         guard currentUpNext.indices.contains(queueIndex) else { return }
         let selected = currentUpNext[queueIndex]
@@ -1415,6 +1418,18 @@ final class MediaManager {
 
     func playNext(fromQueueOnly: Bool = false) {
         AppHaptics.light()
+        if DiscoverQueueService.shared.isPlayingFromDiscoverQueue {
+            let seed = currentItem
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let started = await DiscoverQueueService.shared.playNextAutoDiscover(after: seed)
+                if !started {
+                    self.playFallbackActiveQueue(fromQueueOnly: fromQueueOnly)
+                }
+            }
+            return
+        }
+
         if let queued = popNextQueuedItem() {
             play(queued, inPlaylist: activePlaylistID)
             return
@@ -1485,6 +1500,15 @@ final class MediaManager {
     func playPrevious() {
         if currentTime > 3 {
             seek(to: 0)
+            return
+        }
+        if DiscoverQueueService.shared.isPlayingFromDiscoverQueue {
+            Task { @MainActor [weak self] in
+                let handled = await DiscoverQueueService.shared.playPreviousDiscoverItem()
+                if !handled {
+                    self?.seek(to: 0)
+                }
+            }
             return
         }
         if let prevHandler = externalQueuePreviousHandler, prevHandler() {
@@ -3441,6 +3465,27 @@ final class MediaManager {
             return
         }
 
+        if DiscoverQueueService.shared.isPlayingFromDiscoverQueue {
+            let seed = currentItem
+            isPlaying = false
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let started = await DiscoverQueueService.shared.playNextAutoDiscover(after: seed)
+                if !started {
+                    if self.repeatMode == .all {
+                        self.seek(to: 0)
+                        self.resume()
+                    } else {
+                        self.seek(to: 0)
+                        if let currentItem = self.currentItem {
+                            self.updateNowPlayingInfo(for: currentItem)
+                        }
+                    }
+                }
+            }
+            return
+        }
+
         if let queued = popNextQueuedItem() {
             play(queued, inPlaylist: activePlaylistID)
             return
@@ -3565,6 +3610,9 @@ final class MediaManager {
     }
 
     private func peekNextCrossfadeCandidate() -> (item: MediaItem, fromUserQueue: Bool)? {
+        if DiscoverQueueService.shared.isPlayingFromDiscoverQueue {
+            return nil
+        }
         if let queued = upNextItems.first {
             return (queued, true)
         }

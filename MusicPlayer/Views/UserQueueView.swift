@@ -197,6 +197,67 @@ struct UserQueueContentView: View {
             }
             .listRowBackground(Color.clear)
             .listRowSeparator(.hidden)
+
+            playbackSourceToggleRow
+                .listRowBackground(Color.clear)
+                .listRowSeparator(.hidden)
+        }
+    }
+
+    private var playbackSourceToggleRow: some View {
+        let isDiscoverActive = discoverQueue.isPlayingFromDiscoverQueue
+        let personalLabel: String = {
+            if let savedID = discoverQueue.savedPlaylistIDBeforeDiscover,
+               let pl = mediaManager.playlists.first(where: { $0.id == savedID }) {
+                return pl.name
+            }
+            if let activeID = mediaManager.activePlaylistID,
+               let pl = mediaManager.playlists.first(where: { $0.id == activeID }) {
+                return pl.name
+            }
+            return "Personal Queue (\(queuedRows.count))"
+        }()
+
+        return HStack(spacing: 8) {
+            Text("Playing From:")
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(isEmbeddedDarkGlass ? .white.opacity(0.65) : .secondary)
+
+            Button {
+                AppHaptics.selection()
+                discoverQueue.switchToPersonalQueue(playNextNow: false)
+                withAnimation(.easeInOut(duration: 0.18)) {
+                    selectedTab = .upNext
+                }
+            } label: {
+                Label(personalLabel, systemImage: "music.note.list")
+                    .font(.caption2.weight(.semibold))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.mini)
+            .tint(!isDiscoverActive ? Color.accentColor : (isEmbeddedDarkGlass ? Color.white.opacity(0.14) : Color.secondary.opacity(0.22)))
+            .foregroundStyle(!isDiscoverActive ? .white : (isEmbeddedDarkGlass ? .white.opacity(0.8) : .primary))
+
+            Button {
+                AppHaptics.selection()
+                discoverQueue.switchToDiscoverQueue(playNextNow: false)
+                withAnimation(.easeInOut(duration: 0.18)) {
+                    selectedTab = .discover
+                }
+            } label: {
+                Label("Discover Queue", systemImage: "sparkles")
+                    .font(.caption2.weight(.semibold))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.mini)
+            .tint(isDiscoverActive ? Color.purple : (isEmbeddedDarkGlass ? Color.white.opacity(0.14) : Color.secondary.opacity(0.22)))
+            .foregroundStyle(isDiscoverActive ? .white : (isEmbeddedDarkGlass ? .white.opacity(0.8) : .primary))
+
+            Spacer(minLength: 0)
         }
     }
 
@@ -463,20 +524,22 @@ struct UserQueueContentView: View {
                     Image(systemName: "sparkles")
                         .font(.title2)
                         .foregroundStyle(isEmbeddedDarkGlass ? .white.opacity(0.7) : .secondary)
-                    Text("No Related Tracks Yet")
+                    Text("No More Unplayed Tracks")
                         .font(.subheadline.weight(.semibold))
                         .foregroundStyle(isEmbeddedDarkGlass ? .white : .primary)
-                    Text("Play a song or video to populate related tracks automatically.")
+                    Text("Tap Discover More to load a fresh wave of related songs & videos excluding what you just played.")
                         .font(.caption)
                         .foregroundStyle(isEmbeddedDarkGlass ? .white.opacity(0.65) : .secondary)
                         .multilineTextAlignment(.center)
-                    if let current = mediaManager.currentItem {
-                        Button("Try Refresh") {
-                            discoverQueue.refreshIfNeeded(for: current, force: true)
-                        }
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
+                    Button {
+                        Task { await discoverQueue.discoverMore() }
+                    } label: {
+                        Label("Discover More", systemImage: "sparkles")
+                            .font(.caption.weight(.semibold))
                     }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.purple)
+                    .controlSize(.small)
                 }
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 20)
@@ -485,6 +548,32 @@ struct UserQueueContentView: View {
                 ForEach(discoverQueue.items) { item in
                     discoverQueueRow(item)
                 }
+
+                HStack {
+                    Spacer()
+                    Button {
+                        Task { await discoverQueue.discoverMore() }
+                    } label: {
+                        if discoverQueue.isLoading {
+                            HStack(spacing: 6) {
+                                ProgressView()
+                                    .controlSize(.mini)
+                                Text("Loading More...")
+                                    .font(.caption.weight(.semibold))
+                            }
+                        } else {
+                            Label("Discover More", systemImage: "sparkles")
+                                .font(.caption.weight(.semibold))
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.purple)
+                    .controlSize(.small)
+                    .disabled(discoverQueue.isLoading)
+                    Spacer()
+                }
+                .padding(.vertical, 8)
+                .listRowBackground(Color.clear)
             }
         } header: {
             VStack(alignment: .leading, spacing: 6) {
@@ -512,15 +601,14 @@ struct UserQueueContentView: View {
                     }
                     .tint(discoverQueue.isAutoPlayEnabled ? .purple : .secondary)
 
-                    if let current = mediaManager.currentItem {
-                        Button {
-                            discoverQueue.refreshIfNeeded(for: current, force: true)
-                        } label: {
-                            Image(systemName: "arrow.clockwise")
-                                .font(.caption.weight(.semibold))
-                        }
-                        .tint(isEmbeddedDarkGlass ? .white.opacity(0.8) : .accentColor)
+                    Button {
+                        Task { await discoverQueue.discoverMore() }
+                    } label: {
+                        Label("Discover More", systemImage: "arrow.clockwise")
+                            .font(.caption2.weight(.semibold))
                     }
+                    .tint(.purple)
+                    .disabled(discoverQueue.isLoading)
                 }
             }
         }

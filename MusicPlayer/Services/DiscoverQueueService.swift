@@ -43,6 +43,11 @@ final class DiscoverQueueService {
     var activePlayingID: String?
     var statusMessage: String?
 
+    /// True whenever playback is actively advancing through Discover Queue instead of the user's
+    /// personal Playing Next / playlist queue (preserved intact until the user switches back).
+    var isPlayingFromDiscoverQueue: Bool = false
+    @ObservationIgnored var savedPlaylistIDBeforeDiscover: UUID?
+
     var isAutoPlayEnabled: Bool {
         didSet {
             UserDefaults.standard.set(isAutoPlayEnabled, forKey: Self.autoPlayDefaultsKey)
@@ -52,6 +57,9 @@ final class DiscoverQueueService {
     @ObservationIgnored private var refreshTask: Task<Void, Never>?
     @ObservationIgnored private var playedHistoryIDs: [String] = []
     @ObservationIgnored private var playedNormKeys: Set<String> = []
+    @ObservationIgnored private var playedDiscoverStack: [DiscoverQueueItem] = []
+    @ObservationIgnored private var usedSeedVideoIDs: Set<String> = []
+    @ObservationIgnored private var lastSeedItem: MediaItem?
     @ObservationIgnored private var videoIDCacheByNormKey: [String: String] = [:]
 
     private init() {
@@ -62,25 +70,69 @@ final class DiscoverQueueService {
         }
     }
 
+    // MARK: - Queue Source Switching (Personal Queue / Playlist <-> Discover Queue)
+
+    func enterDiscoverPlaybackMode(preservingPlaylistID playlistID: UUID?) {
+        if !isPlayingFromDiscoverQueue {
+            savedPlaylistIDBeforeDiscover = playlistID
+        }
+        isPlayingFromDiscoverQueue = true
+    }
+
+    func switchToPersonalQueue(playNextNow: Bool = false) {
+        let mm = MediaManager.shared
+        isPlayingFromDiscoverQueue = false
+        if let saved = savedPlaylistIDBeforeDiscover {
+            mm.activePlaylistID = saved
+        }
+        savedPlaylistIDBeforeDiscover = nil
+        if playNextNow {
+            mm.playNext(fromQueueOnly: false)
+        }
+    }
+
+    func switchToDiscoverQueue(playNextNow: Bool = false) {
+        enterDiscoverPlaybackMode(preservingPlaylistID: MediaManager.shared.activePlaylistID)
+        if let current = MediaManager.shared.currentItem, items.isEmpty && !isLoading {
+            refreshIfNeeded(for: current, force: true)
+        }
+        if playNextNow {
+            let seed = MediaManager.shared.currentItem
+            Task { @MainActor in
+                _ = await playNextAutoDiscover(after: seed)
+            }
+        }
+    }
+
     // MARK: - Playback Tracking & Auto-Refresh
 
     func handleNowPlayingChanged(to item: MediaItem, fromDiscoverQueue: Bool = false) {
         let key = trackKey(for: item)
         recordPlayedTrack(item)
+        if !fromDiscoverQueue {
+            lastSeedItem = item
+        }
 
-        if !fromDiscoverQueue && key != seedKey {
-            refreshIfNeeded(for: item, force: true)
-        } else if fromDiscoverQueue {
+        if fromDiscoverQueue {
+            isPlayingFromDiscoverQueue = true
             let activeID = activePlayingID
             items.removeAll { candidate in
                 if let activeID, candidate.id == activeID { return true }
                 return matches(candidate, item: item)
             }
-            if items.count < 5 {
+            if items.isEmpty {
+                Task { @MainActor [weak self] in
+                    await self?.discoverMore()
+                }
+            }
+        } else {
+            isPlayingFromDiscoverQueue = false
+            savedPlaylistIDBeforeDiscover = nil
+            if key != seedKey {
+                refreshIfNeeded(for: item, force: true)
+            } else if items.isEmpty {
                 refreshIfNeeded(for: item, force: true)
             }
-        } else if items.isEmpty {
-            refreshIfNeeded(for: item, force: true)
         }
     }
 
@@ -92,6 +144,7 @@ final class DiscoverQueueService {
 
         refreshTask?.cancel()
         seedKey = key
+        lastSeedItem = item
         let cleanMeta = cleanedMetadata(for: item)
         seedTitle = cleanMeta.song
         seedArtist = cleanMeta.artist
@@ -103,6 +156,9 @@ final class DiscoverQueueService {
         isLoading = true
 
         let itemID = MediaManager.shared.sourceVideoID(for: item)
+        if let itemID, !itemID.isEmpty {
+            usedSeedVideoIDs.insert(itemID)
+        }
         let capturedItem = item
         let snapshotHistory = Set(playedHistoryIDs)
         let snapshotNorms = playedNormKeys
@@ -123,6 +179,7 @@ final class DiscoverQueueService {
             if let resolvedSeed = fetched.resolvedSeedVideoID, !resolvedSeed.isEmpty {
                 let normKey = Self.normalizedTrackKey(title: cleanMeta.song, artist: cleanMeta.artist)
                 self.videoIDCacheByNormKey[normKey] = resolvedSeed
+                self.usedSeedVideoIDs.insert(resolvedSeed)
                 if !capturedItem.relativePath.hasPrefix("__remote__/") {
                     MediaManager.shared.setSourceVideoID(resolvedSeed, for: capturedItem)
                 }
@@ -132,6 +189,62 @@ final class DiscoverQueueService {
             self.items = merged
             self.isLoading = false
         }
+    }
+
+    /// Reloads fresh related songs and music videos while strictly excluding everything that played prior.
+    func discoverMore() async {
+        let anchorItem = MediaManager.shared.currentItem ?? lastSeedItem
+        guard let anchorItem else { return }
+
+        refreshTask?.cancel()
+        isLoading = true
+        statusMessage = "Discovering more related tracks..."
+
+        // Pick a related un-seeded videoID from the tail of current Discover items (or latest played)
+        // so YouTube Music returns a fresh wave instead of repeating the first 50 items.
+        let unusedFromQueue = items.reversed().compactMap(\.videoID).first { !usedSeedVideoIDs.contains($0) }
+        let unusedFromPlayed = playedDiscoverStack.reversed().compactMap(\.videoID).first { !usedSeedVideoIDs.contains($0) }
+        let fallbackVid = MediaManager.shared.sourceVideoID(for: anchorItem)
+        let chosenSeedVid = unusedFromQueue ?? unusedFromPlayed ?? fallbackVid
+
+        if let chosenSeedVid, !chosenSeedVid.isEmpty {
+            usedSeedVideoIDs.insert(chosenSeedVid)
+        }
+
+        let clean = cleanedMetadata(for: anchorItem)
+        let offlineMatches = buildLocalRelatedItems(for: anchorItem, cleanArtist: clean.artist, cleanTitle: clean.song)
+        let priorShownIDs = Set(items.map(\.id)).union(items.compactMap(\.videoID))
+        let snapshotHistory = Set(playedHistoryIDs).union(priorShownIDs)
+        let snapshotNorms = playedNormKeys
+
+        var fetched = await Self.fetchOnlineRelatedItems(
+            for: anchorItem,
+            seedVideoID: chosenSeedVid,
+            cleanSong: clean.song,
+            cleanArtist: clean.artist,
+            videoCache: videoIDCacheByNormKey,
+            excludedIDs: snapshotHistory,
+            excludedNorms: snapshotNorms
+        )
+
+        // If rotating from the previous wave excluded too many, widen once keeping ONLY playedHistoryIDs excluded.
+        if fetched.items.count < 5 {
+            let playedOnly = Set(playedHistoryIDs)
+            fetched = await Self.fetchOnlineRelatedItems(
+                for: anchorItem,
+                seedVideoID: unusedFromQueue ?? fallbackVid ?? chosenSeedVid,
+                cleanSong: clean.song,
+                cleanArtist: clean.artist,
+                videoCache: videoIDCacheByNormKey,
+                excludedIDs: playedOnly,
+                excludedNorms: snapshotNorms
+            )
+        }
+
+        let merged = mergeOnline(fetched.items, withOffline: offlineMatches, seedItem: anchorItem)
+        items = merged
+        isLoading = false
+        statusMessage = nil
     }
 
     // MARK: - Playback & Auto-Play
@@ -151,6 +264,12 @@ final class DiscoverQueueService {
         items.removeAll { $0.id == discoverItem.id }
 
         let mm = MediaManager.shared
+        enterDiscoverPlaybackMode(preservingPlaylistID: mm.activePlaylistID)
+        playedDiscoverStack.append(discoverItem)
+        if playedDiscoverStack.count > 40 {
+            playedDiscoverStack.removeFirst(playedDiscoverStack.count - 40)
+        }
+
         if let localMatch = findCachedLocalMatch(for: discoverItem, in: mm.items) {
             _ = mm.play(localMatch, inPlaylist: nil, fromDiscoverQueue: true)
             return true
@@ -204,27 +323,25 @@ final class DiscoverQueueService {
     }
 
     @discardableResult
+    func playPreviousDiscoverItem() async -> Bool {
+        guard playedDiscoverStack.count >= 2 else { return false }
+        _ = playedDiscoverStack.popLast()
+        guard let prev = playedDiscoverStack.popLast() else { return false }
+        return await playItem(prev)
+    }
+
+    @discardableResult
     func playNextAutoDiscover(after item: MediaItem?) async -> Bool {
-        if items.isEmpty, let item {
-            let clean = cleanedMetadata(for: item)
-            let localSeed = buildLocalRelatedItems(for: item, cleanArtist: clean.artist, cleanTitle: clean.song)
-            items = localSeed
+        enterDiscoverPlaybackMode(preservingPlaylistID: MediaManager.shared.activePlaylistID)
+        if items.isEmpty {
             if isLoading {
                 let deadline = Date().addingTimeInterval(3.5)
                 while isLoading && Date() < deadline {
                     try? await Task.sleep(nanoseconds: 150_000_000)
                 }
-            } else {
-                let fetched = await Self.fetchOnlineRelatedItems(
-                    for: item,
-                    seedVideoID: MediaManager.shared.sourceVideoID(for: item),
-                    cleanSong: clean.song,
-                    cleanArtist: clean.artist,
-                    videoCache: videoIDCacheByNormKey,
-                    excludedIDs: Set(playedHistoryIDs),
-                    excludedNorms: playedNormKeys
-                )
-                items = mergeOnline(fetched.items, withOffline: localSeed, seedItem: item)
+            }
+            if items.isEmpty {
+                await discoverMore()
             }
         }
 
@@ -330,8 +447,8 @@ final class DiscoverQueueService {
         let norm = Self.normalizedTrackKey(title: clean.song, artist: clean.artist)
         if !norm.isEmpty {
             playedNormKeys.insert(norm)
-            if playedNormKeys.count > 120 {
-                playedNormKeys = Set(playedNormKeys.prefix(60))
+            if playedNormKeys.count > 400 {
+                playedNormKeys = Set(playedNormKeys.prefix(250))
             }
         }
     }
@@ -350,8 +467,8 @@ final class DiscoverQueueService {
     private func appendHistoryID(_ id: String) {
         playedHistoryIDs.removeAll { $0 == id }
         playedHistoryIDs.append(id)
-        if playedHistoryIDs.count > 60 {
-            playedHistoryIDs.removeFirst(playedHistoryIDs.count - 60)
+        if playedHistoryIDs.count > 250 {
+            playedHistoryIDs.removeFirst(playedHistoryIDs.count - 250)
         }
     }
 
@@ -394,11 +511,15 @@ final class DiscoverQueueService {
         let seedTitleKey = ArtistDatabase.normalizeLookupKey(cleanTitle)
 
         var scored: [(score: Int, item: MediaItem)] = []
+        let historySet = Set(playedHistoryIDs)
         for cand in mm.items where cand.relativePath != seed.relativePath {
+            if let candVid = mm.sourceVideoID(for: cand), historySet.contains(candVid) { continue }
+            if historySet.contains("local:\(cand.relativePath)") { continue }
             let meta = cleanedMetadata(for: cand)
             let candArtistKey = ArtistDatabase.normalizeLookupKey(meta.artist)
             let candTitleKey = ArtistDatabase.normalizeLookupKey(meta.song)
             if candTitleKey == seedTitleKey && candArtistKey == seedArtistKey { continue }
+            if playedNormKeys.contains(Self.normalizedTrackKey(title: meta.song, artist: meta.artist)) { continue }
 
             var score = 0
             if !seedArtistKey.isEmpty && candArtistKey == seedArtistKey {
