@@ -140,7 +140,7 @@ struct AIRecognizedTrackInfo: Equatable, Sendable {
 @Observable
 final class SyncedLyricsService {
     static let shared = SyncedLyricsService()
-    nonisolated static let currentAlignmentVersion = 4
+    nonisolated static let currentAlignmentVersion = 5
 
     var currentLyrics: ResolvedTrackLyrics?
     var currentLoadingKey: String?
@@ -216,16 +216,17 @@ final class SyncedLyricsService {
                     activeFetchTask = Task {
                         let heard = await SongAudioListener.listen(to: item.fileURL)
                         guard !Task.isCancelled else { return }
-                        let upgraded = await fetchAndAlignDuringImport(
-                            item: item,
-                            title: item.displayTitle,
-                            artist: item.artist ?? "",
-                            duration: item.durationSeconds,
-                            heard: heard
-                        )
-                        if !upgraded, !Task.isCancelled {
+                        if disk.isTimeSynced || disk.lines.count >= 4 {
                             let reAligned = await SongAudioListener.autoAlign(lyrics: disk, heard: heard, fileURL: item.fileURL)
                             storeAlignedLyrics(reAligned, for: item)
+                        } else {
+                            _ = await fetchAndAlignDuringImport(
+                                item: item,
+                                title: item.displayTitle,
+                                artist: item.artist ?? "",
+                                duration: item.durationSeconds,
+                                heard: heard
+                            )
                         }
                     }
                 }
@@ -284,8 +285,7 @@ final class SyncedLyricsService {
             if var resolved {
                 // Automatically line synced or plain lyrics up into real-time word-timed lyrics against local audio.
                 if !item.relativePath.hasPrefix("__remote__/") && !item.isHLS {
-                    let cachedWhisper = await WhisperTranscriptionEngine.shared.isModelCachedLocally
-                    let preHeard = cachedWhisper ? await SongAudioListener.listen(to: item.fileURL) : nil
+                    let preHeard = await SongAudioListener.listen(to: item.fileURL)
                     resolved = await SongAudioListener.autoAlign(lyrics: resolved, heard: preHeard, fileURL: item.fileURL)
                     guard !Task.isCancelled else { return }
                 }
@@ -467,7 +467,9 @@ final class SyncedLyricsService {
                 }
 
                 var autoSaved = false
-                if outcome.isHighConfidence && !MediaManager.shared.isArtistVerified(for: item) {
+                let existingArtist = item.artist?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                let needsArtistFill = existingArtist.isEmpty || existingArtist == "Unknown Artist"
+                if outcome.isHighConfidence && (forceReidentify || (!MediaManager.shared.isArtistVerified(for: item) && needsArtistFill)) {
                     MediaManager.shared.confirmVerifiedArtist(
                         for: item,
                         artistName: canonicalArtist,

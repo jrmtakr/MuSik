@@ -1596,8 +1596,13 @@ final class MediaManager {
         forceOverwriteVerified: Bool = false
     ) -> Bool {
         var entry = customMetadataByPath[relativePath] ?? CustomTrackMetadata()
-        if !forceOverwriteVerified && entry.isArtistVerified == true && entry.autoIdentifiedSource == nil {
-            return false
+        if !forceOverwriteVerified && entry.isArtistVerified == true {
+            let existingArtist = entry.artist?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let existingTitle = entry.title?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let hasRealArtist = !existingArtist.isEmpty && existingArtist != "Unknown Artist" && existingArtist != "Various Artists"
+            if entry.autoIdentifiedSource == nil || (hasRealArtist && !existingTitle.isEmpty) {
+                return false
+            }
         }
         let cleanTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
         let cleanArtist = ArtistDatabase.canonicalizeSingle(artist.trimmingCharacters(in: .whitespacesAndNewlines))

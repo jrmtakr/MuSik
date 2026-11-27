@@ -366,10 +366,13 @@ final class WholeSongAIService {
 
         let topCandidate = verification.candidates.first
         let topHasLyricEvidence = topCandidate?.matchReasons.contains(where: { $0.contains("Lyrics") }) == true
+        let topTitleMatches = topCandidate.map {
+            ArtistDatabase.normalizeLookupKey($0.trackTitle) == ArtistDatabase.normalizeLookupKey(item.displayTitle)
+        } ?? false
         let isConfidentMatch: Bool = {
             guard let top = topCandidate else { return false }
-            if top.score >= 68 { return true }
-            if topHasLyricEvidence && top.score >= 52 { return true }
+            if top.score >= 76 { return true }
+            if topHasLyricEvidence && (top.score >= 66 || (topTitleMatches && top.score >= 56)) { return true }
             return false
         }()
 
@@ -387,20 +390,6 @@ final class WholeSongAIService {
             decidedGenre = top.genre ?? ArtistDatabase.genre(forArtist: top.artistName)
             decidedArtworkURL = top.artworkURL
         } else {
-            // Fall back to cleaned title / YouTube credit hint without forcing an unverified catalog artist
-            let cleaned = ArtistDatabase.cleanSongTitleForSearch(
-                rawTitle: item.displayTitle,
-                rawArtistTag: item.artist,
-                ignoredChannels: ListeningWrappedService.shared.ignoredChannels
-            )
-            if !cleaned.songOnly.isEmpty {
-                decidedTitle = cleaned.songOnly
-            }
-            if let hint = verification.youtubeCreditHint, !hint.isEmpty {
-                decidedArtist = hint
-            } else if let artistHint = cleaned.artistHint, !artistHint.isEmpty {
-                decidedArtist = artistHint
-            }
             confidenceScore = 0
         }
 
@@ -414,18 +403,18 @@ final class WholeSongAIService {
         }
         if Task.isCancelled { return }
 
-        // Apply decided Song, Album, and Artist to MediaManager
+        // Only overwrite track title/artist/album when verification reached high confidence.
         let cleanFinalArtist = decidedArtist?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let cleanFinalAlbum = decidedAlbum?.trimmingCharacters(in: .whitespacesAndNewlines)
 
-        if isConfidentMatch || downloadedArtwork != nil || decidedTitle != item.displayTitle || (cleanFinalAlbum?.isEmpty == false) {
+        if isConfidentMatch {
             MediaManager.shared.updateTrackInfo(
                 for: item,
                 title: decidedTitle,
                 artist: cleanFinalArtist,
                 album: cleanFinalAlbum,
                 coverImage: downloadedArtwork,
-                markArtistVerified: isConfidentMatch,
+                markArtistVerified: true,
                 genre: decidedGenre
             )
         }

@@ -1,5 +1,6 @@
 import Accelerate
 import AVFoundation
+import CoreMedia
 import Foundation
 @preconcurrency import Speech
 
@@ -60,17 +61,19 @@ enum SongAudioListener {
     }
 
     /// Transcribes the whole file (audio or music video).
-    /// Prefers on-demand CoreML Whisper (`wordTimestamps: true`), falling back cleanly to 5s-overlapping
-    /// Apple `SFSpeechRecognizer` chunks when Whisper hasn't finished downloading or is offline.
+    /// Uses cached on-device CoreML Whisper (`allowDownload: false` so playback never stalls on model download),
+    /// falling back immediately to 5s-overlapping Apple `SFSpeechRecognizer` chunks when Whisper isn't cached yet.
     static func listen(
         to fileURL: URL,
         maxSeconds: Double = 15 * 60,
+        languageHint: String? = "en",
         onProgress: (@Sendable (Int, Int, Double) -> Void)? = nil
     ) async -> [HeardWord]? {
         if let whisperWords = await WhisperTranscriptionEngine.shared.transcribeWholeFile(
             fileURL: fileURL,
             maxSeconds: maxSeconds,
-            allowDownload: true,
+            allowDownload: false,
+            languageHint: languageHint,
             onProgress: onProgress
         ), !whisperWords.isEmpty {
             return whisperWords.map {
@@ -319,6 +322,39 @@ enum SongAudioListener {
         return .inconclusive
     }
 
+    /// Returns true when `heard` shares a real ordered phrase or >= 3 monotonic lyric anchors (prevents bag-of-words mislabels).
+    static func hasOrderedPhraseMatch(heard: [HeardWord], lyrics: ResolvedTrackLyrics) -> Bool {
+        guard heard.count >= 6, !lyrics.lines.isEmpty else { return false }
+        if lyrics.isTimeSynced && alignmentAnchors(heard: heard, lines: lyrics.lines).count >= 3 {
+            return true
+        }
+        // Check contiguous 4-word phrases anywhere in heard transcript (for plain lyrics or unsynced drafts).
+        let heardNorms = heard.map(\.token)
+        for line in lyrics.lines where !line.isInstrumentalBreak {
+            let toks = tokens(line.text)
+            guard toks.count >= 4 else { continue }
+            for k in 0...(toks.count - 4) {
+                let target = Array(toks[k..<(k + 4)])
+                let contentCount = target.filter { $0.count >= 3 && !stopWords.contains($0) }.count
+                guard contentCount >= 2 else { continue }
+                for h in 0...(heardNorms.count - 4) {
+                    var matched = 0
+                    var cursor = h
+                    let hEnd = min(heardNorms.count, h + 6)
+                    for wt in target {
+                        while cursor < hEnd && heardNorms[cursor] != wt { cursor += 1 }
+                        if cursor < hEnd {
+                            matched += 1
+                            cursor += 1
+                        }
+                    }
+                    if matched == 4 { return true }
+                }
+            }
+        }
+        return false
+    }
+
     /// A distinctive run of heard words, for looking a song up by its lyrics when nothing else knows it.
     static func searchPhrases(from heard: [HeardWord], count: Int = 3) -> [String] {
         let words = heard.map(\.token)
@@ -349,11 +385,15 @@ enum SongAudioListener {
     private static func alignWithAnchors(
         lyrics: ResolvedTrackLyrics,
         heard: [HeardWord],
-        curve: VocalEnvelope?
+        curve: VocalEnvelope?,
+        preserveUncoveredSections: Bool = false
     ) -> ResolvedTrackLyrics? {
         guard lyrics.isTimeSynced, !lyrics.lines.isEmpty else { return nil }
         let anchors = alignmentAnchors(heard: heard, lines: lyrics.lines)
-        guard !anchors.isEmpty else { return nil }
+        guard anchors.count >= 4 else { return nil }
+        let anchorSpan = (anchors.last?.lyricTime ?? 0) - (anchors.first?.lyricTime ?? 0)
+        let totalSpan = max(1.0, (lyrics.lines.last?.startTime ?? 0) - (lyrics.lines.first?.startTime ?? 0))
+        guard anchorSpan >= 20.0 || anchorSpan >= totalSpan * 0.25 else { return nil }
 
         // Precompute split point inside each irregular gap [a, b] using largest lyric pause or deepest singing valley.
         let nonBreakLines = lyrics.lines.filter { !$0.isInstrumentalBreak }
@@ -397,11 +437,19 @@ enum SongAudioListener {
         }
 
         func map(_ t: Double) -> Double {
-            if anchors.count == 1 || t <= anchors[0].lyricTime {
-                return t + (anchors[0].fileTime - anchors[0].lyricTime)
+            if t <= anchors[0].lyricTime {
+                let firstDelta = anchors[0].fileTime - anchors[0].lyricTime
+                if preserveUncoveredSections && abs(firstDelta) > 4.0 {
+                    return t
+                }
+                return t + firstDelta
             }
             if let last = anchors.last, t >= last.lyricTime {
-                return t + (last.fileTime - last.lyricTime)
+                let lastDelta = last.fileTime - last.lyricTime
+                if preserveUncoveredSections && abs(lastDelta) > 4.0 {
+                    return t
+                }
+                return t + lastDelta
             }
             for k in 0..<(anchors.count - 1) {
                 let a = anchors[k], b = anchors[k + 1]
@@ -480,10 +528,20 @@ enum SongAudioListener {
 
         var working = lyrics
         if working.isTimeSynced {
-            if let heard, let sttAligned = alignWithAnchors(lyrics: working, heard: heard, curve: curve) {
-                working = sttAligned
-            } else {
-                working = alignAcousticallyInternal(lyrics: working, curve: curve)
+            // 1. Always run acoustic / Section-DTW alignment first using harmonic singing envelope
+            //    so skits/intros/breaks are locked across sections even when ASR missed parts of the song.
+            let acousticallyAligned = alignAcousticallyInternal(lyrics: working, curve: curve)
+            let hadSectionDTW = acousticallyAligned.attributionText?.contains("section-DTW") == true
+            working = acousticallyAligned
+
+            // 2. Refine individual lines using >= 4 ordered multi-section heard anchors without clobbering uncovered sections.
+            if let heard, let sttRefined = alignWithAnchors(
+                lyrics: working,
+                heard: heard,
+                curve: curve,
+                preserveUncoveredSections: hadSectionDTW
+            ) {
+                working = sttRefined
             }
         } else {
             working = alignPlainLyricsIntoRealTimeSync(lyrics: working, heard: heard, curve: curve)
@@ -1006,7 +1064,8 @@ enum SongAudioListener {
             let rawEnd = min(nextLineFloor, max(rawStart + 0.45, line.endTime > rawStart + 0.25 ? line.endTime : nextLineFloor))
             let minVocalDur = min(rawEnd - rawStart, max(0.50, Double(rawWords.count) * 0.14))
 
-            // Trim silent leading padding and trailing beat tails via 43 Hz vocal energy so words track actual vocals.
+            // Trim silent leading padding (up to 1.35s) and trailing drum/beat tails via 43 Hz harmonic vocal energy
+            // requiring 3 sustained onset frames (~70ms) and 4 sustained release frames (~93ms) so snares can't stretch lines.
             var vocalStart = rawStart
             var vocalEnd = rawEnd
             if let curve, !curve.fastVocalEnvelope.isEmpty {
@@ -1014,31 +1073,42 @@ enum SongAudioListener {
                 let iStart = max(0, min(curve.fastVocalEnvelope.count - 1, Int(rawStart / dt)))
                 let iEnd = max(iStart + 1, min(curve.fastVocalEnvelope.count, Int(rawEnd / dt)))
 
-                let maxTrimLeadIdx = min(iEnd, Int((min(rawStart + 0.50, rawEnd - minVocalDur)) / dt))
-                if maxTrimLeadIdx > iStart {
+                let maxTrimLeadIdx = min(iEnd, Int((min(rawStart + 1.35, rawEnd - minVocalDur)) / dt))
+                if maxTrimLeadIdx > iStart + 2 {
                     var scan = iStart
-                    while scan < maxTrimLeadIdx && curve.fastVocalEnvelope[scan] < -0.22 {
+                    while scan + 2 < maxTrimLeadIdx {
+                        let s0 = curve.fastVocalEnvelope[scan]
+                        let s1 = curve.fastVocalEnvelope[scan + 1]
+                        let s2 = curve.fastVocalEnvelope[scan + 2]
+                        if s0 >= -0.14 && s1 >= -0.10 && s2 >= -0.12 {
+                            break
+                        }
                         scan += 1
                     }
-                    if scan < maxTrimLeadIdx && curve.fastVocalEnvelope[scan] >= -0.10 {
+                    if scan + 2 < maxTrimLeadIdx {
                         vocalStart = max(rawStart, min(rawEnd - minVocalDur, Double(scan) * dt - 0.03))
                     }
                 }
 
-                let minEndIdx = max(iStart + 2, Int((vocalStart + minVocalDur) / dt))
-                if iEnd > minEndIdx + 2 {
-                    for rev in stride(from: iEnd - 1, through: minEndIdx + 1, by: -1) {
-                        if curve.fastVocalEnvelope[rev] > -0.15 && curve.fastVocalEnvelope[rev - 1] > -0.18 {
-                            vocalEnd = max(vocalStart + minVocalDur, min(rawEnd, Double(rev + 1) * dt + 0.10))
+                let minEndIdx = max(iStart + 3, Int((vocalStart + minVocalDur) / dt))
+                if iEnd > minEndIdx + 4 {
+                    for rev in stride(from: iEnd - 1, through: minEndIdx + 3, by: -1) {
+                        let f0 = curve.fastVocalEnvelope[rev]
+                        let f1 = curve.fastVocalEnvelope[rev - 1]
+                        let f2 = curve.fastVocalEnvelope[rev - 2]
+                        let f3 = curve.fastVocalEnvelope[rev - 3]
+                        let mean4 = (f0 + f1 + f2 + f3) * 0.25
+                        if f0 > -0.16 && f1 > -0.14 && f2 > -0.14 && f3 > -0.14 && mean4 > -0.05 {
+                            vocalEnd = max(vocalStart + minVocalDur, min(rawEnd, Double(rev + 1) * dt + 0.08))
                             break
                         }
                     }
                 }
             }
 
-            // Piecewise monotonic SFSpeechRecognizer word anchoring (compensating ~80ms dictation emission lag).
+            // Piecewise monotonic Whisper/Speech word anchoring (compensating ~40ms ASR offset).
             let localHeard: [HeardWord] = (heard ?? []).filter {
-                $0.time >= rawStart - 0.35 && $0.time <= rawEnd + 0.35
+                $0.time >= rawStart - 0.45 && $0.time <= rawEnd + 0.45
             }
             var wordAnchors: [(wIdx: Int, time: Double)] = []
             if !localHeard.isEmpty {
@@ -1056,7 +1126,7 @@ enum SongAudioListener {
                         let ht = localHeard[h].token
                         let match = (ht == normW) || (normW.count >= 4 && ht.count >= 4 && ht.prefix(4) == normW.prefix(4))
                         guard match else { continue }
-                        let adjT = localHeard[h].time - 0.08
+                        let adjT = localHeard[h].time - 0.04
                         if adjT >= minAllowed - 0.05 && adjT <= maxAllowed + 0.05 {
                             foundIdx = h
                             break
@@ -2018,7 +2088,7 @@ enum SongAudioListener {
         let settings: [String: Any] = [
             AVFormatIDKey: kAudioFormatLinearPCM,
             AVSampleRateKey: sampleRate,
-            AVNumberOfChannelsKey: 1,
+            AVNumberOfChannelsKey: 2,
             AVLinearPCMBitDepthKey: 16,
             AVLinearPCMIsBigEndianKey: false,
             AVLinearPCMIsFloatKey: false,
@@ -2031,23 +2101,33 @@ enum SongAudioListener {
         guard reader.startReading() else { return nil }
 
         let maxSamples = Int(sampleRate * 900)
-        var samples: [Float] = []
-        var scale: Float = 1.0 / 32768.0
-        while reader.status == .reading, samples.count < maxSamples {
+        var midSamples: [Float] = []
+        var sideSamples: [Float] = []
+        midSamples.reserveCapacity(min(maxSamples, Int(sampleRate * 300)))
+        sideSamples.reserveCapacity(min(maxSamples, Int(sampleRate * 300)))
+        let scale: Float = 1.0 / 32768.0
+        var sumMidSq: Double = 0
+        var sumSideSq: Double = 0
+        while reader.status == .reading, midSamples.count < maxSamples {
             guard let sb = output.copyNextSampleBuffer(),
                   let bb = CMSampleBufferGetDataBuffer(sb) else { break }
             var length = 0
             var pointer: UnsafeMutablePointer<Int8>?
             if CMBlockBufferGetDataPointer(bb, atOffset: 0, lengthAtOffsetOut: nil, totalLengthOut: &length, dataPointerOut: &pointer) == noErr,
-               let ptr = pointer, length >= 2 {
-                let count = min(length / MemoryLayout<Int16>.size, maxSamples - samples.count)
-                var raw = [Float](repeating: 0, count: count)
-                var scaled = [Float](repeating: 0, count: count)
-                ptr.withMemoryRebound(to: Int16.self, capacity: count) { i16 in
-                    vDSP_vflt16(i16, 1, &raw, 1, vDSP_Length(count))
+               let ptr = pointer, length >= 4 {
+                let frameCount = min(length / (2 * MemoryLayout<Int16>.size), maxSamples - midSamples.count)
+                ptr.withMemoryRebound(to: Int16.self, capacity: frameCount * 2) { i16 in
+                    for f in 0..<frameCount {
+                        let l = Float(i16[f * 2]) * scale
+                        let r = Float(i16[f * 2 + 1]) * scale
+                        let m = 0.5 * (l + r)
+                        let s = 0.5 * (l - r)
+                        midSamples.append(m)
+                        sideSamples.append(s)
+                        sumMidSq += Double(m * m)
+                        sumSideSq += Double(s * s)
+                    }
                 }
-                vDSP_vsmul(raw, 1, &scale, &scaled, 1, vDSP_Length(count))
-                samples.append(contentsOf: scaled)
             }
             CMSampleBufferInvalidate(sb)
         }
@@ -2055,11 +2135,13 @@ enum SongAudioListener {
         let fftSize = 1024
         let log2N = vDSP_Length(10)
         let hop = 256 // ~43.07 Hz resolution for crisp beat tracking & multi-rate downsampling
-        guard samples.count >= fftSize,
+        guard midSamples.count >= fftSize,
               let setup = vDSP_create_fftsetup(log2N, FFTRadix(kFFTRadix2)) else {
             return nil
         }
         defer { vDSP_destroy_fftsetup(setup) }
+
+        let hasStereoSide = sqrt(sumSideSq / Double(midSamples.count)) > 0.05 * sqrt(sumMidSq / Double(midSamples.count) + 1e-12)
 
         var window = [Float](repeating: 0, count: fftSize)
         vDSP_hann_window(&window, vDSP_Length(fftSize), Int32(vDSP_HANN_NORM))
@@ -2068,10 +2150,16 @@ enum SongAudioListener {
         var real = [Float](repeating: 0, count: halfN)
         var imag = [Float](repeating: 0, count: halfN)
         var mags = [Float](repeating: 0, count: halfN)
+        var windowedSide = [Float](repeating: 0, count: fftSize)
+        var realSide = [Float](repeating: 0, count: halfN)
+        var imagSide = [Float](repeating: 0, count: halfN)
+        var magsSide = [Float](repeating: 0, count: halfN)
 
-        let estFrames = (samples.count - fftSize) / hop + 1
+        let estFrames = (midSamples.count - fftSize) / hop + 1
         var rawVocal43Hz: [Double] = []
         rawVocal43Hz.reserveCapacity(estFrames)
+        var rawFlatness43Hz: [Double] = []
+        rawFlatness43Hz.reserveCapacity(estFrames)
         var rawFlux43Hz: [Double] = []
         rawFlux43Hz.reserveCapacity(estFrames)
         var rawVocalFlux43Hz: [Double] = []
@@ -2082,8 +2170,8 @@ enum SongAudioListener {
         var hasPrev = false
 
         var pos = 0
-        while pos + fftSize <= samples.count {
-            samples.withUnsafeBufferPointer { sPtr in
+        while pos + fftSize <= midSamples.count {
+            midSamples.withUnsafeBufferPointer { sPtr in
                 vDSP_vmul(sPtr.baseAddress! + pos, 1, window, 1, &windowed, 1, vDSP_Length(fftSize))
             }
             real.withUnsafeMutableBufferPointer { rPtr in
@@ -2098,9 +2186,28 @@ enum SongAudioListener {
                     vDSP_zvmags(&split, 1, &mags, 1, vDSP_Length(halfN))
                 }
             }
+            if hasStereoSide {
+                sideSamples.withUnsafeBufferPointer { ssPtr in
+                    vDSP_vmul(ssPtr.baseAddress! + pos, 1, window, 1, &windowedSide, 1, vDSP_Length(fftSize))
+                }
+                realSide.withUnsafeMutableBufferPointer { rPtr in
+                    imagSide.withUnsafeMutableBufferPointer { iPtr in
+                        var split = DSPSplitComplex(realp: rPtr.baseAddress!, imagp: iPtr.baseAddress!)
+                        windowedSide.withUnsafeBufferPointer { wPtr in
+                            wPtr.baseAddress!.withMemoryRebound(to: DSPComplex.self, capacity: halfN) { cPtr in
+                                vDSP_ctoz(cPtr, 2, &split, 1, vDSP_Length(halfN))
+                            }
+                        }
+                        vDSP_fft_zrip(setup, &split, 1, log2N, FFTDirection(FFT_FORWARD))
+                        vDSP_zvmags(&split, 1, &magsSide, 1, vDSP_Length(halfN))
+                    }
+                }
+            }
 
-            // 6 perceptual bands (sub/kick, low-mid, vocal-low, vocal-mid, vocal-hi, air) + 300-3400 Hz vocal sum.
-            var b0: Float = 0, b1: Float = 0, b2: Float = 0, b3: Float = 0, b4: Float = 0, b5: Float = 0, vocalSum: Float = 0
+            // 6 perceptual full-mix bands + stereo-center harmonic vocal isolation (250-3450 Hz) with flatness gate.
+            var b0: Float = 0, b1: Float = 0, b2: Float = 0, b3: Float = 0, b4: Float = 0, b5: Float = 0
+            var centerVocalSum: Float = 0
+            var sb0 = 0.0, sb1 = 0.0, sb2 = 0.0, sb3 = 0.0, sb4 = 0.0, sb5 = 0.0
             for b in 2..<min(halfN, 512) {
                 let m = mags[b]
                 if b < 10 { b0 += m }
@@ -2109,9 +2216,30 @@ enum SongAudioListener {
                 else if b < 230 { b3 += m }
                 else if b < 350 { b4 += m }
                 else { b5 += m }
-                if b >= 28 && b < 316 { vocalSum += m }
+                if b >= 23 && b < 320 {
+                    let cM = hasStereoSide ? max(Float(0), m - 0.80 * magsSide[b]) : m
+                    centerVocalSum += cM
+                    let sub = (b - 23) / 50
+                    let cd = Double(cM)
+                    switch sub {
+                    case 0: sb0 += cd
+                    case 1: sb1 += cd
+                    case 2: sb2 += cd
+                    case 3: sb3 += cd
+                    case 4: sb4 += cd
+                    default: sb5 += cd
+                    }
+                }
             }
-            rawVocal43Hz.append(log1p(Double(vocalSum)))
+            let eps = 1e-6
+            let logMean = (log(sb0 + eps) + log(sb1 + eps) + log(sb2 + eps) + log(sb3 + eps) + log(sb4 + eps) + log(sb5 + eps)) / 6.0
+            let arithMean = max(eps, (sb0 + sb1 + sb2 + sb3 + sb4 + sb5) / 6.0)
+            let flatness = min(1.0, max(0.0, exp(logMean) / arithMean))
+            let percRatio = Double(b4 + b5) / max(1e-3, Double(b2 + b3))
+            let harmonicFactor = max(0.05, min(1.0, (0.82 - flatness) / 0.32 - 0.35 * max(0.0, percRatio - 0.65)))
+
+            rawVocal43Hz.append(log1p(Double(centerVocalSum)) * harmonicFactor)
+            rawFlatness43Hz.append(flatness)
             rawBands43Hz.append([
                 log1p(Double(b0)), log1p(Double(b1)), log1p(Double(b2)),
                 log1p(Double(b3)), log1p(Double(b4)), log1p(Double(b5))
@@ -2125,8 +2253,8 @@ enum SongAudioListener {
                     let d = lm - prevLogMags[b]
                     if d > 0 {
                         fluxVal += d
-                        if b >= 28 {
-                            vocalFluxVal += d
+                        if b >= 23 {
+                            vocalFluxVal += d * harmonicFactor
                         }
                     }
                 }
@@ -2138,16 +2266,30 @@ enum SongAudioListener {
             pos += hop
         }
 
+        // Smooth 43 Hz harmonic vocal energy lightly ([0.22, 0.56, 0.22]) so 23ms drum impulses decay cleanly.
+        var smoothedVocal43Hz = rawVocal43Hz
+        if rawVocal43Hz.count >= 3 {
+            for i in 1..<(rawVocal43Hz.count - 1) {
+                smoothedVocal43Hz[i] = 0.22 * rawVocal43Hz[i - 1] + 0.56 * rawVocal43Hz[i] + 0.22 * rawVocal43Hz[i + 1]
+            }
+        }
+
         // Downsample 43.07 Hz vocal log-energy by 4 (~10.77 Hz / 0.0929s per frame) for smooth phrase curve.
         let dsEnv = 4
-        let envCount = rawVocal43Hz.count / dsEnv
+        let envCount = smoothedVocal43Hz.count / dsEnv
         guard envCount > 0 else { return nil }
         var rawEnergies = [Double](repeating: 0, count: envCount)
+        var meanFlatness = [Double](repeating: 0, count: envCount)
         for i in 0..<envCount {
             let base = i * dsEnv
             var s = 0.0
-            for k in 0..<dsEnv { s += rawVocal43Hz[base + k] }
+            var fSum = 0.0
+            for k in 0..<dsEnv {
+                s += smoothedVocal43Hz[base + k]
+                fSum += rawFlatness43Hz[base + k]
+            }
             rawEnergies[i] = s / Double(dsEnv)
+            meanFlatness[i] = fSum / Double(dsEnv)
         }
         let sorted = rawEnergies.sorted()
         let p20 = sorted[max(0, sorted.count / 5)]
@@ -2157,7 +2299,7 @@ enum SongAudioListener {
         let centered = rawEnergies.map { min(1.0, max(-1.0, ($0 - mid) / spread)) }
 
         // Compute low-frequency musical accompaniment (kick/bass/low-mid: b0 + b1) to separate
-        // dry choppy talking skits from sustained singing over music.
+        // dry choppy talking skits & percussive breaks from sustained harmonic singing over music.
         var rawMusicLow = [Double](repeating: 0, count: envCount)
         for i in 0..<envCount {
             let base = i * dsEnv
@@ -2190,6 +2332,9 @@ enum SongAudioListener {
             if lowNorm[i] < -0.60 {
                 // Essentially no musical bed (e.g., dry spoken skit): suppress unless ultra-sustained a cappella.
                 rawSinging[i] = duty >= 0.85 ? (v * 0.25) : -0.28
+            } else if meanFlatness[i] > 0.68 && duty < 0.72 {
+                // Flat broadband percussive burst / noise break (snares, hats, crowd applause) without harmonic voice.
+                rawSinging[i] = -0.22
             } else if lowNorm[i] < -0.40 && duty < 0.58 {
                 rawSinging[i] = -0.28
             } else if lowNorm[i] < -0.25 && duty < 0.48 {
@@ -2207,8 +2352,8 @@ enum SongAudioListener {
             singingEnvelope[i] = min(1.0, max(-1.0, sum / Double(b - a + 1)))
         }
 
-        // Keep full 43.07 Hz centered vocal energy & p95-normalized vocal onset flux for crisp word/syllable warping.
-        let fastVocalEnvelope = rawVocal43Hz.map { min(1.0, max(-1.0, ($0 - mid) / spread)) }
+        // Keep full 43.07 Hz centered harmonic vocal energy & p95-normalized vocal onset flux for crisp word/syllable warping.
+        let fastVocalEnvelope = smoothedVocal43Hz.map { min(1.0, max(-1.0, ($0 - mid) / spread)) }
         let sortedFlux = rawVocalFlux43Hz.sorted()
         let fluxP95 = sortedFlux.isEmpty ? 1.0 : max(0.25, sortedFlux[min(sortedFlux.count - 1, (sortedFlux.count * 19) / 20)])
         let fastVocalOnset = rawVocalFlux43Hz.map { min(1.0, max(0.0, $0 / fluxP95)) }
@@ -2288,14 +2433,28 @@ enum SongAudioListener {
             while i < heard.count {
                 let end = min(heard.count, i + window)
                 var hits = Set<String>()
+                var nonStopHits = 0
+                var lineCursor = 0
+                var orderedHits = 0
                 var firstHit: Int?
-                for j in i..<end where needed.contains(heard[j].token) {
-                    if firstHit == nil { firstHit = j }
-                    hits.insert(heard[j].token)
+                for j in i..<end {
+                    let tok = heard[j].token
+                    if needed.contains(tok) {
+                        if firstHit == nil { firstHit = j }
+                        if !stopWords.contains(tok) && tok.count >= 3 { nonStopHits += 1 }
+                        hits.insert(tok)
+                        if lineCursor < lineTokens.count,
+                           let relIdx = lineTokens[lineCursor...].firstIndex(of: tok) {
+                            orderedHits += 1
+                            lineCursor = relIdx + 1
+                        }
+                    }
                 }
-                let sc = Double(hits.count) / Double(needed.count)
-                if sc >= minScore, let firstHit {
-                    allMatches.append((max(0, heard[firstHit].time - 0.15), sc))
+                let bagScore = Double(hits.count) / Double(needed.count)
+                let ordScore = Double(orderedHits) / Double(lineTokens.count)
+                let combinedScore = 0.55 * bagScore + 0.45 * ordScore
+                if bagScore >= minScore && ordScore >= 0.50 && nonStopHits >= 2, let firstHit {
+                    allMatches.append((max(0, heard[firstHit].time - 0.10), combinedScore))
                 }
                 i += 1
             }

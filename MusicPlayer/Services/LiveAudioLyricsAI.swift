@@ -787,27 +787,11 @@ enum LiveAudioLyricsAI {
         }
 
         if let bestLRCLIB = rescored.max(by: { $0.score < $1.score }),
-           bestLRCLIB.textOverlapCount >= 2 || bestLRCLIB.score >= 45 {
-            return bestLRCLIB
-        }
-
-        // Fallback: fetch Genius plain lyrics for top Genius lyric hit if LRCLIB had no entry at all
-        if let topGenius = geniusHits.first {
-            if let plain = await fetchGeniusPlainLyrics(url: topGenius.url) {
-                let extracted = ArtistDatabase.extractArtists(rawArtistTag: topGenius.artist, rawTitle: topGenius.title, isArtistVerified: true)
-                let canonicalArtist = ArtistDatabase.canonicalizeSingle(extracted.primaryArtist.isEmpty ? topGenius.artist : extracted.primaryArtist)
-                return RecognizedLyricsCandidate(
-                    trackName: itunesMatch?.trackName ?? topGenius.title,
-                    artistName: itunesMatch?.artistName ?? canonicalArtist,
-                    genre: itunesMatch?.genre ?? ArtistDatabase.genre(forArtist: canonicalArtist) ?? extracted.genre,
-                    durationSeconds: duration ?? itunesMatch?.durationSeconds,
-                    syncedLyrics: nil,
-                    plainLyrics: plain,
-                    source: "Genius",
-                    isInCatalog: ArtistDatabase.lookup(canonicalArtist) != nil,
-                    textOverlapCount: 3,
-                    score: 50
-                )
+           bestLRCLIB.textOverlapCount >= 4 && bestLRCLIB.score >= 75 {
+            if let dur = bestLRCLIB.durationSeconds, let localDur = duration, localDur > 10, abs(dur - localDur) > 28.0 {
+                // Duration mismatch is too wide for a confident transcript-based rename.
+            } else {
+                return bestLRCLIB
             }
         }
 

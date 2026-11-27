@@ -283,6 +283,10 @@ enum ArtistDatabase {
             "version", "edit", "mix", "part", "pt.", "intro", "outro", "interlude",
             "skit", "explicit", "clean", "master", "leak", "v1", "v2", "v3", "v4", "v5"
         ]
+        let noiseOrQualityKeywords: [String] = [
+            "official", "music video", "official video", "official audio", "visualizer",
+            "lyric video", "lyrics", "cdq", "hq", "hd", "4k", "1080p", "720p", "snippet", "leaked"
+        ]
         if let regex = try? NSRegularExpression(pattern: pattern, options: []) {
             while let match = regex.firstMatch(in: working, range: NSRange(location: 0, length: (working as NSString).length)),
                   match.numberOfRanges > 1 {
@@ -295,6 +299,11 @@ enum ArtistDatabase {
 
                 if lower == "single" || lower == "unreleased single" {
                     isSingle = true
+                    working = before
+                    continue
+                }
+                if noiseOrQualityKeywords.contains(where: { lower == $0 || lower.contains($0) }) ||
+                    lower.hasPrefix("prod.") || lower.hasPrefix("prod ") {
                     working = before
                     continue
                 }
@@ -598,10 +607,12 @@ enum ArtistDatabase {
         ) != nil
 
         let distinctYTSongs = Set(youtubeSongs.map { normalizeLookupKey($0.title) }.filter { !$0.isEmpty })
-        let multiSongYT = distinctYTSongs.count >= 2
+        let multiSongYT = !singleSongMixGuard && (
+            distinctYTSongs.count >= 4 || (distinctYTSongs.count >= 3 && (durationSeconds ?? 0) >= 480)
+        )
         let genericMixWithLongDuration = !singleSongMixGuard && (durationSeconds ?? 0) >= 540
             && lower.range(of: #"\bmix\b"#, options: .regularExpression) != nil
-        let longUnknownFallback = allowLongDurationFallback && (durationSeconds ?? 0) >= 720 && !singleSongMixGuard
+        let longUnknownFallback = allowLongDurationFallback && (durationSeconds ?? 0) >= 1500 && !singleSongMixGuard
 
         guard explicitComp || genreOrEraMix || multiSongYT || genericMixWithLongDuration || longUnknownFallback else {
             return nil

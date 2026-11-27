@@ -449,7 +449,9 @@ final class SongIdentificationService {
                     lyricsToAlign = lyrics
                     song = candidate
                 case .contradicted:
-                    song = nil
+                    // Keep verified catalog/playlist/title metadata (noisy ASR on beats/skits must never
+                    // wipe out a real match); just avoid pinning mismatched LRCLIB lyrics to this track.
+                    lyricsToAlign = nil
                 case .inconclusive:
                     lyricsToAlign = lyrics
                 }
@@ -815,6 +817,9 @@ final class SongIdentificationService {
                 let text = (row["syncedLyrics"] as? String) ?? (row["plainLyrics"] as? String) ?? ""
                 guard !text.isEmpty else { continue }
                 let duration = row["duration"] as? Double
+                if let localDuration, localDuration > 10, let duration, abs(localDuration - duration) > 25 {
+                    continue
+                }
                 let parsed = SyncedLyricsService.parseLRCOrPlain(text: text, duration: duration)
                 let lyrics = ResolvedTrackLyrics(
                     cacheKey: "heard",
@@ -827,7 +832,9 @@ final class SongIdentificationService {
                     expectedDurationSeconds: duration,
                     lines: parsed.lines
                 )
-                guard case .confirmed(let ratio) = SongAudioListener.verdict(heard: heard, lyrics: lyrics), ratio >= 0.35 else {
+                guard case .confirmed(let ratio) = SongAudioListener.verdict(heard: heard, lyrics: lyrics),
+                      ratio >= 0.45,
+                      SongAudioListener.hasOrderedPhraseMatch(heard: heard, lyrics: lyrics) else {
                     continue
                 }
                 // Lyrics match strongly. Pull album/cover from a catalog when one agrees.
