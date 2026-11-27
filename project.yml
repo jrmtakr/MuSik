@@ -10,6 +10,9 @@ packages:
   FFmpegKit:
     url: https://github.com/kingslay/FFmpegKit.git
     exactVersion: 6.1.4
+  WhisperKit:
+    url: https://github.com/argmaxinc/WhisperKit.git
+    exactVersion: 1.1.1
 targets:
   MusicPlayer:
     type: application
@@ -27,6 +30,8 @@ targets:
         product: Libavutil
       - package: FFmpegKit
         product: Libswscale
+      - package: WhisperKit
+        product: WhisperKit
     settings:
       base:
         INFOPLIST_FILE: MusicPlayer/Info.plist

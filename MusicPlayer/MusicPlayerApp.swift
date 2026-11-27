@@ -130,6 +130,9 @@ struct MusicPlayerApp: App {
                     SystemActionRouter.registerHomeQuickActions()
                     await wrappedService.requestPermissionAndScheduleDecemberDrop()
                     await trendingService.refreshIfDue()
+                    Task.detached(priority: .utility) {
+                        await WhisperTranscriptionEngine.shared.warmUpInBackground()
+                    }
                     wifiServer.onFileReceived = { tempURL, fileName, folderPath in
                         mediaManager.importTemporaryFile(from: tempURL, preferredFileName: fileName, inFolder: folderPath)
                     }

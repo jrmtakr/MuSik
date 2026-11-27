@@ -25,9 +25,10 @@ struct SyncedLyricLine: Identifiable, Codable, Hashable, Sendable {
     var words: [LyricWordTiming]
     let isInstrumentalBreak: Bool
     var hasNativeWordTimings: Bool = false
+    var isSpokenDialogue: Bool = false
 
     enum CodingKeys: String, CodingKey {
-        case id, startTime, endTime, text, words, isInstrumentalBreak, hasNativeWordTimings
+        case id, startTime, endTime, text, words, isInstrumentalBreak, hasNativeWordTimings, isSpokenDialogue
     }
 
     init(
@@ -37,7 +38,8 @@ struct SyncedLyricLine: Identifiable, Codable, Hashable, Sendable {
         text: String,
         words: [LyricWordTiming] = [],
         isInstrumentalBreak: Bool = false,
-        hasNativeWordTimings: Bool = false
+        hasNativeWordTimings: Bool = false,
+        isSpokenDialogue: Bool = false
     ) {
         self.id = id
         self.startTime = startTime
@@ -46,6 +48,7 @@ struct SyncedLyricLine: Identifiable, Codable, Hashable, Sendable {
         self.words = words
         self.isInstrumentalBreak = isInstrumentalBreak
         self.hasNativeWordTimings = hasNativeWordTimings
+        self.isSpokenDialogue = isSpokenDialogue
     }
 
     init(from decoder: Decoder) throws {
@@ -57,6 +60,7 @@ struct SyncedLyricLine: Identifiable, Codable, Hashable, Sendable {
         words = try c.decodeIfPresent([LyricWordTiming].self, forKey: .words) ?? []
         isInstrumentalBreak = try c.decodeIfPresent(Bool.self, forKey: .isInstrumentalBreak) ?? false
         hasNativeWordTimings = try c.decodeIfPresent(Bool.self, forKey: .hasNativeWordTimings) ?? false
+        isSpokenDialogue = try c.decodeIfPresent(Bool.self, forKey: .isSpokenDialogue) ?? false
     }
 }
 
@@ -70,11 +74,12 @@ struct ResolvedTrackLyrics: Codable, Sendable {
     var syncedOffsetSeconds: Double
     var tempoScale: Double = 1.0
     var expectedDurationSeconds: Double? = nil
+    var alignmentVersion: Int = 1
     let lines: [SyncedLyricLine]
 
     enum CodingKeys: String, CodingKey {
         case cacheKey, trackTitle, artistName, isTimeSynced, sourceLabel, attributionText
-        case syncedOffsetSeconds, tempoScale, expectedDurationSeconds, lines
+        case syncedOffsetSeconds, tempoScale, expectedDurationSeconds, alignmentVersion, lines
     }
 
     init(
@@ -87,6 +92,7 @@ struct ResolvedTrackLyrics: Codable, Sendable {
         syncedOffsetSeconds: Double,
         tempoScale: Double = 1.0,
         expectedDurationSeconds: Double? = nil,
+        alignmentVersion: Int = 1,
         lines: [SyncedLyricLine]
     ) {
         self.cacheKey = cacheKey
@@ -98,6 +104,7 @@ struct ResolvedTrackLyrics: Codable, Sendable {
         self.syncedOffsetSeconds = syncedOffsetSeconds
         self.tempoScale = tempoScale
         self.expectedDurationSeconds = expectedDurationSeconds
+        self.alignmentVersion = alignmentVersion
         self.lines = lines
     }
 
@@ -112,6 +119,7 @@ struct ResolvedTrackLyrics: Codable, Sendable {
         syncedOffsetSeconds = try c.decode(Double.self, forKey: .syncedOffsetSeconds)
         tempoScale = try c.decodeIfPresent(Double.self, forKey: .tempoScale) ?? 1.0
         expectedDurationSeconds = try c.decodeIfPresent(Double.self, forKey: .expectedDurationSeconds)
+        alignmentVersion = try c.decodeIfPresent(Int.self, forKey: .alignmentVersion) ?? 1
         lines = try c.decode([SyncedLyricLine].self, forKey: .lines)
     }
 }
@@ -132,6 +140,7 @@ struct AIRecognizedTrackInfo: Equatable, Sendable {
 @Observable
 final class SyncedLyricsService {
     static let shared = SyncedLyricsService()
+    nonisolated static let currentAlignmentVersion = 4
 
     var currentLyrics: ResolvedTrackLyrics?
     var currentLoadingKey: String?
@@ -199,6 +208,27 @@ final class SyncedLyricsService {
                 memoryCache[key] = disk
                 currentLyrics = disk
                 lastError = nil
+                if disk.alignmentVersion < Self.currentAlignmentVersion,
+                   !item.relativePath.hasPrefix("__remote__/"),
+                   !item.isHLS,
+                   !disk.sourceLabel.localizedCaseInsensitiveContains("Custom") {
+                    activeFetchTask?.cancel()
+                    activeFetchTask = Task {
+                        let heard = await SongAudioListener.listen(to: item.fileURL)
+                        guard !Task.isCancelled else { return }
+                        let upgraded = await fetchAndAlignDuringImport(
+                            item: item,
+                            title: item.displayTitle,
+                            artist: item.artist ?? "",
+                            duration: item.durationSeconds,
+                            heard: heard
+                        )
+                        if !upgraded, !Task.isCancelled {
+                            let reAligned = await SongAudioListener.autoAlign(lyrics: disk, heard: heard, fileURL: item.fileURL)
+                            storeAlignedLyrics(reAligned, for: item)
+                        }
+                    }
+                }
                 return
             }
         }
@@ -254,9 +284,12 @@ final class SyncedLyricsService {
             if var resolved {
                 // Automatically line synced or plain lyrics up into real-time word-timed lyrics against local audio.
                 if !item.relativePath.hasPrefix("__remote__/") && !item.isHLS {
-                    resolved = await SongAudioListener.autoAlign(lyrics: resolved, heard: nil, fileURL: item.fileURL)
+                    let cachedWhisper = await WhisperTranscriptionEngine.shared.isModelCachedLocally
+                    let preHeard = cachedWhisper ? await SongAudioListener.listen(to: item.fileURL) : nil
+                    resolved = await SongAudioListener.autoAlign(lyrics: resolved, heard: preHeard, fileURL: item.fileURL)
                     guard !Task.isCancelled else { return }
                 }
+                resolved.alignmentVersion = Self.currentAlignmentVersion
                 currentLoadingKey = nil
                 memoryCache[key] = resolved
                 saveToDisk(resolved)
@@ -650,6 +683,7 @@ final class SyncedLyricsService {
             syncedOffsetSeconds: 0,
             tempoScale: 1.0,
             expectedDurationSeconds: item.durationSeconds,
+            alignmentVersion: Self.currentAlignmentVersion,
             lines: lyrics.lines
         )
         memoryCache[key] = stored

@@ -435,7 +435,12 @@ struct AppleMusicLyricsView: View {
                         .foregroundColor(.white.opacity(baseOpacity))
                 }
             }
-            .font(.system(size: lyrics.isTimeSynced ? 29 : 23, weight: .bold, design: .default))
+            .font(.system(
+                size: line.isSpokenDialogue ? (lyrics.isTimeSynced ? 22 : 19) : (lyrics.isTimeSynced ? 29 : 23),
+                weight: line.isSpokenDialogue ? .semibold : .bold,
+                design: .default
+            ))
+            .italic(line.isSpokenDialogue)
             .lineSpacing(4)
             .multilineTextAlignment(.leading)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -611,7 +616,9 @@ struct AppleMusicLyricsView: View {
         let rawTime: Double
         if mediaManager.isPlaying {
             let dt = max(0, min(0.18, now.timeIntervalSince(lastSyncWallTime)))
-            let hwLatency = min(0.45, max(0.0, AVAudioSession.sharedInstance().outputLatency))
+            let hwLatency = mediaManager.isUsingEqualizerBackend
+                ? min(0.45, max(0.0, AVAudioSession.sharedInstance().outputLatency))
+                : 0.0
             rawTime = max(0, lastSyncPlaybackTime + dt * Double(mediaManager.playbackRate) - hwLatency)
         } else {
             rawTime = mediaManager.currentTime

@@ -3,10 +3,19 @@ import AVFoundation
 import Foundation
 @preconcurrency import Speech
 
-/// One word the on-device speech engine heard, with its time in the file.
+/// One word heard in the file by Whisper / on-device speech, with raw display text and timing span.
 struct HeardWord: Sendable, Hashable {
     let token: String
+    let rawText: String
     let time: Double
+    let endTime: Double
+
+    init(token: String, rawText: String? = nil, time: Double, endTime: Double? = nil) {
+        self.token = token
+        self.rawText = (rawText?.isEmpty == false) ? rawText! : token
+        self.time = time
+        self.endTime = max(time + 0.05, endTime ?? (time + 0.25))
+    }
 }
 
 /// What listening to the whole song concluded about a proposed song name.
@@ -26,8 +35,9 @@ enum ListeningVerdict: Sendable, Equatable {
 ///      piece by piece, so a skit in the middle of a video doesn't throw off the rest of the song.
 /// Runs fully on the phone (no account, no key). Needs the Speech Recognition permission the app already asks for.
 enum SongAudioListener {
-    /// Seconds of audio per recognition request (Apple limits server requests to about a minute).
+    /// Seconds of audio per Speech fallback chunk & overlap step to avoid cutting words on chunk edges.
     private static let chunkSeconds: Double = 55
+    private static let chunkStepSeconds: Double = 50
 
     // MARK: - Listening
 
@@ -49,12 +59,30 @@ enum SongAudioListener {
         return nil
     }
 
-    /// Transcribes the whole file (audio or music video). Returns nil when speech recognition isn't allowed or available.
+    /// Transcribes the whole file (audio or music video).
+    /// Prefers on-demand CoreML Whisper (`wordTimestamps: true`), falling back cleanly to 5s-overlapping
+    /// Apple `SFSpeechRecognizer` chunks when Whisper hasn't finished downloading or is offline.
     static func listen(
         to fileURL: URL,
         maxSeconds: Double = 15 * 60,
         onProgress: (@Sendable (Int, Int, Double) -> Void)? = nil
     ) async -> [HeardWord]? {
+        if let whisperWords = await WhisperTranscriptionEngine.shared.transcribeWholeFile(
+            fileURL: fileURL,
+            maxSeconds: maxSeconds,
+            allowDownload: true,
+            onProgress: onProgress
+        ), !whisperWords.isEmpty {
+            return whisperWords.map {
+                HeardWord(
+                    token: $0.token,
+                    rawText: $0.rawText,
+                    time: $0.startTime,
+                    endTime: $0.endTime
+                )
+            }
+        }
+
         guard SFSpeechRecognizer.authorizationStatus() == .authorized,
               let recognizer = SFSpeechRecognizer(locale: .current)
                 ?? SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
@@ -74,7 +102,7 @@ enum SongAudioListener {
         }
 
         let total = min(duration, maxSeconds)
-        let totalChunks = max(1, Int(ceil(total / chunkSeconds)))
+        let totalChunks = max(1, Int(ceil(total / chunkStepSeconds)))
         var heard: [HeardWord] = []
         var start: Double = 0
         var chunkIdx = 0
@@ -86,10 +114,19 @@ enum SongAudioListener {
             onProgress?(chunkIdx, totalChunks, total)
             if let chunkURL = await exportAudioChunk(asset: asset, start: start, length: length) {
                 let words = await recognize(url: chunkURL, recognizer: recognizer, offset: start)
-                heard.append(contentsOf: words)
+                for w in words {
+                    if let prev = heard.last, abs(w.time - prev.time) < 0.30, w.token == prev.token {
+                        continue
+                    }
+                    if let prev = heard.last, w.time < prev.time - 0.05 {
+                        continue
+                    }
+                    heard.append(w)
+                }
                 try? FileManager.default.removeItem(at: chunkURL)
             }
-            start += chunkSeconds
+            if start + length >= total { break }
+            start += chunkStepSeconds
         }
         return heard
     }
@@ -230,13 +267,23 @@ enum SongAudioListener {
                 if let result, result.isFinal {
                     let words = result.bestTranscription.segments.compactMap { seg -> HeardWord? in
                         let token = normalizeToken(seg.substring)
-                        return token.isEmpty ? nil : HeardWord(token: token, time: offset + seg.timestamp)
+                        return token.isEmpty ? nil : HeardWord(
+                            token: token,
+                            rawText: seg.substring,
+                            time: offset + seg.timestamp,
+                            endTime: offset + seg.timestamp + max(0.08, seg.duration)
+                        )
                     }
                     if gate.claim() { cont.resume(returning: (words, false)) }
                 } else if error != nil {
                     let partialWords = result?.bestTranscription.segments.compactMap { seg -> HeardWord? in
                         let token = normalizeToken(seg.substring)
-                        return token.isEmpty ? nil : HeardWord(token: token, time: offset + seg.timestamp)
+                        return token.isEmpty ? nil : HeardWord(
+                            token: token,
+                            rawText: seg.substring,
+                            time: offset + seg.timestamp,
+                            endTime: offset + seg.timestamp + max(0.08, seg.duration)
+                        )
                     } ?? []
                     if gate.claim() { cont.resume(returning: (partialWords, true)) }
                 }
@@ -296,9 +343,58 @@ enum SongAudioListener {
     /// Re-times every synced lyric line (and word) to where it was actually heard in this file.
     /// Returns nil when too little was heard to align safely.
     static func align(lyrics: ResolvedTrackLyrics, heard: [HeardWord]) -> ResolvedTrackLyrics? {
+        alignWithAnchors(lyrics: lyrics, heard: heard, curve: nil)
+    }
+
+    private static func alignWithAnchors(
+        lyrics: ResolvedTrackLyrics,
+        heard: [HeardWord],
+        curve: VocalEnvelope?
+    ) -> ResolvedTrackLyrics? {
         guard lyrics.isTimeSynced, !lyrics.lines.isEmpty else { return nil }
         let anchors = alignmentAnchors(heard: heard, lines: lyrics.lines)
         guard !anchors.isEmpty else { return nil }
+
+        // Precompute split point inside each irregular gap [a, b] using largest lyric pause or deepest singing valley.
+        let nonBreakLines = lyrics.lines.filter { !$0.isInstrumentalBreak }
+        var intervalSplits: [Double] = []
+        intervalSplits.reserveCapacity(max(0, anchors.count - 1))
+        for k in 0..<(max(0, anchors.count - 1)) {
+            let a = anchors[k], b = anchors[k + 1]
+            var splitLyricTime = (a.lyricTime + b.lyricTime) * 0.5
+            // Prefer largest natural break in the LRC between a and b.
+            var maxLyricGap = 1.2
+            for idx in 0..<max(0, nonBreakLines.count - 1) {
+                let s0 = nonBreakLines[idx].endTime
+                let s1 = nonBreakLines[idx + 1].startTime
+                let mid = (s0 + s1) * 0.5
+                if s0 >= a.lyricTime && s1 <= b.lyricTime && (s1 - s0) > maxLyricGap {
+                    maxLyricGap = s1 - s0
+                    splitLyricTime = mid
+                }
+            }
+            // Refine split if the file itself has a distinct silent/talking valley between a.fileTime and b.fileTime.
+            if maxLyricGap <= 1.2, let curve, !curve.singingEnvelope.isEmpty, b.fileTime - a.fileTime > 4.0 {
+                let dt = curve.frameDurationSeconds
+                let i0 = max(0, min(curve.singingEnvelope.count - 1, Int((a.fileTime + 0.6) / dt)))
+                let i1 = max(i0 + 1, min(curve.singingEnvelope.count, Int((b.fileTime - 0.6) / dt)))
+                if i1 > i0 + 4 {
+                    var bestValleyIdx = (i0 + i1) / 2
+                    var bestAvg = Double.infinity
+                    for idx in i0..<(i1 - 3) {
+                        let avg = (curve.singingEnvelope[idx] + curve.singingEnvelope[idx + 1] + curve.singingEnvelope[idx + 2]) / 3.0
+                        if avg < bestAvg {
+                            bestAvg = avg
+                            bestValleyIdx = idx + 1
+                        }
+                    }
+                    let valleyFileTime = Double(bestValleyIdx) * dt
+                    let frac = min(0.85, max(0.15, (valleyFileTime - a.fileTime) / max(0.5, b.fileTime - a.fileTime)))
+                    splitLyricTime = a.lyricTime + (b.lyricTime - a.lyricTime) * frac
+                }
+            }
+            intervalSplits.append(splitLyricTime)
+        }
 
         func map(_ t: Double) -> Double {
             if anchors.count == 1 || t <= anchors[0].lyricTime {
@@ -314,13 +410,11 @@ enum SongAudioListener {
                 let fileGap = b.fileTime - a.fileTime
                 let slope = lyricGap > 0.01 ? fileGap / lyricGap : 1
                 if slope > 0.9 && slope < 1.12 {
-                    // Same tempo: interpolate smoothly.
                     return a.fileTime + (t - a.lyricTime) * slope
                 }
-                // A skit/break was inserted (or cut) between these two lines: keep each line glued
-                // to the nearer anchor instead of stretching everything in between.
-                let nearA = (t - a.lyricTime) <= (b.lyricTime - t)
-                let ref = nearA ? a : b
+                // Split across the deepest gap/valley so pre-skit lines glue to `a` and post-skit lines glue to `b`.
+                let splitT = k < intervalSplits.count ? intervalSplits[k] : (a.lyricTime + b.lyricTime) * 0.5
+                let ref = (t <= splitT) ? a : b
                 return t + (ref.fileTime - ref.lyricTime)
             }
             return t
@@ -340,7 +434,8 @@ enum SongAudioListener {
                 text: line.text,
                 words: newWords,
                 isInstrumentalBreak: line.isInstrumentalBreak,
-                hasNativeWordTimings: line.hasNativeWordTimings
+                hasNativeWordTimings: line.hasNativeWordTimings,
+                isSpokenDialogue: line.isSpokenDialogue
             ))
         }
         // Keep lines in order even if two anchors disagreed slightly.
@@ -353,7 +448,8 @@ enum SongAudioListener {
                 text: remapped[i].text,
                 words: remapped[i].words,
                 isInstrumentalBreak: remapped[i].isInstrumentalBreak,
-                hasNativeWordTimings: remapped[i].hasNativeWordTimings
+                hasNativeWordTimings: remapped[i].hasNativeWordTimings,
+                isSpokenDialogue: remapped[i].isSpokenDialogue
             )
         }
 
@@ -363,23 +459,18 @@ enum SongAudioListener {
             artistName: lyrics.artistName,
             isTimeSynced: true,
             sourceLabel: "Synced Lyrics · aligned to this file",
-            attributionText: (lyrics.attributionText ?? "LRCLIB") + " · re-timed by listening (\(anchors.count) anchor lines)",
+            attributionText: (lyrics.attributionText ?? "LRCLIB") + " · re-timed across gaps (\(anchors.count) anchors)",
             syncedOffsetSeconds: 0,
             tempoScale: 1.0,
             expectedDurationSeconds: nil,
+            alignmentVersion: SyncedLyricsService.currentAlignmentVersion,
             lines: remapped
         )
     }
 
-    // MARK: - Hybrid Automatic Whole-Song Aligner (STT + Acoustic Vocal-Band Cross-Correlation + Real-Time Word Timings)
+    // MARK: - Hybrid Automatic Whole-Song Aligner (Whisper/STT + Section-DTW + Real-Time Word & Dialogue Timings)
 
-    /// Automatically lines up ANY `lyrics` (both synced `.lrc` and plain/Genius text) against `fileURL`
-    /// into real-time synced line + word timings with zero user input:
-    ///   1. If `lyrics` are already time-synced: re-times them via whole-song STT word anchors, or falls back to
-    ///      vocal-band & repeated-chorus cross-correlation to remove intro/outro/tempo drift.
-    ///   2. If `lyrics` are plain/untimed text: converts them into real-time synced lines (`isTimeSynced = true`)
-    ///      using STT heard-word anchors, chorus similarity anchors, vocal energy warp, and guarded beat snapping.
-    ///   3. Populates real-time word-by-word `LyricWordTiming` highlights anchored to heard words and 43 Hz vocal/syllable curves.
+    /// Automatically lines up ANY `lyrics` against `fileURL` into real-time synced line, word, and spoken dialogue timings.
     static func autoAlign(lyrics: ResolvedTrackLyrics, heard: [HeardWord]?, fileURL: URL) async -> ResolvedTrackLyrics {
         guard !lyrics.lines.isEmpty else { return lyrics }
 
@@ -389,7 +480,7 @@ enum SongAudioListener {
 
         var working = lyrics
         if working.isTimeSynced {
-            if let heard, let sttAligned = align(lyrics: working, heard: heard) {
+            if let heard, let sttAligned = alignWithAnchors(lyrics: working, heard: heard, curve: curve) {
                 working = sttAligned
             } else {
                 working = alignAcousticallyInternal(lyrics: working, curve: curve)
@@ -397,7 +488,146 @@ enum SongAudioListener {
         } else {
             working = alignPlainLyricsIntoRealTimeSync(lyrics: working, heard: heard, curve: curve)
         }
-        return withRealTimeWordTimings(in: working, heard: heard, curve: curve)
+        working = withRealTimeWordTimings(in: working, heard: heard, curve: curve)
+        working = insertSpokenDialogueAndBreaks(in: working, heard: heard, curve: curve)
+        working.alignmentVersion = SyncedLyricsService.currentAlignmentVersion
+        return working
+    }
+
+    /// Populates misc spoken talking/skits (intro, mid-song gaps, outro) from Whisper/Speech transcripts
+    /// and preserves clean Apple-Music-style instrumental break dots (`•••`) across long non-talking pauses.
+    private static func insertSpokenDialogueAndBreaks(
+        in lyrics: ResolvedTrackLyrics,
+        heard: [HeardWord]?,
+        curve: VocalEnvelope?
+    ) -> ResolvedTrackLyrics {
+        guard lyrics.isTimeSynced, !lyrics.lines.isEmpty else { return lyrics }
+        let songLines = lyrics.lines.filter { !$0.isInstrumentalBreak && !$0.isSpokenDialogue }
+        guard !songLines.isEmpty else { return lyrics }
+
+        let sortedHeard = (heard ?? []).sorted { $0.time < $1.time }
+        let curveDur = curve.map { Double($0.envelope.count) * $0.frameDurationSeconds } ?? 0
+        let totalDuration = max(curveDur, lyrics.expectedDurationSeconds ?? 0, songLines.last?.endTime ?? 0)
+
+        func spokenLinesForGap(
+            start gapStart: Double,
+            end gapEnd: Double,
+            adjacentLines: [SyncedLyricLine]
+        ) -> [SyncedLyricLine] {
+            guard gapEnd - gapStart >= 2.8 else { return [] }
+            let adjTokens = Set(adjacentLines.flatMap { tokens($0.text) })
+            let gapWords = sortedHeard.filter { w in
+                guard w.time >= gapStart + 0.15, w.endTime <= gapEnd - 0.15 else { return false }
+                // Avoid copying boundary words that actually belong to the first/last instant of neighboring lyric lines.
+                if (w.time < gapStart + 0.55 || w.endTime > gapEnd - 0.55) && adjTokens.contains(w.token) {
+                    return false
+                }
+                return true
+            }
+            guard gapWords.count >= 3 else { return [] }
+
+            // Require at least some non-stopped meaningful words or clear multi-word phrase.
+            var groups: [[HeardWord]] = []
+            var cur: [HeardWord] = []
+            for w in gapWords {
+                if let prev = cur.last {
+                    if (w.time - prev.endTime) >= 0.85 || cur.count >= 7 {
+                        groups.append(cur)
+                        cur = [w]
+                    } else {
+                        cur.append(w)
+                    }
+                } else {
+                    cur.append(w)
+                }
+            }
+            if !cur.isEmpty { groups.append(cur) }
+
+            return groups.compactMap { grp -> SyncedLyricLine? in
+                guard let first = grp.first, let last = grp.last else { return nil }
+                let s = max(gapStart, first.time)
+                let e = min(gapEnd, max(s + 0.45, last.endTime))
+                let wordTimings = grp.map {
+                    LyricWordTiming(text: $0.rawText, startTime: max(s, $0.time), endTime: min(e, max($0.time + 0.06, $0.endTime)))
+                }
+                let text = grp.map(\.rawText).joined(separator: " ")
+                return SyncedLyricLine(
+                    startTime: s,
+                    endTime: e,
+                    text: text,
+                    words: wordTimings,
+                    isInstrumentalBreak: false,
+                    hasNativeWordTimings: true,
+                    isSpokenDialogue: true
+                )
+            }
+        }
+
+        var result: [SyncedLyricLine] = []
+        // 1. Intro gap before first song line (skits / spoken intros).
+        if let firstSong = songLines.first, firstSong.startTime >= 3.0 {
+            let introSpoken = spokenLinesForGap(start: 0.1, end: firstSong.startTime - 0.25, adjacentLines: [firstSong])
+            if !introSpoken.isEmpty {
+                result.append(contentsOf: introSpoken)
+            } else if firstSong.startTime >= 5.0 {
+                result.append(SyncedLyricLine(
+                    startTime: 0.4,
+                    endTime: max(1.0, firstSong.startTime - 0.35),
+                    text: "",
+                    words: [],
+                    isInstrumentalBreak: true
+                ))
+            }
+        }
+
+        // 2. Song lines + mid-song gaps/skits/instrumental solos.
+        for i in 0..<songLines.count {
+            let cur = songLines[i]
+            result.append(cur)
+            if i + 1 < songLines.count {
+                let next = songLines[i + 1]
+                let gapStart = cur.endTime + 0.20
+                let gapEnd = next.startTime - 0.20
+                let gapSpan = gapEnd - gapStart
+                if gapSpan >= 2.8 {
+                    let midSpoken = spokenLinesForGap(start: gapStart, end: gapEnd, adjacentLines: [cur, next])
+                    if !midSpoken.isEmpty {
+                        result.append(contentsOf: midSpoken)
+                    } else if gapSpan >= 4.2 {
+                        result.append(SyncedLyricLine(
+                            startTime: gapStart + 0.15,
+                            endTime: max(gapStart + 0.85, gapEnd - 0.15),
+                            text: "",
+                            words: [],
+                            isInstrumentalBreak: true
+                        ))
+                    }
+                }
+            }
+        }
+
+        // 3. Outro spoken dialogue / skit after the last song line.
+        if let lastSong = songLines.last, totalDuration - lastSong.endTime >= 3.0 {
+            let outroEnd = min(totalDuration, max(lastSong.endTime + 3.0, (sortedHeard.last?.endTime ?? lastSong.endTime) + 1.0))
+            let outroSpoken = spokenLinesForGap(start: lastSong.endTime + 0.30, end: outroEnd, adjacentLines: [lastSong])
+            if !outroSpoken.isEmpty {
+                result.append(contentsOf: outroSpoken)
+            }
+        }
+
+        return ResolvedTrackLyrics(
+            cacheKey: lyrics.cacheKey,
+            trackTitle: lyrics.trackTitle,
+            artistName: lyrics.artistName,
+            isTimeSynced: lyrics.isTimeSynced,
+            sourceLabel: lyrics.sourceLabel,
+            attributionText: lyrics.attributionText,
+            syncedOffsetSeconds: lyrics.syncedOffsetSeconds,
+            tempoScale: lyrics.tempoScale,
+            expectedDurationSeconds: lyrics.expectedDurationSeconds,
+            alignmentVersion: SyncedLyricsService.currentAlignmentVersion,
+            lines: result
+        )
     }
 
     private static func alignPlainLyricsIntoRealTimeSync(
@@ -411,16 +641,17 @@ enum SongAudioListener {
         let totalDuration = curve.map { Double($0.envelope.count) * $0.frameDurationSeconds } ?? lyrics.expectedDurationSeconds ?? 180.0
         guard totalDuration > 10 else { return lyrics }
 
-        // Detect sustained vocal onset & release (ignoring isolated single-frame drum transients in long intros).
+        // Detect sustained singing onset & release (suppressing dry choppy intro/outro spoken skits).
         var firstVocalSec: Double = min(4.0, totalDuration * 0.08)
         var lastVocalSec: Double = max(firstVocalSec + 6.0, totalDuration - min(5.0, totalDuration * 0.05))
-        if let curve, curve.envelope.count >= 40 {
+        let singingEnv = curve.map { $0.singingEnvelope.isEmpty ? $0.envelope : $0.singingEnvelope }
+        if let curve, let singingEnv, singingEnv.count >= 40 {
             let dt = curve.frameDurationSeconds
-            let winFrames = 12 // 1.2s sustained vocal window
+            let winFrames = 12 // 1.2s sustained singing window
             var sustainedStartIdx: Int?
-            if curve.envelope.count > winFrames {
-                for i in 0...(curve.envelope.count - winFrames) {
-                    let slice = curve.envelope[i..<(i + winFrames)]
+            if singingEnv.count > winFrames {
+                for i in 0...(singingEnv.count - winFrames) {
+                    let slice = singingEnv[i..<(i + winFrames)]
                     let mean = slice.reduce(0, +) / Double(winFrames)
                     let activeCount = slice.filter { $0 > 0.06 }.count
                     if mean > -0.02 && activeCount >= 5 {
@@ -431,13 +662,13 @@ enum SongAudioListener {
             }
             if let sustainedStartIdx {
                 firstVocalSec = max(0, Double(sustainedStartIdx) * dt - 0.3)
-            } else if let firstIdx = curve.envelope.firstIndex(where: { $0 > 0.12 }) {
+            } else if let firstIdx = singingEnv.firstIndex(where: { $0 > 0.12 }) {
                 firstVocalSec = max(0, Double(firstIdx) * dt - 0.3)
             }
 
-            if curve.envelope.count > winFrames {
-                for i in stride(from: curve.envelope.count - winFrames, through: 0, by: -1) {
-                    let slice = curve.envelope[i..<(i + winFrames)]
+            if singingEnv.count > winFrames {
+                for i in stride(from: singingEnv.count - winFrames, through: 0, by: -1) {
+                    let slice = singingEnv[i..<(i + winFrames)]
                     let mean = slice.reduce(0, +) / Double(winFrames)
                     let activeCount = slice.filter { $0 > 0.05 }.count
                     if mean > -0.05 && activeCount >= 4 {
@@ -453,57 +684,12 @@ enum SongAudioListener {
             firstVocalSec = max(0, heardFirst.time - 0.35)
         }
 
-        // Find monotonic anchors between line indices and actual heard vocal timestamps.
+        // Find monotonic anchors between line indices and multi-peak heard vocal timestamps (supporting repeated choruses).
         var indexAnchors: [(lineIdx: Int, fileTime: Double)] = []
         if let heard, heard.count >= 6 {
-            var rawHits: [(lineIdx: Int, fileTime: Double)] = []
-            for (lIdx, line) in nonEmptyLines.enumerated() {
-                let lineTokens = tokens(line.text)
-                guard lineTokens.count >= 3 else { continue }
-                let needed = Set(lineTokens)
-                let window = lineTokens.count + 3
-                var bestScore = 0.0
-                var bestStart: Int?
-                var i = 0
-                while i < heard.count {
-                    let end = min(heard.count, i + window)
-                    var hits = Set<String>()
-                    var firstHit: Int?
-                    for j in i..<end where needed.contains(heard[j].token) {
-                        if firstHit == nil { firstHit = j }
-                        hits.insert(heard[j].token)
-                    }
-                    let sc = Double(hits.count) / Double(needed.count)
-                    if sc > bestScore, let firstHit {
-                        bestScore = sc
-                        bestStart = firstHit
-                    }
-                    i += 1
-                }
-                if bestScore >= 0.55, let bestStart {
-                    rawHits.append((lIdx, max(0, heard[bestStart].time - 0.15)))
-                }
-            }
-
-            if !rawHits.isEmpty {
-                var len = Array(repeating: 1, count: rawHits.count)
-                var prev = Array(repeating: -1, count: rawHits.count)
-                for i in 0..<rawHits.count {
-                    for j in 0..<i where rawHits[j].lineIdx < rawHits[i].lineIdx && rawHits[j].fileTime < rawHits[i].fileTime {
-                        if len[j] + 1 > len[i] {
-                            len[i] = len[j] + 1
-                            prev[i] = j
-                        }
-                    }
-                }
-                if var cursor = len.indices.max(by: { len[$0] < len[$1] }) {
-                    while cursor >= 0 {
-                        indexAnchors.append(rawHits[cursor])
-                        cursor = prev[cursor]
-                    }
-                    indexAnchors.reverse()
-                }
-            }
+            let items = nonEmptyLines.enumerated().map { (pos: Double($0.offset), text: $0.element.text, origIndex: $0.offset) }
+            let peaks = collectMultiPeakAnchors(heard: heard, items: items, minScore: 0.55)
+            indexAnchors = peaks.map { (lineIdx: $0.origIndex, fileTime: $0.fileTime) }
         }
 
         // Word-weight per line so longer lines get proportionally longer time slots.
@@ -513,23 +699,31 @@ enum SongAudioListener {
             cumWeights[i + 1] = cumWeights[i] + weights[i]
         }
 
-        // Map normalized progress [0, 1] onto acoustic vocal-band energy curve between anchors
-        // so lines naturally linger/pause across instrumental bridges even when Speech missed words.
+        // Map normalized progress [0, 1] onto acoustic singing-band energy curve between anchors
+        // so lines naturally linger/pause across skits/instrumental bridges instead of gliding through them.
         func energyWarpedTime(between startTime: Double, and endTime: Double, fraction: Double) -> Double {
             let f = min(1.0, max(0.0, fraction))
-            guard f > 0, f < 1, endTime - startTime > 3.0, let curve, !curve.envelope.isEmpty else {
+            guard f > 0, f < 1, endTime - startTime > 3.0, let curve,
+                  let activeEnv = singingEnv, !activeEnv.isEmpty else {
                 return startTime + (endTime - startTime) * f
             }
             let dt = curve.frameDurationSeconds
-            let i0 = max(0, min(curve.envelope.count - 1, Int(startTime / dt)))
-            let i1 = max(i0 + 1, min(curve.envelope.count, Int(endTime / dt)))
+            let i0 = max(0, min(activeEnv.count - 1, Int(startTime / dt)))
+            let i1 = max(i0 + 1, min(activeEnv.count, Int(endTime / dt)))
             guard i1 > i0 + 1 else {
                 return startTime + (endTime - startTime) * f
             }
             var cumEnergy = [Double](repeating: 0, count: i1 - i0 + 1)
             for k in 0..<(i1 - i0) {
-                let v = curve.envelope[i0 + k] // [-1, +1]
-                let vocalWeight = v > -0.05 ? (0.35 + max(0, v)) : 0.10
+                let v = activeEnv[i0 + k] // [-1, +1]
+                let vocalWeight: Double
+                if v > -0.05 {
+                    vocalWeight = 0.35 + max(0, v)
+                } else if v > -0.10 {
+                    vocalWeight = 0.08
+                } else {
+                    vocalWeight = 0.015
+                }
                 cumEnergy[k + 1] = cumEnergy[k] + vocalWeight
             }
             let totalEnergy = cumEnergy.last ?? 0
@@ -993,6 +1187,8 @@ enum SongAudioListener {
             ? []
             : Array(detectRepeatedChorusBlocks(in: lrcNonBreakLines.map(\.text)).prefix(3))
 
+        let singingEnv = curve.singingEnvelope.isEmpty ? curve.envelope : curve.singingEnvelope
+
         // Convert LRC vocal intervals into expected activity markers once per scale.
         var bestScore = -Double.infinity
         var zeroOffsetScore = -Double.infinity
@@ -1031,8 +1227,8 @@ enum SongAudioListener {
                     let t = pt.time + offset
                     guard t >= 0, t < actualDuration else { continue }
                     let idx = Int(t / dt)
-                    guard idx >= 0, idx < curve.envelope.count else { continue }
-                    let v = curve.envelope[idx] // centered around ~0 (-1 silent, +1 vocal active)
+                    guard idx >= 0, idx < singingEnv.count else { continue }
+                    let v = singingEnv[idx] // centered around ~0 (-1 silent/skit, +1 singing active)
                     sum += pt.isSing ? v : (-v * 0.45)
                     count += 1
                 }
@@ -1080,6 +1276,18 @@ enum SongAudioListener {
             }
         }
 
+        // Also check Piecewise Section-DTW (Viterbi) across >= 4s LRC singing gaps so mid-video skits or extra pauses
+        // shift Verse 2 / Chorus 2 independently without disturbing Verse 1 or introducing false jumps on studio songs.
+        if let piecewise = alignSectionsWithViterbi(
+            lyrics: lyrics,
+            curve: curve,
+            singingEnv: singingEnv,
+            lrcNonBreakLines: lrcNonBreakLines,
+            lrcChorusPairs: lrcChorusPairs
+        ) {
+            return piecewise
+        }
+
         // Require a genuine correlation improvement before shifting timestamps away from 0.
         let meaningfulImprovement = abs(bestOffset) >= 0.4 && bestScore > zeroOffsetScore + 0.06 && bestScore > 0.08
         guard meaningfulImprovement || abs(bestScale - 1.0) >= 0.015 else {
@@ -1106,7 +1314,8 @@ enum SongAudioListener {
                 text: line.text,
                 words: words,
                 isInstrumentalBreak: line.isInstrumentalBreak,
-                hasNativeWordTimings: line.hasNativeWordTimings
+                hasNativeWordTimings: line.hasNativeWordTimings,
+                isSpokenDialogue: line.isSpokenDialogue
             )
         }
 
@@ -1121,6 +1330,311 @@ enum SongAudioListener {
             syncedOffsetSeconds: 0,
             tempoScale: 1.0,
             expectedDurationSeconds: actualDuration,
+            alignmentVersion: lyrics.alignmentVersion,
+            lines: remapped
+        )
+    }
+
+    /// Piecewise Section-DTW (Viterbi) aligner: splits synced lyrics at >= 4s singing gaps into sections and finds
+    /// the optimal monotonically increasing offset per section (-12s..+95s) when a music video inserts skits or breaks.
+    private static func alignSectionsWithViterbi(
+        lyrics: ResolvedTrackLyrics,
+        curve: VocalEnvelope,
+        singingEnv: [Double],
+        lrcNonBreakLines: [SyncedLyricLine],
+        lrcChorusPairs: [RepeatedChorusBlock]
+    ) -> ResolvedTrackLyrics? {
+        let dt = curve.frameDurationSeconds
+        let actualDuration = Double(singingEnv.count) * dt
+
+        struct VocalSection {
+            var lineIndices: [Int]
+            var startTime: Double
+            var endTime: Double
+            var samples: [(time: Double, weight: Double, isSing: Bool)]
+        }
+
+        var rawSections: [[Int]] = []
+        var current: [Int] = []
+        var hadBreakSinceLast = false
+        for (idx, line) in lyrics.lines.enumerated() {
+            if line.isInstrumentalBreak || line.isSpokenDialogue {
+                hadBreakSinceLast = true
+                continue
+            }
+            if current.isEmpty {
+                current.append(idx)
+                hadBreakSinceLast = false
+                continue
+            }
+            let prevEnd = lyrics.lines[current.last!].endTime
+            let firstStart = lyrics.lines[current.first!].startTime
+            let gap = line.startTime - prevEnd
+            let span = prevEnd - firstStart
+            if (hadBreakSinceLast || gap >= 4.0) && (current.count >= 2 || span >= 4.0 || gap >= 8.0) {
+                rawSections.append(current)
+                current = [idx]
+            } else {
+                current.append(idx)
+            }
+            hadBreakSinceLast = false
+        }
+        if !current.isEmpty { rawSections.append(current) }
+
+        // Cap section count at <= 10 by merging smallest intra-section gaps first.
+        while rawSections.count > 10 {
+            var bestMerge = 0
+            var minGap = Double.infinity
+            for s in 0..<(rawSections.count - 1) {
+                let g = lyrics.lines[rawSections[s + 1].first!].startTime - lyrics.lines[rawSections[s].last!].endTime
+                if g < minGap {
+                    minGap = g
+                    bestMerge = s
+                }
+            }
+            rawSections[bestMerge].append(contentsOf: rawSections[bestMerge + 1])
+            rawSections.remove(at: bestMerge + 1)
+        }
+        guard rawSections.count >= 2 else { return nil }
+
+        var sections: [VocalSection] = rawSections.map { indices in
+            let s0 = lyrics.lines[indices.first!].startTime
+            let e0 = lyrics.lines[indices.last!].endTime
+            var pts: [(time: Double, weight: Double, isSing: Bool)] = []
+            for k in 0..<indices.count {
+                let ln = lyrics.lines[indices[k]]
+                pts.append((ln.startTime, 1.0, true))
+                pts.append(((ln.startTime + ln.endTime) * 0.5, 1.0, true))
+                if k > 0 {
+                    let prevLn = lyrics.lines[indices[k - 1]]
+                    if ln.startTime - prevLn.endTime >= 0.8 {
+                        pts.append((ln.startTime - 0.55, 0.7, false))
+                    }
+                }
+            }
+            // Contrast edges around section onset/release so sections lock right onto singing entrances after skits.
+            pts.append((s0 - 1.1, 1.1, false))
+            pts.append((s0 - 0.5, 1.1, false))
+            pts.append((s0 + 0.35, 1.3, true))
+            pts.append((s0 + 1.0, 1.2, true))
+            pts.append((e0 + 0.7, 0.8, false))
+            return VocalSection(lineIndices: indices, startTime: s0, endTime: e0, samples: pts)
+        }
+
+        // Map original vocal line indices -> section index for chorus self-similarity verification.
+        var lineToSection: [Int: Int] = [:]
+        for (sIdx, sec) in sections.enumerated() {
+            for li in sec.lineIndices { lineToSection[li] = sIdx }
+        }
+        let nonBreakOrigIndices = lyrics.lines.enumerated()
+            .filter { !$0.element.isInstrumentalBreak && !$0.element.isSpokenDialogue }
+            .map(\.offset)
+
+        func sectionForNonBreakIdx(_ nbIdx: Int) -> Int {
+            guard nbIdx >= 0, nbIdx < nonBreakOrigIndices.count else { return 0 }
+            return lineToSection[nonBreakOrigIndices[nbIdx]] ?? 0
+        }
+
+        func scoreSection(_ sec: VocalSection, offset: Double) -> Double {
+            let totalWeight = sec.samples.reduce(0.0) { $0 + $1.weight }
+            var sum = 0.0
+            var usedWeight = 0.0
+            for pt in sec.samples {
+                let t = pt.time + offset
+                guard t >= 0, t < actualDuration else { continue }
+                let idx = Int(t / dt)
+                guard idx >= 0, idx < singingEnv.count else { continue }
+                let v = singingEnv[idx]
+                sum += pt.weight * (pt.isSing ? v : (-v * 0.45))
+                usedWeight += pt.weight
+            }
+            guard usedWeight > totalWeight * 0.35 else { return -2.0 }
+            return (sum / usedWeight) - min(0.05, abs(offset) * 0.0005)
+        }
+
+        var offsets: [Double] = []
+        var oVal = -12.0
+        while oVal <= 95.0 {
+            offsets.append(oVal)
+            oVal += 0.5
+        }
+        guard let zeroIdx = offsets.firstIndex(where: { abs($0) < 0.01 }) else { return nil }
+        let kCount = sections.count
+        let oCount = offsets.count
+
+        var emit = Array(repeating: Array(repeating: -2.0, count: oCount), count: kCount)
+        for s in 0..<kCount {
+            for oi in 0..<oCount {
+                emit[s][oi] = scoreSection(sections[s], offset: offsets[oi])
+            }
+        }
+
+        func chorusBonus(sectionOffsets: [Double]) -> Double {
+            guard !lrcChorusPairs.isEmpty, !curve.spectralBands.isEmpty, curve.spectralFrameDuration > 0.05 else {
+                return 0
+            }
+            var cSum = 0.0
+            var cCnt = 0
+            for pair in lrcChorusPairs {
+                guard pair.firstStartLine + pair.lineCount <= lrcNonBreakLines.count,
+                      pair.repeatStartLine + pair.lineCount <= lrcNonBreakLines.count else { continue }
+                let o1 = sectionOffsets[sectionForNonBreakIdx(pair.firstStartLine)]
+                let o2 = sectionOffsets[sectionForNonBreakIdx(pair.repeatStartLine)]
+                let t1 = lrcNonBreakLines[pair.firstStartLine].startTime + o1
+                let end1 = lrcNonBreakLines[pair.firstStartLine + pair.lineCount - 1].endTime + o1
+                let t2 = lrcNonBreakLines[pair.repeatStartLine].startTime + o2
+                let fCount = max(12, Int(max(6.0, min(28.0, end1 - t1)) / curve.spectralFrameDuration))
+                let s1 = Int(t1 / curve.spectralFrameDuration)
+                let s2 = Int(t2 / curve.spectralFrameDuration)
+                if s1 >= 0, s2 >= 0,
+                   s1 + fCount <= curve.spectralBands.count,
+                   s2 + fCount <= curve.spectralBands.count {
+                    cSum += spectralCosineSimilarity(bands: curve.spectralBands, startA: s1, startB: s2, length: fCount)
+                    cCnt += 1
+                }
+            }
+            return cCnt > 0 ? 0.14 * (cSum / Double(cCnt)) : 0
+        }
+
+        let uniform0Total = (0..<kCount).reduce(0.0) { $0 + emit[$1][zeroIdx] } + chorusBonus(sectionOffsets: Array(repeating: 0, count: kCount))
+        var uniformBestTotal = -Double.infinity
+        for oi in 0..<oCount {
+            let total = (0..<kCount).reduce(0.0) { $0 + emit[$1][oi] } + chorusBonus(sectionOffsets: Array(repeating: offsets[oi], count: kCount))
+            if total > uniformBestTotal { uniformBestTotal = total }
+        }
+
+        var dp = Array(repeating: Array(repeating: -Double.infinity, count: oCount), count: kCount)
+        var back = Array(repeating: Array(repeating: -1, count: oCount), count: kCount)
+        for oi in 0..<oCount {
+            if sections[0].startTime + offsets[oi] >= -0.5 {
+                dp[0][oi] = emit[0][oi]
+            }
+        }
+        for s in 1..<kCount {
+            for ci in 0..<oCount {
+                let currOff = offsets[ci]
+                let currEmit = emit[s][ci]
+                guard currEmit > -1.5 else { continue }
+                var bestVal = -Double.infinity
+                var bestPrev = -1
+                for pi in 0..<oCount {
+                    let prevDp = dp[s - 1][pi]
+                    guard prevDp > -Double.infinity else { continue }
+                    let prevOff = offsets[pi]
+                    let delta = currOff - prevOff
+                    guard abs(delta) < 0.01 || (delta >= -12.0 && delta <= 75.0 && abs(delta) >= 2.0) else { continue }
+                    guard sections[s].startTime + currOff >= sections[s - 1].endTime + prevOff - 0.6 else { continue }
+                    let penalty = abs(delta) < 0.01 ? 0.0 : (0.085 + 0.0015 * abs(delta))
+                    let cand = prevDp + currEmit - penalty
+                    if cand > bestVal {
+                        bestVal = cand
+                        bestPrev = pi
+                    }
+                }
+                dp[s][ci] = bestVal
+                back[s][ci] = bestPrev
+            }
+        }
+
+        guard let bestLastIdx = (0..<oCount).max(by: { dp[kCount - 1][$0] < dp[kCount - 1][$1] }),
+              dp[kCount - 1][bestLastIdx] > -Double.infinity else {
+            return nil
+        }
+
+        var chosenOffsets = [Double](repeating: 0, count: kCount)
+        var cursor = bestLastIdx
+        for s in stride(from: kCount - 1, through: 0, by: -1) {
+            chosenOffsets[s] = offsets[cursor]
+            cursor = back[s][cursor]
+        }
+
+        // Local +-0.5s fine polish (0.1s step) per section while keeping monotonic boundaries.
+        for s in 0..<kCount {
+            let base = chosenOffsets[s]
+            var bestLocalOff = base
+            var bestLocalScore = scoreSection(sections[s], offset: base)
+            var delta = -0.5
+            while delta <= 0.51 {
+                let cand = base + delta
+                let lowerOk = (s == 0)
+                    ? (sections[0].startTime + cand >= 0)
+                    : (sections[s].startTime + cand >= sections[s - 1].endTime + chosenOffsets[s - 1] - 0.4)
+                let upperOk = (s == kCount - 1) || (sections[s].endTime + cand <= sections[s + 1].startTime + chosenOffsets[s + 1] + 0.4)
+                if lowerOk && upperOk {
+                    let sc = scoreSection(sections[s], offset: cand)
+                    if sc > bestLocalScore {
+                        bestLocalScore = sc
+                        bestLocalOff = cand
+                    }
+                }
+                delta += 0.1
+            }
+            chosenOffsets[s] = bestLocalOff
+        }
+
+        let minOff = chosenOffsets.min() ?? 0
+        let maxOff = chosenOffsets.max() ?? 0
+        guard maxOff - minOff >= 2.0 else { return nil }
+
+        var dpTotal = 0.0
+        for s in 0..<kCount {
+            dpTotal += scoreSection(sections[s], offset: chosenOffsets[s])
+            if s > 0 {
+                let delta = abs(chosenOffsets[s] - chosenOffsets[s - 1])
+                if delta >= 0.01 {
+                    dpTotal -= (0.085 + 0.0015 * delta)
+                }
+            }
+        }
+        dpTotal += chorusBonus(sectionOffsets: chosenOffsets)
+
+        let margin = min(0.28, 0.06 * Double(kCount))
+        guard dpTotal > uniform0Total + margin, dpTotal > uniformBestTotal + margin else {
+            return nil
+        }
+
+        var remapped = lyrics.lines
+        for (idx, line) in lyrics.lines.enumerated() {
+            let sIdx = lineToSection[idx] ?? {
+                // Fallback for instrumental break / interlude markers: match preceding section offset.
+                let prev = lineToSection.keys.filter { $0 < idx }.max()
+                return prev.flatMap { lineToSection[$0] } ?? 0
+            }()
+            let off = chosenOffsets[sIdx]
+            let s = max(0, line.startTime + off)
+            let e = max(s, line.endTime + off)
+            let words = line.words.map {
+                LyricWordTiming(
+                    id: $0.id,
+                    text: $0.text,
+                    startTime: max(0, $0.startTime + off),
+                    endTime: max(0, $0.endTime + off)
+                )
+            }
+            remapped[idx] = SyncedLyricLine(
+                id: line.id,
+                startTime: s,
+                endTime: e,
+                text: line.text,
+                words: words,
+                isInstrumentalBreak: line.isInstrumentalBreak,
+                hasNativeWordTimings: line.hasNativeWordTimings,
+                isSpokenDialogue: line.isSpokenDialogue
+            )
+        }
+
+        let note = String(format: "section-DTW (%+.1fs..%+.1fs)", minOff, maxOff)
+        return ResolvedTrackLyrics(
+            cacheKey: lyrics.cacheKey,
+            trackTitle: lyrics.trackTitle,
+            artistName: lyrics.artistName,
+            isTimeSynced: true,
+            sourceLabel: "Synced Lyrics · auto-aligned",
+            attributionText: (lyrics.attributionText ?? "LRCLIB") + " · \(note)",
+            syncedOffsetSeconds: 0,
+            tempoScale: 1.0,
+            expectedDurationSeconds: actualDuration,
+            alignmentVersion: lyrics.alignmentVersion,
             lines: remapped
         )
     }
@@ -1144,6 +1658,8 @@ enum SongAudioListener {
         let frameDurationSeconds: Double
         /// Normalized centered vocal-band activity in roughly [-1, +1] (~10.8 Hz).
         let envelope: [Double]
+        /// Singing-weighted envelope (~10.8 Hz) suppressing dry choppy dialogue skits without musical backing.
+        let singingEnvelope: [Double]
         /// High-resolution 43.07 Hz (~23ms) centered vocal-band energy for syllable & pause word alignment.
         let fastFrameDurationSeconds: Double
         let fastVocalEnvelope: [Double]
@@ -1640,6 +2156,57 @@ enum SongAudioListener {
         let spread = max(0.25, (p80 - p20) * 0.5)
         let centered = rawEnergies.map { min(1.0, max(-1.0, ($0 - mid) / spread)) }
 
+        // Compute low-frequency musical accompaniment (kick/bass/low-mid: b0 + b1) to separate
+        // dry choppy talking skits from sustained singing over music.
+        var rawMusicLow = [Double](repeating: 0, count: envCount)
+        for i in 0..<envCount {
+            let base = i * dsEnv
+            var s = 0.0
+            for k in 0..<dsEnv {
+                s += (rawBands43Hz[base + k][0] + rawBands43Hz[base + k][1]) * 0.5
+            }
+            rawMusicLow[i] = s / Double(dsEnv)
+        }
+        let sortedLow = rawMusicLow.sorted()
+        let lowP20 = sortedLow[max(0, sortedLow.count / 5)]
+        let lowP80 = sortedLow[min(sortedLow.count - 1, (sortedLow.count * 4) / 5)]
+        let lowMid = (lowP20 + lowP80) * 0.5
+        let lowSpread = max(0.25, (lowP80 - lowP20) * 0.5)
+        let lowNorm = rawMusicLow.map { min(1.0, max(-1.0, ($0 - lowMid) / lowSpread)) }
+
+        var rawSinging = [Double](repeating: 0, count: envCount)
+        for i in 0..<envCount {
+            let v = centered[i]
+            guard v > 0 else {
+                rawSinging[i] = v
+                continue
+            }
+            let w0 = max(0, i - 7)
+            let w1 = min(envCount - 1, i + 7)
+            let spanCount = max(1, w1 - w0 + 1)
+            var active = 0
+            for j in w0...w1 where centered[j] > 0.05 { active += 1 }
+            let duty = Double(active) / Double(spanCount)
+            if lowNorm[i] < -0.60 {
+                // Essentially no musical bed (e.g., dry spoken skit): suppress unless ultra-sustained a cappella.
+                rawSinging[i] = duty >= 0.85 ? (v * 0.25) : -0.28
+            } else if lowNorm[i] < -0.40 && duty < 0.58 {
+                rawSinging[i] = -0.28
+            } else if lowNorm[i] < -0.25 && duty < 0.48 {
+                rawSinging[i] = v * 0.35
+            } else {
+                rawSinging[i] = v
+            }
+        }
+        var singingEnvelope = [Double](repeating: 0, count: envCount)
+        for i in 0..<envCount {
+            let a = max(0, i - 2)
+            let b = min(envCount - 1, i + 2)
+            var sum = 0.0
+            for j in a...b { sum += rawSinging[j] }
+            singingEnvelope[i] = min(1.0, max(-1.0, sum / Double(b - a + 1)))
+        }
+
         // Keep full 43.07 Hz centered vocal energy & p95-normalized vocal onset flux for crisp word/syllable warping.
         let fastVocalEnvelope = rawVocal43Hz.map { min(1.0, max(-1.0, ($0 - mid) / spread)) }
         let sortedFlux = rawVocalFlux43Hz.sorted()
@@ -1681,6 +2248,7 @@ enum SongAudioListener {
         return VocalEnvelope(
             frameDurationSeconds: fastDt * Double(dsEnv),
             envelope: centered,
+            singingEnvelope: singingEnvelope,
             fastFrameDurationSeconds: fastDt,
             fastVocalEnvelope: fastVocalEnvelope,
             fastVocalOnset: fastVocalOnset,
@@ -1690,19 +2258,32 @@ enum SongAudioListener {
         )
     }
 
-    /// Finds lyric lines that were clearly heard, and when. Keeps only anchors that move forward in
-    /// both lyric time and file time (longest consistent chain), so a misheard word can't scramble timing.
-    private static func alignmentAnchors(heard: [HeardWord], lines: [SyncedLyricLine]) -> [Anchor] {
+    /// Finds up to `maxPeaksPerItem` well-separated occurrences (>= 12s apart) per lyric line in `heard` so
+    /// repeated choruses don't collapse onto the first match, then selects the best monotonic chain (weighted LIS).
+    private static func collectMultiPeakAnchors(
+        heard: [HeardWord],
+        items: [(pos: Double, text: String, origIndex: Int)],
+        minScore: Double,
+        maxPeaksPerItem: Int = 3,
+        minPeakSeparationSeconds: Double = 12.0
+    ) -> [(pos: Double, fileTime: Double, origIndex: Int)] {
         guard heard.count >= 6 else { return [] }
-        var candidates: [Anchor] = []
+        struct CandidatePeak {
+            let pos: Double
+            let fileTime: Double
+            let origIndex: Int
+            let score: Double
+        }
 
-        for line in lines where !line.isInstrumentalBreak {
-            let lineTokens = tokens(line.text).filter { !$0.isEmpty }
+        var candidates: [CandidatePeak] = []
+        for item in items {
+            let lineTokens = tokens(item.text).filter { !$0.isEmpty }
             guard lineTokens.count >= 3 else { continue }
             let needed = Set(lineTokens)
+            guard needed.count >= 3 else { continue }
             let window = lineTokens.count + 3
-            var bestScore = 0.0
-            var bestStart: Int?
+
+            var allMatches: [(time: Double, score: Double)] = []
             var i = 0
             while i < heard.count {
                 let end = min(heard.count, i + window)
@@ -1712,38 +2293,61 @@ enum SongAudioListener {
                     if firstHit == nil { firstHit = j }
                     hits.insert(heard[j].token)
                 }
-                let score = Double(hits.count) / Double(needed.count)
-                if score > bestScore, let firstHit {
-                    bestScore = score
-                    bestStart = firstHit
+                let sc = Double(hits.count) / Double(needed.count)
+                if sc >= minScore, let firstHit {
+                    allMatches.append((max(0, heard[firstHit].time - 0.15), sc))
                 }
                 i += 1
             }
-            if bestScore >= 0.6, let bestStart, Set(lineTokens).count >= 3 {
-                candidates.append(Anchor(lyricTime: line.startTime, fileTime: max(0, heard[bestStart].time - 0.15)))
+
+            let ranked = allMatches.sorted {
+                if $0.score != $1.score { return $0.score > $1.score }
+                return $0.time < $1.time
+            }
+            var chosenTimes: [Double] = []
+            for m in ranked {
+                if chosenTimes.allSatisfy({ abs($0 - m.time) >= minPeakSeparationSeconds }) {
+                    chosenTimes.append(m.time)
+                    candidates.append(CandidatePeak(pos: item.pos, fileTime: m.time, origIndex: item.origIndex, score: m.score))
+                    if chosenTimes.count >= maxPeaksPerItem { break }
+                }
             }
         }
         guard !candidates.isEmpty else { return [] }
 
-        // Longest chain increasing in both lyric time and file time.
-        let sorted = candidates.sorted { $0.lyricTime < $1.lyricTime }
-        var length = Array(repeating: 1, count: sorted.count)
+        let sorted = candidates.sorted {
+            if $0.pos != $1.pos { return $0.pos < $1.pos }
+            return $0.fileTime < $1.fileTime
+        }
+        var dpWeight = sorted.map { 1.0 + 0.1 * $0.score }
         var previous = Array(repeating: -1, count: sorted.count)
         for i in 0..<sorted.count {
-            for j in 0..<i where sorted[j].fileTime < sorted[i].fileTime && sorted[j].lyricTime < sorted[i].lyricTime {
-                if length[j] + 1 > length[i] {
-                    length[i] = length[j] + 1
+            for j in 0..<i where sorted[j].pos < sorted[i].pos && sorted[j].fileTime + 0.35 <= sorted[i].fileTime {
+                let cand = dpWeight[j] + 1.0 + 0.1 * sorted[i].score
+                if cand > dpWeight[i] {
+                    dpWeight[i] = cand
                     previous[i] = j
                 }
             }
         }
-        guard var idx = length.indices.max(by: { length[$0] < length[$1] }) else { return [] }
-        var chain: [Anchor] = []
+        guard var idx = dpWeight.indices.max(by: { dpWeight[$0] < dpWeight[$1] }) else { return [] }
+        var chain: [(pos: Double, fileTime: Double, origIndex: Int)] = []
         while idx >= 0 {
-            chain.append(sorted[idx])
+            let item = sorted[idx]
+            chain.append((pos: item.pos, fileTime: item.fileTime, origIndex: item.origIndex))
             idx = previous[idx]
         }
         return chain.reversed()
+    }
+
+    /// Finds lyric lines that were clearly heard, and when. Supports repeated choruses via multi-peak matching and
+    /// keeps the highest-scoring monotonic chain moving forward in both lyric time and file time.
+    private static func alignmentAnchors(heard: [HeardWord], lines: [SyncedLyricLine]) -> [Anchor] {
+        let items = lines.enumerated()
+            .filter { !$0.element.isInstrumentalBreak && !$0.element.isSpokenDialogue }
+            .map { (pos: $0.element.startTime, text: $0.element.text, origIndex: $0.offset) }
+        return collectMultiPeakAnchors(heard: heard, items: items, minScore: 0.6)
+            .map { Anchor(lyricTime: $0.pos, fileTime: $0.fileTime) }
     }
 
     // MARK: - Text helpers

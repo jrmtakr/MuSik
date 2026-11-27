@@ -91,7 +91,7 @@ final class MediaManager {
     private(set) var player: AVPlayer?
     private(set) var ffmpegPlayer: KSMEPlayer?
     private(set) var isUsingFFmpegBackend = false
-    private var isUsingEqualizerBackend = false
+    private(set) var isUsingEqualizerBackend = false
     @ObservationIgnored private var crossfadeTriggeredForCurrentTrack = false
 
     @ObservationIgnored var externalQueueNextHandler: (() -> Bool)?
