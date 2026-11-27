@@ -161,9 +161,9 @@ final class SongIdentificationService {
         var sourceName: String
     }
 
-    private static let userAgent = "MuseJRM/1.0 (https://github.com/jrmtakr/music-player)"
+    nonisolated private static let userAgent = "MuseJRM/1.0 (https://github.com/jrmtakr/music-player)"
     /// Max length difference (seconds) for two sources to count as the same recording.
-    private static let durationTolerance: Double = 4
+    nonisolated private static let durationTolerance: Double = 4
 
     private init() {}
 
@@ -1361,7 +1361,7 @@ final class SongIdentificationService {
             for row in rows {
                 guard let title = row["trackName"] as? String,
                       let artist = row["artistName"] as? String else { continue }
-                let duration = (row["trackTimeMillis"] as? NSNumber)?.doubleValue.map { $0 / 1000.0 }
+                let duration = (row["trackTimeMillis"] as? NSNumber).map { $0.doubleValue / 1000.0 }
                 guard let score = matchScore(claim: claim, title: title, artist: artist, duration: duration, localDuration: localDuration) else {
                     continue
                 }
@@ -1451,7 +1451,7 @@ final class SongIdentificationService {
             guard let title = rec["title"] as? String else { continue }
             let credits = (rec["artist-credit"] as? [[String: Any]]) ?? []
             let artist = credits.map { (($0["name"] as? String) ?? "") + (($0["joinphrase"] as? String) ?? "") }.joined()
-            let duration = (rec["length"] as? NSNumber)?.doubleValue.map { $0 / 1000.0 }
+            let duration = (rec["length"] as? NSNumber).map { $0.doubleValue / 1000.0 }
             guard !artist.isEmpty,
                   let score = Self.matchScore(claim: claim, title: title, artist: artist, duration: duration, localDuration: localDuration) else {
                 continue
