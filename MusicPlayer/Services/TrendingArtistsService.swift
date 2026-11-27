@@ -46,10 +46,46 @@ struct DiscoveredArtistRecord: Identifiable, Hashable, Codable {
     }
 }
 
+enum TrendingSongPlatform: String, Codable, Hashable, Sendable {
+    case youtube = "YouTube"
+    case tiktok = "TikTok"
+    case combined = "TikTok • YouTube"
+
+    var badgeColor: Color {
+        switch self {
+        case .youtube: return .red
+        case .tiktok: return .pink
+        case .combined: return .purple
+        }
+    }
+}
+
+struct TrendingSongItem: Identifiable, Hashable, Codable, Sendable {
+    let id: String
+    let title: String
+    let artist: String
+    let videoID: String?
+    let artworkURLString: String?
+    let platform: TrendingSongPlatform
+    let durationSeconds: Double?
+
+    var artworkURL: URL? {
+        if let artworkURLString, let url = URL(string: artworkURLString) {
+            return url
+        }
+        if let videoID, !videoID.isEmpty {
+            return URL(string: "https://i.ytimg.com/vi/\(videoID)/hqdefault.jpg")
+        }
+        return nil
+    }
+}
+
 private struct TrendingArtistsPersistedState: Codable {
     var artists: [DiscoveredArtistRecord] = []
     var lastRefreshedAt: Date?
     var autoMonthlyRefresh: Bool = true
+    var trendingSongs: [TrendingSongItem]? = nil
+    var lastSongsRefreshedAt: Date? = nil
 }
 
 struct ArtistReleaseItem: Identifiable, Hashable {
@@ -127,7 +163,13 @@ final class TrendingArtistsService {
 
     private var state = TrendingArtistsPersistedState()
     var isRefreshing = false
+    var isLoadingSongs = false
+    var resolvingSongID: String?
     var lastStatusMessage: String?
+
+    var trendingSongs: [TrendingSongItem] {
+        state.trendingSongs ?? []
+    }
 
     private var storageFileURL: URL {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -984,6 +1026,464 @@ final class TrendingArtistsService {
         f.formatOptions = [.withInternetDateTime]
         return f
     }()
+
+    // MARK: - Combined TikTok + YouTube Trending Songs Feed
+
+    func refreshTrendingSongsIfNeeded(force: Bool = false) async {
+        if !force, let songs = state.trendingSongs, !songs.isEmpty,
+           let refreshed = state.lastSongsRefreshedAt,
+           Date().timeIntervalSince(refreshed) < 4 * 3600 {
+            return
+        }
+        guard !isLoadingSongs else { return }
+        await MainActor.run {
+            self.isLoadingSongs = true
+        }
+
+        let year = Calendar.current.component(.year, from: .now)
+        async let ytExploreTask = Self.fetchYouTubeExploreTrendingSongs()
+        async let ytSearchTask = Self.fetchYouTubeOfficialMVTrending(year: year)
+        async let ttPlaylistsTask = Self.fetchTikTokTrendingSongTracks(year: year)
+        async let deezerChartTask = Self.fetchDeezerTopTrendingSongs()
+
+        let ytExplore = await ytExploreTask
+        let ytSearch = await ytSearchTask
+        let ttSongs = await ttPlaylistsTask
+        let dzCharts = await deezerChartTask
+
+        let combined = Self.mergeTrendingSongs(
+            youtubeExplore: ytExplore,
+            youtubeSearch: ytSearch,
+            tiktokTracks: ttSongs,
+            chartTracks: dzCharts
+        )
+
+        await MainActor.run {
+            if !combined.isEmpty {
+                self.state.trendingSongs = combined
+                self.state.lastSongsRefreshedAt = .now
+                self.saveToDisk()
+            }
+            self.isLoadingSongs = false
+        }
+    }
+
+    @MainActor
+    @discardableResult
+    func playTrendingSong(_ song: TrendingSongItem, isVideo: Bool = true) async -> Bool {
+        let mm = MediaManager.shared
+        if let vid = song.videoID,
+           let local = mm.existingMediaItem(forVideoID: vid) {
+            _ = mm.play(local)
+            return true
+        }
+        let normTarget = ArtistDatabase.normalizeLookupKey(ArtistDatabase.cleanSongTitleForSearch(rawTitle: song.title).songOnly)
+        if !normTarget.isEmpty,
+           let localMatch = mm.items.first(where: { item in
+               let itemTitle = ArtistDatabase.normalizeLookupKey(ArtistDatabase.cleanSongTitleForSearch(rawTitle: item.displayTitle).songOnly)
+               return itemTitle == normTarget
+           }) {
+            _ = mm.play(localMatch)
+            return true
+        }
+
+        resolvingSongID = song.id
+        defer {
+            if resolvingSongID == song.id {
+                resolvingSongID = nil
+            }
+        }
+
+        guard let resolved = await resolvePlayableTrendingStream(for: song) else {
+            MediaManager.shared.errorMessage = "Could not load stream for \"\(song.title)\"."
+            return false
+        }
+
+        let candidateStreams = resolved.streams
+        let videoProgressive = candidateStreams.filter { !$0.isHLS && !$0.isAudio && $0.pairedAudioURL == nil }
+        let hlsStreams = candidateStreams.filter { $0.isHLS }
+        let audioStreams = candidateStreams.filter { $0.isAudio && !$0.isHLS }
+        let directAny = candidateStreams.filter { !$0.isHLS && $0.pairedAudioURL == nil }
+
+        let chosenStream: DetectedBrowserMedia?
+        if isVideo && song.videoID != nil {
+            chosenStream = videoProgressive.first ?? hlsStreams.first ?? directAny.first ?? audioStreams.first ?? candidateStreams.first
+        } else {
+            chosenStream = audioStreams.first ?? videoProgressive.first ?? hlsStreams.first ?? directAny.first ?? candidateStreams.first
+        }
+        guard let stream = chosenStream else { return false }
+
+        mm.playRemoteStream(
+            url: stream.url,
+            title: song.title,
+            artist: song.artist,
+            headers: stream.customHeaders,
+            isVideo: (song.videoID != nil && !stream.isAudio),
+            sourceVideoID: resolved.videoID,
+            artworkURL: song.artworkURL,
+            durationSeconds: song.durationSeconds ?? resolved.durationSeconds
+        )
+        return true
+    }
+
+    @MainActor
+    func cacheTrendingSongOffline(_ song: TrendingSongItem, downloader: WebMediaDownloader) async -> MediaItem? {
+        resolvingSongID = song.id
+        defer {
+            if resolvingSongID == song.id {
+                resolvingSongID = nil
+            }
+        }
+        guard let resolved = await resolvePlayableTrendingStream(for: song),
+              !resolved.streams.isEmpty else {
+            MediaManager.shared.errorMessage = "Could not cache \"\(song.title)\"."
+            return nil
+        }
+        let videoStreams = resolved.streams.filter { !$0.isAudio }
+        let ordered = (song.videoID != nil && !videoStreams.isEmpty)
+            ? videoStreams + resolved.streams.filter(\.isAudio)
+            : resolved.streams
+        guard let primary = ordered.first else { return nil }
+        let media = DetectedBrowserMedia(
+            url: primary.url,
+            pairedAudioURL: primary.pairedAudioURL,
+            isHLS: primary.isHLS,
+            isAudio: primary.isAudio,
+            title: song.title,
+            author: song.artist,
+            qualityLabel: primary.qualityLabel,
+            referer: primary.referer,
+            customHeaders: primary.customHeaders,
+            durationSeconds: song.durationSeconds ?? resolved.durationSeconds ?? primary.durationSeconds,
+            isActivelyPlaying: false
+        )
+        return await downloader.downloadGroupTrackOffline(
+            media,
+            fallbackStreams: Array(ordered.dropFirst()),
+            sourceVideoID: resolved.videoID
+        )
+    }
+
+    private func resolvePlayableTrendingStream(for song: TrendingSongItem) async -> YouTubeResolvedResult? {
+        var targetVideoID = song.videoID
+        if targetVideoID == nil || targetVideoID?.isEmpty == true {
+            let clean = ArtistDatabase.cleanSongTitleForSearch(rawTitle: song.title)
+            let q = [song.artist, clean.songOnly]
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+                .joined(separator: " ")
+            let hits = await PlaylistURLImporter.searchYouTubeTracks(query: q, limit: 5)
+            targetVideoID = hits.first?.videoID
+        }
+
+        guard let vid = targetVideoID,
+              !vid.isEmpty,
+              let watchURL = URL(string: "https://www.youtube.com/watch?v=\(vid)") else {
+            return nil
+        }
+
+        if let resolved = await YouTubeStreamResolver.resolveStreams(for: watchURL),
+           !resolved.streams.isEmpty {
+            return resolved
+        }
+        if let browserResolved = await BrowserYouTubeResolver.shared.resolveStreamsInBrowser(
+            videoID: vid,
+            priorityLockTimeout: 2.5
+        ), !browserResolved.result.streams.isEmpty {
+            return browserResolved.result
+        }
+        return await YouTubeStreamResolver.resolveAgeRestrictedFallback(
+            videoID: vid,
+            title: song.title,
+            author: song.artist,
+            durationSeconds: song.durationSeconds
+        )
+    }
+
+    // MARK: - Combined TikTok & YouTube Feed Fetchers
+
+    private static let ytRemixClientVersion = "1.20250311.01.00"
+    private static let ytWebClientVersion = "2.20250311.00.00"
+
+    private static func isBlockedCompilationTitle(_ rawTitle: String) -> Bool {
+        let lower = rawTitle.lowercased()
+        let banned = ["playlist", "mashup", "megamix", "nonstop", "1 hour", "1hr", "compilation", "mix 202"]
+        return banned.contains(where: { lower.contains($0) })
+    }
+
+    private static func fetchYouTubeExploreTrendingSongs() async -> [TrendingSongItem] {
+        guard let url = URL(string: "https://music.youtube.com/youtubei/v1/browse?prettyPrint=false") else {
+            return []
+        }
+        let bodyObj: [String: Any] = [
+            "browseId": "FEmusic_explore",
+            "context": [
+                "client": [
+                    "clientName": "WEB_REMIX",
+                    "clientVersion": ytRemixClientVersion,
+                    "hl": "en",
+                    "gl": "US"
+                ]
+            ]
+        ]
+        guard let bodyData = try? JSONSerialization.data(withJSONObject: bodyObj) else { return [] }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.httpBody = bodyData
+        req.timeoutInterval = 10
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue(safariUA, forHTTPHeaderField: "User-Agent")
+        req.setValue("https://music.youtube.com", forHTTPHeaderField: "Origin")
+        req.setValue("67", forHTTPHeaderField: "X-YouTube-Client-Name")
+        req.setValue(ytRemixClientVersion, forHTTPHeaderField: "X-YouTube-Client-Version")
+
+        guard let (data, resp) = try? await URLSession.shared.data(for: req),
+              let http = resp as? HTTPURLResponse,
+              (200...299).contains(http.statusCode),
+              let json = try? JSONSerialization.jsonObject(with: data) else {
+            return []
+        }
+
+        func runsText(_ obj: Any?) -> String {
+            guard let dict = obj as? [String: Any] else { return "" }
+            if let s = dict["simpleText"] as? String { return s }
+            if let runs = dict["runs"] as? [[String: Any]] {
+                return runs.compactMap { $0["text"] as? String }.joined()
+            }
+            return ""
+        }
+
+        var out: [TrendingSongItem] = []
+        var seenVID = Set<String>()
+
+        func walk(_ node: Any, depth: Int) {
+            guard depth < 24, out.count < 55 else { return }
+            if let arr = node as? [Any] {
+                for item in arr { walk(item, depth: depth + 1) }
+                return
+            }
+            guard let dict = node as? [String: Any] else { return }
+            if let item = dict["musicResponsiveListItemRenderer"] as? [String: Any] {
+                var vid = ((item["navigationEndpoint"] as? [String: Any])?["watchEndpoint"] as? [String: Any])?["videoId"] as? String
+                if vid == nil,
+                   let ov = item["overlay"] as? [String: Any],
+                   let mt = ov["musicItemThumbnailOverlayRenderer"] as? [String: Any],
+                   let cnt = mt["content"] as? [String: Any],
+                   let btn = cnt["musicPlayButtonRenderer"] as? [String: Any],
+                   let nav = btn["playNavigationEndpoint"] as? [String: Any] {
+                    vid = (nav["watchEndpoint"] as? [String: Any])?["videoId"] as? String
+                }
+                let flexCols = item["flexColumns"] as? [[String: Any]] ?? []
+                if vid == nil {
+                    for col in flexCols {
+                        let runs = ((col["musicResponsiveListItemFlexColumnRenderer"] as? [String: Any])?["text"] as? [String: Any])?["runs"] as? [[String: Any]] ?? []
+                        for r in runs {
+                            if let v2 = ((r["navigationEndpoint"] as? [String: Any])?["watchEndpoint"] as? [String: Any])?["videoId"] as? String, !v2.isEmpty {
+                                vid = v2
+                                break
+                            }
+                        }
+                        if vid != nil { break }
+                    }
+                }
+                if let vid, !vid.isEmpty, seenVID.insert(vid).inserted {
+                    let cols = flexCols.map { runsText(($0["musicResponsiveListItemFlexColumnRenderer"] as? [String: Any])?["text"]) }
+                    let rawTitle = (cols.first ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                    let artistPart = cols.count > 1
+                        ? cols[1].components(separatedBy: " • ").first?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                        : ""
+                    if !rawTitle.isEmpty, !isBlockedCompilationTitle(rawTitle) {
+                        out.append(TrendingSongItem(
+                            id: "yt:\(vid)",
+                            title: rawTitle,
+                            artist: artistPart.isEmpty ? "YouTube Music" : artistPart,
+                            videoID: vid,
+                            artworkURLString: "https://i.ytimg.com/vi/\(vid)/hqdefault.jpg",
+                            platform: .youtube,
+                            durationSeconds: nil
+                        ))
+                    }
+                }
+                return
+            }
+            if let two = dict["musicTwoRowItemRenderer"] as? [String: Any] {
+                var vid = ((two["navigationEndpoint"] as? [String: Any])?["watchEndpoint"] as? [String: Any])?["videoId"] as? String
+                if vid == nil,
+                   let ov = two["thumbnailOverlay"] as? [String: Any],
+                   let mt = ov["musicItemThumbnailOverlayRenderer"] as? [String: Any],
+                   let cnt = mt["content"] as? [String: Any],
+                   let btn = cnt["musicPlayButtonRenderer"] as? [String: Any],
+                   let nav = btn["playNavigationEndpoint"] as? [String: Any] {
+                    vid = (nav["watchEndpoint"] as? [String: Any])?["videoId"] as? String
+                }
+                if let vid, !vid.isEmpty, seenVID.insert(vid).inserted {
+                    let rawTitle = runsText(two["title"]).trimmingCharacters(in: .whitespacesAndNewlines)
+                    let artistPart = runsText(two["subtitle"]).components(separatedBy: " • ").first?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                    if !rawTitle.isEmpty, !isBlockedCompilationTitle(rawTitle) {
+                        out.append(TrendingSongItem(
+                            id: "yt:\(vid)",
+                            title: rawTitle,
+                            artist: artistPart.isEmpty ? "YouTube Music" : artistPart,
+                            videoID: vid,
+                            artworkURLString: "https://i.ytimg.com/vi/\(vid)/hqdefault.jpg",
+                            platform: .youtube,
+                            durationSeconds: nil
+                        ))
+                    }
+                }
+                return
+            }
+            for (_, v) in dict {
+                if v is [String: Any] || v is [Any] {
+                    walk(v, depth: depth + 1)
+                }
+            }
+        }
+
+        walk(json, depth: 0)
+        return out
+    }
+
+    private static func fetchYouTubeOfficialMVTrending(year: Int) async -> [TrendingSongItem] {
+        let hits = await PlaylistURLImporter.searchYouTubeTracks(query: "Official Music Video \(year)", limit: 25)
+        return hits.compactMap { hit -> TrendingSongItem? in
+            guard !hit.title.isEmpty, !isBlockedCompilationTitle(hit.title) else { return nil }
+            if let dur = hit.durationSeconds, dur > 600 || dur < 30 { return nil }
+            return TrendingSongItem(
+                id: "yt:\(hit.videoID)",
+                title: hit.title,
+                artist: hit.artist.isEmpty ? "YouTube" : hit.artist,
+                videoID: hit.videoID,
+                artworkURLString: "https://i.ytimg.com/vi/\(hit.videoID)/hqdefault.jpg",
+                platform: .youtube,
+                durationSeconds: hit.durationSeconds
+            )
+        }
+    }
+
+    private static func fetchTikTokTrendingSongTracks(year: Int) async -> [TrendingSongItem] {
+        var collected: [TrendingSongItem] = []
+        var seenKeys = Set<String>()
+        for query in ["TikTok Viral Hits \(year)", "TikTok Trending Songs"] {
+            guard let encoded = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+                  let searchURL = URL(string: "https://api.deezer.com/search/playlist?q=\(encoded)&limit=5"),
+                  let json = await getJSON(url: searchURL) as? [String: Any],
+                  let playlists = json["data"] as? [[String: Any]] else {
+                continue
+            }
+            for pl in playlists.filter({ ($0["nb_tracks"] as? Int ?? 0) >= 15 }).prefix(2) {
+                guard let pid = pl["id"] as? Int,
+                      let tracksURL = URL(string: "https://api.deezer.com/playlist/\(pid)/tracks?limit=35"),
+                      let tJson = await getJSON(url: tracksURL) as? [String: Any],
+                      let rows = tJson["data"] as? [[String: Any]] else {
+                    continue
+                }
+                for row in rows {
+                    guard let title = row["title"] as? String, !title.isEmpty else { continue }
+                    let artist = (row["artist"] as? [String: Any])?["name"] as? String ?? ""
+                    guard !artist.isEmpty else { continue }
+                    let key = "\(ArtistDatabase.normalizeLookupKey(title))|\(ArtistDatabase.normalizeLookupKey(artist))"
+                    guard seenKeys.insert(key).inserted else { continue }
+                    let albumDict = row["album"] as? [String: Any]
+                    let artStr = (albumDict?["cover_big"] as? String) ?? (albumDict?["cover_medium"] as? String)
+                    let dur = row["duration"] as? Double
+                    let idNum = (row["id"] as? Int).map(String.init) ?? key
+                    collected.append(TrendingSongItem(
+                        id: "tt:\(idNum)",
+                        title: title,
+                        artist: artist,
+                        videoID: nil,
+                        artworkURLString: artStr,
+                        platform: .tiktok,
+                        durationSeconds: dur
+                    ))
+                }
+            }
+        }
+        return collected
+    }
+
+    private static func fetchDeezerTopTrendingSongs() async -> [TrendingSongItem] {
+        guard let url = URL(string: "https://api.deezer.com/chart/0/tracks?limit=35"),
+              let dict = await getJSON(url: url) as? [String: Any],
+              let rows = dict["data"] as? [[String: Any]] else {
+            return []
+        }
+        return rows.compactMap { row -> TrendingSongItem? in
+            guard let title = row["title"] as? String, !title.isEmpty else { return nil }
+            let artist = (row["artist"] as? [String: Any])?["name"] as? String ?? ""
+            guard !artist.isEmpty else { return nil }
+            let albumDict = row["album"] as? [String: Any]
+            let artStr = (albumDict?["cover_big"] as? String) ?? (albumDict?["cover_medium"] as? String)
+            let dur = row["duration"] as? Double
+            let idNum = (row["id"] as? Int).map(String.init) ?? title
+            return TrendingSongItem(
+                id: "ttchart:\(idNum)",
+                title: title,
+                artist: artist,
+                videoID: nil,
+                artworkURLString: artStr,
+                platform: .tiktok,
+                durationSeconds: dur
+            )
+        }
+    }
+
+    private static func mergeTrendingSongs(
+        youtubeExplore: [TrendingSongItem],
+        youtubeSearch: [TrendingSongItem],
+        tiktokTracks: [TrendingSongItem],
+        chartTracks: [TrendingSongItem]
+    ) -> [TrendingSongItem] {
+        func songKey(_ item: TrendingSongItem) -> String {
+            let clean = ArtistDatabase.cleanSongTitleForSearch(rawTitle: item.title)
+            let songNorm = ArtistDatabase.normalizeLookupKey(clean.songOnly)
+            let artistNorm = ArtistDatabase.normalizeLookupKey(item.artist)
+            return "\(songNorm)|\(artistNorm)"
+        }
+
+        let ytPool = youtubeExplore + youtubeSearch
+        let ttPool = tiktokTracks + chartTracks
+        let ttKeys = Set(ttPool.map(songKey))
+
+        var out: [TrendingSongItem] = []
+        var seen = Set<String>()
+        var seenVID = Set<String>()
+
+        func appendIfNew(_ item: TrendingSongItem) {
+            if let vid = item.videoID, !seenVID.insert(vid).inserted { return }
+            let k = songKey(item)
+            guard !k.isEmpty, seen.insert(k).inserted else { return }
+            if item.platform == .youtube && ttKeys.contains(k) {
+                out.append(TrendingSongItem(
+                    id: item.id,
+                    title: item.title,
+                    artist: item.artist,
+                    videoID: item.videoID,
+                    artworkURLString: item.artworkURLString,
+                    platform: .combined,
+                    durationSeconds: item.durationSeconds
+                ))
+            } else {
+                out.append(item)
+            }
+        }
+
+        // Interleave YouTube Trending and TikTok Viral evenly down a long 80-item Discovery scroll.
+        var yi = 0
+        var ti = 0
+        while out.count < 85 && (yi < ytPool.count || ti < ttPool.count) {
+            for _ in 0..<2 where yi < ytPool.count && out.count < 85 {
+                appendIfNew(ytPool[yi])
+                yi += 1
+            }
+            for _ in 0..<2 where ti < ttPool.count && out.count < 85 {
+                appendIfNew(ttPool[ti])
+                ti += 1
+            }
+        }
+        return out
+    }
 
     // MARK: - Persistence
 

@@ -400,7 +400,7 @@ final class SyncedLyricsService {
         activeAITaskKey = key
         isAIRecognizing = true
         aiErrorMessage = nil
-        aiStatusMessage = "AI listening across full song..."
+        aiStatusMessage = "Listening across full song..."
 
         let existingLyrics = (currentLyrics?.cacheKey == key) ? currentLyrics : nil
 

@@ -13,7 +13,7 @@ import UIKit
 final class ShazamFingerprintEngine: SongRecognitionEngine, @unchecked Sendable {
     static let shared = ShazamFingerprintEngine()
 
-    let name = "Shazam AI"
+    let name = "Shazam Match"
 
     // MARK: - Signal Processing Constants
 
@@ -175,7 +175,7 @@ final class ShazamFingerprintEngine: SongRecognitionEngine, @unchecked Sendable 
             isrc: nil,
             artworkURL: matched.artworkURL,
             durationSeconds: matched.durationSeconds ?? durationHint,
-            source: "Shazam AI (acoustic match)"
+            source: "Shazam (acoustic match)"
         )
 
         storeRecord(
@@ -248,7 +248,7 @@ final class ShazamFingerprintEngine: SongRecognitionEngine, @unchecked Sendable 
             isrc: nil,
             artworkURL: rec.artworkURLString.flatMap { URL(string: $0) },
             durationSeconds: rec.durationSeconds,
-            source: "Shazam AI (local fingerprint)"
+            source: "Shazam (local fingerprint)"
         )
     }
 

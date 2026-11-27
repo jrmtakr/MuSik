@@ -36,7 +36,7 @@ struct MediaRowView: View {
                 if isPendingAIAnalysis {
                     songIDService.prioritize(item)
                     mediaManager.statusMessage = songIDService.analysisStatusText(for: item)
-                        ?? "AI is listening to whole song before playback..."
+                        ?? "Listening to whole song before playback..."
                 } else {
                     onPlay()
                 }
@@ -59,8 +59,8 @@ struct MediaRowView: View {
                                 ProgressView()
                                     .controlSize(.small)
                                     .tint(.white)
-                                Text("AI")
-                                    .font(.system(size: 9, weight: .bold))
+                                Text("SYNC")
+                                    .font(.system(size: 8, weight: .bold))
                                     .foregroundStyle(.white.opacity(0.9))
                             }
                         } else if isCurrent {
@@ -126,7 +126,7 @@ struct MediaRowView: View {
                         }
 
                         if isPendingAIAnalysis {
-                            let stepLabel = songIDService.analysisStatusText(for: item) ?? "AI analyzing whole song..."
+                            let stepLabel = songIDService.analysisStatusText(for: item) ?? "Analyzing whole song..."
                             VStack(alignment: .leading, spacing: 3) {
                                 HStack(spacing: 6) {
                                     Image(systemName: "waveform.and.magnifyingglass")
@@ -171,7 +171,7 @@ struct MediaRowView: View {
                     }
                 } label: {
                     if isPendingAIAnalysis {
-                        Label("AI Analyzing Before Play...", systemImage: "waveform.and.magnifyingglass")
+                        Label("Analyzing Before Play...", systemImage: "waveform.and.magnifyingglass")
                     } else {
                         Label(isCurrent && mediaManager.isPlaying ? "Pause" : "Play",
                               systemImage: isCurrent && mediaManager.isPlaying ? "pause.fill" : "play.fill")

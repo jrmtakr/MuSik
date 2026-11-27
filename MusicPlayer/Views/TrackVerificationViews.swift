@@ -159,7 +159,7 @@ struct VerifyTrackArtistSheet: View {
                         .compactMap { $0 }
                         .filter { !$0.isEmpty }
                     if !summaryParts.isEmpty {
-                        Text("AI Full Listen: \(summaryParts.joined(separator: " • ")) (\(aiRes.heardWordCount) words)")
+                        Text("Full Track Scan: \(summaryParts.joined(separator: " • ")) (\(aiRes.heardWordCount) words)")
                     }
                 }
                 if let aiErr = wholeSongAI.lastError, !aiErr.isEmpty {

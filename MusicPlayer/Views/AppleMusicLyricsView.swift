@@ -585,7 +585,7 @@ struct AppleMusicLyricsView: View {
                     ProgressView(value: max(0.02, wholeSongAI.progressFraction))
                         .tint(.white)
                         .frame(maxWidth: 220)
-                    Text(wholeSongAI.statusMessage ?? "AI listening to whole song...")
+                    Text(wholeSongAI.statusMessage ?? "Listening to whole song...")
                         .font(.caption.weight(.medium))
                         .foregroundStyle(.white.opacity(0.75))
                         .multilineTextAlignment(.center)

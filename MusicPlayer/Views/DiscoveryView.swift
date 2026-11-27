@@ -19,7 +19,28 @@ struct DiscoveryView: View {
     @State private var siteTitle = ""
     @State private var siteURL = ""
     @State private var showMangaReaderHub = false
+    @State private var selectedOnlineManga: OnlineMangaSeries?
     @State private var showWrappedSheet = false
+    @State private var mangaService = MangaDexService.shared
+
+    enum TrendingFilterOption: String, CaseIterable, Identifiable {
+        case all = "All"
+        case youtube = "YouTube"
+        case tiktok = "TikTok"
+        var id: String { rawValue }
+    }
+    @State private var trendingFilter: TrendingFilterOption = .all
+
+    private var filteredTrendingSongs: [TrendingSongItem] {
+        switch trendingFilter {
+        case .all:
+            return trendingService.trendingSongs
+        case .youtube:
+            return trendingService.trendingSongs.filter { $0.platform == .youtube || $0.platform == .combined }
+        case .tiktok:
+            return trendingService.trendingSongs.filter { $0.platform == .tiktok || $0.platform == .combined }
+        }
+    }
 
     private let columns = [
         GridItem(.adaptive(minimum: 74, maximum: 92), spacing: 12)
@@ -45,17 +66,11 @@ struct DiscoveryView: View {
 
                     speedDialSection
 
-                    wrappedBannerCard
-
-                    trendingArtistsShelfSection
-
-                    mangaReaderCard
-
                     if !offlineSongs.isEmpty {
                         shelfSection(
                             title: "Offline Songs",
                             items: offlineSongs,
-                            actionTitle: "Play All"
+                            actionTitle: "More"
                         ) {
                             if let first = offlineSongs.first {
                                 mediaManager.play(first)
@@ -73,6 +88,14 @@ struct DiscoveryView: View {
                         }
                     }
 
+                    mangaShelfSection
+
+                    trendingSongsSection
+
+                    wrappedBannerCard
+
+                    trendingArtistsShelfSection
+
                     if !browserStore.bookmarks.isEmpty {
                         bookmarksSection
                     }
@@ -81,6 +104,12 @@ struct DiscoveryView: View {
                 .padding(.vertical, 12)
             }
             .navigationTitle("Discovery")
+            .refreshable {
+                await refreshDiscoveryFeeds(force: true)
+            }
+            .task {
+                await refreshDiscoveryFeeds(force: false)
+            }
             .toolbar {
                 ToolbarItemGroup(placement: .topBarTrailing) {
                     Button {
@@ -105,6 +134,9 @@ struct DiscoveryView: View {
             .miniPlayerInset(showPlayerSheet: $showPlayerSheet)
             .sheet(isPresented: $showMangaReaderHub) {
                 MangaLibrarySheetView()
+            }
+            .sheet(item: $selectedOnlineManga) { manga in
+                OnlineMangaDetailView(manga: manga)
             }
             .sheet(isPresented: $showWrappedSheet) {
                 WrappedDashboardSheet()
@@ -348,53 +380,290 @@ struct DiscoveryView: View {
         }
     }
 
-    private var mangaReaderCard: some View {
-        Button {
-            showMangaReaderHub = true
-        } label: {
-            HStack(spacing: 14) {
-                ZStack {
-                    RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .fill(
-                            LinearGradient(
-                                colors: [Color.orange.opacity(0.85), Color.pink.opacity(0.85)],
-                                startPoint: .topLeading,
-                                endPoint: .bottomTrailing
-                            )
-                        )
-                        .frame(width: 48, height: 48)
-                    Image(systemName: "book.pages.fill")
-                        .font(.title3.weight(.semibold))
-                        .foregroundStyle(.white)
+    private var mangaShelfSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("Manga")
+                    .font(.headline)
+                Spacer()
+                Button("More") {
+                    showMangaReaderHub = true
                 }
+                .font(.subheadline.weight(.medium))
+            }
 
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("Manga, Comic & Story Reader")
-                        .font(.subheadline.weight(.bold))
-                        .foregroundStyle(.primary)
-                    Text(
-                        mangaChapterCount > 0
-                            ? "\(mangaChapterCount) \(mangaChapterCount == 1 ? "item" : "items") ready • Scroll, Page & Manga RTL"
-                            : "Read image folders, .CBZ/.ZIP comics & .TXT stories offline"
+            if mangaService.popularManga.isEmpty {
+                Button {
+                    showMangaReaderHub = true
+                } label: {
+                    HStack(spacing: 14) {
+                        ZStack {
+                            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                .fill(
+                                    LinearGradient(
+                                        colors: [Color.orange.opacity(0.85), Color.pink.opacity(0.85)],
+                                        startPoint: .topLeading,
+                                        endPoint: .bottomTrailing
+                                    )
+                                )
+                                .frame(width: 48, height: 48)
+                            Image(systemName: "book.pages.fill")
+                                .font(.title3.weight(.semibold))
+                                .foregroundStyle(.white)
+                        }
+
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("Manga, Comic & Story Reader")
+                                .font(.subheadline.weight(.bold))
+                                .foregroundStyle(.primary)
+                            Text(
+                                mangaChapterCount > 0
+                                    ? "\(mangaChapterCount) \(mangaChapterCount == 1 ? "item" : "items") ready • Browse Free Manga Server & Offline Reader"
+                                    : "Read popular manga free in-app or import .CBZ/.ZIP offline"
+                            )
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                        }
+
+                        Spacer()
+                        if mangaService.isLoadingCatalog {
+                            ProgressView()
+                                .controlSize(.small)
+                        } else {
+                            Image(systemName: "chevron.right")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.tertiary)
+                        }
+                    }
+                    .padding(12)
+                    .background(
+                        settings.hasCustomBackground ? settings.themedRowBackgroundColor : Color(.secondarySystemBackground),
+                        in: RoundedRectangle(cornerRadius: 14, style: .continuous)
                     )
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
+                }
+                .buttonStyle(.plain)
+            } else {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(alignment: .top, spacing: 12) {
+                        ForEach(mangaService.popularManga.prefix(18)) { manga in
+                            Button {
+                                selectedOnlineManga = manga
+                            } label: {
+                                VStack(alignment: .leading, spacing: 6) {
+                                    ZStack(alignment: .bottomLeading) {
+                                        AsyncImage(url: manga.thumbnailURL) { img in
+                                            img.resizable().scaledToFill()
+                                        } placeholder: {
+                                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                                .fill(Color.orange.opacity(0.16))
+                                                .overlay {
+                                                    Image(systemName: "book.pages.fill")
+                                                        .foregroundStyle(.orange)
+                                                }
+                                        }
+                                        .frame(width: 112, height: 158)
+                                        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+
+                                        HStack(spacing: 4) {
+                                            Image(systemName: "book.pages.fill")
+                                                .font(.system(size: 9, weight: .bold))
+                                            Text("Read")
+                                                .font(.system(size: 10, weight: .bold))
+                                        }
+                                        .foregroundStyle(.white)
+                                        .padding(.horizontal, 7)
+                                        .padding(.vertical, 3)
+                                        .background(.black.opacity(0.68), in: Capsule())
+                                        .padding(6)
+                                    }
+
+                                    Text(manga.title)
+                                        .font(.caption.weight(.semibold))
+                                        .foregroundStyle(.primary)
+                                        .lineLimit(2)
+                                        .frame(width: 112, alignment: .leading)
+                                }
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                    .padding(.vertical, 2)
+                }
+            }
+        }
+    }
+
+    private var trendingSongsSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 10) {
+                Text("Trending")
+                    .font(.headline)
+
+                HStack(spacing: 6) {
+                    ForEach(TrendingFilterOption.allCases) { option in
+                        let isSelected = trendingFilter == option
+                        Button {
+                            AppHaptics.selection()
+                            trendingFilter = option
+                        } label: {
+                            Text(option.rawValue)
+                                .font(.caption2.weight(.semibold))
+                                .padding(.horizontal, 9)
+                                .padding(.vertical, 4)
+                                .background(
+                                    isSelected ? Color.accentColor : Color(.secondarySystemBackground),
+                                    in: Capsule()
+                                )
+                                .foregroundStyle(isSelected ? .white : .secondary)
+                        }
+                        .buttonStyle(.plain)
+                    }
                 }
 
                 Spacer()
 
-                Image(systemName: "chevron.right")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.tertiary)
+                if trendingService.isLoadingSongs {
+                    ProgressView()
+                        .controlSize(.small)
+                } else {
+                    Button {
+                        Task { await trendingService.refreshTrendingSongsIfNeeded(force: true) }
+                    } label: {
+                        Image(systemName: "arrow.clockwise")
+                            .font(.subheadline.weight(.medium))
+                    }
+                }
             }
-            .padding(12)
-            .background(
-                settings.hasCustomBackground ? settings.themedRowBackgroundColor : Color(.secondarySystemBackground),
-                in: RoundedRectangle(cornerRadius: 14, style: .continuous)
-            )
+
+            if filteredTrendingSongs.isEmpty {
+                VStack(spacing: 10) {
+                    if trendingService.isLoadingSongs {
+                        ProgressView()
+                        Text("Loading trending songs from TikTok & YouTube...")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Text("Tap to load trending songs from TikTok & YouTube")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Button("Load Trending Songs") {
+                            Task { await trendingService.refreshTrendingSongsIfNeeded(force: true) }
+                        }
+                        .font(.caption.weight(.semibold))
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                    }
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 24)
+            } else {
+                LazyVStack(alignment: .leading, spacing: 12) {
+                    ForEach(filteredTrendingSongs) { song in
+                        trendingSongRow(song)
+                    }
+                }
+            }
+        }
+    }
+
+    private func trendingSongRow(_ song: TrendingSongItem) -> some View {
+        let isResolving = trendingService.resolvingSongID == song.id
+        return Button {
+            Task {
+                let played = await trendingService.playTrendingSong(song, isVideo: song.videoID != nil)
+                if played && song.videoID != nil {
+                    showPlayerSheet = true
+                }
+            }
+        } label: {
+            HStack(spacing: 12) {
+                ZStack {
+                    AsyncImage(url: song.artworkURL) { img in
+                        img.resizable().scaledToFill()
+                    } placeholder: {
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .fill(song.platform.badgeColor.opacity(0.16))
+                            .overlay {
+                                Image(systemName: song.videoID != nil ? "play.rectangle.fill" : "music.note")
+                                    .foregroundStyle(song.platform.badgeColor)
+                            }
+                    }
+                    .frame(width: 124, height: 70)
+                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+
+                    if isResolving {
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .fill(.black.opacity(0.5))
+                            .frame(width: 124, height: 70)
+                        ProgressView()
+                            .tint(.white)
+                    }
+                }
+
+                VStack(alignment: .leading, spacing: 5) {
+                    Text(song.title)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.primary)
+                        .lineLimit(2)
+                        .multilineTextAlignment(.leading)
+
+                    HStack(spacing: 6) {
+                        Text(song.artist)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+
+                        Text(song.platform.rawValue)
+                            .font(.system(size: 10, weight: .semibold))
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(song.platform.badgeColor.opacity(0.15), in: Capsule())
+                            .foregroundStyle(song.platform.badgeColor)
+                    }
+                }
+
+                Spacer(minLength: 0)
+            }
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .contextMenu {
+            Button {
+                Task {
+                    let played = await trendingService.playTrendingSong(song, isVideo: song.videoID != nil)
+                    if played && song.videoID != nil {
+                        showPlayerSheet = true
+                    }
+                }
+            } label: {
+                Label("Play Now", systemImage: "play.fill")
+            }
+
+            Button {
+                Task {
+                    _ = await trendingService.playTrendingSong(song, isVideo: false)
+                }
+            } label: {
+                Label("Play Audio Only", systemImage: "headphones")
+            }
+
+            Button {
+                Task {
+                    _ = await trendingService.cacheTrendingSongOffline(song, downloader: downloader)
+                }
+            } label: {
+                Label("Cache Offline", systemImage: "arrow.down.circle")
+            }
+
+            if let vid = song.videoID {
+                Button {
+                    openURLInBrowser("https://m.youtube.com/watch?v=\(vid)", title: song.title)
+                } label: {
+                    Label("Open in Browser", systemImage: "safari")
+                }
+            }
+        }
     }
 
     private var speedDialSection: some View {
@@ -588,6 +857,17 @@ struct DiscoveryView: View {
     private func openURLInBrowser(_ urlString: String, title: String? = nil) {
         browserStore.openInActiveTab(urlString: urlString, title: title)
         selectedTab = .browser
+    }
+
+    private func refreshDiscoveryFeeds(force: Bool) async {
+        await withTaskGroup(of: Void.self) { group in
+            group.addTask {
+                await MangaDexService.shared.loadCatalogIfNeeded(force: force)
+            }
+            group.addTask {
+                await TrendingArtistsService.shared.refreshTrendingSongsIfNeeded(force: force)
+            }
+        }
     }
 
     private func shelfSubtitle(for item: MediaItem) -> String {

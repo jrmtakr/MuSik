@@ -748,8 +748,8 @@ final class MediaManager {
                 SongIdentificationService.shared.prioritize(capturedItem)
             }
             let detail = SongIdentificationService.stepLabelSync(forRelativePath: item.relativePath)
-                ?? "AI is listening to whole song..."
-            statusMessage = "Waiting for AI analysis before playback: \(detail)"
+                ?? "Listening to whole song..."
+            statusMessage = "Analyzing track before playback: \(detail)"
             return false
         }
 
@@ -1472,7 +1472,7 @@ final class MediaManager {
 
         if readyQueue.isEmpty {
             pause()
-            statusMessage = "Waiting for AI analysis to finish..."
+            statusMessage = "Waiting for track analysis to finish..."
             return
         }
 

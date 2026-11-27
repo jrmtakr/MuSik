@@ -126,12 +126,12 @@ enum LiveAudioLyricsAI {
 
         if isLocalPlayableFile {
             if let recognizer, recognizer.isAvailable {
-                await onProgress("AI listening to full track...")
+                await onProgress("Listening to full track...")
                 let listened = await SongAudioListener.listen(to: item.fileURL, maxSeconds: 15 * 60) { chunkIdx, totalChunks, totalSeconds in
                     Task { @MainActor in
                         let mins = Int(totalSeconds) / 60
                         let secs = Int(totalSeconds) % 60
-                        onProgress("AI listening across full song (\(chunkIdx)/\(totalChunks) • \(mins):\(String(format: "%02d", secs)))...")
+                        onProgress("Listening across full song (\(chunkIdx)/\(totalChunks) • \(mins):\(String(format: "%02d", secs)))...")
                     }
                 }
                 if let listened, !listened.isEmpty {
@@ -239,13 +239,13 @@ enum LiveAudioLyricsAI {
                 )
                 let summaryNote: String = {
                     if let attr = aligned.attributionText, attr.contains("aligned") {
-                        return "AI Synced across song (\(aligned.lines.count) lines)"
+                        return "Synced across song (\(aligned.lines.count) lines)"
                     }
                     if let anchor {
                         let signStr = String(format: "%+.1fs", anchor.offsetSeconds)
-                        return "AI Synced (\(signStr)) to \"\(anchor.lineText)\""
+                        return "Synced (\(signStr)) to \"\(anchor.lineText)\""
                     }
-                    return "AI Synced \(aligned.lines.count) lyric lines"
+                    return "Synced \(aligned.lines.count) lyric lines"
                 }()
 
                 return LiveLyricsSyncOutcome(
@@ -307,8 +307,8 @@ enum LiveAudioLyricsAI {
                     trackTitle: resolvedTitle,
                     artistName: resolvedArtist,
                     isTimeSynced: parsed.isSynced,
-                    sourceLabel: "AI Matched Synced",
-                    attributionText: "AI full-song match • \(recognized?.source ?? "LRCLIB")",
+                    sourceLabel: "Matched Synced",
+                    attributionText: "Full-song match • \(recognized?.source ?? "LRCLIB")",
                     syncedOffsetSeconds: 0,
                     tempoScale: 1.0,
                     expectedDurationSeconds: recognized?.durationSeconds,
@@ -343,8 +343,8 @@ enum LiveAudioLyricsAI {
                     trackTitle: resolvedTitle,
                     artistName: resolvedArtist,
                     isTimeSynced: false,
-                    sourceLabel: "AI Matched Lyrics",
-                    attributionText: "AI full-song match • \(recognized?.source ?? "Genius")",
+                    sourceLabel: "Matched Lyrics",
+                    attributionText: "Full-song match • \(recognized?.source ?? "Genius")",
                     syncedOffsetSeconds: 0,
                     tempoScale: 1.0,
                     expectedDurationSeconds: recognized?.durationSeconds,
@@ -394,7 +394,7 @@ enum LiveAudioLyricsAI {
                 in: aligned.lines,
                 tempoScale: 1.0
             )
-            let methodTag = shazamMatch != nil ? "Shazam AI + Whole-Song Audio" : "Whole-Song AI"
+            let methodTag = shazamMatch != nil ? "Shazam + Full-Song Audio" : "Full-Song Audio"
             return LiveLyricsSyncOutcome(
                 identifiedTitle: resolvedTitle,
                 identifiedArtist: resolvedArtist,
@@ -428,7 +428,7 @@ enum LiveAudioLyricsAI {
                 alignedLyrics: synthesized,
                 computedOffsetSeconds: 0,
                 alignedLineText: synthesized.lines.first(where: { !$0.isInstrumentalBreak })?.text,
-                statusMessage: "AI transcribed & synced \(synthesized.lines.count) lines from audio",
+                statusMessage: "Transcribed & synced \(synthesized.lines.count) lines from audio",
                 errorMessage: nil
             )
         }
@@ -452,7 +452,7 @@ enum LiveAudioLyricsAI {
 
         let noMatchReason: String
         if authStatus != .authorized && isLocalPlayableFile {
-            noMatchReason = "Enable Speech Recognition in Settings -> MuseJRM, or let Shazam AI analyze when online."
+            noMatchReason = "Enable Speech Recognition in Settings -> MuseJRM, or let Music Recognition analyze when online."
         } else if heardWords.count < 3 {
             noMatchReason = "No clear vocals or Shazam match detected across the audio track."
         } else {

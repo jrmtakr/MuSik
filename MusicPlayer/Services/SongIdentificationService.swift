@@ -214,7 +214,7 @@ final class SongIdentificationService {
         guard !queuedPaths.contains(item.relativePath) else { return }
         queuedPaths.insert(item.relativePath)
         progressByPath[item.relativePath] = 0.02
-        let queuedLabel = "Queued for AI whole-song analysis..."
+        let queuedLabel = "Queued for full-song matching..."
         stepLabelByPath[item.relativePath] = queuedLabel
         Self.syncStateBox.setPending(item.relativePath, pending: true)
         Self.syncStateBox.setLabel(item.relativePath, label: queuedLabel)
@@ -286,7 +286,7 @@ final class SongIdentificationService {
             return step
         }
         if isBlockedPendingAI(item) {
-            return "Queued for AI whole-song analysis..."
+            return "Queued for full-song matching..."
         }
         return nil
     }
@@ -296,7 +296,7 @@ final class SongIdentificationService {
         if let idx = queue.firstIndex(where: { $0.relativePath == item.relativePath }), idx > 0 {
             let target = queue.remove(at: idx)
             queue.insert(target, at: 0)
-            updateTrackStep(path: item.relativePath, label: "Prioritized for AI whole-song analysis...")
+            updateTrackStep(path: item.relativePath, label: "Prioritized for full-song matching...")
         } else if activePath != item.relativePath && !queuedPaths.contains(item.relativePath)
                     && MediaManager.shared.customMetadata(forRelativePath: item.relativePath)?.aiAnalysisCompleted == false {
             enqueue(
@@ -374,7 +374,7 @@ final class SongIdentificationService {
         }
         guard FileManager.default.fileExists(atPath: request.fileURL.path) else { return nil }
         updateTrackStep(path: request.relativePath, progress: 0.08, label: "Reading track tags & metadata...")
-        lastStatus = "AI analyzing \"\(request.hintTitle)\"..."
+        lastStatus = "Analyzing \"\(request.hintTitle)\"..."
 
         let embedded = await Self.readEmbeddedMetadata(from: request.fileURL)
         let seedTitle = (embedded.title?.isEmpty == false ? embedded.title! : request.hintTitle)
@@ -447,7 +447,7 @@ final class SongIdentificationService {
         // Listen to the whole song: confirm the name from the sung lyrics, identify unknown uploads
         // with Shazam acoustic matching, and align lyrics with this exact recording before playback.
         await Self.ensureSpeechPermissionIfPossible()
-        updateTrackStep(path: request.relativePath, progress: 0.15, label: "AI listening to whole song...")
+        updateTrackStep(path: request.relativePath, progress: 0.15, label: "Listening to whole song...")
         lastStatus = "Listening to whole song: \"\(song?.title ?? bestSeedTitle)\"..."
 
         let capturedPath = request.relativePath
@@ -461,7 +461,7 @@ final class SongIdentificationService {
                 let frac = 0.15 + 0.52 * (Double(chunkIdx) / Double(max(1, totalChunks)))
                 let mins = Int(totalSeconds) / 60
                 let secs = Int(totalSeconds) % 60
-                let label = "AI listening to song (\(chunkIdx)/\(totalChunks) • \(mins):\(String(format: "%02d", secs)))..."
+                let label = "Listening to song (\(chunkIdx)/\(totalChunks) • \(mins):\(String(format: "%02d", secs)))..."
                 self?.updateTrackStep(path: capturedPath, progress: frac, label: label)
                 self?.lastStatus = "Listening to whole song (\(chunkIdx)/\(totalChunks)): \"\(capturedLabelTitle)\""
             }
@@ -522,8 +522,8 @@ final class SongIdentificationService {
 
         // Shazam acoustic constellation + preview matcher across the whole song (lyric guessing disabled for foreign/instrumental tracks).
         if song == nil {
-            updateTrackStep(path: request.relativePath, progress: 0.77, label: "Running Shazam AI acoustic match...")
-            lastStatus = "Running Shazam AI acoustic fingerprint..."
+            updateTrackStep(path: request.relativePath, progress: 0.77, label: "Running acoustic match...")
+            lastStatus = "Running acoustic fingerprint match..."
             let splitSeed = bestSeedArtist.isEmpty ? Self.splitTrailingCatalogArtist(bestSeedTitle) : nil
             let shazamSeedTitle = splitSeed?.title ?? bestSeedTitle
             let shazamSeedArtist = splitSeed?.artist ?? bestSeedArtist
@@ -638,7 +638,7 @@ final class SongIdentificationService {
                     genre: fallbackGenre,
                     isrc: nil,
                     coverImage: frameCover,
-                    source: "On-File AI Analysis",
+                    source: "On-File Audio Match",
                     forceOverwriteVerified: allowOverwriteVerified
                 )
             }
@@ -665,7 +665,7 @@ final class SongIdentificationService {
                 hasLyrics: alignedDuringImport
             )
             progressByPath[request.relativePath] = 1.0
-            lastStatus = "AI analyzed: \"\(fallbackTitle)\" by \(fallbackArtist) (\(fallbackAlbum))"
+            lastStatus = "Analyzed: \"\(fallbackTitle)\" by \(fallbackArtist) (\(fallbackAlbum))"
             return nil
         }
 
@@ -797,7 +797,7 @@ final class SongIdentificationService {
             genre: resolvedGenre,
             isrc: nil,
             coverImage: cover,
-            source: "AI Compilation Analysis",
+            source: "Compilation Audio Match",
             forceOverwriteVerified: allowOverwriteVerified
         )
         WholeSongAIService.shared.markCompletedFromImport(
@@ -820,7 +820,7 @@ final class SongIdentificationService {
             isrc: nil,
             artworkURL: ytCards.compactMap(\.artworkURL).first,
             durationSeconds: request.durationSeconds,
-            source: "AI Compilation Analysis"
+            source: "Compilation Audio Match"
         )
     }
 

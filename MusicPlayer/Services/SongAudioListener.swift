@@ -1051,14 +1051,14 @@ enum SongAudioListener {
         if didBeatSnap, let bpm = curve?.beatGrid?.bpm {
             details.append(String(format: "%.0f BPM beat-snapped", bpm))
         }
-        let note = details.isEmpty ? "AI vocal-energy real-time sync" : "AI audio-synced (\(details.joined(separator: ", ")))"
+        let note = details.isEmpty ? "Vocal-energy real-time sync" : "Audio-synced (\(details.joined(separator: ", ")))"
         return ResolvedTrackLyrics(
             cacheKey: lyrics.cacheKey,
             trackTitle: lyrics.trackTitle,
             artistName: lyrics.artistName,
             isTimeSynced: true,
-            sourceLabel: "Real-Time Synced Lyrics · AI",
-            attributionText: (lyrics.attributionText ?? "AI Sync") + " · \(note)",
+            sourceLabel: "Real-Time Synced Lyrics",
+            attributionText: (lyrics.attributionText ?? "Auto Sync") + " · \(note)",
             syncedOffsetSeconds: 0,
             tempoScale: 1.0,
             expectedDurationSeconds: totalDuration,
@@ -1149,8 +1149,8 @@ enum SongAudioListener {
             trackTitle: trackTitle,
             artistName: artistName.isEmpty ? "Unknown Artist" : artistName,
             isTimeSynced: true,
-            sourceLabel: "AI Whole-Song Lyrics",
-            attributionText: "AI transcribed whole song automatically",
+            sourceLabel: "Full-Song Lyrics",
+            attributionText: "Transcribed full song automatically",
             syncedOffsetSeconds: 0,
             tempoScale: 1.0,
             expectedDurationSeconds: totalDur,

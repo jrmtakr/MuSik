@@ -1905,7 +1905,7 @@ struct BrowserTabView: View {
                     Text(
                         currentDownload != nil
                         ? "Caching Video..."
-                        : (aiPendingItem != nil ? "AI Analyzing Whole Song..." : (resolvingStepLabel ?? "Fetching Video Stream..."))
+                        : (aiPendingItem != nil ? "Analyzing Whole Song..." : (resolvingStepLabel ?? "Fetching Video Stream..."))
                     )
                     .font(.subheadline.weight(.semibold))
                     Text(title)
@@ -2004,7 +2004,7 @@ struct BrowserTabView: View {
                         .foregroundStyle(.green)
                 }
                 VStack(alignment: .leading, spacing: 1) {
-                    Text(isPendingAI ? "AI Analyzing Whole Song..." : "👉 Tap to playback offline!")
+                    Text(isPendingAI ? "Analyzing Whole Song..." : "👉 Tap to playback offline!")
                         .font(.caption.weight(.bold))
                         .foregroundStyle(.primary)
                     Text(isPendingAI ? (aiStep ?? item.displayTitle) : item.displayTitle)
@@ -2013,7 +2013,7 @@ struct BrowserTabView: View {
                         .lineLimit(1)
                 }
                 Spacer()
-                Text(isPendingAI ? "AI Wait" : "Play")
+                Text(isPendingAI ? "Syncing" : "Play")
                     .font(.caption.weight(.semibold))
                     .padding(.horizontal, 10)
                     .padding(.vertical, 4)

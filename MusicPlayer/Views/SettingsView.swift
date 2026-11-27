@@ -214,7 +214,7 @@ struct SettingsView: View {
 
                     Toggle(isOn: $settings.autoAISyncLyrics) {
                         VStack(alignment: .leading, spacing: 2) {
-                            Text("AI Auto-Sync & Recognize Lyrics")
+                            Text("Auto-Sync & Recognize Lyrics")
                             Text("Automatically identifies and aligns mismatched lyrics while playing")
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
