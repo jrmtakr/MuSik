@@ -59,6 +59,7 @@ final class BrowserYouTubeResolver: NSObject, WKNavigationDelegate, WKScriptMess
     static func youtubeCookieHeader(forceRefresh: Bool = false, timeoutSeconds: Double = 1.0) async -> String? {
         if !forceRefresh,
            let cached = cachedCookieState,
+           YouTubeStreamResolver.hasSignedInCookies(cached.value),
            Date().timeIntervalSince(cached.fetchedAt) < 60 {
             return cached.value
         }
@@ -697,6 +698,9 @@ final class BrowserYouTubeResolver: NSObject, WKNavigationDelegate, WKScriptMess
         activeResolveContinuation = nil
         activeTimeoutTask?.cancel()
         activeTimeoutTask = nil
+        webView?.evaluateJavaScript(
+            "document.querySelectorAll('video,audio').forEach(function(m){try{m.muted=true;m.volume=0;m.pause();}catch(e){}});"
+        )
         cont.resume(returning: result)
     }
 

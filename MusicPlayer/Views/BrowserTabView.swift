@@ -295,11 +295,25 @@ struct WebViewWrapper: UIViewRepresentable {
         window.addEventListener('touchend', noteUserGesture, true);
         window.addEventListener('click', noteUserGesture, true);
 
-        function shouldBlockYTWebPlayback() {
+        function shouldBlockYTWebPlayback(el) {
+            if (window.__mpPauseWebVideo) return true;
             var vid = currentYTVideoId();
-            if (!vid) return false;
-            if (window.__mpAllowWebVideoID && window.__mpAllowWebVideoID === vid) return false;
-            return !!(window.__mpPauseWebVideo || window.__mpInterceptYouTubePlayback);
+            if (vid) {
+                if (window.__mpAllowWebVideoID && window.__mpAllowWebVideoID === vid) return false;
+                return !!window.__mpInterceptYouTubePlayback;
+            }
+            if (window.__mpInterceptYouTubePlayback) {
+                if (!el) return !isYTHost();
+                var tag = el.tagName ? el.tagName.toLowerCase() : '';
+                if (tag === 'audio') return true;
+                if (isYTHost()) {
+                    return !el.muted;
+                }
+                if (!(el.muted && el.loop && el.duration > 0 && el.duration < 3)) {
+                    return true;
+                }
+            }
+            return false;
         }
 
         function notifyYTPlayRequest(force, overrideVideoId, overrideURL, overrideTitle) {
@@ -520,7 +534,7 @@ struct WebViewWrapper: UIViewRepresentable {
                         report(abs, kind, el.duration, !!isActivePlay);
                     }
                 }
-                if (shouldBlockYTWebPlayback()) {
+                if (shouldBlockYTWebPlayback(el)) {
                     try { el.autoplay = false; el.removeAttribute('autoplay'); } catch (err) {}
                     if (typeof el.pause === 'function' && !el.paused) {
                         el.muted = true;
@@ -548,7 +562,7 @@ struct WebViewWrapper: UIViewRepresentable {
         var origPlay = HTMLMediaElement.prototype.play;
         HTMLMediaElement.prototype.play = function() {
             inspectMediaElement(this, true);
-            if (shouldBlockYTWebPlayback()) {
+            if (shouldBlockYTWebPlayback(this)) {
                 try {
                     this.autoplay = false;
                     this.removeAttribute('autoplay');
@@ -571,13 +585,13 @@ struct WebViewWrapper: UIViewRepresentable {
         document.addEventListener('canplay', function(e) { inspectMediaElement(e.target, !e.target.paused); }, true);
         document.addEventListener('play', function(e) {
             inspectMediaElement(e.target, true);
-            if (shouldBlockYTWebPlayback()) {
+            if (shouldBlockYTWebPlayback(e.target)) {
                 try { e.target.muted = true; e.target.pause(); } catch (err) {}
             }
         }, true);
         document.addEventListener('playing', function(e) {
             inspectMediaElement(e.target, true);
-            if (shouldBlockYTWebPlayback()) {
+            if (shouldBlockYTWebPlayback(e.target)) {
                 try { e.target.muted = true; e.target.pause(); } catch (err) {}
             }
         }, true);
@@ -658,7 +672,7 @@ struct WebViewWrapper: UIViewRepresentable {
                     return;
                 }
 
-                if (!shouldBlockYTWebPlayback()) return;
+                if (!currentYTVideoId() || !shouldBlockYTWebPlayback(e.target)) return;
                 var t = e.target;
                 if (!t || !t.closest) return;
                 if (t.closest('a[href]')) return;
@@ -2437,12 +2451,12 @@ struct BrowserTabView: View {
             return
         }
 
-        if settings.autoCacheDetectedMedia || (media.isActivelyPlaying && !settings.inlineVideoPlayback) {
+        if settings.autoCacheDetectedMedia || media.isActivelyPlaying {
             guard !autoCachedURLs.contains(key) else { return }
             if let dur = media.durationSeconds, dur > 0, dur < 3, !media.isActivelyPlaying {
                 return
             }
-            if media.isActivelyPlaying && (settings.autoOpenPlayerAfterCache || !settings.inlineVideoPlayback) {
+            if media.isActivelyPlaying {
                 awaitingAutoOpenPlayer = true
                 cachingOverlayTitle = media.title ?? (browser.pageTitle.isEmpty ? "Caching Video..." : browser.pageTitle)
                 browser.pausePageMedia()
