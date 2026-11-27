@@ -270,7 +270,7 @@ final class SyncedLyricsService {
         }
 
         activeFetchTask = Task {
-            let importAnalysisPending = SongIdentificationService.shared.isBlockedPendingAI(relativePath: item.relativePath)
+            let importAnalysisPending = SongIdentificationService.shared.isIdentifying(item)
             if !forceReload,
                customTitle == nil,
                customArtist == nil,
@@ -1181,9 +1181,10 @@ final class SyncedLyricsService {
             if let u = c3?.url { primaryQueries.append(u) }
         }
 
+        let capturedGetURL = getURL
         async let getRowTask: [String: Any]? = {
-            guard let getURL else { return nil }
-            return await fetchSingleLRCLIBObject(url: getURL)
+            guard let capturedGetURL else { return nil }
+            return await fetchSingleLRCLIBObject(url: capturedGetURL)
         }()
         let capturedPrimary = primaryQueries
         async let searchRowsTask: [[String: Any]] = withTaskGroup(of: [[String: Any]].self) { group in

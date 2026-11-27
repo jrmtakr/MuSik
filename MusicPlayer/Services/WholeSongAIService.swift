@@ -124,7 +124,7 @@ final class WholeSongAIService {
         }
 
         if isUnknownSongNeedingFirstListen(item),
-           !SongIdentificationService.shared.isBlockedPendingAI(relativePath: item.relativePath) {
+           !SongIdentificationService.shared.isIdentifying(item) {
             startWholeSongListen(for: item, force: false)
         }
     }
@@ -133,7 +133,7 @@ final class WholeSongAIService {
         guard !item.relativePath.hasPrefix("__remote__/"),
               !hasCompletedFirstListen(for: item),
               activeTrackPath != item.relativePath,
-              !SongIdentificationService.shared.isBlockedPendingAI(relativePath: item.relativePath) else {
+              !SongIdentificationService.shared.isIdentifying(item) else {
             return
         }
         if let dur = item.durationSeconds, dur > 1800 {
@@ -146,7 +146,7 @@ final class WholeSongAIService {
         guard !item.relativePath.hasPrefix("__remote__/") else { return }
         if !force && (hasCompletedFirstListen(for: item) ||
                        activeTrackPath == item.relativePath ||
-                       SongIdentificationService.shared.isBlockedPendingAI(relativePath: item.relativePath)) {
+                       SongIdentificationService.shared.isIdentifying(item)) {
             return
         }
 
