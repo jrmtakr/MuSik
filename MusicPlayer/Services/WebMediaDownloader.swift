@@ -523,8 +523,8 @@ final class WebMediaDownloader {
         using session: URLSession,
         onProgress: (@Sendable (Double) -> Void)? = nil
     ) async -> URL? {
-        // Chunked HTTP Range downloads prevent YouTube CDN single-stream throttling/stalls and give continuous progress.
-        let chunkSize: Int64 = 1_572_864 // 1.5 MB per chunk
+        // Keep Range chunks <= 256 KB to stay cleanly under YouTube CDN burst/Range caps without 403 retries.
+        var chunkSize: Int64 = 262_144
         let isGooglevideo = url.host?.lowercased().contains("googlevideo.com") == true
         var expectedTotal: Int64? = Self.queryContentLength(from: url)
 
@@ -646,18 +646,22 @@ final class WebMediaDownloader {
             if let expectedTotal, offset >= expectedTotal {
                 break
             }
-            let endByte: Int64
-            if let expectedTotal {
-                endByte = min(offset + chunkSize - 1, expectedTotal - 1)
-            } else {
-                endByte = offset + chunkSize - 1
-            }
-            if endByte < offset { break }
 
             var chunkWritten = false
             var hitEOF = false
             for attempt in 0..<3 {
                 if Task.isCancelled { return nil }
+                let endByte: Int64
+                if let expectedTotal {
+                    endByte = min(offset + chunkSize - 1, expectedTotal - 1)
+                } else {
+                    endByte = offset + chunkSize - 1
+                }
+                if endByte < offset {
+                    hitEOF = true
+                    chunkWritten = true
+                    break
+                }
                 var chunkReq = URLRequest(url: url)
                 headers.forEach { chunkReq.setValue($0.value, forHTTPHeaderField: $0.key) }
                 chunkReq.timeoutInterval = 25
@@ -672,6 +676,10 @@ final class WebMediaDownloader {
                         break
                     }
                     guard http.statusCode == 206 || http.statusCode == 200 else {
+                        if http.statusCode == 403 && isGooglevideo && chunkSize > 131_072 {
+                            chunkSize = max(131_072, chunkSize / 2)
+                            continue
+                        }
                         if http.statusCode == 403 || http.statusCode == 404 {
                             // CDN token expired or blocked — fail fast so fallback stream takes over cleanly.
                             return nil
@@ -770,6 +778,70 @@ final class WebMediaDownloader {
         let cleanTitle = sanitizedTitle(title, fallbackURL: normalizedURL, defaultTitle: "Media")
         let maxSec = maxDurationMinutes > 0 ? Double(maxDurationMinutes * 60) : nil
         let mergedHeaders = enrichedHeaders(headers, for: normalizedURL)
+
+        if normalizedURL.host?.lowercased().contains("googlevideo.com") == true {
+            let lowerQ = normalizedURL.absoluteString.lowercased()
+            let inferredExt = (lowerQ.contains("mime=audio") || lowerQ.contains("mime%3daudio")) ? "m4a" : "mp4"
+            activeDownloads.append(BrowserDownloadItem(id: downloadID, title: cleanTitle, sourceURL: normalizedURL, progress: 0.02, isHLS: false))
+            MediaManager.shared.statusMessage = "Downloading \(cleanTitle)..."
+            let session = ephemeralDataSession
+            let asyncTask = Task {
+                defer {
+                    activeAsyncTasks.removeValue(forKey: downloadID)
+                    activeDownloads.removeAll { $0.id == downloadID }
+                }
+                guard let tempFile = await fetchTempFile(from: normalizedURL, ext: inferredExt, headers: mergedHeaders, using: session, onProgress: { frac in
+                    Task { @MainActor [weak self] in
+                        self?.updateProgress(downloadID: downloadID, fraction: min(0.95, 0.02 + frac * 0.93))
+                    }
+                }) else {
+                    if !Task.isCancelled {
+                        tryNextFallbackOrFail(
+                            fallbacks: fallbackStreams,
+                            maxDurationMinutes: maxDurationMinutes,
+                            destinationFolder: destinationFolder,
+                            sourceURL: normalizedURL,
+                            failureMessage: "Could not download stream for \(cleanTitle)."
+                        )
+                    }
+                    return
+                }
+                if Task.isCancelled {
+                    try? FileManager.default.removeItem(at: tempFile)
+                    return
+                }
+                if let maxSec, knownDurationSeconds == nil,
+                   let localDur = await resolveLocalDuration(at: tempFile), localDur > maxSec {
+                    try? FileManager.default.removeItem(at: tempFile)
+                    recordFailedDownload(
+                        sourceURL: normalizedURL,
+                        message: "Skipped \"\(cleanTitle)\" (exceeds \(maxDurationMinutes) min limit)."
+                    )
+                    return
+                }
+                updateProgress(downloadID: downloadID, fraction: 0.98)
+                if let saved = MediaManager.shared.importTemporaryFile(
+                    from: tempFile,
+                    preferredFileName: "\(cleanTitle).\(inferredExt)",
+                    inFolder: destinationFolder
+                ) {
+                    let updated = MediaManager.shared.applyDownloadedMetadataAndPlaylist(for: saved, title: title ?? cleanTitle, artist: artist)
+                    recordCompletedDownload(updated, sourceURL: normalizedURL)
+                } else {
+                    try? FileManager.default.removeItem(at: tempFile)
+                    tryNextFallbackOrFail(
+                        fallbacks: fallbackStreams,
+                        maxDurationMinutes: maxDurationMinutes,
+                        destinationFolder: destinationFolder,
+                        sourceURL: normalizedURL,
+                        failureMessage: "Could not save cached media."
+                    )
+                }
+                LocalMediaCacheProxy.shared.refreshCacheSize()
+            }
+            activeAsyncTasks[downloadID] = asyncTask
+            return
+        }
 
         if let maxSec, knownDurationSeconds == nil {
             let probeTask = Task {

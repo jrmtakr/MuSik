@@ -179,16 +179,19 @@ final class SongIdentificationService {
     ) {
         guard !item.isHLS else {
             MediaManager.shared.markAIAnalysisCompleted(relativePath: item.relativePath)
+            completedRevision &+= 1
             return
         }
         // Never fight metadata the user confirmed or edited by hand.
         if let meta = MediaManager.shared.customMetadata(forRelativePath: item.relativePath),
            meta.isArtistVerified == true, meta.autoIdentifiedSource == nil {
             MediaManager.shared.markAIAnalysisCompleted(relativePath: item.relativePath)
+            completedRevision &+= 1
             return
         }
         guard FileManager.default.fileExists(atPath: item.fileURL.path) else {
             MediaManager.shared.markAIAnalysisCompleted(relativePath: item.relativePath)
+            completedRevision &+= 1
             return
         }
 

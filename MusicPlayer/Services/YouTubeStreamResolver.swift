@@ -201,9 +201,8 @@ enum YouTubeStreamResolver {
         )
         _ = await evaluateCandidate(androidResult)
 
-        // 2. Also fetch IOS client when working results lack HLS so video caching always has an HLS fallback alongside adaptive MP4.
-        let hasWorkingHLS = workingResults.contains { res in res.streams.contains(where: \.isHLS) }
-        if workingResults.isEmpty || !hasWorkingHLS {
+        // 2. IOS client fallback (only if ANDROID yielded no working streams; ANDROID already includes HD adaptive & progressive MP4).
+        if workingResults.isEmpty {
             let iosResult = await fetchInnerTube(
                 videoID: videoID,
                 sourcePageURL: url,
@@ -346,24 +345,62 @@ enum YouTubeStreamResolver {
         return progressiveHD + adaptiveMux + hls + progressiveSD + audioOnly
     }
 
+    private static let ephemeralProbeSession: URLSession = {
+        let config = URLSessionConfiguration.ephemeral
+        config.timeoutIntervalForRequest = 6
+        config.timeoutIntervalForResource = 8
+        config.waitsForConnectivity = false
+        return URLSession(configuration: config)
+    }()
+
     private static func isURLReachable(_ url: URL, headers: [String: String]?) async -> Bool {
-        // Test the exact un-ranged GET that URLSession.downloadTask uses (YouTube CDN can return
-        // 206 on a tiny Range probe then 403 on the full GET download).
-        var req = URLRequest(url: url)
-        req.httpMethod = "GET"
-        req.timeoutInterval = 7
-        headers?.forEach { req.setValue($0.value, forHTTPHeaderField: $0.key) }
-        do {
-            let (bytes, resp) = try await URLSession.shared.bytes(for: req)
-            guard let http = resp as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
+        // Probe both byte 0 and a mid-stream offset (1.8 MB when clen allows) with tiny 1 KB Range requests:
+        // YouTube CDN lets un-tokened adaptive streams read the first ~500-800 KB (206) then blocks later chunks (403),
+        // while progressive MP4s (e.g. itag=18) and valid streams stay 206 through EOF.
+        let lower = url.absoluteString.lowercased()
+        let isPlaylist = url.pathExtension.lowercased() == "m3u8" || lower.contains(".m3u8")
+
+        func probeRange(_ rangeHeader: String?) async -> Bool {
+            var req = URLRequest(url: url)
+            req.httpMethod = "GET"
+            req.timeoutInterval = 6
+            headers?.forEach { req.setValue($0.value, forHTTPHeaderField: $0.key) }
+            if let rangeHeader {
+                req.setValue(rangeHeader, forHTTPHeaderField: "Range")
+            }
+            do {
+                let (bytes, resp) = try await ephemeralProbeSession.bytes(for: req)
+                guard let http = resp as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
+                    return false
+                }
+                var iter = bytes.makeAsyncIterator()
+                let firstByte = try? await iter.next()
+                return firstByte != nil
+            } catch {
                 return false
             }
-            var iter = bytes.makeAsyncIterator()
-            let firstByte = try? await iter.next()
-            return firstByte != nil
-        } catch {
+        }
+
+        let initialRange: String? = isPlaylist ? nil : "bytes=0-1023"
+        guard await probeRange(initialRange) else {
             return false
         }
+
+        if !isPlaylist,
+           url.host?.lowercased().contains("googlevideo.com") == true,
+           let comps = URLComponents(url: url, resolvingAgainstBaseURL: false),
+           let clenStr = comps.queryItems?.first(where: { $0.name.lowercased() == "clen" })?.value,
+           let clen = Int64(clenStr),
+           clen > 1_500_000 {
+            let midOffset = min(1_800_000, max(900_000, clen / 2))
+            if midOffset + 1023 < clen {
+                guard await probeRange("bytes=\(midOffset)-\(midOffset + 1023)") else {
+                    return false
+                }
+            }
+        }
+
+        return true
     }
 
     static func parsePlayerResponseJSON(
