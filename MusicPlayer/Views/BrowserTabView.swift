@@ -1302,10 +1302,6 @@ struct BrowserTabView: View {
                     activeDownloadsStrip
                 }
 
-                if let detected = browser.detectedMedia, !showCachingOverlay {
-                    detectedMediaBanner(detected)
-                }
-
                 ZStack {
                     WebViewWrapper(
                         url: activeURL,
@@ -2174,46 +2170,6 @@ struct BrowserTabView: View {
             )
             downloadStatus = "Background caching started for \"\(created?.name ?? playlistName)\""
         }
-    }
-
-    private func detectedMediaBanner(_ media: DetectedBrowserMedia) -> some View {
-        HStack(spacing: 10) {
-            Image(systemName: media.isAudio ? "music.note" : "film")
-                .foregroundStyle(Color.accentColor)
-            VStack(alignment: .leading, spacing: 1) {
-                HStack(spacing: 5) {
-                    Text("\(media.kindLabel) Detected")
-                        .font(.caption.weight(.semibold))
-                    if let dur = media.formattedDuration {
-                        Text("• \(dur)")
-                            .font(.caption2.monospacedDigit())
-                            .foregroundStyle(.secondary)
-                    }
-                }
-                Text(media.title?.isEmpty == false ? (media.title ?? "") : media.url.lastPathComponent)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
-            Spacer()
-            if browser.detectedStreams.count > 1 {
-                Button("All (\(browser.detectedStreams.count))") {
-                    showingStreamsSheet = true
-                }
-                .font(.caption.weight(.semibold))
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-            }
-            Button(media.isHLS ? "Quality" : "Cache") {
-                handleDetectedMedia(media, autoMode: false)
-            }
-            .font(.caption.weight(.semibold))
-            .buttonStyle(.borderedProminent)
-            .controlSize(.small)
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 7)
-        .background(Color.accentColor.opacity(0.12))
     }
 
     private var addressBar: some View {
