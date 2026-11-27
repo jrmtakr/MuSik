@@ -704,7 +704,13 @@ final class TrendingArtistsService {
         let hits = await PlaylistURLImporter.searchYouTubeTracks(query: query, limit: 5)
         guard let best = hits.first,
               let watchURL = URL(string: "https://www.youtube.com/watch?v=\(best.videoID)"),
-              let resolved = await YouTubeStreamResolver.resolveStreams(for: watchURL),
+              let resolved = await YouTubeStreamResolver.resolveStreamsWithUnrestrictedFallback(
+                  for: watchURL,
+                  videoID: best.videoID,
+                  titleHint: title,
+                  authorHint: artist,
+                  durationHint: best.durationSeconds
+              ),
               !resolved.streams.isEmpty else {
             MediaManager.shared.errorMessage = "Could not find an ad-free stream for \"\(title)\"."
             return false
@@ -737,7 +743,13 @@ final class TrendingArtistsService {
         let hits = await PlaylistURLImporter.searchYouTubeTracks(query: "\(artist) \(title)", limit: 5)
         guard let best = hits.first,
               let watchURL = URL(string: "https://www.youtube.com/watch?v=\(best.videoID)"),
-              let resolved = await YouTubeStreamResolver.resolveStreams(for: watchURL),
+              let resolved = await YouTubeStreamResolver.resolveStreamsWithUnrestrictedFallback(
+                  for: watchURL,
+                  videoID: best.videoID,
+                  titleHint: title,
+                  authorHint: artist,
+                  durationHint: best.durationSeconds
+              ),
               !resolved.streams.isEmpty else {
             MediaManager.shared.errorMessage = "Could not download \"\(title)\"."
             return nil
@@ -1384,21 +1396,12 @@ final class TrendingArtistsService {
             return nil
         }
 
-        if let resolved = await YouTubeStreamResolver.resolveStreams(for: watchURL),
-           !resolved.streams.isEmpty {
-            return resolved
-        }
-        if let browserResolved = await BrowserYouTubeResolver.shared.resolveStreamsInBrowser(
+        return await YouTubeStreamResolver.resolveStreamsWithUnrestrictedFallback(
+            for: watchURL,
             videoID: vid,
-            priorityLockTimeout: 2.5
-        ), !browserResolved.result.streams.isEmpty {
-            return browserResolved.result
-        }
-        return await YouTubeStreamResolver.resolveAgeRestrictedFallback(
-            videoID: vid,
-            title: song.title,
-            author: song.artist,
-            durationSeconds: song.durationSeconds
+            titleHint: song.title,
+            authorHint: song.artist,
+            durationHint: song.durationSeconds
         )
     }
 

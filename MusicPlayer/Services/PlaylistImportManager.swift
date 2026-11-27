@@ -88,7 +88,7 @@ enum PlaylistImportFailureReason: String, Codable, CaseIterable, Sendable {
     var suggestion: String {
         switch self {
         case .notFoundOnYouTube: return "The title/artist search found no video. Try retrying, or search it manually in the Browser tab."
-        case .videoUnavailable: return "The video is private, removed, region-locked or age-restricted. Signing into YouTube in the Browser tab can help."
+        case .videoUnavailable: return "The video is private, removed, region-locked, or restricted without an unrestricted copy."
         case .noPlayableStream: return "YouTube returned no stream the app can save. Retrying with \"Always Resolve via Built-in Browser\" often fixes this."
         case .blockedByYouTube: return "YouTube rejected the request (HTTP 403/429). Wait a few minutes, then retry."
         case .tooLong: return "Turn off \"Skip Tracks Longer Than Max Duration\" or raise the limit in Settings."
@@ -1187,14 +1187,22 @@ final class PlaylistImportManager {
         }
 
         if resolvedResult == nil || (resolvedResult?.streams.isEmpty ?? true) {
-            usedBrowser = true
-            if let browserResolved = await BrowserYouTubeResolver.shared.resolveStreamsInBrowser(videoID: resolvedVideoID) {
-                if !browserResolved.result.streams.isEmpty || resolvedResult == nil {
-                    resolvedResult = browserResolved.result
+            let hasSignedCookies = YouTubeStreamResolver.hasSignedInCookies(cookiesHeader)
+                || await BrowserYouTubeResolver.hasSignedInYouTubeCookies(timeoutSeconds: 0.4)
+            let skipBrowserLoginWall = !job.alwaysUseBrowserResolver && !hasSignedCookies && (
+                YouTubeStreamResolver.isLoginOrAgeGateReason(resolvedResult?.errorReason)
+                    || YouTubeStreamResolver.isAgeOrLoginRestrictedReason(resolvedResult?.errorReason)
+            )
+            if !skipBrowserLoginWall {
+                usedBrowser = true
+                if let browserResolved = await BrowserYouTubeResolver.shared.resolveStreamsInBrowser(videoID: resolvedVideoID) {
+                    if !browserResolved.result.streams.isEmpty || resolvedResult == nil {
+                        resolvedResult = browserResolved.result
+                    }
+                    cookiesHeader = browserResolved.cookiesHeader ?? cookiesHeader
                 }
-                cookiesHeader = browserResolved.cookiesHeader ?? cookiesHeader
+                guard stillValid() else { return }
             }
-            guard stillValid() else { return }
         }
 
         if resolvedResult == nil || (resolvedResult?.streams.isEmpty ?? true) {

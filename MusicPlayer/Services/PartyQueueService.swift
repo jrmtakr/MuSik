@@ -924,7 +924,13 @@ final class PartyQueueService {
 
         guard let vid = videoID,
               let watchURL = URL(string: "https://www.youtube.com/watch?v=\(vid)"),
-              let resolved = await YouTubeStreamResolver.resolveStreams(for: watchURL),
+              let resolved = await YouTubeStreamResolver.resolveStreamsWithUnrestrictedFallback(
+                  for: watchURL,
+                  videoID: vid,
+                  titleHint: targetEntry.title,
+                  authorHint: targetEntry.artist,
+                  durationHint: targetEntry.durationSeconds
+              ),
               !resolved.streams.isEmpty else {
             MediaManager.shared.errorMessage = "Could not load \"\(targetEntry.title)\"."
             return false

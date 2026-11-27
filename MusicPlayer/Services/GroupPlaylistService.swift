@@ -1009,7 +1009,13 @@ final class GroupPlaylistService {
 
         guard let vid = videoID,
               let watchURL = URL(string: "https://www.youtube.com/watch?v=\(vid)"),
-              let resolved = await YouTubeStreamResolver.resolveStreams(for: watchURL),
+              let resolved = await YouTubeStreamResolver.resolveStreamsWithUnrestrictedFallback(
+                  for: watchURL,
+                  videoID: vid,
+                  titleHint: track.title,
+                  authorHint: track.artist,
+                  durationHint: track.durationSeconds
+              ),
               !resolved.streams.isEmpty else {
             MediaManager.shared.errorMessage = "Could not load stream for \"\(track.title)\"."
             return false

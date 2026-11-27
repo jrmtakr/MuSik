@@ -92,6 +92,37 @@ enum YouTubeStreamResolver {
         return url
     }
 
+    /// Extracts a wrapped YouTube watch/shorts video target when YouTube or Google Account
+    /// redirects a video click through `/signin?next=...` or `/ServiceLogin?continue=...` while signed out.
+    static func unwrapLoginContinueYouTubeVideoURL(_ url: URL) -> (videoID: String, watchURL: URL)? {
+        guard let comps = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let items = comps.queryItems else {
+            return nil
+        }
+        let pathLower = url.path.lowercased()
+        let isAuthRoute = pathLower.hasPrefix("/signin")
+            || pathLower.hasPrefix("/servicelogin")
+            || pathLower.hasPrefix("/account")
+        guard isAuthRoute else { return nil }
+
+        for name in ["next", "continue", "u", "url", "q"] {
+            guard let raw = items.first(where: { $0.name.lowercased() == name })?.value,
+                  !raw.isEmpty else { continue }
+            let candidateURL: URL?
+            if raw.hasPrefix("/") {
+                candidateURL = URL(string: "https://m.youtube.com\(raw)")
+            } else {
+                candidateURL = URL(string: raw)
+            }
+            if let candidateURL,
+               isYouTubeURL(candidateURL),
+               let vid = extractVideoID(from: candidateURL) {
+                return (vid, candidateURL)
+            }
+        }
+        return nil
+    }
+
     private static func sanitizedVideoID(_ raw: String) -> String? {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.count >= 8 else { return nil }
@@ -311,17 +342,36 @@ enum YouTubeStreamResolver {
                     await fetchInnerTube(
                         videoID: videoID,
                         sourcePageURL: url,
-                        clientName: "MWEB",
-                        clientHeaderID: "2",
-                        clientVersion: "2.20260301.01.00",
-                        userAgent: WebMediaDownloader.browserUserAgent,
-                        extraClientFields: ["platform": "MOBILE"],
-                        visitorData: visitorDataForRequests,
-                        cookiesHeader: resolvedCookies,
-                        signatureTimestamp: sts
+                        clientName: "ANDROID_VR",
+                        clientHeaderID: "28",
+                        clientVersion: androidVRClientVersion,
+                        userAgent: androidVRUserAgent,
+                        extraClientFields: [
+                            "deviceMake": "Oculus",
+                            "deviceModel": "Quest 3",
+                            "osName": "Android",
+                            "osVersion": "12L",
+                            "androidSdkVersion": 32
+                        ],
+                        visitorData: nil,
+                        cookiesHeader: nil
                     )
                 }
                 if signedIn {
+                    group.addTask {
+                        await fetchInnerTube(
+                            videoID: videoID,
+                            sourcePageURL: url,
+                            clientName: "MWEB",
+                            clientHeaderID: "2",
+                            clientVersion: "2.20260301.01.00",
+                            userAgent: WebMediaDownloader.browserUserAgent,
+                            extraClientFields: ["platform": "MOBILE"],
+                            visitorData: visitorDataForRequests,
+                            cookiesHeader: resolvedCookies,
+                            signatureTimestamp: sts
+                        )
+                    }
                     group.addTask {
                         await fetchInnerTube(
                             videoID: videoID,
@@ -1189,8 +1239,70 @@ enum YouTubeStreamResolver {
 
     private static let scClientCache = SoundCloudClientIDCache()
 
+    /// Unified signed-out-friendly resolver:
+    /// 1) Direct InnerTube clients -> 2) Built-in WKWebView only when cookies exist or gate isn't a signed-out login wall
+    /// -> 3) Verified unrestricted YouTube/SoundCloud alternate match.
+    static func resolveStreamsWithUnrestrictedFallback(
+        for watchURL: URL,
+        videoID: String,
+        titleHint: String? = nil,
+        authorHint: String? = nil,
+        durationHint: Double? = nil,
+        cookiesHeader: String? = nil,
+        referer: String? = nil,
+        visitorData: String? = nil,
+        skipReachabilityProbe: Bool = false,
+        allowBrowserResolver: Bool = true
+    ) async -> YouTubeResolvedResult? {
+        var resolved = await resolveStreams(
+            for: watchURL,
+            cookiesHeader: cookiesHeader,
+            referer: referer,
+            visitorData: visitorData,
+            skipReachabilityProbe: skipReachabilityProbe
+        )
+        if let res = resolved, !res.streams.isEmpty {
+            return res
+        }
+
+        if allowBrowserResolver {
+            let hasSignedCookies: Bool
+            if let cookiesHeader, !cookiesHeader.isEmpty {
+                hasSignedCookies = Self.hasSignedInCookies(cookiesHeader)
+            } else {
+                hasSignedCookies = await BrowserYouTubeResolver.hasSignedInYouTubeCookies(timeoutSeconds: 0.4)
+            }
+            let skipBrowserLoginWall = !hasSignedCookies && (
+                isLoginOrAgeGateReason(resolved?.errorReason)
+                    || isAgeOrLoginRestrictedReason(resolved?.errorReason)
+            )
+            if !skipBrowserLoginWall,
+               let browserResolved = await BrowserYouTubeResolver.shared.resolveStreamsInBrowser(
+                   videoID: videoID,
+                   priorityLockTimeout: 3.0
+               ) {
+                if !browserResolved.result.streams.isEmpty {
+                    return browserResolved.result
+                }
+                if resolved == nil || resolved?.title == "YouTube Video" {
+                    resolved = browserResolved.result
+                }
+            }
+        }
+
+        if let unrestricted = await resolveAgeRestrictedFallback(
+            videoID: videoID,
+            title: resolved?.title ?? titleHint,
+            author: resolved?.author ?? authorHint,
+            durationSeconds: resolved?.durationSeconds ?? durationHint
+        ), !unrestricted.streams.isEmpty {
+            return unrestricted
+        }
+        return resolved
+    }
+
     /// Resolves a verified equivalent public stream (alternate non-restricted upload or SoundCloud match)
-    /// when YouTube blocks a track behind an age-restriction / age-confirmation wall even after sign-in attempts.
+    /// when YouTube blocks a track behind an age-restriction / sign-in wall so playback & caching proceed signed out.
     static func resolveAgeRestrictedFallback(
         videoID: String,
         title: String?,
@@ -1206,7 +1318,9 @@ enum YouTubeStreamResolver {
             }
             return publicMeta.title ?? "YouTube Video"
         }()
-        let effectiveAuthor = author ?? publicMeta.author
+        let effectiveAuthor = (author?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
+            ? author
+            : publicMeta.author
         let effectiveDuration = durationSeconds ?? publicMeta.durationSeconds
 
         guard effectiveTitle.caseInsensitiveCompare("YouTube Video") != .orderedSame,
@@ -1214,21 +1328,24 @@ enum YouTubeStreamResolver {
             return nil
         }
 
-        // Clean title & query for accurate matching (strip parenthetical edition noise while keeping song core).
-        let searchQuery = cleanSearchText(effectiveTitle, author: effectiveAuthor)
-        guard !searchQuery.isEmpty else { return nil }
+        let queries = buildAlternateSearchQueries(rawTitle: effectiveTitle, author: effectiveAuthor)
+        guard !queries.isEmpty else { return nil }
+
+        let targetArtistTokens = expectedArtistTokens(rawTitle: effectiveTitle, author: effectiveAuthor)
 
         // Race unrestricted YouTube reuploads & SoundCloud catalog concurrently for speed.
         async let altYTTask = resolveNonRestrictedYouTubeAlternative(
             excludingVideoID: videoID,
-            query: searchQuery,
+            queries: queries,
             targetTitle: effectiveTitle,
+            targetArtistTokens: targetArtistTokens,
             targetDuration: effectiveDuration
         )
         async let scTask = resolveSoundCloudAlternateStream(
-            query: searchQuery,
+            queries: queries,
             targetTitle: effectiveTitle,
             targetAuthor: effectiveAuthor,
+            targetArtistTokens: targetArtistTokens,
             targetDuration: effectiveDuration
         )
 
@@ -1257,23 +1374,51 @@ enum YouTubeStreamResolver {
         return nil
     }
 
+    private static func decodeHTMLEntities(_ text: String) -> String {
+        text
+            .replacingOccurrences(of: "&amp;", with: "&")
+            .replacingOccurrences(of: "&#39;", with: "'")
+            .replacingOccurrences(of: "&#x27;", with: "'")
+            .replacingOccurrences(of: "&quot;", with: "\"")
+            .replacingOccurrences(of: "&lt;", with: "<")
+            .replacingOccurrences(of: "&gt;", with: ">")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func firstRegexCapture(_ pattern: String, in text: String) -> String? {
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]),
+              let match = regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
+              match.numberOfRanges > 1,
+              let range = Range(match.range(at: 1), in: text) else {
+            return nil
+        }
+        return String(text[range])
+    }
+
     private static func fetchPublicVideoMetadata(videoID: String) async -> (title: String?, author: String?, durationSeconds: Double?) {
         async let oembedTask: (title: String?, author: String?) = {
-            guard let oembedURL = URL(string: "https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=\(videoID)&format=json") else {
-                return (nil, nil)
+            let endpoints = [
+                "https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=\(videoID)&format=json",
+                "https://noembed.com/embed?url=https://www.youtube.com/watch?v=\(videoID)"
+            ]
+            for endpoint in endpoints {
+                guard let oembedURL = URL(string: endpoint) else { continue }
+                var req = URLRequest(url: oembedURL)
+                req.timeoutInterval = 3.5
+                req.setValue(desktopBrowserUserAgent, forHTTPHeaderField: "User-Agent")
+                guard let (data, resp) = try? await URLSession.shared.data(for: req),
+                      let http = resp as? HTTPURLResponse,
+                      (200...299).contains(http.statusCode),
+                      let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let rawTitle = (obj["title"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                      !rawTitle.isEmpty else {
+                    continue
+                }
+                let t = decodeHTMLEntities(rawTitle)
+                let a = (obj["author_name"] as? String).map(decodeHTMLEntities)
+                return (t, a?.isEmpty == false ? a : nil)
             }
-            var req = URLRequest(url: oembedURL)
-            req.timeoutInterval = 4.0
-            req.setValue(desktopBrowserUserAgent, forHTTPHeaderField: "User-Agent")
-            guard let (data, resp) = try? await URLSession.shared.data(for: req),
-                  let http = resp as? HTTPURLResponse,
-                  (200...299).contains(http.statusCode),
-                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                return (nil, nil)
-            }
-            let t = (obj["title"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
-            let a = (obj["author_name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
-            return (t, a)
+            return (nil, nil)
         }()
 
         async let htmlTask: (title: String?, durationSeconds: Double?) = {
@@ -1289,21 +1434,21 @@ enum YouTubeStreamResolver {
                 return (nil, nil)
             }
             var dur: Double?
-            if let match = html.range(of: #""lengthSeconds"\s*:\s*"(\d+)""#, options: .regularExpression) {
-                let digits = html[match].components(separatedBy: CharacterSet.decimalDigits.inverted).joined()
-                if let sec = Double(digits), sec > 0 { dur = sec }
+            if let digits = firstRegexCapture(#""lengthSeconds"\s*:\s*"(\d+)""#, in: html),
+               let sec = Double(digits), sec > 0 {
+                dur = sec
             }
-            var fallbackTitle: String?
-            if let tRange = html.range(of: #""title"\s*:\s*"([^"]+)""#, options: .regularExpression) {
-                let raw = String(html[tRange])
-                if let firstQ = raw.lastIndex(of: "\"") {
-                    let sub = raw[..<firstQ]
-                    if let prevQ = sub.lastIndex(of: "\"") {
-                        fallbackTitle = String(sub[sub.index(after: prevQ)...])
-                    }
+            var fallbackTitle: String? = firstRegexCapture(#"<meta\s+property="og:title"\s+content="([^"]+)""#, in: html)
+                ?? firstRegexCapture(#"<meta\s+name="title"\s+content="([^"]+)""#, in: html)
+                ?? firstRegexCapture(#""title"\s*:\s*"([^"]+)""#, in: html)
+            if fallbackTitle == nil,
+               let docTitle = firstRegexCapture(#"<title>([^<]+)</title>"#, in: html) {
+                let stripped = docTitle.replacingOccurrences(of: " - YouTube", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
+                if !stripped.isEmpty, stripped.caseInsensitiveCompare("YouTube") != .orderedSame {
+                    fallbackTitle = stripped
                 }
             }
-            return (fallbackTitle, dur)
+            return (fallbackTitle.map(decodeHTMLEntities), dur)
         }()
 
         let (oe, hm) = await (oembedTask, htmlTask)
@@ -1316,7 +1461,10 @@ enum YouTubeStreamResolver {
         let replaced = folded.replacingOccurrences(of: "$", with: "s")
         let stopWords: Set<String> = [
             "the", "and", "with", "feat", "ft", "featuring", "official", "video", "audio",
-            "music", "lyrics", "lyric", "visualizer", "hd", "hq", "prod", "by", "full", "stream"
+            "music", "lyrics", "lyric", "visualizer", "hd", "hq", "4k", "prod", "by", "full", "stream",
+            "explicit", "unrated", "uncensored", "dirty", "clean", "version", "ver", "edition",
+            "topic", "vevo", "channel", "original", "remaster", "remastered", "short", "film",
+            "directors", "director", "cut", "mv", "listen", "online", "for", "free", "on", "soundcloud"
         ]
         let rawTokens = replaced.components(separatedBy: CharacterSet.alphanumerics.inverted)
         return rawTokens.filter { !$0.isEmpty && !stopWords.contains($0) && $0.count >= 2 }
@@ -1331,26 +1479,99 @@ enum YouTubeStreamResolver {
         return denom > 0 ? inter / denom : 0
     }
 
-    private static func cleanSearchText(_ rawTitle: String, author: String?) -> String {
+    private static func cleanAuthorName(_ rawAuthor: String?) -> String {
+        guard let rawAuthor else { return "" }
+        var a = rawAuthor.trimmingCharacters(in: .whitespacesAndNewlines)
+        a = a.replacingOccurrences(of: #"\s*-\s*Topic$"#, with: "", options: [.regularExpression, .caseInsensitive])
+        a = a.replacingOccurrences(of: #"(?:vevo|official|channel|music|records)$"#, with: "", options: [.regularExpression, .caseInsensitive])
+        a = a.replacingOccurrences(of: #"(?<=[a-z])(?=[A-Z])"#, with: " ", options: .regularExpression)
+        a = a.replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+        return a.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func expectedArtistTokens(rawTitle: String, author: String?) -> Set<String> {
+        if let dashRange = rawTitle.range(of: #"\s[-–—]\s"#, options: .regularExpression) {
+            let left = String(rawTitle[..<dashRange.lowerBound])
+            let toks = Set(normalizedWordTokens(left))
+            if !toks.isEmpty { return toks }
+        }
+        let cleanedA = cleanAuthorName(author)
+        if !cleanedA.isEmpty, author?.lowercased().contains("topic") != true {
+            let toks = Set(normalizedWordTokens(cleanedA))
+            if !toks.isEmpty { return toks }
+        }
+        return []
+    }
+
+    private static func artistMatchesTarget(
+        expectedTokens: Set<String>,
+        candidateTitle: String,
+        candidateArtist: String?
+    ) -> Bool {
+        guard !expectedTokens.isEmpty else { return true }
+        let titleToks = Set(normalizedWordTokens(candidateTitle))
+        if !expectedTokens.isDisjoint(with: titleToks) { return true }
+        let cleanedCandA = cleanAuthorName(candidateArtist)
+        let candArtistToks = Set(normalizedWordTokens(cleanedCandA))
+        if !expectedTokens.isDisjoint(with: candArtistToks) { return true }
+        let joinedCandA = normalizedWordTokens(candidateArtist ?? "").joined()
+        let joinedCandT = normalizedWordTokens(candidateTitle).joined()
+        return expectedTokens.contains { tok in
+            tok.count >= 4 && (joinedCandA.contains(tok) || joinedCandT.contains(tok))
+        }
+    }
+
+    private static func buildAlternateSearchQueries(rawTitle: String, author: String?) -> [String] {
         var cleaned = rawTitle
-            .replacingOccurrences(of: #"\s*[\(\[]\s*(?:official\s*(?:music\s*)?(?:video|audio)|lyrics?|hd|hq|4k|explicit)[^\)\]]*[\)\]]"#, with: " ", options: [.regularExpression, .caseInsensitive])
+            .replacingOccurrences(of: #"\s*[\(\[]\s*(?:official\s*(?:music\s*)?(?:video|audio)|lyrics?|lyric\s*video|visualizer|hd|hq|4k|explicit|unrated|uncensored|director'?s?\s*cut|short\s*film)[^\)\]]*[\)\]]"#, with: " ", options: [.regularExpression, .caseInsensitive])
             .replacingOccurrences(of: #"\s*(?:ft\.?|feat\.?)\s+"#, with: " ", options: [.regularExpression, .caseInsensitive])
             .replacingOccurrences(of: "$", with: "s")
-        cleaned = cleaned.replacingOccurrences(of: #"[^\p{L}\p{N}\s-]"#, with: " ", options: .regularExpression)
-        cleaned = cleaned.replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression).trimmingCharacters(in: .whitespacesAndNewlines)
-        if let author, !author.isEmpty {
-            let authorTokens = Set(normalizedWordTokens(author))
-            let titleTokens = Set(normalizedWordTokens(cleaned))
-            if !authorTokens.isEmpty && authorTokens.isDisjoint(with: titleTokens) && !author.lowercased().contains("topic") {
-                return "\(author) \(cleaned)"
+        let strippedShortParens = cleaned
+            .replacingOccurrences(of: #"\s*[\(\[][^\)\]]{1,24}[\)\]]"#, with: " ", options: .regularExpression)
+        cleaned = cleaned
+            .replacingOccurrences(of: #"[^\p{L}\p{N}\s-]"#, with: " ", options: .regularExpression)
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let core = strippedShortParens
+            .replacingOccurrences(of: #"[^\p{L}\p{N}\s-]"#, with: " ", options: .regularExpression)
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        let hasArtistDash = rawTitle.range(of: #"\s[-–—]\s"#, options: .regularExpression) != nil
+        let cleanedA = cleanAuthorName(author)
+        var queries: [String] = []
+        let normalizeSpace: (String) -> String = { s in
+            s.lowercased().replacingOccurrences(of: " - ", with: " ")
+        }
+        var seenNorm = Set<String>()
+        func appendUnique(_ q: String) {
+            let trimmed = q.trimmingCharacters(in: .whitespacesAndNewlines)
+            let key = normalizeSpace(trimmed)
+            guard !trimmed.isEmpty, seenNorm.insert(key).inserted else { return }
+            queries.append(trimmed)
+        }
+
+        if !hasArtistDash, !cleanedA.isEmpty {
+            let aToks = Set(normalizedWordTokens(cleanedA))
+            let tToks = Set(normalizedWordTokens(core))
+            if !aToks.isEmpty && aToks.isDisjoint(with: tToks) {
+                appendUnique("\(cleanedA) \(core)")
             }
         }
-        return cleaned
+        let noDashCore = core.replacingOccurrences(of: #"\s[-–—]\s"#, with: " ", options: .regularExpression)
+        appendUnique(noDashCore)
+        if cleaned != core {
+            appendUnique(cleaned)
+        }
+        return Array(queries.prefix(2))
     }
 
     private static let alternateExcludeNoiseTokens: Set<String> = [
-        "reaction", "review", "parody", "tutorial", "karaoke", "instrumental",
-        "slowed", "sped", "nightcore", "8d", "cover", "remix", "teaser", "trailer"
+        "reaction", "review", "parody", "parodie", "tutorial", "karaoke", "instrumental",
+        "slowed", "sped", "nightcore", "8d", "cover", "remix", "teaser", "trailer",
+        "live", "edit", "mashup", "acapella", "chopped", "screwed", "bootleg",
+        "reverb", "snippet", "interview", "remake", "tribute", "concert", "tour",
+        "festival", "iheartradio", "coachella", "flip", "unreleased"
     ]
 
     private static func hasDisallowedNoiseTokens(targetTitle: String, candidateTitle: String) -> Bool {
@@ -1374,259 +1595,456 @@ enum YouTubeStreamResolver {
             }
             return true
         } else {
-            // Tier 2: cinematic Music Video (e.g. 7-min film cut) matched to its exact unrestricted studio audio/lyrics upload.
-            guard overlap >= 0.85, let candDur = candidateDuration else { return false }
+            // Tier 2: cinematic Music Video (e.g. 7-10 min film cut) matched to its exact unrestricted studio audio/lyrics upload.
+            guard overlap >= 0.72, let candDur = candidateDuration else { return false }
             return candDur >= 90 && candDur <= 600
         }
     }
 
+    private static func fetchPlayableYouTubeAlternative(videoID: String, altURL: URL) async -> YouTubeResolvedResult? {
+        if let android = await fetchInnerTube(
+            videoID: videoID,
+            sourcePageURL: altURL,
+            clientName: "ANDROID",
+            clientHeaderID: "3",
+            clientVersion: androidClientVersion,
+            userAgent: androidClientUserAgent,
+            extraClientFields: ["osName": "Android", "osVersion": "14", "androidSdkVersion": 34],
+            visitorData: nil,
+            cookiesHeader: nil
+        ), !android.streams.isEmpty {
+            return android
+        }
+        async let iosTask = fetchInnerTube(
+            videoID: videoID,
+            sourcePageURL: altURL,
+            clientName: "IOS",
+            clientHeaderID: "5",
+            clientVersion: iosClientVersion,
+            userAgent: iosClientUserAgent,
+            extraClientFields: ["deviceMake": "Apple", "deviceModel": "iPhone16,2", "osName": "iPhone", "osVersion": "18.3.2"],
+            visitorData: nil,
+            cookiesHeader: nil
+        )
+        async let vrTask = fetchInnerTube(
+            videoID: videoID,
+            sourcePageURL: altURL,
+            clientName: "ANDROID_VR",
+            clientHeaderID: "28",
+            clientVersion: androidVRClientVersion,
+            userAgent: androidVRUserAgent,
+            extraClientFields: ["deviceMake": "Oculus", "deviceModel": "Quest 3", "osName": "Android", "osVersion": "12L", "androidSdkVersion": 32],
+            visitorData: nil,
+            cookiesHeader: nil
+        )
+        let (ios, vr) = await (iosTask, vrTask)
+        if let ios, !ios.streams.isEmpty { return ios }
+        if let vr, !vr.streams.isEmpty { return vr }
+        return nil
+    }
+
     private static func resolveNonRestrictedYouTubeAlternative(
         excludingVideoID: String,
-        query: String,
+        queries: [String],
         targetTitle: String,
+        targetArtistTokens: Set<String>,
         targetDuration: Double?
     ) async -> YouTubeResolvedResult? {
-        let hits = await PlaylistURLImporter.searchYouTubeTracks(query: query, limit: 10)
-        for strictTier in [true, false] {
-            for hit in hits {
-                if Task.isCancelled { return nil }
-                guard hit.videoID != excludingVideoID else { continue }
-                guard !hasDisallowedNoiseTokens(targetTitle: targetTitle, candidateTitle: hit.title) else { continue }
-                let overlap = titleTokenOverlap(targetTitle, hit.title)
-                guard matchesDurationOrStudioAudio(
-                    candidateDuration: hit.durationSeconds,
-                    targetDuration: targetDuration,
-                    overlap: overlap,
-                    strictTier: strictTier
-                ) else {
-                    continue
-                }
-                guard let altURL = URL(string: "https://www.youtube.com/watch?v=\(hit.videoID)") else { continue }
-
-                let android = await fetchInnerTube(
-                    videoID: hit.videoID,
-                    sourcePageURL: altURL,
-                    clientName: "ANDROID",
-                    clientHeaderID: "3",
-                    clientVersion: androidClientVersion,
-                    userAgent: androidClientUserAgent,
-                    extraClientFields: ["osName": "Android", "osVersion": "14", "androidSdkVersion": 34],
-                    visitorData: nil,
-                    cookiesHeader: nil
-                )
-                guard let android else { continue }
-                let realOverlap = max(overlap, titleTokenOverlap(targetTitle, android.title))
-                guard !hasDisallowedNoiseTokens(targetTitle: targetTitle, candidateTitle: android.title),
-                      matchesDurationOrStudioAudio(
-                          candidateDuration: android.durationSeconds ?? hit.durationSeconds,
-                          targetDuration: targetDuration,
-                          overlap: realOverlap,
-                          strictTier: strictTier
-                      ),
-                      !android.streams.isEmpty else {
-                    continue
-                }
-                let reachable = await filterReachableStreams(android.streams)
-                if !reachable.isEmpty {
-                    return YouTubeResolvedResult(
-                        videoID: hit.videoID,
-                        title: android.title != "YouTube Video" ? android.title : hit.title,
-                        author: android.author ?? hit.artist,
-                        durationSeconds: android.durationSeconds ?? hit.durationSeconds,
-                        streams: reachable,
-                        errorReason: nil
-                    )
+        var testedIDs = Set<String>([excludingVideoID])
+        for query in queries {
+            if Task.isCancelled { return nil }
+            let hits = await PlaylistURLImporter.searchYouTubeTracks(query: query, limit: 10)
+            for strictTier in [true, false] {
+                for hit in hits {
+                    if Task.isCancelled { return nil }
+                    guard testedIDs.insert(hit.videoID).inserted else { continue }
+                    guard !hasDisallowedNoiseTokens(targetTitle: targetTitle, candidateTitle: hit.title) else { continue }
+                    guard artistMatchesTarget(
+                        expectedTokens: targetArtistTokens,
+                        candidateTitle: hit.title,
+                        candidateArtist: hit.artist
+                    ) else {
+                        continue
+                    }
+                    let overlap = titleTokenOverlap(targetTitle, hit.title)
+                    guard matchesDurationOrStudioAudio(
+                        candidateDuration: hit.durationSeconds,
+                        targetDuration: targetDuration,
+                        overlap: overlap,
+                        strictTier: strictTier
+                    ) else {
+                        continue
+                    }
+                    guard let altURL = URL(string: "https://www.youtube.com/watch?v=\(hit.videoID)"),
+                          let resolvedAlt = await fetchPlayableYouTubeAlternative(videoID: hit.videoID, altURL: altURL) else {
+                        continue
+                    }
+                    let realOverlap = max(overlap, titleTokenOverlap(targetTitle, resolvedAlt.title))
+                    guard !hasDisallowedNoiseTokens(targetTitle: targetTitle, candidateTitle: resolvedAlt.title),
+                          artistMatchesTarget(
+                              expectedTokens: targetArtistTokens,
+                              candidateTitle: resolvedAlt.title,
+                              candidateArtist: resolvedAlt.author ?? hit.artist
+                          ),
+                          matchesDurationOrStudioAudio(
+                              candidateDuration: resolvedAlt.durationSeconds ?? hit.durationSeconds,
+                              targetDuration: targetDuration,
+                              overlap: realOverlap,
+                              strictTier: strictTier
+                          ),
+                          !resolvedAlt.streams.isEmpty else {
+                        continue
+                    }
+                    let reachable = await filterReachableStreams(resolvedAlt.streams)
+                    if !reachable.isEmpty {
+                        return YouTubeResolvedResult(
+                            videoID: hit.videoID,
+                            title: resolvedAlt.title != "YouTube Video" ? resolvedAlt.title : hit.title,
+                            author: resolvedAlt.author ?? hit.artist,
+                            durationSeconds: resolvedAlt.durationSeconds ?? hit.durationSeconds,
+                            streams: reachable,
+                            errorReason: nil
+                        )
+                    }
                 }
             }
         }
         return nil
     }
 
-    private static func resolveSoundCloudAlternateStream(
-        query: String,
+    private struct SoundCloudTrackCandidate {
+        let title: String
+        let artist: String
+        let permalinkURL: URL
+        let durationSeconds: Double?
+        let trackAuth: String
+        let transcodings: [(urlString: String, isHLS: Bool, isProgressive: Bool, isAAC: Bool)]
+    }
+
+    private static func isPlayableSoundCloudTranscoding(urlString: String, protocolName: String, mimeType: String, snipped: Bool) -> Bool {
+        if snipped { return false }
+        let lowerURL = urlString.lowercased()
+        let lowerProto = protocolName.lowercased()
+        let lowerMime = mimeType.lowercased()
+        if lowerProto.contains("encrypted") || lowerURL.contains("encrypted-hls") || lowerURL.contains("/cbc-encrypted") || lowerURL.contains("/ctr-encrypted") {
+            return false
+        }
+        if lowerMime.contains("opus") || lowerURL.contains("/opus") {
+            return false
+        }
+        return lowerProto == "progressive" || lowerProto == "hls" || lowerURL.contains("/progressive") || lowerURL.contains("/hls")
+    }
+
+    private static func resolveSoundCloudStream(
+        from candidate: SoundCloudTrackCandidate,
+        clientID: String,
         targetTitle: String,
         targetAuthor: String?,
         targetDuration: Double?
     ) async -> [DetectedBrowserMedia]? {
-        guard let encoded = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
-              let searchURL = URL(string: "https://soundcloud.com/search/sounds?q=\(encoded)") else {
-            return nil
+        let hdrs = ["User-Agent": desktopBrowserUserAgent, "Referer": candidate.permalinkURL.absoluteString]
+        let ordered = candidate.transcodings.sorted { a, b in
+            if a.isProgressive != b.isProgressive { return a.isProgressive && !b.isProgressive }
+            if a.isAAC != b.isAAC { return a.isAAC && !b.isAAC }
+            return false
         }
 
-        var sReq = URLRequest(url: searchURL)
-        sReq.timeoutInterval = 5.0
-        sReq.setValue(desktopBrowserUserAgent, forHTTPHeaderField: "User-Agent")
-        guard let (sData, sResp) = try? await URLSession.shared.data(for: sReq),
-              let sHTTP = sResp as? HTTPURLResponse,
-              (200...299).contains(sHTTP.statusCode),
-              let searchHTML = String(data: sData, encoding: .utf8) else {
-            return nil
-        }
-
-        let bannedRoots: Set<String> = [
-            "search", "discover", "you", "settings", "terms-of-use", "pages", "charts",
-            "popular", "upload", "jobs", "people", "pro", "go", "signin", "signup",
-            "stream", "stations", "mobile", "imprint", "messages", "notifications", "sets"
-        ]
-        guard let pathRegex = try? NSRegularExpression(pattern: #"href="(/[a-zA-Z0-9_-]{2,60}/[a-zA-Z0-9_-]{2,80})""#) else {
-            return nil
-        }
-        let matches = pathRegex.matches(in: searchHTML, range: NSRange(searchHTML.startIndex..., in: searchHTML))
-        var seenPaths = Set<String>()
-        var candidateURLs: [(url: URL, slugScore: Double)] = []
-        let targetTokens = Set(normalizedWordTokens(targetTitle))
-        for m in matches {
-            guard let r = Range(m.range(at: 1), in: searchHTML) else { continue }
-            let path = String(searchHTML[r])
-            let parts = path.split(separator: "/").map(String.init)
-            guard parts.count == 2,
-                  !bannedRoots.contains(parts[0].lowercased()),
-                  !bannedRoots.contains(parts[1].lowercased()),
-                  seenPaths.insert(path).inserted,
-                  let fullURL = URL(string: "https://soundcloud.com\(path)") else {
-                continue
-            }
-            let slugText = parts[1].replacingOccurrences(of: "-", with: " ")
-            if hasDisallowedNoiseTokens(targetTitle: targetTitle, candidateTitle: slugText) {
-                continue
-            }
-            let slugOverlap = titleTokenOverlap(targetTitle, slugText)
-            candidateURLs.append((fullURL, slugOverlap))
-        }
-        candidateURLs.sort { $0.slugScore > $1.slugScore }
-
-        var fetchedTracks: [(entry: (url: URL, slugScore: Double), html: String, fullDur: Double?, pageTitle: String, overlap: Double)] = []
-        for entry in candidateURLs.prefix(8) {
+        for trans in ordered {
             if Task.isCancelled { return nil }
-            var tReq = URLRequest(url: entry.url)
-            tReq.timeoutInterval = 4.5
-            tReq.setValue(desktopBrowserUserAgent, forHTTPHeaderField: "User-Agent")
-            guard let (tData, tResp) = try? await URLSession.shared.data(for: tReq),
-                  let tHTTP = tResp as? HTTPURLResponse,
-                  (200...299).contains(tHTTP.statusCode),
-                  let html = String(data: tData, encoding: .utf8) else {
+            let sep = trans.urlString.contains("?") ? "&" : "?"
+            var resolveStr = "\(trans.urlString)\(sep)client_id=\(clientID)"
+            if !candidate.trackAuth.isEmpty,
+               let encAuth = candidate.trackAuth.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) {
+                resolveStr += "&track_authorization=\(encAuth)"
+            }
+            guard let resolveURL = URL(string: resolveStr) else { continue }
+            var apiReq = URLRequest(url: resolveURL)
+            apiReq.timeoutInterval = 4.5
+            apiReq.setValue(desktopBrowserUserAgent, forHTTPHeaderField: "User-Agent")
+            guard let (aData, aResp) = try? await URLSession.shared.data(for: apiReq),
+                  let aHTTP = aResp as? HTTPURLResponse,
+                  (200...299).contains(aHTTP.statusCode),
+                  let json = try? JSONSerialization.jsonObject(with: aData) as? [String: Any],
+                  let streamStr = json["url"] as? String,
+                  let streamURL = URL(string: streamStr) else {
                 continue
             }
-            // Skip 30-second Go+ SNIP preview snippets so we never cache a truncated clip.
-            if html.contains("\"policy\":\"SNIP\"") { continue }
+            let lowerStream = streamStr.lowercased()
+            if lowerStream.contains("/opus") { continue }
 
-            var trackDur: Double?
-            if let dRange = html.range(of: #""full_duration"\s*:\s*(\d+)"#, options: .regularExpression) {
-                let digits = html[dRange].components(separatedBy: CharacterSet.decimalDigits.inverted).joined()
-                if let ms = Double(digits), ms > 0 {
-                    trackDur = ms / 1000.0
-                }
-            }
-            if let fullD = trackDur,
-               let actualRange = html.range(of: #""duration"\s*:\s*(\d+)"#, options: .regularExpression) {
-                let digits = html[actualRange].components(separatedBy: CharacterSet.decimalDigits.inverted).joined()
-                if let ms = Double(digits), ms > 0, abs((ms / 1000.0) - fullD) > 5.0 {
+            let isHLS = trans.isHLS || lowerStream.contains(".m3u8")
+            if isHLS {
+                // Verify the .m3u8 playlist is reachable AND free of FairPlay SAMPLE-AES DRM before accepting.
+                var mReq = URLRequest(url: streamURL)
+                mReq.timeoutInterval = 4.5
+                hdrs.forEach { mReq.setValue($0.value, forHTTPHeaderField: $0.key) }
+                guard let (mData, mResp) = try? await ephemeralProbeSession.data(for: mReq),
+                      let mHTTP = mResp as? HTTPURLResponse,
+                      (200...299).contains(mHTTP.statusCode),
+                      let m3uText = String(data: mData, encoding: .utf8),
+                      !m3uText.contains("SAMPLE-AES"),
+                      !m3uText.contains("skd://") else {
                     continue
                 }
-            }
-
-            var pageTitle = ""
-            if let titleRange = html.range(of: #"<title>([^<]+)</title>"#, options: .regularExpression) {
-                pageTitle = String(html[titleRange])
-                    .replacingOccurrences(of: "<title>", with: "")
-                    .replacingOccurrences(of: "</title>", with: "")
-                    .replacingOccurrences(of: "Stream ", with: "")
-                    .replacingOccurrences(of: "&amp;", with: "&")
-                    .replacingOccurrences(of: "&#39;", with: "'")
-                    .replacingOccurrences(of: "&#x27;", with: "'")
-                    .replacingOccurrences(of: "&quot;", with: "\"")
-            }
-            guard !hasDisallowedNoiseTokens(targetTitle: targetTitle, candidateTitle: pageTitle) else {
-                continue
-            }
-            let overlap = max(entry.slugScore, titleTokenOverlap(targetTitle, pageTitle))
-            guard overlap >= 0.50 || targetTokens.isSubset(of: Set(normalizedWordTokens(pageTitle))) else {
-                continue
-            }
-            fetchedTracks.append((entry, html, trackDur, pageTitle, overlap))
-        }
-
-        for strictTier in [true, false] {
-            for item in fetchedTracks {
-                if Task.isCancelled { return nil }
-                let html = item.html
-                guard matchesDurationOrStudioAudio(
-                    candidateDuration: item.fullDur,
-                    targetDuration: targetDuration,
-                    overlap: item.overlap,
-                    strictTier: strictTier
-                ) else {
-                    continue
-                }
-                let entry = item.entry
-                let trackDur = item.fullDur
-
-            var trackAuth = ""
-            if let taRange = html.range(of: #""track_authorization"\s*:\s*"([^"]+)""#, options: .regularExpression) {
-                let slice = String(html[taRange])
-                if let q = slice.dropLast().lastIndex(of: "\"") {
-                    trackAuth = String(slice[slice.index(after: q)..<slice.index(before: slice.endIndex)])
-                }
-            }
-
-            // Prefer progressive HTTP audio first, then HLS playlist.
-            var transcodings: [String] = []
-            if let transRegex = try? NSRegularExpression(pattern: #""url"\s*:\s*"(https://api-v2\.soundcloud\.com/media/[^"]+)""#) {
-                let tm = transRegex.matches(in: html, range: NSRange(html.startIndex..., in: html))
-                for m in tm {
-                    if let rr = Range(m.range(at: 1), in: html) {
-                        transcodings.append(String(html[rr]))
-                    }
-                }
-            }
-            guard !transcodings.isEmpty else { continue }
-            let orderedTrans = transcodings.filter { $0.contains("/progressive") } + transcodings.filter { !$0.contains("/progressive") }
-
-            guard let clientID = await resolveSoundCloudClientID(fromHTML: html) else { continue }
-
-            for transURLStr in orderedTrans {
-                let sep = transURLStr.contains("?") ? "&" : "?"
-                var resolveStr = "\(transURLStr)\(sep)client_id=\(clientID)"
-                if !trackAuth.isEmpty,
-                   let encAuth = trackAuth.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) {
-                    resolveStr += "&track_authorization=\(encAuth)"
-                }
-                guard let resolveURL = URL(string: resolveStr) else { continue }
-                var apiReq = URLRequest(url: resolveURL)
-                apiReq.timeoutInterval = 4.5
-                apiReq.setValue(desktopBrowserUserAgent, forHTTPHeaderField: "User-Agent")
-                guard let (aData, aResp) = try? await URLSession.shared.data(for: apiReq),
-                      let aHTTP = aResp as? HTTPURLResponse,
-                      (200...299).contains(aHTTP.statusCode),
-                      let json = try? JSONSerialization.jsonObject(with: aData) as? [String: Any],
-                      let streamStr = json["url"] as? String,
-                      let streamURL = URL(string: streamStr) else {
-                    continue
-                }
-                let hdrs = ["User-Agent": desktopBrowserUserAgent]
-                let lowerStream = streamStr.lowercased()
-                if lowerStream.contains("/opus") {
-                    continue
-                }
+            } else {
                 guard await isURLReachable(streamURL, headers: hdrs) else {
                     continue
                 }
-                let isHLS = transURLStr.contains("/hls") || lowerStream.contains(".m3u8")
-                let candidate = DetectedBrowserMedia(
-                    url: streamURL,
-                    pairedAudioURL: nil,
-                    isHLS: isHLS,
-                    isAudio: true,
-                    title: targetTitle,
-                    author: targetAuthor,
-                    qualityLabel: isHLS ? "HLS Audio" : "MP3 Audio",
-                    referer: entry.url.absoluteString,
-                    customHeaders: hdrs,
-                    durationSeconds: trackDur ?? targetDuration,
-                    isActivelyPlaying: true
-                )
-                return [candidate]
             }
+
+            let isMP3 = lowerStream.contains(".mp3") || (!isHLS && !trans.isAAC)
+            let media = DetectedBrowserMedia(
+                url: streamURL,
+                pairedAudioURL: nil,
+                isHLS: isHLS,
+                isAudio: true,
+                title: targetTitle,
+                author: targetAuthor ?? candidate.artist,
+                qualityLabel: isHLS ? "HLS Audio" : (isMP3 ? "MP3 Audio" : "M4A Audio"),
+                referer: candidate.permalinkURL.absoluteString,
+                customHeaders: hdrs,
+                durationSeconds: candidate.durationSeconds ?? targetDuration,
+                isActivelyPlaying: true
+            )
+            return [media]
+        }
+        return nil
+    }
+
+    private static func resolveSoundCloudAlternateStream(
+        queries: [String],
+        targetTitle: String,
+        targetAuthor: String?,
+        targetArtistTokens: Set<String>,
+        targetDuration: Double?
+    ) async -> [DetectedBrowserMedia]? {
+        var clientID = await scClientCache.current()
+        for query in queries {
+            if Task.isCancelled { return nil }
+            guard let encoded = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) else { continue }
+
+            if clientID == nil,
+               let searchHTMLURL = URL(string: "https://soundcloud.com/search/sounds?q=\(encoded)") {
+                var sReq = URLRequest(url: searchHTMLURL)
+                sReq.timeoutInterval = 4.5
+                sReq.setValue(desktopBrowserUserAgent, forHTTPHeaderField: "User-Agent")
+                if let (sData, _) = try? await URLSession.shared.data(for: sReq),
+                   let sHTML = String(data: sData, encoding: .utf8) {
+                    clientID = await resolveSoundCloudClientID(fromHTML: sHTML)
+                }
+            }
+
+            // Fast path: SoundCloud API v2 JSON returns all track metadata + non-DRM transcodings in 1 call.
+            if let cid = clientID,
+               let apiSearchURL = URL(string: "https://api-v2.soundcloud.com/search/tracks?q=\(encoded)&client_id=\(cid)&limit=12") {
+                var apiReq = URLRequest(url: apiSearchURL)
+                apiReq.timeoutInterval = 5.0
+                apiReq.setValue(desktopBrowserUserAgent, forHTTPHeaderField: "User-Agent")
+                if let (data, resp) = try? await URLSession.shared.data(for: apiReq),
+                   let http = resp as? HTTPURLResponse,
+                   (200...299).contains(http.statusCode),
+                   let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let collection = root["collection"] as? [[String: Any]] {
+                    var parsedCandidates: [(cand: SoundCloudTrackCandidate, overlap: Double)] = []
+                    for item in collection {
+                        if let policy = item["policy"] as? String, policy.uppercased() == "SNIP" { continue }
+                        let fullMs = (item["full_duration"] as? NSNumber)?.doubleValue ?? 0
+                        let durMs = (item["duration"] as? NSNumber)?.doubleValue ?? fullMs
+                        let fullDur = fullMs > 0 ? fullMs / 1000.0 : nil
+                        if fullMs > 0, durMs > 0, abs((durMs - fullMs) / 1000.0) > 5.0 { continue }
+
+                        let title = ((item["title"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                        let username = (((item["user"] as? [String: Any])?["username"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                        guard !title.isEmpty,
+                              let permalinkStr = item["permalink_url"] as? String,
+                              let permalinkURL = URL(string: permalinkStr),
+                              !hasDisallowedNoiseTokens(targetTitle: targetTitle, candidateTitle: title),
+                              artistMatchesTarget(expectedTokens: targetArtistTokens, candidateTitle: title, candidateArtist: username) else {
+                            continue
+                        }
+                        let combinedText = username.isEmpty ? title : "\(username) \(title)"
+                        let overlap = max(titleTokenOverlap(targetTitle, title), titleTokenOverlap(targetTitle, combinedText))
+                        guard overlap >= 0.55 else { continue }
+
+                        let trackAuth = (item["track_authorization"] as? String) ?? ""
+                        let rawTrans = ((item["media"] as? [String: Any])?["transcodings"] as? [[String: Any]]) ?? []
+                        let trans: [(urlString: String, isHLS: Bool, isProgressive: Bool, isAAC: Bool)] = rawTrans.compactMap { t in
+                            guard let u = t["url"] as? String else { return nil }
+                            let fmt = t["format"] as? [String: Any]
+                            let proto = (fmt?["protocol"] as? String) ?? ""
+                            let mime = (fmt?["mime_type"] as? String) ?? ""
+                            let snipped = (t["snipped"] as? Bool) ?? false
+                            guard isPlayableSoundCloudTranscoding(urlString: u, protocolName: proto, mimeType: mime, snipped: snipped) else {
+                                return nil
+                            }
+                            return (u, proto.lowercased() == "hls" || u.contains("/hls"), proto.lowercased() == "progressive" || u.contains("/progressive"), mime.lowercased().contains("mp4"))
+                        }
+                        guard !trans.isEmpty else { continue }
+                        parsedCandidates.append((SoundCloudTrackCandidate(
+                            title: title,
+                            artist: username,
+                            permalinkURL: permalinkURL,
+                            durationSeconds: fullDur ?? (durMs > 0 ? durMs / 1000.0 : nil),
+                            trackAuth: trackAuth,
+                            transcodings: trans
+                        ), overlap))
+                    }
+
+                    for strictTier in [true, false] {
+                        for entry in parsedCandidates {
+                            guard matchesDurationOrStudioAudio(
+                                candidateDuration: entry.cand.durationSeconds,
+                                targetDuration: targetDuration,
+                                overlap: entry.overlap,
+                                strictTier: strictTier
+                            ) else { continue }
+                            if let streams = await resolveSoundCloudStream(
+                                from: entry.cand,
+                                clientID: cid,
+                                targetTitle: targetTitle,
+                                targetAuthor: targetAuthor,
+                                targetDuration: targetDuration
+                            ) {
+                                return streams
+                            }
+                        }
+                    }
+                }
+            }
+
+            // HTML fallback path if SoundCloud search API returned nothing.
+            guard let searchURL = URL(string: "https://soundcloud.com/search/sounds?q=\(encoded)") else { continue }
+            var sReq = URLRequest(url: searchURL)
+            sReq.timeoutInterval = 5.0
+            sReq.setValue(desktopBrowserUserAgent, forHTTPHeaderField: "User-Agent")
+            guard let (sData, sResp) = try? await URLSession.shared.data(for: sReq),
+                  let sHTTP = sResp as? HTTPURLResponse,
+                  (200...299).contains(sHTTP.statusCode),
+                  let searchHTML = String(data: sData, encoding: .utf8) else {
+                continue
+            }
+
+            let bannedRoots: Set<String> = [
+                "search", "discover", "you", "settings", "terms-of-use", "pages", "charts",
+                "popular", "upload", "jobs", "people", "pro", "go", "signin", "signup",
+                "stream", "stations", "mobile", "imprint", "messages", "notifications", "sets"
+            ]
+            guard let pathRegex = try? NSRegularExpression(pattern: #"href="(/[a-zA-Z0-9_-]{2,60}/[a-zA-Z0-9_-]{2,80})""#) else {
+                continue
+            }
+            let matches = pathRegex.matches(in: searchHTML, range: NSRange(searchHTML.startIndex..., in: searchHTML))
+            var seenPaths = Set<String>()
+            var candidateURLs: [(url: URL, slugScore: Double)] = []
+            for m in matches {
+                guard let r = Range(m.range(at: 1), in: searchHTML) else { continue }
+                let path = String(searchHTML[r])
+                let parts = path.split(separator: "/").map(String.init)
+                guard parts.count == 2,
+                      !bannedRoots.contains(parts[0].lowercased()),
+                      !bannedRoots.contains(parts[1].lowercased()),
+                      seenPaths.insert(path).inserted,
+                      let fullURL = URL(string: "https://soundcloud.com\(path)") else {
+                    continue
+                }
+                let slugText = parts[1].replacingOccurrences(of: "-", with: " ")
+                if hasDisallowedNoiseTokens(targetTitle: targetTitle, candidateTitle: slugText) {
+                    continue
+                }
+                candidateURLs.append((fullURL, titleTokenOverlap(targetTitle, slugText)))
+            }
+            candidateURLs.sort { $0.slugScore > $1.slugScore }
+
+            var fetchedTracks: [(cand: SoundCloudTrackCandidate, overlap: Double)] = []
+            for entry in candidateURLs.prefix(6) {
+                if Task.isCancelled { return nil }
+                var tReq = URLRequest(url: entry.url)
+                tReq.timeoutInterval = 4.5
+                tReq.setValue(desktopBrowserUserAgent, forHTTPHeaderField: "User-Agent")
+                guard let (tData, tResp) = try? await URLSession.shared.data(for: tReq),
+                      let tHTTP = tResp as? HTTPURLResponse,
+                      (200...299).contains(tHTTP.statusCode),
+                      let html = String(data: tData, encoding: .utf8),
+                      !html.contains("\"policy\":\"SNIP\"") else {
+                    continue
+                }
+
+                var trackDur: Double?
+                if let digits = firstRegexCapture(#""full_duration"\s*:\s*(\d+)"#, in: html),
+                   let ms = Double(digits), ms > 0 {
+                    trackDur = ms / 1000.0
+                }
+                if let fullD = trackDur,
+                   let actualDigits = firstRegexCapture(#""duration"\s*:\s*(\d+)"#, in: html),
+                   let ms = Double(actualDigits), ms > 0, abs((ms / 1000.0) - fullD) > 5.0 {
+                    continue
+                }
+
+                var pageTitle = ""
+                var pageArtist = ""
+                if let rawTitle = firstRegexCapture(#"<title>([^<]+)</title>"#, in: html) {
+                    let cleanedTitle = decodeHTMLEntities(rawTitle)
+                        .replacingOccurrences(of: "Stream ", with: "")
+                        .replacingOccurrences(of: #"\s*\|\s*Listen online.*$"#, with: "", options: .regularExpression)
+                    if let byRange = cleanedTitle.range(of: " by ", options: .backwards) {
+                        pageTitle = String(cleanedTitle[..<byRange.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+                        pageArtist = String(cleanedTitle[byRange.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+                    } else {
+                        pageTitle = cleanedTitle
+                    }
+                }
+                guard !hasDisallowedNoiseTokens(targetTitle: targetTitle, candidateTitle: pageTitle),
+                      artistMatchesTarget(expectedTokens: targetArtistTokens, candidateTitle: pageTitle, candidateArtist: pageArtist) else {
+                    continue
+                }
+                let overlap = max(entry.slugScore, titleTokenOverlap(targetTitle, "\(pageTitle) \(pageArtist)"))
+                guard overlap >= 0.55 else { continue }
+
+                var transcodings: [(urlString: String, isHLS: Bool, isProgressive: Bool, isAAC: Bool)] = []
+                if let transRegex = try? NSRegularExpression(pattern: #""url"\s*:\s*"(https://api-v2\.soundcloud\.com/media/[^"]+)""#) {
+                    let tm = transRegex.matches(in: html, range: NSRange(html.startIndex..., in: html))
+                    for m in tm {
+                        if let rr = Range(m.range(at: 1), in: html) {
+                            let u = String(html[rr])
+                            if isPlayableSoundCloudTranscoding(urlString: u, protocolName: "", mimeType: "", snipped: false) {
+                                transcodings.append((u, u.contains("/hls"), u.contains("/progressive"), false))
+                            }
+                        }
+                    }
+                }
+                guard !transcodings.isEmpty else { continue }
+                if clientID == nil {
+                    clientID = await resolveSoundCloudClientID(fromHTML: html)
+                }
+                let trackAuth = firstRegexCapture(#""track_authorization"\s*:\s*"([^"]+)""#, in: html) ?? ""
+                fetchedTracks.append((SoundCloudTrackCandidate(
+                    title: pageTitle,
+                    artist: pageArtist,
+                    permalinkURL: entry.url,
+                    durationSeconds: trackDur,
+                    trackAuth: trackAuth,
+                    transcodings: transcodings
+                ), overlap))
+            }
+
+            guard let cid = clientID else { continue }
+            for strictTier in [true, false] {
+                for item in fetchedTracks {
+                    guard matchesDurationOrStudioAudio(
+                        candidateDuration: item.cand.durationSeconds,
+                        targetDuration: targetDuration,
+                        overlap: item.overlap,
+                        strictTier: strictTier
+                    ) else { continue }
+                    if let streams = await resolveSoundCloudStream(
+                        from: item.cand,
+                        clientID: cid,
+                        targetTitle: targetTitle,
+                        targetAuthor: targetAuthor,
+                        targetDuration: targetDuration
+                    ) {
+                        return streams
+                    }
+                }
             }
         }
         return nil

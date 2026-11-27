@@ -569,7 +569,13 @@ final class PlaylistTimeMachineService {
 
         guard let vid = videoID, !vid.isEmpty,
               let watchURL = URL(string: "https://www.youtube.com/watch?v=\(vid)"),
-              let resolved = await YouTubeStreamResolver.resolveStreams(for: watchURL),
+              let resolved = await YouTubeStreamResolver.resolveStreamsWithUnrestrictedFallback(
+                  for: watchURL,
+                  videoID: vid,
+                  titleHint: track.displayTitle,
+                  authorHint: track.artist,
+                  durationHint: track.durationSeconds
+              ),
               !resolved.streams.isEmpty else {
             MediaManager.shared.errorMessage = "Could not find a downloadable source for \"\(track.displayTitle)\"."
             return nil

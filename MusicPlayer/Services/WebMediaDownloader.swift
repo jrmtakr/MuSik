@@ -1166,34 +1166,13 @@ final class WebMediaDownloader {
                 cookieHeader = await BrowserYouTubeResolver.youtubeCookieHeader()
             }
 
-            var ytResult = await YouTubeStreamResolver.resolveStreams(
+            let ytResult = await YouTubeStreamResolver.resolveStreamsWithUnrestrictedFallback(
                 for: url,
+                videoID: videoID,
+                titleHint: title,
                 cookiesHeader: cookieHeader,
                 referer: headers?["Referer"] ?? url.absoluteString
             )
-
-            if ytResult == nil || (ytResult?.streams.isEmpty ?? true) {
-                MediaManager.shared.statusMessage = "Resolving YouTube stream in browser..."
-                if let browserResolved = await BrowserYouTubeResolver.shared.resolveStreamsInBrowser(videoID: videoID) {
-                    if !browserResolved.result.streams.isEmpty {
-                        ytResult = browserResolved.result
-                    } else if ytResult == nil || (ytResult?.title == "YouTube Video") {
-                        ytResult = browserResolved.result
-                    }
-                }
-            }
-
-            if ytResult == nil || (ytResult?.streams.isEmpty ?? true) {
-                MediaManager.shared.statusMessage = "Finding verified match for restricted stream..."
-                if let altResult = await YouTubeStreamResolver.resolveAgeRestrictedFallback(
-                    videoID: videoID,
-                    title: ytResult?.title ?? title,
-                    author: ytResult?.author,
-                    durationSeconds: ytResult?.durationSeconds
-                ), !altResult.streams.isEmpty {
-                    ytResult = altResult
-                }
-            }
 
             if let ytResult, !ytResult.streams.isEmpty {
                 let videoStreams = ytResult.streams.filter { !$0.isAudio }
@@ -1217,13 +1196,16 @@ final class WebMediaDownloader {
                         patchedPrimary,
                         fallbackStreams: Array(ordered.dropFirst()),
                         maxDurationMinutes: maxDurationMinutes,
-                        destinationFolder: destinationFolder
+                        destinationFolder: destinationFolder,
+                        youTubeVideoID: videoID
                     )
                     return
                 }
             }
 
-            let errMsg = ytResult?.errorReason ?? "Could not resolve YouTube stream. Try opening the video in the Browser tab."
+            let errMsg = YouTubeStreamResolver.isAgeOrLoginRestrictedReason(ytResult?.errorReason)
+                ? "This video is restricted by YouTube and no unrestricted copy was found."
+                : (ytResult?.errorReason ?? "Could not resolve YouTube stream. Try opening the video in the Browser tab.")
             recordFailedDownload(sourceURL: url, message: errMsg)
             return
         }
@@ -1523,6 +1505,11 @@ final class WebMediaDownloader {
         }
 
         if audioOnly {
+            if videoJoined.ext == "mp3" {
+                let movedMP3 = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString).mp3")
+                try? FileManager.default.moveItem(at: videoJoined.url, to: movedMP3)
+                return (movedMP3, "mp3", false)
+            }
             let m4aOut = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString).m4a")
             let remuxed = await Task.detached(priority: .userInitiated) {
                 FFmpegMediaService.remuxAudioTrackToM4A(inputURL: videoJoined.url, outputURL: m4aOut)
@@ -1732,7 +1719,8 @@ final class WebMediaDownloader {
         guard orderedParts.count == totalCount else { return nil }
 
         let isFMP4 = initData != nil || segments.first?.url.pathExtension.lowercased() == "m4s"
-        let joinedExt = isFMP4 ? "mp4" : "ts"
+        let isMP3Segs = segments.first?.url.path.lowercased().contains(".mp3") == true
+        let joinedExt = isFMP4 ? "mp4" : (isMP3Segs ? "mp3" : "ts")
         let joinedURL = workDir.appendingPathComponent("\(filePrefix)_joined.\(joinedExt)")
 
         FileManager.default.createFile(atPath: joinedURL.path, contents: nil)
@@ -2608,7 +2596,12 @@ final class WebMediaDownloader {
                 }
             } else {
                 let cleanURL = cleanedStreamURLIfRangeFragment(candidate.url)
-                let ext = candidate.isAudio ? "m4a" : "mp4"
+                let isMP3Audio = candidate.isAudio && (
+                    cleanURL.pathExtension.lowercased() == "mp3"
+                        || cleanURL.absoluteString.lowercased().contains(".mp3")
+                        || candidate.qualityLabel?.lowercased().contains("mp3") == true
+                )
+                let ext = candidate.isAudio ? (isMP3Audio ? "mp3" : "m4a") : "mp4"
                 var tempURL = await fetchTempFile(from: cleanURL, ext: ext, headers: primaryHeaders, using: ephemeralDataSession, pageURL: pageRef)
                 if tempURL == nil && !Task.isCancelled {
                     tempURL = await fetchTempFile(from: cleanURL, ext: ext, headers: minimalHeaders, using: ephemeralDataSession, pageURL: pageRef)

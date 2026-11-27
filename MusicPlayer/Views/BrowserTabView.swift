@@ -244,7 +244,7 @@ struct WebViewWrapper: UIViewRepresentable {
             return extractYTVideoIdFromURL(window.location.href);
         }
 
-        var ytCardSelector = 'ytm-video-with-context-renderer, ytm-compact-video-renderer, ytm-compact-radio-renderer, ytm-radio-renderer, ytm-rich-item-renderer, ytm-grid-video-renderer, ytm-playlist-video-renderer, ytm-playlist-panel-video-renderer, ytm-compact-playlist-renderer, ytm-media-item, ytm-video-card-renderer, ytm-reel-item-renderer, ytm-shorts-lockup-view-model, ytd-video-renderer, ytd-compact-video-renderer, ytd-radio-renderer, ytd-compact-radio-renderer, ytd-rich-item-renderer, ytd-grid-video-renderer, yt-lockup-view-model';
+        var ytCardSelector = 'ytm-video-with-context-renderer, ytm-compact-video-renderer, ytm-compact-radio-renderer, ytm-radio-renderer, ytm-rich-item-renderer, ytm-grid-video-renderer, ytm-playlist-video-renderer, ytm-playlist-panel-video-renderer, ytm-compact-playlist-renderer, ytm-media-item, ytm-video-card-renderer, ytm-reel-item-renderer, ytm-shorts-lockup-view-model, ytm-lockup-view-model, ytm-reel-shelf-renderer, ytm-compact-show-renderer, ytd-video-renderer, ytd-compact-video-renderer, ytd-radio-renderer, ytd-compact-radio-renderer, ytd-rich-item-renderer, ytd-grid-video-renderer, yt-lockup-view-model';
 
         function extractCardTitle(el) {
             try {
@@ -620,7 +620,7 @@ struct WebViewWrapper: UIViewRepresentable {
                         }
                     }
                     if (node.matches && node.matches(ytCardSelector) && node.querySelector) {
-                        var inner = node.querySelector('a[href*="/watch"], a[href*="/shorts/"], a[href*="youtu.be/"], a[href*="/v/"]');
+                        var inner = node.querySelector('a[href*="/watch"], a[href*="/shorts/"], a[href*="youtu.be/"], a[href*="/v/"], a[href*="/embed/"], a[href*="/live/"]');
                         if (inner) {
                             var iHref = inner.getAttribute('href') || inner.href || '';
                             var iVid = extractYTVideoIdFromURL(iHref);
@@ -643,7 +643,7 @@ struct WebViewWrapper: UIViewRepresentable {
                     }
                     var card = t.closest(ytCardSelector);
                     if (card && card.querySelector) {
-                        var cLink = card.querySelector('a[href*="/watch"], a[href*="/shorts/"], a[href*="youtu.be/"], a[href*="/v/"]');
+                        var cLink = card.querySelector('a[href*="/watch"], a[href*="/shorts/"], a[href*="youtu.be/"], a[href*="/v/"], a[href*="/embed/"], a[href*="/live/"]');
                         if (cLink) {
                             var cHref = cLink.getAttribute('href') || cLink.href || '';
                             var cVid = extractYTVideoIdFromURL(cHref);
@@ -1214,6 +1214,14 @@ struct WebViewWrapper: UIViewRepresentable {
             let isMainOrBlank = navigationAction.targetFrame?.isMainFrame ?? true
             if isMainOrBlank, let rawTargetURL = navigationAction.request.url {
                 let targetURL = YouTubeStreamResolver.unwrapGoogleRedirectIfNeeded(rawTargetURL)
+                if lastInterceptYouTubePlayback,
+                   let authWrapped = YouTubeStreamResolver.unwrapLoginContinueYouTubeVideoURL(targetURL) {
+                    DispatchQueue.main.async {
+                        self.onYouTubePlayRequested(authWrapped.videoID, authWrapped.watchURL, nil, nil)
+                    }
+                    decisionHandler(.cancel)
+                    return
+                }
                 if lastInterceptYouTubePlayback,
                    YouTubeStreamResolver.isYouTubeURL(targetURL),
                    !(targetURL.path.hasPrefix("/playlist") && !(targetURL.query?.contains("v=") ?? false)),
@@ -2829,7 +2837,12 @@ struct BrowserTabView: View {
                 } else {
                     browser.resumePageMediaControl()
                 }
-                let reason = resolved?.errorReason ?? "Could not resolve downloadable stream for this video."
+                let reason: String
+                if YouTubeStreamResolver.isAgeOrLoginRestrictedReason(resolved?.errorReason) {
+                    reason = "This video is restricted by YouTube and no unrestricted copy was found."
+                } else {
+                    reason = resolved?.errorReason ?? "Could not resolve downloadable stream for this video."
+                }
                 downloadStatus = reason
                 mediaManager.errorMessage = reason
             }
