@@ -50,7 +50,15 @@ struct UserQueueContentView: View {
     var isEmbeddedDarkGlass: Bool = false
     let onAddSongs: () -> Void
 
+    private enum QueuePanelTab: String, CaseIterable {
+        case upNext
+        case discover
+    }
+
     @State private var showAddSongsInline = false
+    @State private var selectedTab: QueuePanelTab = .upNext
+    @State private var discoverQueue = DiscoverQueueService.shared
+    @State private var downloader = WebMediaDownloader.shared
 
     private struct QueuedRow: Identifiable {
         let index: Int
@@ -63,21 +71,38 @@ struct UserQueueContentView: View {
     }
 
     private var continueItems: [MediaItem] {
-        mediaManager.continuePlayingItems
+        if mediaManager.activePlaylistID == nil && queuedRows.isEmpty && discoverQueue.isAutoPlayEnabled {
+            return []
+        }
+        return mediaManager.continuePlayingItems
     }
 
     var body: some View {
         List {
             controlsAndNowPlayingSection
-            userQueueSection
-            if !continueItems.isEmpty {
-                continuePlayingSection
+            if selectedTab == .upNext {
+                userQueueSection
+                if !continueItems.isEmpty {
+                    continuePlayingSection
+                }
+            } else {
+                discoverQueueSection
             }
         }
         .listStyle(.plain)
         .scrollContentBackground(isEmbeddedDarkGlass ? .hidden : .automatic)
         .sheet(isPresented: $showAddSongsInline) {
             QueueSongPickerSheet()
+        }
+        .onAppear {
+            if let current = mediaManager.currentItem {
+                discoverQueue.refreshIfNeeded(for: current)
+            }
+        }
+        .onChange(of: mediaManager.currentItem?.relativePath) { _, _ in
+            if let current = mediaManager.currentItem {
+                discoverQueue.refreshIfNeeded(for: current)
+            }
         }
     }
 
@@ -165,7 +190,41 @@ struct UserQueueContentView: View {
                 .padding(.vertical, 4)
                 .listRowBackground(isEmbeddedDarkGlass ? Color.white.opacity(0.08) : Color.secondary.opacity(0.08))
             }
+
+            HStack(spacing: 8) {
+                queueTabPill(.upNext, title: "Playing Next (\(queuedRows.count))", systemImage: "list.bullet")
+                queueTabPill(.discover, title: "Discover Queue (\(discoverQueue.items.count))", systemImage: "sparkles")
+            }
+            .listRowBackground(Color.clear)
+            .listRowSeparator(.hidden)
         }
+    }
+
+    private func queueTabPill(_ tab: QueuePanelTab, title: String, systemImage: String) -> some View {
+        let isSelected = selectedTab == tab
+        return Button {
+            AppHaptics.selection()
+            withAnimation(.easeInOut(duration: 0.18)) {
+                selectedTab = tab
+            }
+            if tab == .discover, let current = mediaManager.currentItem {
+                discoverQueue.refreshIfNeeded(for: current, force: discoverQueue.items.isEmpty)
+            }
+        } label: {
+            Label(title, systemImage: systemImage)
+                .font(.caption.weight(.semibold))
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 7)
+        }
+        .buttonStyle(.borderedProminent)
+        .tint(
+            isSelected
+            ? (tab == .discover ? Color.purple : Color.accentColor)
+            : (isEmbeddedDarkGlass ? Color.white.opacity(0.14) : Color.secondary.opacity(0.22))
+        )
+        .foregroundStyle(isSelected ? .white : (isEmbeddedDarkGlass ? .white.opacity(0.85) : .primary))
     }
 
     private var userQueueSection: some View {
@@ -182,7 +241,7 @@ struct UserQueueContentView: View {
                         .font(.caption)
                         .foregroundStyle(isEmbeddedDarkGlass ? .white.opacity(0.65) : .secondary)
                         .multilineTextAlignment(.center)
-                    HStack(spacing: 8) {
+                    HStack(spacing: 6) {
                         Button {
                             if isEmbeddedDarkGlass {
                                 showAddSongsInline = true
@@ -191,7 +250,9 @@ struct UserQueueContentView: View {
                             }
                         } label: {
                             Label("Browse Songs", systemImage: "plus.circle.fill")
-                                .font(.caption.weight(.semibold))
+                                .font(.caption2.weight(.semibold))
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.75)
                         }
                         .buttonStyle(.borderedProminent)
                         .controlSize(.small)
@@ -200,9 +261,29 @@ struct UserQueueContentView: View {
                             mediaManager.reshuffleQueueWithAllCachedMedia()
                         } label: {
                             Label("Reshuffle All", systemImage: "shuffle")
-                                .font(.caption.weight(.semibold))
+                                .font(.caption2.weight(.semibold))
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.75)
                         }
                         .buttonStyle(.bordered)
+                        .controlSize(.small)
+
+                        Button {
+                            AppHaptics.selection()
+                            withAnimation(.easeInOut(duration: 0.18)) {
+                                selectedTab = .discover
+                            }
+                            if let current = mediaManager.currentItem {
+                                discoverQueue.refreshIfNeeded(for: current, force: discoverQueue.items.isEmpty)
+                            }
+                        } label: {
+                            Label("Discover Queue", systemImage: "sparkles")
+                                .font(.caption2.weight(.semibold))
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.75)
+                        }
+                        .buttonStyle(.bordered)
+                        .tint(.purple)
                         .controlSize(.small)
                     }
                 }
@@ -352,6 +433,222 @@ struct UserQueueContentView: View {
                 .font(.caption.weight(.bold))
                 .foregroundStyle(isEmbeddedDarkGlass ? .white.opacity(0.75) : .secondary)
         }
+    }
+
+    private var discoverQueueSection: some View {
+        Section {
+            if let status = discoverQueue.statusMessage {
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text(status)
+                        .font(.caption)
+                        .foregroundStyle(isEmbeddedDarkGlass ? .white.opacity(0.85) : .secondary)
+                }
+                .listRowBackground(Color.clear)
+            }
+
+            if discoverQueue.items.isEmpty && discoverQueue.isLoading {
+                VStack(spacing: 10) {
+                    ProgressView()
+                    Text("Finding related songs & videos...")
+                        .font(.caption)
+                        .foregroundStyle(isEmbeddedDarkGlass ? .white.opacity(0.7) : .secondary)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 24)
+                .listRowBackground(Color.clear)
+            } else if discoverQueue.items.isEmpty {
+                VStack(spacing: 10) {
+                    Image(systemName: "sparkles")
+                        .font(.title2)
+                        .foregroundStyle(isEmbeddedDarkGlass ? .white.opacity(0.7) : .secondary)
+                    Text("No Related Tracks Yet")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(isEmbeddedDarkGlass ? .white : .primary)
+                    Text("Play a song or video to populate related tracks automatically.")
+                        .font(.caption)
+                        .foregroundStyle(isEmbeddedDarkGlass ? .white.opacity(0.65) : .secondary)
+                        .multilineTextAlignment(.center)
+                    if let current = mediaManager.currentItem {
+                        Button("Try Refresh") {
+                            discoverQueue.refreshIfNeeded(for: current, force: true)
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                    }
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 20)
+                .listRowBackground(Color.clear)
+            } else {
+                ForEach(discoverQueue.items) { item in
+                    discoverQueueRow(item)
+                }
+            }
+        } header: {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text(
+                        discoverQueue.seedTitle.isEmpty
+                        ? "Discover Queue"
+                        : "Discover Queue • Related to \(discoverQueue.seedTitle)"
+                    )
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(isEmbeddedDarkGlass ? .white.opacity(0.85) : .secondary)
+                    .lineLimit(1)
+
+                    Spacer()
+
+                    Button {
+                        AppHaptics.selection()
+                        discoverQueue.isAutoPlayEnabled.toggle()
+                    } label: {
+                        Label(
+                            discoverQueue.isAutoPlayEnabled ? "Auto-Play On" : "Auto-Play Off",
+                            systemImage: discoverQueue.isAutoPlayEnabled ? "infinity.circle.fill" : "infinity.circle"
+                        )
+                        .font(.caption2.weight(.semibold))
+                    }
+                    .tint(discoverQueue.isAutoPlayEnabled ? .purple : .secondary)
+
+                    if let current = mediaManager.currentItem {
+                        Button {
+                            discoverQueue.refreshIfNeeded(for: current, force: true)
+                        } label: {
+                            Image(systemName: "arrow.clockwise")
+                                .font(.caption.weight(.semibold))
+                        }
+                        .tint(isEmbeddedDarkGlass ? .white.opacity(0.8) : .accentColor)
+                    }
+                }
+            }
+        }
+    }
+
+    private func discoverQueueRow(_ item: DiscoverQueueItem) -> some View {
+        let localMatch = item.localRelativePath.flatMap { path in
+            mediaManager.items.first(where: { $0.relativePath == path })
+        }
+        return HStack(spacing: 12) {
+            Button {
+                Task {
+                    await discoverQueue.playItem(item)
+                }
+            } label: {
+                HStack(spacing: 12) {
+                    if let localMatch {
+                        MediaArtworkView(
+                            item: localMatch,
+                            image: mediaManager.thumbnails[localMatch.relativePath],
+                            cornerRadius: 8,
+                            iconSize: 15
+                        )
+                        .frame(width: 44, height: 44)
+                    } else if let artURL = item.artworkURL {
+                        AsyncImage(url: artURL) { phase in
+                            switch phase {
+                            case .success(let image):
+                                image
+                                    .resizable()
+                                    .aspectRatio(contentMode: .fill)
+                            default:
+                                ZStack {
+                                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                        .fill(Color.secondary.opacity(0.22))
+                                    Image(systemName: item.kind == .video ? "film" : "music.note")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+                        .frame(width: 44, height: 44)
+                        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    } else {
+                        ZStack {
+                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                .fill(Color.secondary.opacity(0.22))
+                            Image(systemName: item.kind == .video ? "film" : "music.note")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        .frame(width: 44, height: 44)
+                    }
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(item.title)
+                            .font(.subheadline.weight(.medium))
+                            .foregroundStyle(isEmbeddedDarkGlass ? .white : .primary)
+                            .lineLimit(1)
+
+                        HStack(spacing: 5) {
+                            Text(item.kind.rawValue)
+                                .font(.system(size: 9, weight: .bold))
+                                .padding(.horizontal, 5)
+                                .padding(.vertical, 1)
+                                .background(
+                                    (item.kind == .video ? Color.blue : Color.purple).opacity(0.22),
+                                    in: Capsule()
+                                )
+                                .foregroundStyle(item.kind == .video ? Color.cyan : Color.purple)
+
+                            if localMatch != nil {
+                                Text("Offline")
+                                    .font(.system(size: 9, weight: .bold))
+                                    .padding(.horizontal, 5)
+                                    .padding(.vertical, 1)
+                                    .background(Color.green.opacity(0.2), in: Capsule())
+                                    .foregroundStyle(.green)
+                            }
+
+                            Text(item.artist)
+                                .font(.caption)
+                                .foregroundStyle(isEmbeddedDarkGlass ? .white.opacity(0.68) : .secondary)
+                                .lineLimit(1)
+                        }
+                    }
+
+                    Spacer()
+
+                    if let dur = item.durationText {
+                        Text(dur)
+                            .font(.caption2.monospacedDigit())
+                            .foregroundStyle(isEmbeddedDarkGlass ? .white.opacity(0.55) : .secondary)
+                    }
+                }
+            }
+            .buttonStyle(.plain)
+
+            Menu {
+                Button {
+                    Task { await discoverQueue.playItem(item) }
+                } label: {
+                    Label("Play Now", systemImage: "play.fill")
+                }
+                Button {
+                    discoverQueue.enqueueNext(item, downloader: downloader)
+                } label: {
+                    Label("Play Next", systemImage: "text.line.first.and.arrowtriangle.forward")
+                }
+                Button {
+                    discoverQueue.addToPersonalQueue(item, downloader: downloader)
+                } label: {
+                    Label("Add to Queue", systemImage: "text.append")
+                }
+                if localMatch == nil && item.videoID != nil {
+                    Button {
+                        discoverQueue.cacheOffline(item, downloader: downloader)
+                    } label: {
+                        Label("Save Offline", systemImage: "arrow.down.circle")
+                    }
+                }
+            } label: {
+                Image(systemName: "plus.circle")
+                    .font(.subheadline)
+                    .foregroundStyle(isEmbeddedDarkGlass ? .white.opacity(0.75) : .secondary)
+            }
+        }
+        .listRowBackground(Color.clear)
     }
 }
 

@@ -1533,9 +1533,19 @@ enum SongAudioListener {
                     isSpokenDialogue: line.isSpokenDialogue
                 )
             }
-            var copy = lyrics
-            copy.lines = scaledLines
-            return copy
+            return ResolvedTrackLyrics(
+                cacheKey: lyrics.cacheKey,
+                trackTitle: lyrics.trackTitle,
+                artistName: lyrics.artistName,
+                isTimeSynced: lyrics.isTimeSynced,
+                sourceLabel: lyrics.sourceLabel,
+                attributionText: lyrics.attributionText,
+                syncedOffsetSeconds: lyrics.syncedOffsetSeconds,
+                tempoScale: lyrics.tempoScale,
+                expectedDurationSeconds: lyrics.expectedDurationSeconds,
+                alignmentVersion: lyrics.alignmentVersion,
+                lines: scaledLines
+            )
         }()
 
         // Also check Piecewise Section-DTW (Viterbi) across >= 4s LRC singing gaps so mid-video skits or extra pauses

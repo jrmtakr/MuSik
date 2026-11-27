@@ -730,7 +730,12 @@ final class MediaManager {
     }
 
     @discardableResult
-    func play(_ item: MediaItem, inPlaylist playlistID: UUID? = nil, keepExternalQueue: Bool = false) -> Bool {
+    func play(
+        _ item: MediaItem,
+        inPlaylist playlistID: UUID? = nil,
+        keepExternalQueue: Bool = false,
+        fromDiscoverQueue: Bool = false
+    ) -> Bool {
         guard FileManager.default.fileExists(atPath: item.fileURL.path) else {
             errorMessage = "File not found: \(item.fileName)"
             loadLocalFiles()
@@ -766,6 +771,7 @@ final class MediaManager {
         if item.prefersFFmpegEngine {
             playWithFFmpegEngine(url: item.fileURL, item: item, headers: nil)
             Task { @MainActor in WholeSongAIService.shared.handlePlaybackStarted(for: item) }
+            DiscoverQueueService.shared.handleNowPlayingChanged(to: item, fromDiscoverQueue: fromDiscoverQueue)
             return true
         }
 
@@ -781,6 +787,7 @@ final class MediaManager {
                 updateNowPlayingInfo(for: item)
                 syncWrappedSessionStart(for: item)
                 Task { @MainActor in WholeSongAIService.shared.handlePlaybackStarted(for: item) }
+                DiscoverQueueService.shared.handleNowPlayingChanged(to: item, fromDiscoverQueue: fromDiscoverQueue)
                 return true
             } catch {
                 equalizerPlayer.stop()
@@ -807,6 +814,7 @@ final class MediaManager {
         updateNowPlayingInfo(for: item)
         syncWrappedSessionStart(for: item)
         Task { @MainActor in WholeSongAIService.shared.handlePlaybackStarted(for: item) }
+        DiscoverQueueService.shared.handleNowPlayingChanged(to: item, fromDiscoverQueue: fromDiscoverQueue)
         return true
     }
 
@@ -816,7 +824,11 @@ final class MediaManager {
         artist: String? = nil,
         headers: [String: String]? = nil,
         isVideo: Bool,
-        keepExternalQueue: Bool = false
+        keepExternalQueue: Bool = false,
+        sourceVideoID: String? = nil,
+        artworkURL: URL? = nil,
+        durationSeconds: Double? = nil,
+        fromDiscoverQueue: Bool = false
     ) {
         if !keepExternalQueue {
             externalQueueNextHandler = nil
@@ -830,17 +842,34 @@ final class MediaManager {
 
         let ext = url.pathExtension.lowercased()
         let syntheticExt = MediaItem.allSupportedExtensions.contains(ext) ? ext : (isVideo ? "mp4" : "m4a")
+        let remotePath = "__remote__/\(url.absoluteString)"
         let virtualItem = MediaItem(
             id: UUID(),
             name: title,
             fileName: "\(title).\(syntheticExt)",
-            relativePath: "__remote__/\(url.absoluteString)",
+            relativePath: remotePath,
             fileSize: 0,
             dateAdded: .now,
-            durationSeconds: nil,
+            durationSeconds: durationSeconds,
             metadataTitle: title,
             artist: artist ?? url.host
         )
+        if let sourceVideoID, !sourceVideoID.isEmpty {
+            var entry = customMetadataByPath[remotePath] ?? CustomTrackMetadata()
+            entry.sourceVideoID = sourceVideoID
+            customMetadataByPath[remotePath] = entry
+        }
+        if let artworkURL, thumbnails[remotePath] == nil {
+            Task { @MainActor [weak self] in
+                guard let self,
+                      let (data, _) = try? await URLSession.shared.data(from: artworkURL),
+                      let img = UIImage(data: data) else { return }
+                self.thumbnails[remotePath] = img
+                if self.currentItem?.relativePath == remotePath {
+                    self.updateNowPlayingInfo(for: virtualItem)
+                }
+            }
+        }
         Task { @MainActor in WholeSongAIService.shared.handlePlaybackStarted(for: virtualItem) }
 
         let isHLS = ext == "m3u8" || url.absoluteString.lowercased().contains(".m3u8")
@@ -857,7 +886,7 @@ final class MediaManager {
             player = newPlayer
             currentItem = virtualItem
             currentTime = 0
-            duration = 0
+            duration = durationSeconds ?? 0
 
             attachTimeObserver(to: newPlayer, playerItem: playerItem)
             attachEndObserver(to: playerItem)
@@ -877,6 +906,7 @@ final class MediaManager {
         } else {
             playWithFFmpegEngine(url: url, item: virtualItem, headers: headers)
         }
+        DiscoverQueueService.shared.handleNowPlayingChanged(to: virtualItem, fromDiscoverQueue: fromDiscoverQueue)
     }
 
     private func playWithFFmpegEngine(url: URL, item: MediaItem, headers: [String: String]?) {
@@ -1394,6 +1424,23 @@ final class MediaManager {
             return
         }
 
+        // Automatically play from Discover Queue when the user's personal Up Next queue is empty.
+        if activePlaylistID == nil && upNextPaths.isEmpty && DiscoverQueueService.shared.isAutoPlayEnabled {
+            let seed = currentItem
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let started = await DiscoverQueueService.shared.playNextAutoDiscover(after: seed)
+                if !started {
+                    self.playFallbackActiveQueue(fromQueueOnly: fromQueueOnly)
+                }
+            }
+            return
+        }
+
+        playFallbackActiveQueue(fromQueueOnly: fromQueueOnly)
+    }
+
+    private func playFallbackActiveQueue(fromQueueOnly: Bool) {
         let rawQueue = activeQueue
         let readyQueue = rawQueue.filter { !isAIAnalysisPending(for: $0) }
         let queue = readyQueue.isEmpty ? rawQueue : readyQueue
@@ -1422,6 +1469,11 @@ final class MediaManager {
         let nextIndex = index + 1
         if nextIndex < queue.count {
             play(queue[nextIndex], inPlaylist: activePlaylistID)
+        } else if !fromQueueOnly && activePlaylistID != nil && repeatMode == .off && DiscoverQueueService.shared.isAutoPlayEnabled {
+            let seed = currentItem
+            Task { @MainActor in
+                _ = await DiscoverQueueService.shared.playNextAutoDiscover(after: seed)
+            }
         } else if !fromQueueOnly, let first = queue.first {
             play(first, inPlaylist: activePlaylistID)
         } else {
@@ -3398,6 +3450,30 @@ final class MediaManager {
             return
         }
 
+        // Automatically play from Discover Queue when the user's personal Up Next queue is empty.
+        if activePlaylistID == nil && upNextPaths.isEmpty && DiscoverQueueService.shared.isAutoPlayEnabled {
+            let seed = currentItem
+            isPlaying = false
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let started = await DiscoverQueueService.shared.playNextAutoDiscover(after: seed)
+                if !started {
+                    if self.activeQueue.count > 1 {
+                        self.playFallbackActiveQueue(fromQueueOnly: false)
+                    } else if self.repeatMode == .all {
+                        self.seek(to: 0)
+                        self.resume()
+                    } else {
+                        self.seek(to: 0)
+                        if let currentItem = self.currentItem {
+                            self.updateNowPlayingInfo(for: currentItem)
+                        }
+                    }
+                }
+            }
+            return
+        }
+
         if activeQueue.count > 1 {
             playNext(fromQueueOnly: false)
             return
@@ -3492,6 +3568,9 @@ final class MediaManager {
         if let queued = upNextItems.first {
             return (queued, true)
         }
+        if activePlaylistID == nil && upNextPaths.isEmpty && DiscoverQueueService.shared.isAutoPlayEnabled {
+            return nil
+        }
         let queue = activeQueue
         guard !queue.isEmpty else { return nil }
         if isShuffleEnabled, queue.count > 1 {
@@ -3551,6 +3630,7 @@ final class MediaManager {
             updateNowPlayingInfo(for: nextItem)
             syncWrappedSessionStart(for: nextItem)
             Task { @MainActor in WholeSongAIService.shared.handlePlaybackStarted(for: nextItem) }
+            DiscoverQueueService.shared.handleNowPlayingChanged(to: nextItem, fromDiscoverQueue: false)
         } catch {
             crossfadeTriggeredForCurrentTrack = true
         }
