@@ -771,7 +771,8 @@ final class MediaManager {
         if item.prefersFFmpegEngine {
             playWithFFmpegEngine(url: item.fileURL, item: item, headers: nil)
             Task { @MainActor in WholeSongAIService.shared.handlePlaybackStarted(for: item) }
-            DiscoverQueueService.shared.handleNowPlayingChanged(to: item, fromDiscoverQueue: fromDiscoverQueue)
+            DiscoverQueueService.syncModeForNewTrack(fromDiscoverQueue: fromDiscoverQueue)
+            Task { @MainActor in DiscoverQueueService.shared.handleNowPlayingChanged(to: item, fromDiscoverQueue: fromDiscoverQueue) }
             return true
         }
 
@@ -787,7 +788,8 @@ final class MediaManager {
                 updateNowPlayingInfo(for: item)
                 syncWrappedSessionStart(for: item)
                 Task { @MainActor in WholeSongAIService.shared.handlePlaybackStarted(for: item) }
-                DiscoverQueueService.shared.handleNowPlayingChanged(to: item, fromDiscoverQueue: fromDiscoverQueue)
+                DiscoverQueueService.syncModeForNewTrack(fromDiscoverQueue: fromDiscoverQueue)
+                Task { @MainActor in DiscoverQueueService.shared.handleNowPlayingChanged(to: item, fromDiscoverQueue: fromDiscoverQueue) }
                 return true
             } catch {
                 equalizerPlayer.stop()
@@ -814,7 +816,8 @@ final class MediaManager {
         updateNowPlayingInfo(for: item)
         syncWrappedSessionStart(for: item)
         Task { @MainActor in WholeSongAIService.shared.handlePlaybackStarted(for: item) }
-        DiscoverQueueService.shared.handleNowPlayingChanged(to: item, fromDiscoverQueue: fromDiscoverQueue)
+        DiscoverQueueService.syncModeForNewTrack(fromDiscoverQueue: fromDiscoverQueue)
+        Task { @MainActor in DiscoverQueueService.shared.handleNowPlayingChanged(to: item, fromDiscoverQueue: fromDiscoverQueue) }
         return true
     }
 
@@ -906,7 +909,8 @@ final class MediaManager {
         } else {
             playWithFFmpegEngine(url: url, item: virtualItem, headers: headers)
         }
-        DiscoverQueueService.shared.handleNowPlayingChanged(to: virtualItem, fromDiscoverQueue: fromDiscoverQueue)
+        DiscoverQueueService.syncModeForNewTrack(fromDiscoverQueue: fromDiscoverQueue)
+        Task { @MainActor in DiscoverQueueService.shared.handleNowPlayingChanged(to: virtualItem, fromDiscoverQueue: fromDiscoverQueue) }
     }
 
     private func playWithFFmpegEngine(url: URL, item: MediaItem, headers: [String: String]?) {
@@ -1356,8 +1360,13 @@ final class MediaManager {
     }
 
     func playQueuedItem(at queueIndex: Int) {
-        if DiscoverQueueService.shared.isPlayingFromDiscoverQueue {
-            DiscoverQueueService.shared.switchToPersonalQueue(playNextNow: false)
+        if DiscoverQueueService.isPlayingFromDiscoverQueueSync {
+            if let restoredPlaylistID = DiscoverQueueService.exitDiscoverModeSync() {
+                activePlaylistID = restoredPlaylistID
+            }
+            Task { @MainActor in
+                DiscoverQueueService.shared.switchToPersonalQueue(playNextNow: false, restorePlaylistID: false)
+            }
         }
         let currentUpNext = upNextItems
         guard currentUpNext.indices.contains(queueIndex) else { return }
@@ -1418,7 +1427,7 @@ final class MediaManager {
 
     func playNext(fromQueueOnly: Bool = false) {
         AppHaptics.light()
-        if DiscoverQueueService.shared.isPlayingFromDiscoverQueue {
+        if DiscoverQueueService.isPlayingFromDiscoverQueueSync {
             let seed = currentItem
             Task { @MainActor [weak self] in
                 guard let self else { return }
@@ -1440,7 +1449,7 @@ final class MediaManager {
         }
 
         // Automatically play from Discover Queue when the user's personal Up Next queue is empty.
-        if activePlaylistID == nil && upNextPaths.isEmpty && DiscoverQueueService.shared.isAutoPlayEnabled {
+        if activePlaylistID == nil && upNextPaths.isEmpty && DiscoverQueueService.isAutoPlayEnabledSync {
             let seed = currentItem
             Task { @MainActor [weak self] in
                 guard let self else { return }
@@ -1484,7 +1493,7 @@ final class MediaManager {
         let nextIndex = index + 1
         if nextIndex < queue.count {
             play(queue[nextIndex], inPlaylist: activePlaylistID)
-        } else if !fromQueueOnly && activePlaylistID != nil && repeatMode == .off && DiscoverQueueService.shared.isAutoPlayEnabled {
+        } else if !fromQueueOnly && activePlaylistID != nil && repeatMode == .off && DiscoverQueueService.isAutoPlayEnabledSync {
             let seed = currentItem
             Task { @MainActor in
                 _ = await DiscoverQueueService.shared.playNextAutoDiscover(after: seed)
@@ -1502,7 +1511,7 @@ final class MediaManager {
             seek(to: 0)
             return
         }
-        if DiscoverQueueService.shared.isPlayingFromDiscoverQueue {
+        if DiscoverQueueService.isPlayingFromDiscoverQueueSync {
             Task { @MainActor [weak self] in
                 let handled = await DiscoverQueueService.shared.playPreviousDiscoverItem()
                 if !handled {
@@ -3465,7 +3474,7 @@ final class MediaManager {
             return
         }
 
-        if DiscoverQueueService.shared.isPlayingFromDiscoverQueue {
+        if DiscoverQueueService.isPlayingFromDiscoverQueueSync {
             let seed = currentItem
             isPlaying = false
             Task { @MainActor [weak self] in
@@ -3496,7 +3505,7 @@ final class MediaManager {
         }
 
         // Automatically play from Discover Queue when the user's personal Up Next queue is empty.
-        if activePlaylistID == nil && upNextPaths.isEmpty && DiscoverQueueService.shared.isAutoPlayEnabled {
+        if activePlaylistID == nil && upNextPaths.isEmpty && DiscoverQueueService.isAutoPlayEnabledSync {
             let seed = currentItem
             isPlaying = false
             Task { @MainActor [weak self] in
@@ -3610,13 +3619,13 @@ final class MediaManager {
     }
 
     private func peekNextCrossfadeCandidate() -> (item: MediaItem, fromUserQueue: Bool)? {
-        if DiscoverQueueService.shared.isPlayingFromDiscoverQueue {
+        if DiscoverQueueService.isPlayingFromDiscoverQueueSync {
             return nil
         }
         if let queued = upNextItems.first {
             return (queued, true)
         }
-        if activePlaylistID == nil && upNextPaths.isEmpty && DiscoverQueueService.shared.isAutoPlayEnabled {
+        if activePlaylistID == nil && upNextPaths.isEmpty && DiscoverQueueService.isAutoPlayEnabledSync {
             return nil
         }
         let queue = activeQueue
@@ -3678,7 +3687,8 @@ final class MediaManager {
             updateNowPlayingInfo(for: nextItem)
             syncWrappedSessionStart(for: nextItem)
             Task { @MainActor in WholeSongAIService.shared.handlePlaybackStarted(for: nextItem) }
-            DiscoverQueueService.shared.handleNowPlayingChanged(to: nextItem, fromDiscoverQueue: false)
+            DiscoverQueueService.syncModeForNewTrack(fromDiscoverQueue: false)
+            Task { @MainActor in DiscoverQueueService.shared.handleNowPlayingChanged(to: nextItem, fromDiscoverQueue: false) }
         } catch {
             crossfadeTriggeredForCurrentTrack = true
         }

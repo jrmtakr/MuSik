@@ -29,10 +29,87 @@ struct DiscoverQueueItem: Identifiable, Hashable, Sendable {
 final class DiscoverQueueService {
     static let shared = DiscoverQueueService()
 
-    private static let autoPlayDefaultsKey = "musicplayer.discoverQueueAutoPlay"
+    nonisolated private static let autoPlayDefaultsKey = "musicplayer.discoverQueueAutoPlay"
     private static let remixClientVersion = "1.20250311.01.00"
     private static let webUA =
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+
+    private final class PlaybackModeSyncBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var playingFromDiscoverQueue = false
+        private var autoPlayEnabled: Bool
+        private var savedPlaylistID: UUID?
+
+        init(autoPlayEnabled: Bool) {
+            self.autoPlayEnabled = autoPlayEnabled
+        }
+
+        func snapshotPlayingFromDiscoverQueue() -> Bool {
+            lock.lock()
+            let val = playingFromDiscoverQueue
+            lock.unlock()
+            return val
+        }
+
+        func setPlayingFromDiscoverQueue(_ value: Bool) {
+            lock.lock()
+            playingFromDiscoverQueue = value
+            if !value {
+                savedPlaylistID = nil
+            }
+            lock.unlock()
+        }
+
+        func snapshotAutoPlayEnabled() -> Bool {
+            lock.lock()
+            let val = autoPlayEnabled
+            lock.unlock()
+            return val
+        }
+
+        func setAutoPlayEnabled(_ value: Bool) {
+            lock.lock()
+            autoPlayEnabled = value
+            lock.unlock()
+        }
+
+        func setSavedPlaylistID(_ id: UUID?) {
+            lock.lock()
+            savedPlaylistID = id
+            lock.unlock()
+        }
+
+        func exitDiscoverAndConsumeSavedPlaylist() -> UUID? {
+            lock.lock()
+            playingFromDiscoverQueue = false
+            let id = savedPlaylistID
+            savedPlaylistID = nil
+            lock.unlock()
+            return id
+        }
+    }
+
+    nonisolated private static let syncModeBox = PlaybackModeSyncBox(
+        autoPlayEnabled: UserDefaults.standard.object(forKey: autoPlayDefaultsKey) == nil
+            ? true
+            : UserDefaults.standard.bool(forKey: autoPlayDefaultsKey)
+    )
+
+    nonisolated static var isPlayingFromDiscoverQueueSync: Bool {
+        syncModeBox.snapshotPlayingFromDiscoverQueue()
+    }
+
+    nonisolated static var isAutoPlayEnabledSync: Bool {
+        syncModeBox.snapshotAutoPlayEnabled()
+    }
+
+    nonisolated static func syncModeForNewTrack(fromDiscoverQueue: Bool) {
+        syncModeBox.setPlayingFromDiscoverQueue(fromDiscoverQueue)
+    }
+
+    nonisolated static func exitDiscoverModeSync() -> UUID? {
+        syncModeBox.exitDiscoverAndConsumeSavedPlaylist()
+    }
 
     var items: [DiscoverQueueItem] = []
     var seedKey: String = ""
@@ -45,12 +122,21 @@ final class DiscoverQueueService {
 
     /// True whenever playback is actively advancing through Discover Queue instead of the user's
     /// personal Playing Next / playlist queue (preserved intact until the user switches back).
-    var isPlayingFromDiscoverQueue: Bool = false
-    @ObservationIgnored var savedPlaylistIDBeforeDiscover: UUID?
+    var isPlayingFromDiscoverQueue: Bool = false {
+        didSet {
+            Self.syncModeBox.setPlayingFromDiscoverQueue(isPlayingFromDiscoverQueue)
+        }
+    }
+    @ObservationIgnored var savedPlaylistIDBeforeDiscover: UUID? {
+        didSet {
+            Self.syncModeBox.setSavedPlaylistID(savedPlaylistIDBeforeDiscover)
+        }
+    }
 
     var isAutoPlayEnabled: Bool {
         didSet {
             UserDefaults.standard.set(isAutoPlayEnabled, forKey: Self.autoPlayDefaultsKey)
+            Self.syncModeBox.setAutoPlayEnabled(isAutoPlayEnabled)
         }
     }
 
@@ -79,10 +165,10 @@ final class DiscoverQueueService {
         isPlayingFromDiscoverQueue = true
     }
 
-    func switchToPersonalQueue(playNextNow: Bool = false) {
+    func switchToPersonalQueue(playNextNow: Bool = false, restorePlaylistID: Bool = true) {
         let mm = MediaManager.shared
         isPlayingFromDiscoverQueue = false
-        if let saved = savedPlaylistIDBeforeDiscover {
+        if restorePlaylistID, let saved = savedPlaylistIDBeforeDiscover {
             mm.activePlaylistID = saved
         }
         savedPlaylistIDBeforeDiscover = nil
