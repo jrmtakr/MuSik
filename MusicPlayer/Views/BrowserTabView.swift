@@ -193,8 +193,9 @@ struct WebViewWrapper: UIViewRepresentable {
                     return seg && seg.length >= 8 ? seg : null;
                 }
                 if (h !== 'youtube.com' && !h.endsWith('.youtube.com')) return null;
-                // Keep playlist browse pages (/playlist?list=...) navigable unless clicking an actual watch/shorts video.
-                if (u.pathname.indexOf('/playlist') === 0 && !u.searchParams.get('v')) return null;
+                // Keep playlist browse & account/sign-in pages navigable unless clicking an actual watch/shorts video.
+                if u.pathname.indexOf('/playlist') === 0 && !u.searchParams.get('v') { return null; }
+                if (u.pathname.indexOf('/signin') === 0 || u.pathname.indexOf('/ServiceLogin') === 0 || u.pathname.indexOf('/account') === 0) { return null; }
                 var v = u.searchParams.get('v');
                 if (v) return v;
                 var m = u.pathname.match(/\\/(shorts|embed|live)\\/([a-zA-Z0-9_-]{8,16})/);
@@ -1318,6 +1319,11 @@ struct BrowserTabView: View {
                                 urlString = newURL.absoluteString
                             }
                             browserStore.updateActiveTab(urlString: newURL.absoluteString, title: newTitle)
+                            if YouTubeStreamResolver.isYouTubeURL(newURL) || newURL.host?.lowercased().contains("google.com") == true {
+                                Task { @MainActor in
+                                    _ = await BrowserYouTubeResolver.youtubeCookieHeader(forceRefresh: true, timeoutSeconds: 0.8)
+                                }
+                            }
                             if let vid = YouTubeStreamResolver.extractVideoID(from: newURL) {
                                 handleYouTubeVideoNavigation(
                                     videoID: vid,
@@ -2575,21 +2581,42 @@ struct BrowserTabView: View {
                 if let browserResolved = await BrowserYouTubeResolver.shared.resolveStreamsInBrowser(
                     videoID: videoID,
                     priorityLockTimeout: 3.0
-                ), !browserResolved.result.streams.isEmpty {
-                    resolved = browserResolved.result
-                } else if currentYouTubeVideoID == videoID, !browser.detectedStreams.isEmpty {
+                ) {
+                    if !browserResolved.result.streams.isEmpty {
+                        resolved = browserResolved.result
+                    } else if resolved == nil || resolved?.title == "YouTube Video" {
+                        resolved = browserResolved.result
+                    }
+                }
+                if (resolved == nil || resolved?.streams.isEmpty == true),
+                   currentYouTubeVideoID == videoID,
+                   !browser.detectedStreams.isEmpty {
                     let passiveReachable = await YouTubeStreamResolver.filterReachableStreams(browser.detectedStreams)
                     if !passiveReachable.isEmpty {
                         let fallbackTitle = hintTitle ?? (browser.pageTitle.isEmpty ? "YouTube Video" : browser.pageTitle)
                         resolved = YouTubeResolvedResult(
                             videoID: videoID,
                             title: fallbackTitle,
-                            author: nil,
-                            durationSeconds: nil,
+                            author: resolved?.author,
+                            durationSeconds: resolved?.durationSeconds,
                             streams: passiveReachable,
                             errorReason: nil
                         )
                     }
+                }
+            }
+
+            if !Task.isCancelled,
+               activeYouTubeResolveToken == resolveToken,
+               (resolved == nil || resolved?.streams.isEmpty == true) {
+                resolvingStepLabel = "Finding verified unrestricted stream..."
+                if let unrestricted = await YouTubeStreamResolver.resolveAgeRestrictedFallback(
+                    videoID: videoID,
+                    title: resolved?.title ?? hintTitle,
+                    author: resolved?.author,
+                    durationSeconds: resolved?.durationSeconds
+                ), !unrestricted.streams.isEmpty {
+                    resolved = unrestricted
                 }
             }
 

@@ -241,6 +241,7 @@ final class WebMediaDownloader {
         if !isNativeGoogleClient, let ref = media.referer, !ref.isEmpty, reqHeaders["Referer"] == nil {
             reqHeaders["Referer"] = ref
         }
+        let explicitPageURL = media.referer.flatMap(URL.init(string:))
         if media.isHLS {
             startHLSDownload(
                 from: media.url,
@@ -249,7 +250,8 @@ final class WebMediaDownloader {
                 headers: reqHeaders,
                 maxDurationMinutes: maxDurationMinutes,
                 destinationFolder: destinationFolder,
-                fallbackStreams: fallbackStreams
+                fallbackStreams: fallbackStreams,
+                audioOnly: media.isAudio
             )
         } else if let pairedAudio = media.pairedAudioURL {
             downloadMuxedVideoAndAudio(
@@ -261,7 +263,8 @@ final class WebMediaDownloader {
                 knownDurationSeconds: media.durationSeconds,
                 maxDurationMinutes: maxDurationMinutes,
                 destinationFolder: destinationFolder,
-                fallbackStreams: fallbackStreams
+                fallbackStreams: fallbackStreams,
+                pageURL: explicitPageURL
             )
         } else {
             downloadDirectMedia(
@@ -272,7 +275,8 @@ final class WebMediaDownloader {
                 knownDurationSeconds: media.durationSeconds,
                 maxDurationMinutes: maxDurationMinutes,
                 destinationFolder: destinationFolder,
-                fallbackStreams: fallbackStreams
+                fallbackStreams: fallbackStreams,
+                pageURL: explicitPageURL
             )
         }
     }
@@ -286,7 +290,8 @@ final class WebMediaDownloader {
         headers: [String: String]? = nil,
         maxDurationMinutes: Int = 0,
         destinationFolder: String = "",
-        fallbackStreams: [DetectedBrowserMedia] = []
+        fallbackStreams: [DetectedBrowserMedia] = [],
+        audioOnly: Bool = false
     ) {
         let targetURL = selectedVariantURL ?? url
         guard !activeDownloads.contains(where: { $0.sourceURL == url || $0.sourceURL == targetURL }) else {
@@ -311,7 +316,8 @@ final class WebMediaDownloader {
                 minimumBitrate: minimumBitrate,
                 headers: mergedHeaders,
                 maxDurationSeconds: maxSec,
-                destinationFolder: destinationFolder
+                destinationFolder: destinationFolder,
+                audioOnly: audioOnly
             )
             activeAsyncTasks.removeValue(forKey: downloadID)
 
@@ -343,7 +349,8 @@ final class WebMediaDownloader {
         knownDurationSeconds: Double? = nil,
         maxDurationMinutes: Int = 0,
         destinationFolder: String = "",
-        fallbackStreams: [DetectedBrowserMedia] = []
+        fallbackStreams: [DetectedBrowserMedia] = [],
+        pageURL: URL? = nil
     ) {
         let cleanVideo = cleanedStreamURLIfRangeFragment(videoURL)
         let cleanAudio = cleanedStreamURLIfRangeFragment(audioURL)
@@ -377,7 +384,7 @@ final class WebMediaDownloader {
             }
 
             let tracker = AdaptiveProgressTracker()
-            let pageRef = headers?["Referer"].flatMap(URL.init(string:))
+            let pageRef = pageURL ?? headers?["Referer"].flatMap(URL.init(string:))
             async let videoData = fetchTempFile(from: cleanVideo, ext: "mp4", headers: mergedHeaders, using: session, pageURL: pageRef) { frac in
                 let combined = tracker.update(video: frac)
                 Task { @MainActor [weak self] in
@@ -753,7 +760,8 @@ final class WebMediaDownloader {
         knownDurationSeconds: Double? = nil,
         maxDurationMinutes: Int = 0,
         destinationFolder: String = "",
-        fallbackStreams: [DetectedBrowserMedia] = []
+        fallbackStreams: [DetectedBrowserMedia] = [],
+        pageURL: URL? = nil
     ) {
         if let maxMin = maxDurationMinutes > 0 ? maxDurationMinutes : nil,
            let known = knownDurationSeconds, known.isFinite, known > 0,
@@ -802,7 +810,7 @@ final class WebMediaDownloader {
                     activeAsyncTasks.removeValue(forKey: downloadID)
                     activeDownloads.removeAll { $0.id == downloadID }
                 }
-                let pageRef = headers?["Referer"].flatMap(URL.init(string:))
+                let pageRef = pageURL ?? headers?["Referer"].flatMap(URL.init(string:))
                 guard let tempFile = await fetchTempFile(from: normalizedURL, ext: inferredExt, headers: mergedHeaders, using: session, pageURL: pageRef, onProgress: { frac in
                     Task { @MainActor [weak self] in
                         self?.updateProgress(downloadID: downloadID, fraction: min(0.95, 0.02 + frac * 0.93))
@@ -987,7 +995,23 @@ final class WebMediaDownloader {
             if ytResult == nil || (ytResult?.streams.isEmpty ?? true) {
                 MediaManager.shared.statusMessage = "Resolving YouTube stream in browser..."
                 if let browserResolved = await BrowserYouTubeResolver.shared.resolveStreamsInBrowser(videoID: videoID) {
-                    ytResult = browserResolved.result
+                    if !browserResolved.result.streams.isEmpty {
+                        ytResult = browserResolved.result
+                    } else if ytResult == nil || (ytResult?.title == "YouTube Video") {
+                        ytResult = browserResolved.result
+                    }
+                }
+            }
+
+            if ytResult == nil || (ytResult?.streams.isEmpty ?? true) {
+                MediaManager.shared.statusMessage = "Finding verified match for restricted stream..."
+                if let altResult = await YouTubeStreamResolver.resolveAgeRestrictedFallback(
+                    videoID: videoID,
+                    title: ytResult?.title ?? title,
+                    author: ytResult?.author,
+                    durationSeconds: ytResult?.durationSeconds
+                ), !altResult.streams.isEmpty {
+                    ytResult = altResult
                 }
             }
 
@@ -1185,7 +1209,8 @@ final class WebMediaDownloader {
         minimumBitrate: Double?,
         headers: [String: String],
         maxDurationSeconds: Double?,
-        destinationFolder: String
+        destinationFolder: String,
+        audioOnly: Bool = false
     ) async -> Bool {
         guard let output = await downloadHLSToTempFile(
             downloadID: downloadID,
@@ -1194,7 +1219,7 @@ final class WebMediaDownloader {
             minimumBitrate: minimumBitrate,
             headers: headers,
             maxDurationSeconds: maxDurationSeconds,
-            audioOnly: false
+            audioOnly: audioOnly
         ) else {
             return Task.isCancelled
         }
@@ -1406,6 +1431,7 @@ final class WebMediaDownloader {
         let session = ephemeralDataSession
 
         let batchSize = 4
+        let fallbackPageURL = headers["Referer"].flatMap(URL.init(string:))
         for startIdx in stride(from: 0, to: totalCount, by: batchSize) {
             if Task.isCancelled {
                 activeDownloads.removeAll { $0.id == downloadID }
@@ -1421,10 +1447,16 @@ final class WebMediaDownloader {
                             var req = URLRequest(url: seg.url)
                             headers.forEach { req.setValue($0.value, forHTTPHeaderField: $0.key) }
                             req.timeoutInterval = 25
-                            guard let (rawData, resp) = try? await session.data(for: req),
-                                  let http = resp as? HTTPURLResponse,
-                                  (200...299).contains(http.statusCode),
-                                  !rawData.isEmpty else {
+                            var fetchedData: Data?
+                            if let (data, resp) = try? await session.data(for: req),
+                               let http = resp as? HTTPURLResponse,
+                               (200...299).contains(http.statusCode),
+                               !data.isEmpty {
+                                fetchedData = data
+                            } else if seg.url.host?.lowercased().contains("googlevideo.com") == true {
+                                fetchedData = await BrowserYouTubeResolver.shared.fetchDataInBrowser(url: seg.url, pageURL: fallbackPageURL)
+                            }
+                            guard let rawData = fetchedData, !rawData.isEmpty else {
                                 if attempt == 0 {
                                     try? await Task.sleep(for: .milliseconds(250))
                                     continue
@@ -1593,12 +1625,18 @@ final class WebMediaDownloader {
         var req = URLRequest(url: url)
         headers.forEach { req.setValue($0.value, forHTTPHeaderField: $0.key) }
         req.timeoutInterval = 20
-        guard let (data, resp) = try? await ephemeralDataSession.data(for: req),
-              let http = resp as? HTTPURLResponse,
-              (200...299).contains(http.statusCode) else {
-            return nil
+        if let (data, resp) = try? await ephemeralDataSession.data(for: req),
+           let http = resp as? HTTPURLResponse,
+           (200...299).contains(http.statusCode) {
+            return data
         }
-        return data
+        if url.host?.lowercased().contains("googlevideo.com") == true || headers["Referer"] != nil {
+            return await BrowserYouTubeResolver.shared.fetchDataInBrowser(
+                url: url,
+                pageURL: headers["Referer"].flatMap(URL.init(string:))
+            )
+        }
+        return nil
     }
 
     private func parseM3U8(text: String, baseURL: URL) -> ParsedHLSMedia {
@@ -2223,12 +2261,13 @@ final class WebMediaDownloader {
                 continue
             }
 
+            let pageRef = candidate.referer.flatMap(URL.init(string:))
             if let pairedAudio = candidate.pairedAudioURL {
                 if preferAudioOnly {
                     let cleanAudio = cleanedStreamURLIfRangeFragment(pairedAudio)
-                    var tempAudio = await fetchTempFile(from: cleanAudio, ext: "m4a", headers: primaryHeaders, using: ephemeralDataSession)
+                    var tempAudio = await fetchTempFile(from: cleanAudio, ext: "m4a", headers: primaryHeaders, using: ephemeralDataSession, pageURL: pageRef)
                     if tempAudio == nil && !Task.isCancelled {
-                        tempAudio = await fetchTempFile(from: cleanAudio, ext: "m4a", headers: minimalHeaders, using: ephemeralDataSession)
+                        tempAudio = await fetchTempFile(from: cleanAudio, ext: "m4a", headers: minimalHeaders, using: ephemeralDataSession, pageURL: pageRef)
                     }
                     guard let aURL = tempAudio else {
                         continue
@@ -2253,8 +2292,8 @@ final class WebMediaDownloader {
 
                 let cleanVideo = cleanedStreamURLIfRangeFragment(candidate.url)
                 let cleanAudio = cleanedStreamURLIfRangeFragment(pairedAudio)
-                async let videoTemp = fetchTempFile(from: cleanVideo, ext: "mp4", headers: primaryHeaders, using: ephemeralDataSession)
-                async let audioTemp = fetchTempFile(from: cleanAudio, ext: "m4a", headers: primaryHeaders, using: ephemeralDataSession)
+                async let videoTemp = fetchTempFile(from: cleanVideo, ext: "mp4", headers: primaryHeaders, using: ephemeralDataSession, pageURL: pageRef)
+                async let audioTemp = fetchTempFile(from: cleanAudio, ext: "m4a", headers: primaryHeaders, using: ephemeralDataSession, pageURL: pageRef)
                 guard let vURL = await videoTemp, let aURL = await audioTemp else {
                     continue
                 }
@@ -2296,9 +2335,9 @@ final class WebMediaDownloader {
             } else {
                 let cleanURL = cleanedStreamURLIfRangeFragment(candidate.url)
                 let ext = candidate.isAudio ? "m4a" : "mp4"
-                var tempURL = await fetchTempFile(from: cleanURL, ext: ext, headers: primaryHeaders, using: ephemeralDataSession)
+                var tempURL = await fetchTempFile(from: cleanURL, ext: ext, headers: primaryHeaders, using: ephemeralDataSession, pageURL: pageRef)
                 if tempURL == nil && !Task.isCancelled {
-                    tempURL = await fetchTempFile(from: cleanURL, ext: ext, headers: minimalHeaders, using: ephemeralDataSession)
+                    tempURL = await fetchTempFile(from: cleanURL, ext: ext, headers: minimalHeaders, using: ephemeralDataSession, pageURL: pageRef)
                 }
                 guard let downloadedURL = tempURL else { continue }
                 if Task.isCancelled {

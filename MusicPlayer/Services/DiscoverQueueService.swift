@@ -366,16 +366,30 @@ final class DiscoverQueueService {
             return false
         }
 
-        let resolved = await YouTubeStreamResolver.resolveStreams(for: watchURL)
-        let candidateStreams: [DetectedBrowserMedia]
-        if let streams = resolved?.streams, !streams.isEmpty {
-            candidateStreams = streams
-        } else if let browserResolved = await BrowserYouTubeResolver.shared.resolveStreamsInBrowser(
-            videoID: videoID,
-            priorityLockTimeout: 2.5
-        ), !browserResolved.result.streams.isEmpty {
-            candidateStreams = browserResolved.result.streams
-        } else {
+        var resolved = await YouTubeStreamResolver.resolveStreams(for: watchURL)
+        if resolved == nil || (resolved?.streams.isEmpty ?? true) {
+            if let browserResolved = await BrowserYouTubeResolver.shared.resolveStreamsInBrowser(
+                videoID: videoID,
+                priorityLockTimeout: 2.5
+            ) {
+                if !browserResolved.result.streams.isEmpty {
+                    resolved = browserResolved.result
+                } else if resolved == nil {
+                    resolved = browserResolved.result
+                }
+            }
+        }
+        if resolved == nil || (resolved?.streams.isEmpty ?? true) {
+            if let alt = await YouTubeStreamResolver.resolveAgeRestrictedFallback(
+                videoID: videoID,
+                title: resolved?.title ?? discoverItem.title,
+                author: resolved?.author ?? discoverItem.artist,
+                durationSeconds: resolved?.durationSeconds ?? discoverItem.durationSeconds
+            ), !alt.streams.isEmpty {
+                resolved = alt
+            }
+        }
+        guard let candidateStreams = resolved?.streams, !candidateStreams.isEmpty else {
             return false
         }
 
@@ -469,7 +483,24 @@ final class DiscoverQueueService {
         }
         statusMessage = "Caching \(discoverItem.title)..."
         Task { @MainActor in
-            guard let resolved = await YouTubeStreamResolver.resolveStreams(for: watchURL),
+            var resolved = await YouTubeStreamResolver.resolveStreams(for: watchURL)
+            if resolved == nil || (resolved?.streams.isEmpty ?? true) {
+                if let browserResolved = await BrowserYouTubeResolver.shared.resolveStreamsInBrowser(
+                    videoID: videoID,
+                    priorityLockTimeout: 3.0
+                ), !browserResolved.result.streams.isEmpty {
+                    resolved = browserResolved.result
+                }
+            }
+            if resolved == nil || (resolved?.streams.isEmpty ?? true) {
+                resolved = await YouTubeStreamResolver.resolveAgeRestrictedFallback(
+                    videoID: videoID,
+                    title: discoverItem.title,
+                    author: discoverItem.artist,
+                    durationSeconds: discoverItem.durationSeconds
+                )
+            }
+            guard let resolved,
                   let primary = (discoverItem.kind == .video
                     ? resolved.streams.first(where: { !$0.isAudio })
                     : resolved.streams.first(where: { $0.isAudio })) ?? resolved.streams.first else {

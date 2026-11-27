@@ -1189,8 +1189,22 @@ final class PlaylistImportManager {
         if resolvedResult == nil || (resolvedResult?.streams.isEmpty ?? true) {
             usedBrowser = true
             if let browserResolved = await BrowserYouTubeResolver.shared.resolveStreamsInBrowser(videoID: resolvedVideoID) {
-                resolvedResult = browserResolved.result
+                if !browserResolved.result.streams.isEmpty || resolvedResult == nil {
+                    resolvedResult = browserResolved.result
+                }
                 cookiesHeader = browserResolved.cookiesHeader ?? cookiesHeader
+            }
+            guard stillValid() else { return }
+        }
+
+        if resolvedResult == nil || (resolvedResult?.streams.isEmpty ?? true) {
+            if let unrestricted = await YouTubeStreamResolver.resolveAgeRestrictedFallback(
+                videoID: resolvedVideoID,
+                title: resolvedResult?.title ?? track.title,
+                author: resolvedResult?.author ?? track.artist,
+                durationSeconds: resolvedResult?.durationSeconds
+            ), !unrestricted.streams.isEmpty {
+                resolvedResult = unrestricted
             }
             guard stillValid() else { return }
         }

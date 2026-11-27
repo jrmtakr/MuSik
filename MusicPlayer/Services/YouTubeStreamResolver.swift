@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 struct YouTubeResolvedResult {
@@ -254,7 +255,7 @@ enum YouTubeStreamResolver {
             _ = await evaluateCandidate(cleanAndroid)
         }
 
-        // 2. IOS + MWEB fallbacks concurrently when ANDROID yields no reachable streams.
+        // 2. IOS + authenticated WEB/MWEB/TVHTML5 fallbacks concurrently when ANDROID yields no reachable streams.
         if workingResults.isEmpty, !Task.isCancelled {
             let resolvedCookies: String?
             if let cookiesHeader, !cookiesHeader.isEmpty {
@@ -262,6 +263,14 @@ enum YouTubeStreamResolver {
             } else {
                 resolvedCookies = await BrowserYouTubeResolver.youtubeCookieHeader(timeoutSeconds: 0.7)
             }
+            let signedIn = hasSignedInCookies(resolvedCookies)
+            let sts: Int?
+            if signedIn {
+                sts = await currentSignatureTimestamp()
+            } else {
+                sts = nil
+            }
+
             async let iosTask = fetchInnerTube(
                 videoID: videoID,
                 sourcePageURL: url,
@@ -289,15 +298,46 @@ enum YouTubeStreamResolver {
                     "platform": "MOBILE"
                 ],
                 visitorData: visitorDataForRequests,
-                cookiesHeader: resolvedCookies
+                cookiesHeader: resolvedCookies,
+                signatureTimestamp: sts
             )
-            let iosResult = await iosTask
-            let mwebResult = await mwebTask
+            async let webAuthTask = fetchInnerTubeIfEnabled(
+                signedIn,
+                videoID: videoID,
+                sourcePageURL: url,
+                clientName: "WEB",
+                clientHeaderID: "1",
+                clientVersion: "2.20250311.00.00",
+                userAgent: desktopBrowserUserAgent,
+                extraClientFields: [:],
+                visitorData: visitorDataForRequests,
+                cookiesHeader: resolvedCookies,
+                signatureTimestamp: sts
+            )
+            async let tvAuthTask = fetchInnerTubeIfEnabled(
+                signedIn,
+                videoID: videoID,
+                sourcePageURL: url,
+                clientName: "TVHTML5",
+                clientHeaderID: "7",
+                clientVersion: "7.20250311.13.00",
+                userAgent: "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/Version",
+                extraClientFields: [:],
+                visitorData: visitorDataForRequests,
+                cookiesHeader: resolvedCookies,
+                signatureTimestamp: sts
+            )
+
+            let (iosResult, mwebResult, webAuthResult, tvAuthResult) = await (iosTask, mwebTask, webAuthTask, tvAuthTask)
             if !(await evaluateCandidate(iosResult)) {
-                _ = await evaluateCandidate(mwebResult)
+                if !(await evaluateCandidate(mwebResult)) {
+                    if !(await evaluateCandidate(webAuthResult)) {
+                        _ = await evaluateCandidate(tvAuthResult)
+                    }
+                }
             }
 
-            // 3. Mobile web watch HTML fallback (also seeds visitorData cache for future requests).
+            // 3. Mobile web watch HTML fallback (also seeds visitorData cache & extracts age-gated metadata).
             if workingResults.isEmpty, !Task.isCancelled {
                 let mobileHTML = await fetchMobileWebHTML(
                     videoID: videoID,
@@ -483,6 +523,134 @@ enum YouTubeStreamResolver {
         )
     }
 
+    private static let desktopBrowserUserAgent =
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+
+    private static func hasSignedInCookies(_ cookiesHeader: String?) -> Bool {
+        guard let cookiesHeader, !cookiesHeader.isEmpty else { return false }
+        return cookiesHeader.contains("SAPISID=")
+            || cookiesHeader.contains("__Secure-3PAPISID=")
+            || cookiesHeader.contains("__Secure-1PAPISID=")
+    }
+
+    private static func sapisidAuthHeaders(cookiesHeader: String?, origin: String) -> [String: String] {
+        guard let cookiesHeader, !cookiesHeader.isEmpty else { return [:] }
+        var cookiesByName: [String: String] = [:]
+        for pair in cookiesHeader.split(separator: ";") {
+            guard let eq = pair.firstIndex(of: "=") else { continue }
+            let name = pair[..<eq].trimmingCharacters(in: .whitespacesAndNewlines)
+            let val = pair[pair.index(after: eq)...].trimmingCharacters(in: .whitespacesAndNewlines)
+            if !name.isEmpty, !val.isEmpty {
+                cookiesByName[name] = val
+            }
+        }
+
+        let ts = Int(Date().timeIntervalSince1970)
+        var tokens: [String] = []
+        let mappings: [(cookie: String, scheme: String)] = [
+            ("SAPISID", "SAPISIDHASH"),
+            ("__Secure-1PAPISID", "SAPISID1PHASH"),
+            ("__Secure-3PAPISID", "SAPISID3PHASH")
+        ]
+        for entry in mappings {
+            guard let secret = cookiesByName[entry.cookie], !secret.isEmpty else { continue }
+            let input = "\(ts) \(secret) \(origin)"
+            let digest = Insecure.SHA1.hash(data: Data(input.utf8))
+            let hex = digest.map { String(format: "%02x", $0) }.joined()
+            tokens.append("\(entry.scheme) \(ts)_\(hex)")
+        }
+        if tokens.isEmpty, let fallback = cookiesByName["__Secure-3PAPISID"] ?? cookiesByName["SAPISID"] {
+            let input = "\(ts) \(fallback) \(origin)"
+            let digest = Insecure.SHA1.hash(data: Data(input.utf8))
+            let hex = digest.map { String(format: "%02x", $0) }.joined()
+            tokens.append("SAPISIDHASH \(ts)_\(hex)")
+        }
+        guard !tokens.isEmpty else { return [:] }
+        return [
+            "Authorization": tokens.joined(separator: " "),
+            "X-Origin": origin,
+            "X-Goog-AuthUser": "0"
+        ]
+    }
+
+    private actor SignatureTimestampCache {
+        private var cached: (sts: Int, fetchedAt: Date)?
+
+        func current() -> Int? {
+            guard let cached, Date().timeIntervalSince(cached.fetchedAt) < 1800 else { return nil }
+            return cached.sts
+        }
+
+        func store(_ sts: Int) {
+            cached = (sts, Date())
+        }
+    }
+
+    private static let stsCache = SignatureTimestampCache()
+
+    private static func currentSignatureTimestamp() async -> Int? {
+        if let existing = await stsCache.current() {
+            return existing
+        }
+        guard let embedURL = URL(string: "https://www.youtube.com/embed/dQw4w9WgXcQ") else { return nil }
+        var req = URLRequest(url: embedURL)
+        req.timeoutInterval = 4.0
+        req.setValue(desktopBrowserUserAgent, forHTTPHeaderField: "User-Agent")
+        guard let (htmlData, _) = try? await URLSession.shared.data(for: req),
+              let html = String(data: htmlData, encoding: .utf8),
+              let jsMatch = html.range(of: #""jsUrl"\s*:\s*"([^"]+)""#, options: .regularExpression) else {
+            return nil
+        }
+        let quoted = String(html[jsMatch])
+        guard let lastQuote = quoted.dropLast().lastIndex(of: "\"") else { return nil }
+        let rawPath = String(quoted[quoted.index(after: lastQuote)..<quoted.index(before: quoted.endIndex)])
+            .replacingOccurrences(of: "\\/", with: "/")
+        let jsURLString = rawPath.hasPrefix("http") ? rawPath : "https://www.youtube.com\(rawPath)"
+        guard let jsURL = URL(string: jsURLString) else { return nil }
+        var jsReq = URLRequest(url: jsURL)
+        jsReq.timeoutInterval = 5.0
+        jsReq.setValue(desktopBrowserUserAgent, forHTTPHeaderField: "User-Agent")
+        guard let (jsData, _) = try? await URLSession.shared.data(for: jsReq),
+              let jsText = String(data: jsData, encoding: .utf8),
+              let stsRange = jsText.range(of: #"signatureTimestamp\s*:\s*(\d+)"#, options: .regularExpression) else {
+            return nil
+        }
+        let digits = jsText[stsRange].components(separatedBy: CharacterSet.decimalDigits.inverted).joined()
+        if let val = Int(digits), val > 10000 {
+            await stsCache.store(val)
+            return val
+        }
+        return nil
+    }
+
+    private static func fetchInnerTubeIfEnabled(
+        _ enabled: Bool,
+        videoID: String,
+        sourcePageURL: URL,
+        clientName: String,
+        clientHeaderID: String,
+        clientVersion: String,
+        userAgent: String,
+        extraClientFields: [String: Any],
+        visitorData: String?,
+        cookiesHeader: String?,
+        signatureTimestamp: Int? = nil
+    ) async -> YouTubeResolvedResult? {
+        guard enabled else { return nil }
+        return await fetchInnerTube(
+            videoID: videoID,
+            sourcePageURL: sourcePageURL,
+            clientName: clientName,
+            clientHeaderID: clientHeaderID,
+            clientVersion: clientVersion,
+            userAgent: userAgent,
+            extraClientFields: extraClientFields,
+            visitorData: visitorData,
+            cookiesHeader: cookiesHeader,
+            signatureTimestamp: signatureTimestamp
+        )
+    }
+
     private static func fetchInnerTube(
         videoID: String,
         sourcePageURL: URL,
@@ -492,7 +660,8 @@ enum YouTubeStreamResolver {
         userAgent: String,
         extraClientFields: [String: Any],
         visitorData: String?,
-        cookiesHeader: String?
+        cookiesHeader: String?,
+        signatureTimestamp: Int? = nil
     ) async -> YouTubeResolvedResult? {
         guard let dict = await fetchInnerTubePlayerDict(
             videoID: videoID,
@@ -502,18 +671,23 @@ enum YouTubeStreamResolver {
             userAgent: userAgent,
             extraClientFields: extraClientFields,
             visitorData: visitorData,
-            cookiesHeader: cookiesHeader
+            cookiesHeader: cookiesHeader,
+            signatureTimestamp: signatureTimestamp
         ) else {
             return nil
         }
 
-        let headers = ["User-Agent": userAgent]
+        let isWebClient = clientName == "WEB" || clientName == "MWEB" || clientName == "WEB_REMIX" || clientName == "TVHTML5"
+        var headers = ["User-Agent": userAgent]
+        if isWebClient, let cookiesHeader, !cookiesHeader.isEmpty {
+            headers["Cookie"] = cookiesHeader
+        }
         return parsePlayerResponse(
             dict: dict,
             videoID: videoID,
             sourcePageURL: sourcePageURL,
             headers: headers,
-            includeReferer: false
+            includeReferer: isWebClient
         )
     }
 
@@ -525,9 +699,11 @@ enum YouTubeStreamResolver {
         userAgent: String,
         extraClientFields: [String: Any],
         visitorData: String?,
-        cookiesHeader: String?
+        cookiesHeader: String?,
+        signatureTimestamp: Int? = nil
     ) async -> [String: Any]? {
-        guard let apiURL = URL(string: "https://www.youtube.com/youtubei/v1/player?prettyPrint=false") else {
+        let baseHost = clientName == "MWEB" ? "https://m.youtube.com" : (clientName == "WEB_REMIX" ? "https://music.youtube.com" : "https://www.youtube.com")
+        guard let apiURL = URL(string: "\(baseHost)/youtubei/v1/player?prettyPrint=false") else {
             return nil
         }
 
@@ -542,12 +718,20 @@ enum YouTubeStreamResolver {
         }
         extraClientFields.forEach { clientObj[$0.key] = $0.value }
 
-        let bodyDict: [String: Any] = [
+        var bodyDict: [String: Any] = [
             "videoId": videoID,
             "context": ["client": clientObj],
             "contentCheckOk": true,
             "racyCheckOk": true
         ]
+        if let signatureTimestamp {
+            bodyDict["playbackContext"] = [
+                "contentPlaybackContext": [
+                    "html5Preference": "HTML5_PREF_WANTS",
+                    "signatureTimestamp": signatureTimestamp
+                ]
+            ]
+        }
         guard let bodyData = try? JSONSerialization.data(withJSONObject: bodyDict) else {
             return nil
         }
@@ -558,7 +742,8 @@ enum YouTubeStreamResolver {
         req.timeoutInterval = 8
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.setValue(userAgent, forHTTPHeaderField: "User-Agent")
-        req.setValue("https://www.youtube.com", forHTTPHeaderField: "Origin")
+        req.setValue(baseHost, forHTTPHeaderField: "Origin")
+        req.setValue("\(baseHost)/", forHTTPHeaderField: "Referer")
         req.setValue(clientHeaderID, forHTTPHeaderField: "X-YouTube-Client-Name")
         req.setValue(clientVersion, forHTTPHeaderField: "X-YouTube-Client-Version")
         if let visitorData, !visitorData.isEmpty {
@@ -566,6 +751,8 @@ enum YouTubeStreamResolver {
         }
         if let cookiesHeader, !cookiesHeader.isEmpty {
             req.setValue(cookiesHeader, forHTTPHeaderField: "Cookie")
+            let authHeaders = sapisidAuthHeaders(cookiesHeader: cookiesHeader, origin: baseHost)
+            authHeaders.forEach { req.setValue($0.value, forHTTPHeaderField: $0.key) }
         }
 
         guard let (data, resp) = try? await URLSession.shared.data(for: req),
@@ -927,5 +1114,413 @@ enum YouTubeStreamResolver {
             streams: streams,
             errorReason: streams.isEmpty ? reason : nil
         )
+    }
+
+    // MARK: - Age-Restricted / Confirm-Age Resilient Alternate Resolution
+
+    static func isAgeOrLoginRestrictedReason(_ reason: String?) -> Bool {
+        guard let lower = reason?.lowercased(), !lower.isEmpty else { return false }
+        return lower.contains("confirm your age")
+            || lower.contains("sign in")
+            || lower.contains("inappropriate")
+            || lower.contains("age")
+            || lower.contains("login_required")
+    }
+
+    private actor SoundCloudClientIDCache {
+        private var cached: (id: String, fetchedAt: Date)?
+
+        func current() -> String? {
+            guard let cached, Date().timeIntervalSince(cached.fetchedAt) < 3600 else { return nil }
+            return cached.id
+        }
+
+        func store(_ id: String) {
+            cached = (id, Date())
+        }
+    }
+
+    private static let scClientCache = SoundCloudClientIDCache()
+
+    /// Resolves a verified equivalent public stream (alternate non-restricted upload or SoundCloud match)
+    /// when YouTube blocks a track behind an age-restriction / age-confirmation wall even after sign-in attempts.
+    static func resolveAgeRestrictedFallback(
+        videoID: String,
+        title: String?,
+        author: String?,
+        durationSeconds: Double?
+    ) async -> YouTubeResolvedResult? {
+        let publicMeta = await fetchPublicVideoMetadata(videoID: videoID)
+        let effectiveTitle: String = {
+            if let t = title?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !t.isEmpty,
+               t.caseInsensitiveCompare("YouTube Video") != .orderedSame {
+                return t
+            }
+            return publicMeta.title ?? "YouTube Video"
+        }()
+        let effectiveAuthor = author ?? publicMeta.author
+        let effectiveDuration = durationSeconds ?? publicMeta.durationSeconds
+
+        guard effectiveTitle.caseInsensitiveCompare("YouTube Video") != .orderedSame,
+              !effectiveTitle.isEmpty else {
+            return nil
+        }
+
+        // Clean title & query for accurate matching (strip parenthetical edition noise while keeping song core).
+        let searchQuery = cleanSearchText(effectiveTitle, author: effectiveAuthor)
+        guard !searchQuery.isEmpty else { return nil }
+
+        // 1. Check non-age-restricted YouTube reuploads with matching title + duration first.
+        if let altYT = await resolveNonRestrictedYouTubeAlternative(
+            excludingVideoID: videoID,
+            query: searchQuery,
+            targetTitle: effectiveTitle,
+            targetDuration: effectiveDuration
+        ) {
+            return YouTubeResolvedResult(
+                videoID: videoID,
+                title: effectiveTitle,
+                author: effectiveAuthor ?? altYT.author,
+                durationSeconds: effectiveDuration ?? altYT.durationSeconds,
+                streams: altYT.streams,
+                errorReason: nil
+            )
+        }
+
+        // 2. Check SoundCloud public catalog with strict title + duration verification.
+        if let scStreams = await resolveSoundCloudAlternateStream(
+            query: searchQuery,
+            targetTitle: effectiveTitle,
+            targetAuthor: effectiveAuthor,
+            targetDuration: effectiveDuration
+        ), !scStreams.isEmpty {
+            return YouTubeResolvedResult(
+                videoID: videoID,
+                title: effectiveTitle,
+                author: effectiveAuthor,
+                durationSeconds: effectiveDuration ?? scStreams.first?.durationSeconds,
+                streams: scStreams,
+                errorReason: nil
+            )
+        }
+
+        return nil
+    }
+
+    private static func fetchPublicVideoMetadata(videoID: String) async -> (title: String?, author: String?, durationSeconds: Double?) {
+        var resolvedTitle: String?
+        var resolvedAuthor: String?
+        var resolvedDuration: Double?
+
+        if let oembedURL = URL(string: "https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=\(videoID)&format=json") {
+            var req = URLRequest(url: oembedURL)
+            req.timeoutInterval = 4.0
+            req.setValue(desktopBrowserUserAgent, forHTTPHeaderField: "User-Agent")
+            if let (data, resp) = try? await URLSession.shared.data(for: req),
+               let http = resp as? HTTPURLResponse,
+               (200...299).contains(http.statusCode),
+               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                resolvedTitle = (obj["title"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+                resolvedAuthor = (obj["author_name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
+
+        if resolvedDuration == nil,
+           let watchURL = URL(string: "https://www.youtube.com/watch?v=\(videoID)") {
+            var req = URLRequest(url: watchURL)
+            req.timeoutInterval = 4.5
+            req.setValue(desktopBrowserUserAgent, forHTTPHeaderField: "User-Agent")
+            req.setValue("CONSENT=YES+cb.20210328-17-p0.en+FX+299", forHTTPHeaderField: "Cookie")
+            if let (data, _) = try? await URLSession.shared.data(for: req),
+               let html = String(data: data, encoding: .utf8) {
+                if let match = html.range(of: #""lengthSeconds"\s*:\s*"(\d+)""#, options: .regularExpression) {
+                    let digits = html[match].components(separatedBy: CharacterSet.decimalDigits.inverted).joined()
+                    if let sec = Double(digits), sec > 0 {
+                        resolvedDuration = sec
+                    }
+                }
+                if (resolvedTitle == nil || resolvedTitle?.isEmpty == true),
+                   let tRange = html.range(of: #""title"\s*:\s*"([^"]+)""#, options: .regularExpression) {
+                    let raw = String(html[tRange])
+                    if let firstQ = raw.lastIndex(of: "\"") {
+                        let sub = raw[..<firstQ]
+                        if let prevQ = sub.lastIndex(of: "\"") {
+                            resolvedTitle = String(sub[sub.index(after: prevQ)...])
+                        }
+                    }
+                }
+            }
+        }
+
+        return (resolvedTitle, resolvedAuthor, resolvedDuration)
+    }
+
+    private static func normalizedWordTokens(_ text: String) -> [String] {
+        let folded = text.folding(options: [.diacriticInsensitive, .caseInsensitive], locale: .current)
+        let replaced = folded.replacingOccurrences(of: "$", with: "s")
+        let stopWords: Set<String> = [
+            "the", "and", "with", "feat", "ft", "featuring", "official", "video", "audio",
+            "music", "lyrics", "lyric", "visualizer", "hd", "hq", "prod", "by", "full", "stream"
+        ]
+        let rawTokens = replaced.components(separatedBy: CharacterSet.alphanumerics.inverted)
+        return rawTokens.filter { !$0.isEmpty && !stopWords.contains($0) && $0.count >= 2 }
+    }
+
+    private static func titleTokenOverlap(_ a: String, _ b: String) -> Double {
+        let ta = Set(normalizedWordTokens(a))
+        let tb = Set(normalizedWordTokens(b))
+        guard !ta.isEmpty, !tb.isEmpty else { return 0 }
+        let inter = Double(ta.intersection(tb).count)
+        let denom = Double(min(ta.count, tb.count))
+        return denom > 0 ? inter / denom : 0
+    }
+
+    private static func cleanSearchText(_ rawTitle: String, author: String?) -> String {
+        var cleaned = rawTitle
+            .replacingOccurrences(of: #"\s*[\(\[]\s*(?:official\s*(?:music\s*)?(?:video|audio)|lyrics?|hd|hq|4k|explicit)[^\)\]]*[\)\]]"#, with: " ", options: [.regularExpression, .caseInsensitive])
+            .replacingOccurrences(of: #"\s*(?:ft\.?|feat\.?)\s+"#, with: " ", options: [.regularExpression, .caseInsensitive])
+            .replacingOccurrences(of: "$", with: "s")
+        cleaned = cleaned.replacingOccurrences(of: #"[^\p{L}\p{N}\s-]"#, with: " ", options: .regularExpression)
+        cleaned = cleaned.replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression).trimmingCharacters(in: .whitespacesAndNewlines)
+        if let author, !author.isEmpty {
+            let authorTokens = Set(normalizedWordTokens(author))
+            let titleTokens = Set(normalizedWordTokens(cleaned))
+            if !authorTokens.isEmpty && authorTokens.isDisjoint(with: titleTokens) && !author.lowercased().contains("topic") {
+                return "\(author) \(cleaned)"
+            }
+        }
+        return cleaned
+    }
+
+    private static func resolveNonRestrictedYouTubeAlternative(
+        excludingVideoID: String,
+        query: String,
+        targetTitle: String,
+        targetDuration: Double?
+    ) async -> YouTubeResolvedResult? {
+        let hits = await PlaylistURLImporter.searchYouTubeTracks(query: query, limit: 6)
+        for hit in hits {
+            guard hit.videoID != excludingVideoID else { continue }
+            if let targetDuration, targetDuration > 15,
+               let hitDur = hit.durationSeconds, hitDur > 0 {
+                let tol = max(8.0, targetDuration * 0.05)
+                guard abs(hitDur - targetDuration) <= tol else { continue }
+            }
+            let overlap = titleTokenOverlap(targetTitle, hit.title)
+            guard overlap >= 0.72 else { continue }
+            guard let altURL = URL(string: "https://www.youtube.com/watch?v=\(hit.videoID)") else { continue }
+
+            let android = await fetchInnerTube(
+                videoID: hit.videoID,
+                sourcePageURL: altURL,
+                clientName: "ANDROID",
+                clientHeaderID: "3",
+                clientVersion: androidClientVersion,
+                userAgent: androidClientUserAgent,
+                extraClientFields: ["osName": "Android", "osVersion": "14", "androidSdkVersion": 34],
+                visitorData: nil,
+                cookiesHeader: nil
+            )
+            if let streams = android?.streams, !streams.isEmpty {
+                let reachable = await filterReachableStreams(streams)
+                if !reachable.isEmpty {
+                    return YouTubeResolvedResult(
+                        videoID: hit.videoID,
+                        title: hit.title,
+                        author: android?.author ?? hit.artist,
+                        durationSeconds: android?.durationSeconds ?? hit.durationSeconds,
+                        streams: reachable,
+                        errorReason: nil
+                    )
+                }
+            }
+        }
+        return nil
+    }
+
+    private static func resolveSoundCloudAlternateStream(
+        query: String,
+        targetTitle: String,
+        targetAuthor: String?,
+        targetDuration: Double?
+    ) async -> [DetectedBrowserMedia]? {
+        guard let encoded = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+              let searchURL = URL(string: "https://soundcloud.com/search/sounds?q=\(encoded)") else {
+            return nil
+        }
+
+        var sReq = URLRequest(url: searchURL)
+        sReq.timeoutInterval = 5.0
+        sReq.setValue(desktopBrowserUserAgent, forHTTPHeaderField: "User-Agent")
+        guard let (sData, sResp) = try? await URLSession.shared.data(for: sReq),
+              let sHTTP = sResp as? HTTPURLResponse,
+              (200...299).contains(sHTTP.statusCode),
+              let searchHTML = String(data: sData, encoding: .utf8) else {
+            return nil
+        }
+
+        let bannedRoots: Set<String> = [
+            "search", "discover", "you", "settings", "terms-of-use", "pages", "charts",
+            "popular", "upload", "jobs", "people", "pro", "go", "signin", "signup",
+            "stream", "stations", "mobile", "imprint", "messages", "notifications", "sets"
+        ]
+        guard let pathRegex = try? NSRegularExpression(pattern: #"href="(/[a-zA-Z0-9_-]{2,60}/[a-zA-Z0-9_-]{2,80})""#) else {
+            return nil
+        }
+        let matches = pathRegex.matches(in: searchHTML, range: NSRange(searchHTML.startIndex..., in: searchHTML))
+        var seenPaths = Set<String>()
+        var candidateURLs: [(url: URL, slugScore: Double)] = []
+        let targetTokens = Set(normalizedWordTokens(targetTitle))
+        for m in matches {
+            guard let r = Range(m.range(at: 1), in: searchHTML) else { continue }
+            let path = String(searchHTML[r])
+            let parts = path.split(separator: "/").map(String.init)
+            guard parts.count == 2,
+                  !bannedRoots.contains(parts[0].lowercased()),
+                  !bannedRoots.contains(parts[1].lowercased()),
+                  seenPaths.insert(path).inserted,
+                  let fullURL = URL(string: "https://soundcloud.com\(path)") else {
+                continue
+            }
+            let slugOverlap = titleTokenOverlap(targetTitle, parts[1].replacingOccurrences(of: "-", with: " "))
+            candidateURLs.append((fullURL, slugOverlap))
+        }
+        candidateURLs.sort { $0.slugScore > $1.slugScore }
+
+        for entry in candidateURLs.prefix(4) {
+            if Task.isCancelled { return nil }
+            var tReq = URLRequest(url: entry.url)
+            tReq.timeoutInterval = 5.0
+            tReq.setValue(desktopBrowserUserAgent, forHTTPHeaderField: "User-Agent")
+            guard let (tData, tResp) = try? await URLSession.shared.data(for: tReq),
+                  let tHTTP = tResp as? HTTPURLResponse,
+                  (200...299).contains(tHTTP.statusCode),
+                  let html = String(data: tData, encoding: .utf8) else {
+                continue
+            }
+
+            // Extract track duration & title to guard strictly against wrong clips.
+            var trackDur: Double?
+            if let dRange = html.range(of: #""full_duration"\s*:\s*(\d+)"#, options: .regularExpression) {
+                let digits = html[dRange].components(separatedBy: CharacterSet.decimalDigits.inverted).joined()
+                if let ms = Double(digits), ms > 0 {
+                    trackDur = ms / 1000.0
+                }
+            }
+            if let targetDuration, targetDuration > 15 {
+                guard let td = trackDur, td > 15 else { continue }
+                let tol = max(6.0, targetDuration * 0.04)
+                guard abs(td - targetDuration) <= tol else { continue }
+            }
+
+            var pageTitle = ""
+            if let titleRange = html.range(of: #"<title>([^<]+)</title>"#, options: .regularExpression) {
+                pageTitle = String(html[titleRange])
+                    .replacingOccurrences(of: "<title>", with: "")
+                    .replacingOccurrences(of: "</title>", with: "")
+                    .replacingOccurrences(of: "Stream ", with: "")
+                    .replacingOccurrences(of: "&amp;", with: "&")
+                    .replacingOccurrences(of: "&#39;", with: "'")
+                    .replacingOccurrences(of: "&#x27;", with: "'")
+                    .replacingOccurrences(of: "&quot;", with: "\"")
+            }
+            let overlap = max(entry.slugScore, titleTokenOverlap(targetTitle, pageTitle))
+            guard overlap >= 0.50 || targetTokens.isSubset(of: Set(normalizedWordTokens(pageTitle))) else {
+                continue
+            }
+
+            var trackAuth = ""
+            if let taRange = html.range(of: #""track_authorization"\s*:\s*"([^"]+)""#, options: .regularExpression) {
+                let slice = String(html[taRange])
+                if let q = slice.dropLast().lastIndex(of: "\"") {
+                    trackAuth = String(slice[slice.index(after: q)..<slice.index(before: slice.endIndex)])
+                }
+            }
+
+            // Prefer progressive HTTP audio first, then HLS playlist.
+            var transcodings: [String] = []
+            if let transRegex = try? NSRegularExpression(pattern: #""url"\s*:\s*"(https://api-v2\.soundcloud\.com/media/[^"]+)""#) {
+                let tm = transRegex.matches(in: html, range: NSRange(html.startIndex..., in: html))
+                for m in tm {
+                    if let rr = Range(m.range(at: 1), in: html) {
+                        transcodings.append(String(html[rr]))
+                    }
+                }
+            }
+            guard !transcodings.isEmpty else { continue }
+            let orderedTrans = transcodings.filter { $0.contains("/progressive") } + transcodings.filter { !$0.contains("/progressive") }
+
+            guard let clientID = await resolveSoundCloudClientID(fromHTML: html) else { continue }
+
+            for transURLStr in orderedTrans {
+                let sep = transURLStr.contains("?") ? "&" : "?"
+                var resolveStr = "\(transURLStr)\(sep)client_id=\(clientID)"
+                if !trackAuth.isEmpty,
+                   let encAuth = trackAuth.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) {
+                    resolveStr += "&track_authorization=\(encAuth)"
+                }
+                guard let resolveURL = URL(string: resolveStr) else { continue }
+                var apiReq = URLRequest(url: resolveURL)
+                apiReq.timeoutInterval = 4.5
+                apiReq.setValue(desktopBrowserUserAgent, forHTTPHeaderField: "User-Agent")
+                guard let (aData, aResp) = try? await URLSession.shared.data(for: apiReq),
+                      let aHTTP = aResp as? HTTPURLResponse,
+                      (200...299).contains(aHTTP.statusCode),
+                      let json = try? JSONSerialization.jsonObject(with: aData) as? [String: Any],
+                      let streamStr = json["url"] as? String,
+                      let streamURL = URL(string: streamStr) else {
+                    continue
+                }
+                let isHLS = transURLStr.contains("/hls") || streamStr.lowercased().contains(".m3u8")
+                let candidate = DetectedBrowserMedia(
+                    url: streamURL,
+                    pairedAudioURL: nil,
+                    isHLS: isHLS,
+                    isAudio: true,
+                    title: targetTitle,
+                    author: targetAuthor,
+                    qualityLabel: isHLS ? "HLS Audio" : "MP3 Audio",
+                    referer: entry.url.absoluteString,
+                    customHeaders: ["User-Agent": desktopBrowserUserAgent],
+                    durationSeconds: trackDur ?? targetDuration,
+                    isActivelyPlaying: true
+                )
+                return [candidate]
+            }
+        }
+        return nil
+    }
+
+    private static func resolveSoundCloudClientID(fromHTML html: String) async -> String? {
+        if let cached = await scClientCache.current() {
+            return cached
+        }
+        guard let jsRegex = try? NSRegularExpression(pattern: #"src="(https://a-v2\.sndcdn\.com/assets/[^"]+\.js)""#) else {
+            return nil
+        }
+        let matches = jsRegex.matches(in: html, range: NSRange(html.startIndex..., in: html))
+        var urls: [URL] = []
+        for m in matches {
+            if let r = Range(m.range(at: 1), in: html), let u = URL(string: String(html[r])) {
+                urls.append(u)
+            }
+        }
+        for jsURL in urls.reversed().prefix(4) {
+            var req = URLRequest(url: jsURL)
+            req.timeoutInterval = 4.0
+            req.setValue(desktopBrowserUserAgent, forHTTPHeaderField: "User-Agent")
+            guard let (data, _) = try? await URLSession.shared.data(for: req),
+                  let jsText = String(data: data, encoding: .utf8),
+                  let cidRegex = try? NSRegularExpression(pattern: #"client_id\s*[:=]\s*"([A-Za-z0-9]{20,40})""#),
+                  let match = cidRegex.firstMatch(in: jsText, range: NSRange(jsText.startIndex..., in: jsText)),
+                  let idRange = Range(match.range(at: 1), in: jsText) else {
+                continue
+            }
+            let cid = String(jsText[idRange])
+            await scClientCache.store(cid)
+            return cid
+        }
+        return nil
     }
 }
