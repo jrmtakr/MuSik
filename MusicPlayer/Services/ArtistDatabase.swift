@@ -155,7 +155,9 @@ enum ArtistDatabase {
         let baseRaw = rawTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             ? (fileName ?? rawTitle)
             : rawTitle
-        let trimmed = stripFileExtension(baseRaw).trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmed = stripBrowserPageTitleSuffix(
+            stripFileExtension(baseRaw).trimmingCharacters(in: .whitespacesAndNewlines)
+        )
         let (withoutNoise, featuredFromBrackets) = extractFeaturesAndStripNoise(from: trimmed)
         let (wholeStripped, wholeAlbum, wholeExplicitSingle, wholeParenArtist) = extractBracketedProjectTag(from: withoutNoise)
 
@@ -873,6 +875,21 @@ enum ArtistDatabase {
             return true
         }
         return false
+    }
+
+    /// Removes browser / search-engine page-title suffixes that end up in saved or screen-recorded file names,
+    /// e.g. `"crazy my beat - Google Search"` -> `"crazy my beat"` (otherwise "Google Search" is parsed as the artist).
+    static func stripBrowserPageTitleSuffix(_ raw: String) -> String {
+        let pattern = #"(?i)(?:\s*[-–—|·:]\s*|\s+at\s+)(?:google(?:\s+search)?|bing|duckduckgo|yahoo(?:\s+search)?|search\s+results?|youtube(?:\s+music)?|google\s+chrome|microsoft\s*edge|mozilla\s+firefox)\s*$"#
+        var current = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        for _ in 0..<3 {
+            let next = current
+                .replacingOccurrences(of: pattern, with: "", options: .regularExpression)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if next == current || next.isEmpty { break }
+            current = next
+        }
+        return current
     }
 
     private static func stripFileExtension(_ fileName: String) -> String {

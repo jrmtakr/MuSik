@@ -1086,16 +1086,23 @@ enum SongAudioListener {
             curve = nil
         }
 
+        // Synced lyrics published for the same master as this file (duration within 1.5s) already carry correct
+        // timestamps. Section-DTW / anchor re-timing on dense mixes can only make them worse (e.g. Coda
+        // "Crazy my Beat": LRCLIB 31.65s/35.40s/39.15s were pushed to 32.80s/35.55s/39.95s and later sections by -4s..+5s).
+        let audioDuration = curve.map { Double($0.envelope.count) * $0.frameDurationSeconds }
+        let durationLocked = isDurationMatchedSyncedLyrics(lyrics, audioDuration: audioDuration)
+
         var working = stripCreditHeaderLines(from: lyrics)
         if working.isTimeSynced {
-            // 1. Always run acoustic / Section-DTW alignment first using harmonic singing envelope
+            // 1. Run acoustic / Section-DTW alignment first using harmonic singing envelope
             //    so skits/intros/breaks are locked across sections even when ASR missed parts of the song.
-            let acousticallyAligned = alignAcousticallyInternal(lyrics: working, curve: curve)
+            //    Duration-matched lyrics only get a small (<= 1s) global correction and never per-section warping.
+            let acousticallyAligned = alignAcousticallyInternal(lyrics: working, curve: curve, durationLocked: durationLocked)
             let hadSectionDTW = acousticallyAligned.attributionText?.contains("section-DTW") == true
             working = acousticallyAligned
 
             // 2. Refine individual lines using >= 4 ordered multi-section heard anchors without clobbering uncovered sections.
-            if let heard, let sttRefined = alignWithAnchors(
+            if !durationLocked, let heard, let sttRefined = alignWithAnchors(
                 lyrics: working,
                 heard: heard,
                 curve: curve,
@@ -1107,11 +1114,58 @@ enum SongAudioListener {
             working = alignPlainLyricsIntoRealTimeSync(lyrics: working, heard: heard, curve: curve)
         }
         working = reconcileLyricsWithAudio(in: working, heard: heard, curve: curve)
-        working = refinePerLineVocalOnsets(in: working, curve: curve)
+        working = refinePerLineVocalOnsets(in: working, curve: curve, maxShiftSeconds: durationLocked ? 0.2 : nil)
         working = withRealTimeWordTimings(in: working, heard: heard, curve: curve)
         working = insertSpokenDialogueAndBreaks(in: working, heard: heard, curve: curve)
+        if durationLocked, !(working.attributionText ?? "").contains(durationLockedNote) {
+            working = ResolvedTrackLyrics(
+                cacheKey: working.cacheKey,
+                trackTitle: working.trackTitle,
+                artistName: working.artistName,
+                isTimeSynced: working.isTimeSynced,
+                sourceLabel: working.sourceLabel,
+                attributionText: (working.attributionText ?? "LRCLIB") + " · \(durationLockedNote)",
+                syncedOffsetSeconds: working.syncedOffsetSeconds,
+                tempoScale: working.tempoScale,
+                expectedDurationSeconds: working.expectedDurationSeconds,
+                alignmentVersion: working.alignmentVersion,
+                lines: working.lines
+            )
+        }
         working.alignmentVersion = SyncedLyricsService.currentAlignmentVersion
         return working
+    }
+
+    static let durationLockedNote = "original timing kept"
+
+    /// True when time-synced lyrics were published for the same cut as this audio (|duration delta| <= 1.5s)
+    /// and have not already been re-timed by us. Such timestamps are trusted instead of re-warped.
+    nonisolated static func isDurationMatchedSyncedLyrics(_ lyrics: ResolvedTrackLyrics, audioDuration: Double?) -> Bool {
+        guard lyrics.isTimeSynced,
+              let expected = lyrics.expectedDurationSeconds, expected > 20,
+              let audioDuration, audioDuration > 20 else {
+            return false
+        }
+        let label = lyrics.sourceLabel.lowercased()
+        let attribution = (lyrics.attributionText ?? "").lowercased()
+        if label.contains("auto-aligned") || attribution.contains("section-dtw") || attribution.contains("auto-aligned") {
+            return false
+        }
+        if label.contains("instrumental") || label.contains("full-song") || label.contains("adlib")
+            || label.contains("custom") || label.contains("transcribed") {
+            return false
+        }
+        let synced = lyrics.lines.filter { !$0.isInstrumentalBreak && !$0.text.isEmpty }
+        guard synced.count >= 4 else { return false }
+        return abs(expected - audioDuration) <= 1.5
+    }
+
+    /// True when the harmonic singing envelope shows sustained vocal activity (adlibs, hooks, chants),
+    /// i.e. the track should not be rendered as a dots-only instrumental timeline.
+    nonisolated static func curveIndicatesVocals(_ curve: VocalEnvelope?) -> Bool {
+        guard let curve, !curve.singingEnvelope.isEmpty else { return false }
+        let active = curve.singingEnvelope.filter { $0 > 0.25 }.count
+        return Double(active) / Double(curve.singingEnvelope.count) > 0.45
     }
 
     /// Populates misc spoken talking/skits (intro, mid-song gaps, outro) from Whisper/Speech transcripts
@@ -2004,11 +2058,8 @@ enum SongAudioListener {
         let totalDur = max(duration ?? 0, curve.map { Double($0.envelope.count) * $0.frameDurationSeconds } ?? 0)
         guard totalDur >= 8 else { return nil }
         if onlyIfMostlyInstrumental && !hasInstrumentalFilenameHint(trackTitle) {
-            if let curve, !curve.singingEnvelope.isEmpty {
-                let vocalFrac = Double(curve.singingEnvelope.filter { $0 > 0.25 }.count) / Double(curve.singingEnvelope.count)
-                if vocalFrac > 0.45 {
-                    return nil
-                }
+            if curveIndicatesVocals(curve) {
+                return nil
             }
         }
         var breaks: [SyncedLyricLine] = []
@@ -2054,7 +2105,8 @@ enum SongAudioListener {
     /// and ensures every line's words complete cleanly before the next line starts.
     private static func refinePerLineVocalOnsets(
         in lyrics: ResolvedTrackLyrics,
-        curve: VocalEnvelope?
+        curve: VocalEnvelope?,
+        maxShiftSeconds: Double? = nil
     ) -> ResolvedTrackLyrics {
         guard lyrics.isTimeSynced,
               !lyrics.lines.isEmpty,
@@ -2103,12 +2155,14 @@ enum SongAudioListener {
                 ? max(refined[idx - 1].startTime + 0.35, refined[idx - 1].startTime + min(0.95, sepFromPrevStart * 0.55))
                 : 0.0
             let nextStart: Double = (idx + 1 < count) ? refined[idx + 1].startTime : maxCurveTime
-            let maxBackwardPull: Double = (idx == 0 || sepFromPrevStart >= 2.2) ? 1.35 : 0.85
+            let defaultBackwardPull: Double = (idx == 0 || sepFromPrevStart >= 2.2) ? 1.35 : 0.85
+            let maxBackwardPull = maxShiftSeconds.map { min($0, defaultBackwardPull) } ?? defaultBackwardPull
+            let maxForwardPush = maxShiftSeconds.map { min($0, 0.50) } ?? 0.50
 
             var newStart = line.startTime
             if idx == 0 || sepFromPrevStart >= 0.85 || line.hasNativeWordTimings {
                 let minAllowed = max(max(0.05, prevStartFloor), line.startTime - maxBackwardPull)
-                let maxAllowed = min(nextStart - 0.30, line.startTime + 0.50)
+                let maxAllowed = min(nextStart - 0.30, line.startTime + maxForwardPush)
                 if maxAllowed > minAllowed + 0.05 {
                     let origScore = onsetScore(at: line.startTime, orig: line.startTime)
                     var bestT = line.startTime
@@ -2570,7 +2624,11 @@ enum SongAudioListener {
         return alignAcousticallyInternal(lyrics: lyrics, curve: curve)
     }
 
-    private static func alignAcousticallyInternal(lyrics: ResolvedTrackLyrics, curve: VocalEnvelope?) -> ResolvedTrackLyrics {
+    private static func alignAcousticallyInternal(
+        lyrics: ResolvedTrackLyrics,
+        curve: VocalEnvelope?,
+        durationLocked: Bool = false
+    ) -> ResolvedTrackLyrics {
         guard lyrics.isTimeSynced, !lyrics.lines.isEmpty else { return lyrics }
         guard let curve, curve.envelope.count >= 80 else {
             return lyrics
@@ -2583,7 +2641,8 @@ enum SongAudioListener {
 
         // Test natural tempo (1.0) plus stretched/sped-up edits (0.78x..1.32x for slowed+reverb, nightcore, live cuts).
         var candidateScales: [Double] = [1.0]
-        if let expectedDur = lyrics.expectedDurationSeconds,
+        if !durationLocked,
+           let expectedDur = lyrics.expectedDurationSeconds,
            expectedDur > 20, actualDuration > 20 {
             let ratio = actualDuration / expectedDur
             if ratio >= 0.78 && ratio <= 1.32 && abs(ratio - 1.0) >= 0.015 {
@@ -2605,7 +2664,8 @@ enum SongAudioListener {
         var bestOffset: Double = 0
         var bestScale: Double = 1.0
 
-        let maxSweepOffset = min(210.0, max(110.0, actualDuration * 0.55))
+        let maxSweepOffset = durationLocked ? 1.0 : min(210.0, max(110.0, actualDuration * 0.55))
+        let minSweepOffset = durationLocked ? -1.0 : -45.0
 
         for scale in candidateScales {
             let sampleTimes: [(time: Double, isSing: Bool)] = lyrics.lines.flatMap { line -> [(Double, Bool)] in
@@ -2713,7 +2773,7 @@ enum SongAudioListener {
             // Sweep -45s..+maxSweepOffset (0.25s steps across -35..110s, 0.5s outside for long intros & trimmed edits).
             var scaleBestOff = 0.0
             var scaleBestSc = zScore
-            var offset = -45.0
+            var offset = minSweepOffset
             while offset <= maxSweepOffset {
                 let s = scoreShift(offset)
                 if s > scaleBestSc {
@@ -2730,7 +2790,7 @@ enum SongAudioListener {
             }
 
             // Fine 0.04s sweep around peak (-2.2s..+2.2s) to capture exact sub-second karaoke/LRC lag.
-            let fineStart = max(-45.0, scaleBestOff - 2.2)
+            let fineStart = max(minSweepOffset, scaleBestOff - 2.2)
             let fineEnd = min(maxSweepOffset, scaleBestOff + 2.2)
             var fine = fineStart
             while fine <= fineEnd {
@@ -2786,7 +2846,7 @@ enum SongAudioListener {
 
         // Also check Piecewise Section-DTW (Viterbi) across >= 4s LRC singing gaps so mid-video skits or extra pauses
         // shift Verse 2 / Chorus 2 independently without disturbing Verse 1 or introducing false jumps on studio songs.
-        if let piecewise = alignSectionsWithViterbi(
+        if !durationLocked, let piecewise = alignSectionsWithViterbi(
             lyrics: effectiveLyricsForDTW,
             curve: curve,
             singingEnv: singingEnv,
@@ -2797,8 +2857,9 @@ enum SongAudioListener {
         }
 
         // Apply sub-second/multi-second global alignment cleanly whenever vocal & onset correlation improves.
-        let fineShiftImprove = abs(bestOffset) >= 0.10 && abs(bestOffset) <= 3.0 && bestScore > zeroOffsetScore + 0.012 && bestScore > 0.03
-        let largeShiftImprove = abs(bestOffset) > 3.0 && bestScore > zeroOffsetScore + 0.055 && bestScore > 0.08
+        let fineShiftMargin = durationLocked ? 0.03 : 0.012
+        let fineShiftImprove = abs(bestOffset) >= 0.10 && abs(bestOffset) <= 3.0 && bestScore > zeroOffsetScore + fineShiftMargin && bestScore > 0.03
+        let largeShiftImprove = !durationLocked && abs(bestOffset) > 3.0 && bestScore > zeroOffsetScore + 0.055 && bestScore > 0.08
         let meaningfulImprovement = fineShiftImprove || largeShiftImprove
         guard meaningfulImprovement || useTempoScaling || abs(bestScale - 1.0) >= 0.015 else {
             return lyrics

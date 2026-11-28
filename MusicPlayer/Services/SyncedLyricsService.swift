@@ -161,7 +161,7 @@ struct AIRecognizedTrackInfo: Equatable, Sendable {
 @Observable
 final class SyncedLyricsService {
     static let shared = SyncedLyricsService()
-    nonisolated static let currentAlignmentVersion = 10
+    nonisolated static let currentAlignmentVersion = 11
 
     var currentLyrics: ResolvedTrackLyrics?
     var currentLoadingKey: String?
@@ -274,7 +274,11 @@ final class SyncedLyricsService {
                         let isLegacyStudioCache = disk.sourceLabel.contains("Studio")
                             || disk.attributionText?.contains("Kugou") == true
                             || disk.attributionText?.contains("NetEase") == true
-                        if !isContradicted && !isLegacyStudioCache && (disk.isTimeSynced || disk.lines.count >= 4) {
+                        // Dots-only fallbacks and lyrics we already warped must be rebuilt from the original
+                        // candidates; re-aligning the cached copy would keep the dots or compound the warp.
+                        let needsFreshCandidates = Self.cachedLyricsNeedFreshCandidates(disk, title: item.displayTitle)
+                        let isDotsOnly = Self.isDotsOnlyLyrics(disk)
+                        if !isContradicted && !isLegacyStudioCache && !needsFreshCandidates && (disk.isTimeSynced || disk.lines.count >= 4) {
                             let reAligned = await SongAudioListener.autoAlign(lyrics: disk, heard: heard, fileURL: item.fileURL)
                             guard !Task.isCancelled else { return }
                             storeAlignedLyrics(reAligned, for: item)
@@ -286,7 +290,7 @@ final class SyncedLyricsService {
                                 duration: item.durationSeconds,
                                 heard: heard
                             )
-                            if !updatedOk && !isContradicted && (disk.isTimeSynced || disk.lines.count >= 4) && !Task.isCancelled {
+                            if !updatedOk && !isContradicted && !isDotsOnly && (disk.isTimeSynced || disk.lines.count >= 4) && !Task.isCancelled {
                                 let reAligned = await SongAudioListener.autoAlign(lyrics: disk, heard: heard, fileURL: item.fileURL)
                                 guard !Task.isCancelled else { return }
                                 storeAlignedLyrics(reAligned, for: item)
@@ -399,6 +403,9 @@ final class SyncedLyricsService {
             }
 
             let resolved: ResolvedTrackLyrics?
+            var persistResolved = true
+            var vocalRescueCandidates: [ResolvedTrackLyrics]?
+            var scheduleRescue = false
             if !item.relativePath.hasPrefix("__remote__/") && !item.isHLS {
                 // Phase 1: Fetch lyric candidates + on-device vocal curve concurrently without blocking on ASR downloads.
                 async let candidatesTask = collectAllCandidateLyrics(
@@ -466,6 +473,10 @@ final class SyncedLyricsService {
                 guard !Task.isCancelled, self.activeFetchToken == fetchToken else { return }
 
                 let heard: [HeardWord]? = summary.words.isEmpty ? nil : summary.words
+                // When the full speech model was not used, an empty result says nothing about whether the track has vocals.
+                let fullModelListened = await WhisperTranscriptionEngine.shared.isModelReadyInMemory
+                let mayHaveUnheardVocals = !SongAudioListener.hasInstrumentalFilenameHint(rawTitle)
+                    && (SongAudioListener.curveIndicatesVocals(vocalCurve) || !fullModelListened)
                 let isNonEnglish = langCtx.isNonEnglish || {
                     guard let lang = summary.detectedLanguage?.lowercased(), !lang.isEmpty else { return false }
                     return !lang.hasPrefix("en")
@@ -509,7 +520,28 @@ final class SyncedLyricsService {
                         duration: item.durationSeconds,
                         curve: vocalCurve
                     )
+                    // Vocal adlib tracks (e.g. datfootdive "stay") often yield no words from the short, download-free
+                    // listen above. Show the dots for now, but never cache them while the vocal curve shows singing:
+                    // run a full-model transcription in the background so the adlibs replace the dots.
+                    if chosen != nil, mayHaveUnheardVocals {
+                        persistResolved = false
+                        scheduleRescue = true
+                        vocalRescueCandidates = candidates
+                    }
                 }
+                if chosen == nil, heard?.isEmpty ?? true, mayHaveUnheardVocals {
+                    // The bounded listen timed out or heard nothing on a track that clearly has vocals.
+                    scheduleRescue = true
+                    vocalRescueCandidates = candidates
+                }
+                Self.recordLyricsSelection(
+                    item: item,
+                    candidates: candidates,
+                    targetArtist: rawArtist,
+                    heardWordCount: heard?.count ?? 0,
+                    fallback: chosen.map { $0.sourceLabel } ?? "none",
+                    rescueNote: scheduleRescue ? "playback listen heard no words; full-model rescue scheduled" : nil
+                )
                 resolved = chosen
             } else {
                 resolved = await fetchBestLyrics(
@@ -523,16 +555,118 @@ final class SyncedLyricsService {
             guard !Task.isCancelled, self.activeFetchToken == fetchToken else { return }
             if var resolved {
                 resolved.alignmentVersion = Self.currentAlignmentVersion
-                memoryCache[key] = resolved
-                saveToDisk(resolved)
+                if persistResolved {
+                    memoryCache[key] = resolved
+                    saveToDisk(resolved)
+                }
                 currentLyrics = resolved
                 lastError = nil
-            } else {
+            }
+            if scheduleRescue {
+                self.scheduleVocalTranscriptionRescue(
+                    item: item,
+                    rawTitle: rawTitle,
+                    rawArtist: rawArtist,
+                    candidates: vocalRescueCandidates ?? []
+                )
+            }
+            if resolved == nil {
                 lastError = "Lyrics not found yet. Tap Retry or Genius Search below."
                 if customTitle == nil && customArtist == nil && !item.relativePath.hasPrefix("__remote__/") && !importAnalysisPending {
                     WholeSongAIService.shared.triggerIfFirstTimeUnknown(item: item)
                 }
             }
+        }
+    }
+
+    /// Full-song transcription with the on-device speech model allowed to load (or download once), used when the
+    /// vocal curve shows singing but the quick playback listen heard nothing. Replaces the temporary dots with
+    /// synced vocal/adlib lines, or settles on the instrumental timeline once transcription is genuinely empty.
+    private func scheduleVocalTranscriptionRescue(
+        item: MediaItem,
+        rawTitle: String,
+        rawArtist: String,
+        candidates: [ResolvedTrackLyrics]
+    ) {
+        activeRefinementTask?.cancel()
+        activeRefinementTask = Task { [weak self] in
+            guard let self else { return }
+            let summary = await SongAudioListener.listenWithSummary(
+                to: item.fileURL,
+                titleHint: rawTitle,
+                artistHint: rawArtist.isEmpty ? nil : rawArtist,
+                allowModelDownload: true
+            )
+            guard !Task.isCancelled else { return }
+            let langCtx = SongAudioListener.detectLanguageContext(
+                title: rawTitle,
+                artist: rawArtist.isEmpty ? nil : rawArtist
+            )
+            let isNonEnglish = langCtx.isNonEnglish || {
+                guard let lang = summary.detectedLanguage?.lowercased(), !lang.isEmpty else { return false }
+                return !lang.hasPrefix("en")
+            }()
+            let englishASROnForeignTrack = isNonEnglish && (summary.detectedLanguage?.lowercased().hasPrefix("en") ?? false)
+            _ = await self.fetchAndAlignDuringImport(
+                item: item,
+                title: rawTitle,
+                artist: rawArtist,
+                duration: item.durationSeconds,
+                heard: summary.words.isEmpty ? nil : summary.words,
+                prefetchedCandidates: candidates.isEmpty ? nil : candidates,
+                isNonEnglish: isNonEnglish,
+                englishASROnForeignTrack: englishASROnForeignTrack,
+                allowTranscriptionRescue: false
+            )
+        }
+    }
+
+    /// Cached lyrics made only of instrumental-break dots (no text lines).
+    nonisolated static func isDotsOnlyLyrics(_ lyrics: ResolvedTrackLyrics) -> Bool {
+        !lyrics.lines.isEmpty && lyrics.lines.allSatisfy {
+            $0.isInstrumentalBreak || $0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+    }
+
+    /// Whether a stale cached entry must be rebuilt from freshly fetched candidates rather than re-aligned in place.
+    nonisolated static func cachedLyricsNeedFreshCandidates(_ lyrics: ResolvedTrackLyrics, title: String) -> Bool {
+        if lyrics.sourceLabel.localizedCaseInsensitiveContains("Custom") { return false }
+        if isDotsOnlyLyrics(lyrics) {
+            return !SongAudioListener.hasInstrumentalFilenameHint(title)
+        }
+        let attribution = (lyrics.attributionText ?? "").lowercased()
+        return attribution.contains("section-dtw") || lyrics.sourceLabel.lowercased().contains("auto-aligned")
+    }
+
+    /// Plain-language reasons each candidate lost, for the Sync & Song ID diagnostics export.
+    nonisolated static func rejectionReasons(for candidates: [ResolvedTrackLyrics], targetArtist: String) -> [String] {
+        let cleanTarget = targetArtist
+            .replacingOccurrences(of: #"(?i)\s*-\s*topic$|vevo$|\s+official$"#, with: "", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return candidates.prefix(8).map { cand in
+            let who = "\(cand.trackTitle) — \(cand.artistName)"
+            if !cleanTarget.isEmpty && !areArtistsCompatible(target: cleanTarget, candidate: cand.artistName) {
+                return "\(who): artist mismatch vs \(cleanTarget)"
+            }
+            return "\(who): not confirmed by audio/timing"
+        }
+    }
+
+    private static func recordLyricsSelection(
+        item: MediaItem,
+        candidates: [ResolvedTrackLyrics],
+        targetArtist: String,
+        heardWordCount: Int,
+        fallback: String,
+        rescueNote: String?
+    ) {
+        SyncDiagnosticsService.shared.updateTrack(relativePath: item.relativePath, fileName: item.fileName) { diag in
+            if !candidates.isEmpty {
+                diag.rejectedLyricsReasons = rejectionReasons(for: candidates, targetArtist: targetArtist)
+            }
+            diag.heardWordCount = heardWordCount
+            diag.lyricsFallback = fallback
+            if let rescueNote { diag.transcriptionRescue = rescueNote }
         }
     }
 
@@ -1304,7 +1438,8 @@ final class SyncedLyricsService {
         heard: [HeardWord]?,
         prefetchedCandidates: [ResolvedTrackLyrics]? = nil,
         isNonEnglish: Bool = false,
-        englishASROnForeignTrack: Bool = false
+        englishASROnForeignTrack: Bool = false,
+        allowTranscriptionRescue: Bool = true
     ) async -> Bool {
         let key = cacheKey(for: item, artistOverride: artist, titleOverride: title)
         let split = splitArtistAndSong(rawTitle: title, rawArtist: artist)
@@ -1374,31 +1509,88 @@ final class SyncedLyricsService {
         let splitFinal = splitArtistAndSong(rawTitle: title, rawArtist: artist)
         let trackFinalTitle = splitFinal.song.isEmpty ? item.displayTitle : splitFinal.song
         let trackFinalArtist = splitFinal.artist.isEmpty ? (item.artist ?? "Unknown Artist") : splitFinal.artist
-        if let heard, !heard.isEmpty, !englishASROnForeignTrack {
+        let titleIsInstrumental = SongAudioListener.hasInstrumentalFilenameHint(title)
+
+        // Rescue: no lyrics matched and nothing was heard, yet the vocal curve shows singing (adlibs/hooks).
+        // Earlier listens ran without the full speech model (allowModelDownload: false when metadata was already
+        // known), so give it one full-model pass before giving up on words.
+        var heardForFallback = heard
+        var rescueNote: String?
+        let modelWasLoaded = await WhisperTranscriptionEngine.shared.isModelReadyInMemory
+        if allowTranscriptionRescue,
+           (heardForFallback?.isEmpty ?? true),
+           !englishASROnForeignTrack,
+           extractCurve,
+           !titleIsInstrumental,
+           !modelWasLoaded,
+           SongAudioListener.curveIndicatesVocals(vocalCurve) || vocalCurve == nil {
+            let rescue = await SongAudioListener.listenWithSummary(
+                to: item.fileURL,
+                titleHint: title,
+                artistHint: artist.isEmpty ? nil : artist,
+                allowModelDownload: true
+            )
+            if !rescue.words.isEmpty {
+                heardForFallback = rescue.words
+            }
+            rescueNote = "full-model listen heard \(rescue.words.count) words"
+        }
+
+        if let words = heardForFallback, !words.isEmpty, !englishASROnForeignTrack {
             if let transcribed = SongAudioListener.buildSyncedLyricsFromHeard(
-                heard,
+                words,
                 trackTitle: trackFinalTitle,
                 artistName: trackFinalArtist,
                 cacheKey: cacheKey(for: item),
                 duration: duration ?? item.durationSeconds
             ) {
+                Self.recordLyricsSelection(
+                    item: item,
+                    candidates: candidates,
+                    targetArtist: artist,
+                    heardWordCount: words.count,
+                    fallback: transcribed.sourceLabel,
+                    rescueNote: rescueNote
+                )
                 storeAlignedLyrics(transcribed, for: item)
                 return true
             }
         }
-        if SongAudioListener.hasInstrumentalFilenameHint(title) || (heard?.isEmpty ?? true) {
+
+        // Once the full speech model has actually listened and still found no usable words, the dots timeline is final.
+        var transcriptionExhausted = false
+        if !englishASROnForeignTrack {
+            transcriptionExhausted = await WhisperTranscriptionEngine.shared.isModelReadyInMemory
+        }
+        if titleIsInstrumental || (heardForFallback?.isEmpty ?? true) || transcriptionExhausted {
             if let inst = SongAudioListener.buildInstrumentalLyricsIfNeeded(
                 trackTitle: trackFinalTitle,
                 artistName: trackFinalArtist,
                 cacheKey: cacheKey(for: item),
                 duration: duration ?? item.durationSeconds,
                 curve: vocalCurve,
-                onlyIfMostlyInstrumental: true
+                onlyIfMostlyInstrumental: !transcriptionExhausted
             ) {
+                Self.recordLyricsSelection(
+                    item: item,
+                    candidates: candidates,
+                    targetArtist: artist,
+                    heardWordCount: heardForFallback?.count ?? 0,
+                    fallback: inst.sourceLabel,
+                    rescueNote: rescueNote
+                )
                 storeAlignedLyrics(inst, for: item)
                 return true
             }
         }
+        Self.recordLyricsSelection(
+            item: item,
+            candidates: candidates,
+            targetArtist: artist,
+            heardWordCount: heardForFallback?.count ?? 0,
+            fallback: "none",
+            rescueNote: rescueNote
+        )
         return false
     }
 

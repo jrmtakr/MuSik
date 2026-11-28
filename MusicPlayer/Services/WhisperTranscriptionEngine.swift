@@ -27,6 +27,7 @@ actor WhisperTranscriptionEngine {
     private static let primaryVariantName = "openai_whisper-small"
     private static let fallbackVariantName = "openai_whisper-base"
     private static let savedFolderDefaultsKey = "musejrm.whisper.modelFolder.v2"
+    static let downloadLoadTimeoutSeconds: Double = 300
     private static let backgroundSafeComputeOptions = ModelComputeOptions(
         melCompute: .cpuAndNeuralEngine,
         audioEncoderCompute: .cpuAndNeuralEngine,
@@ -367,7 +368,9 @@ actor WhisperTranscriptionEngine {
                     load: true,
                     download: true
                 )
-                loadedKit = await Self.loadKitWithTimeout(config: primaryConfig, timeoutSeconds: 45.0)
+                // First-time download + CoreML compile of the model can take minutes on a phone; a 45s cap could cancel
+                // it on every launch, leaving adlib/vocal transcription on the weaker fallback recognizer.
+                loadedKit = await Self.loadKitWithTimeout(config: primaryConfig, timeoutSeconds: Self.downloadLoadTimeoutSeconds)
                 if loadedKit == nil {
                     let fallbackConfig = WhisperKitConfig(
                         model: Self.fallbackVariantName,
@@ -380,7 +383,7 @@ actor WhisperTranscriptionEngine {
                         load: true,
                         download: true
                     )
-                    loadedKit = await Self.loadKitWithTimeout(config: fallbackConfig, timeoutSeconds: 45.0)
+                    loadedKit = await Self.loadKitWithTimeout(config: fallbackConfig, timeoutSeconds: Self.downloadLoadTimeoutSeconds)
                 }
             }
             guard let kit = loadedKit else {

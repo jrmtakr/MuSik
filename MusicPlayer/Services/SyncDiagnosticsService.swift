@@ -36,6 +36,9 @@ final class SyncDiagnosticsService: @unchecked Sendable {
         var selectedLyricsArtist: String?
         var selectedLyricsDuration: Double?
         var alignmentVersion: Int?
+        var heardWordCount: Int?
+        var lyricsFallback: String?
+        var transcriptionRescue: String?
 
         // Audio alignment & playback route
         var alignmentNote: String?
