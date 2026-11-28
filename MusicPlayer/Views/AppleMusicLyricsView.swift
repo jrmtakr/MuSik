@@ -242,6 +242,7 @@ struct AppleMusicLyricsView: View {
         }
         .onAppear {
             syncClockSnapshot()
+            recordPlaybackDiagnostics()
             tiktokMedia.refreshIfDue()
             pickRandomTikTokGif()
             lyricsService.loadLyricsIfNeeded(for: item)
@@ -251,6 +252,7 @@ struct AppleMusicLyricsView: View {
             pinnedSeekIndex = nil
             pinnedSeekExpiresAt = .distantPast
             syncClockSnapshot()
+            recordPlaybackDiagnostics()
             pickRandomTikTokGif()
             lyricsService.loadLyricsIfNeeded(for: item)
         }
@@ -755,6 +757,16 @@ struct AppleMusicLyricsView: View {
         mediaManager.seek(to: target)
         if !mediaManager.isPlaying {
             mediaManager.resume()
+        }
+    }
+
+    private func recordPlaybackDiagnostics() {
+        let session = AVAudioSession.sharedInstance()
+        let routeDesc = session.currentRoute.outputs.map { "\($0.portType.rawValue)(\($0.portName))" }.joined(separator: ", ")
+        SyncDiagnosticsService.shared.updateTrack(relativePath: item.relativePath, fileName: item.fileName) { diag in
+            diag.audioOutputRoute = routeDesc.isEmpty ? "unknown" : routeDesc
+            diag.isUsingEqualizerBackend = mediaManager.isUsingEqualizerBackend
+            diag.outputLatencySeconds = session.outputLatency
         }
     }
 

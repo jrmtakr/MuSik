@@ -412,6 +412,25 @@ struct SettingsView: View {
                     LabeledContent("Folders", value: "\(mediaManager.folders.count)")
                     LabeledContent("Total Size", value: mediaManager.formattedTotalStorage)
                     LabeledContent("Ads & Tracking", value: "None (100% Ad-Free)")
+
+                    Button {
+                        exportSyncDiagnostics()
+                    } label: {
+                        HStack {
+                            Label("Export Sync & Song ID Diagnostics", systemImage: "square.and.arrow.up")
+                            Spacer()
+                            Text("\(SyncDiagnosticsService.shared.recordCount()) tracks")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    Button(role: .destructive) {
+                        SyncDiagnosticsService.shared.clearAll()
+                        mediaManager.statusMessage = "Cleared sync diagnostics log"
+                    } label: {
+                        Label("Clear Diagnostics Log", systemImage: "trash")
+                    }
                 }
             }
             .navigationTitle("Setting")
@@ -493,6 +512,27 @@ struct SettingsView: View {
             return "Custom Picture"
         }
         return AppIconChoice.all.first(where: { $0.iconName == settings.selectedAppIconName })?.title ?? "Default"
+    }
+
+    private func exportSyncDiagnostics() {
+        guard let url = SyncDiagnosticsService.shared.exportDiagnosticsFileURL() else {
+            mediaManager.errorMessage = "Could not export diagnostics log."
+            return
+        }
+        let activity = UIActivityViewController(activityItems: [url], applicationActivities: nil)
+        guard let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
+              let root = scene.windows.first(where: { $0.isKeyWindow })?.rootViewController ?? scene.windows.first?.rootViewController else {
+            return
+        }
+        var presenter = root
+        while let presented = presenter.presentedViewController {
+            presenter = presented
+        }
+        if let pop = activity.popoverPresentationController {
+            pop.sourceView = presenter.view
+            pop.sourceRect = CGRect(x: presenter.view.bounds.midX, y: presenter.view.bounds.midY, width: 1, height: 1)
+        }
+        presenter.present(activity, animated: true)
     }
 
     private func syncTargetDownloadPlaylist() {

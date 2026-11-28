@@ -457,6 +457,19 @@ final class SongIdentificationService {
         let bestSeedArtist = (effectiveParsed.artistHint ?? (seedArtist.isEmpty ? nil : ArtistDatabase.canonicalizeSingle(seedArtist))) ?? ""
         let fileAlbumOrProject = (embedded.album?.isEmpty == false ? embedded.album : nil) ?? effectiveParsed.albumHint ?? fileHintParsed.albumHint
 
+        SyncDiagnosticsService.shared.updateTrack(relativePath: request.relativePath, fileName: request.fileURL.lastPathComponent) { diag in
+            diag.durationSeconds = request.durationSeconds
+            diag.hintTitle = request.hintTitle
+            diag.hintArtist = request.hintArtist
+            diag.sourceVideoID = request.sourceVideoID
+            diag.sourcePlatform = request.sourcePlatform?.rawValue
+            diag.parsedSong = bestSeedTitle
+            diag.parsedArtist = bestSeedArtist
+            diag.parsedAlbum = fileAlbumOrProject
+            diag.ytCaptionLanguage = ytLangCode
+            diag.ytCards = ytCards.prefix(6).map { "\($0.sourceName): \($0.title) — \($0.artist) (\($0.album ?? "nil"))" }
+        }
+
         var song = await identify(
             fileURL: request.fileURL,
             hintTitle: bestSeedTitle,
@@ -574,6 +587,16 @@ final class SongIdentificationService {
                         precomputedCurve: vocalCurve
                     )
                     SyncedLyricsService.shared.storeAlignedLyrics(aligned, for: item)
+                    SyncDiagnosticsService.shared.updateTrack(relativePath: request.relativePath) { diag in
+                        diag.fastPathTaken = true
+                        diag.finalTitle = immediateSong.title
+                        diag.finalArtist = immediateSong.artist
+                        diag.finalAlbum = immediateSong.album
+                        diag.finalSource = immediateSong.source
+                        diag.lyricsCandidates = prefetchedCandidates.prefix(6).map {
+                            "\($0.sourceLabel): \($0.trackTitle) — \($0.artistName) (synced=\($0.isTimeSynced), dur=\($0.expectedDurationSeconds.map { Int($0) } ?? 0)s)"
+                        }
+                    }
                     if Self.normalize(immediateSong.title) != Self.normalize(immediateSong.artist) {
                         let indexFileURL = request.fileURL
                         let indexPath = request.relativePath
@@ -924,6 +947,18 @@ final class SongIdentificationService {
         // Pre-fetch & auto-align lyrics to this exact file during import (Speech anchors + Acoustic vocal alignment)
         // so lyrics always line up immediately on first playback with zero user input.
         updateTrackStep(path: request.relativePath, progress: 0.92, label: "Aligning lyrics across whole song...")
+        SyncDiagnosticsService.shared.updateTrack(relativePath: request.relativePath) { diag in
+            diag.fastPathTaken = false
+            diag.finalTitle = finalSong.title
+            diag.finalArtist = finalSong.artist
+            diag.finalAlbum = finalSong.album
+            diag.finalSource = finalSong.source
+            if let prefetchedCandidates, !prefetchedCandidates.isEmpty {
+                diag.lyricsCandidates = prefetchedCandidates.prefix(6).map {
+                    "\($0.sourceLabel): \($0.trackTitle) — \($0.artistName) (synced=\($0.isTimeSynced), dur=\($0.expectedDurationSeconds.map { Int($0) } ?? 0)s)"
+                }
+            }
+        }
         var hasFinalLyrics = false
         if !titleHasInstrumentalHint,
            let item = MediaManager.shared.items.first(where: { $0.relativePath == request.relativePath }) {

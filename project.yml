@@ -49,3 +49,20 @@ targets:
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
         CODE_SIGNING_ALLOWED: "NO"
         CODE_SIGNING_REQUIRED: "NO"
+        ENABLE_TESTABILITY: "YES"
+    scheme:
+      testTargets:
+        - MusicPlayerTests
+  MusicPlayerTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: MusicPlayerTests
+    dependencies:
+      - target: MusicPlayer
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: "YES"
+        SWIFT_VERSION: "5.9"
+        CODE_SIGNING_ALLOWED: "NO"
+        CODE_SIGNING_REQUIRED: "NO"

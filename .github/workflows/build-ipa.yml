@@ -18,6 +18,20 @@ jobs:
       - name: Generate Xcode project
         run: xcodegen generate
 
+      - name: Run Swift XCTest suite on iOS Simulator
+        run: |
+          SIM_ID=$(xcrun simctl list devices available iPhone -j | python3 -c "import json,sys; d=json.load(sys.stdin)['devices']; devs=[x['udid'] for k,v in sorted(d.items(), reverse=True) for x in v if x.get('isAvailable') and 'iPhone' in x.get('name','')]; print(devs[0] if devs else '')")
+          echo "Using Simulator UDID: $SIM_ID"
+          xcodebuild \
+            -project MusicPlayer.xcodeproj \
+            -scheme MusicPlayer \
+            -configuration Debug \
+            -destination "platform=iOS Simulator,id=$SIM_ID" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            test
+
       - name: Archive unsigned iOS app
         run: |
           xcodebuild \

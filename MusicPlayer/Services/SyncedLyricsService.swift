@@ -1421,6 +1421,19 @@ final class SyncedLyricsService {
         )
         memoryCache[key] = stored
         saveToDisk(stored)
+        SyncDiagnosticsService.shared.updateTrack(relativePath: item.relativePath, fileName: item.fileName) { diag in
+            diag.durationSeconds = item.durationSeconds
+            diag.selectedLyricsSource = stored.sourceLabel
+            diag.selectedLyricsTitle = stored.trackTitle
+            diag.selectedLyricsArtist = stored.artistName
+            diag.selectedLyricsDuration = stored.expectedDurationSeconds
+            diag.alignmentVersion = stored.alignmentVersion
+            diag.alignmentNote = stored.attributionText
+            diag.lineCount = stored.lines.count
+            diag.sampleTimingLines = stored.lines.filter { !$0.isInstrumentalBreak && $0.startTime >= 0 }.prefix(6).map {
+                String(format: "[%.2f..%.2f] %@", $0.startTime, $0.endTime, String($0.text.prefix(40)))
+            }
+        }
         autoAttemptedKeys.insert(key)
         let isCurrentlyPlayingItem = MediaManager.shared.currentItem?.relativePath == item.relativePath
         if currentLyrics?.cacheKey == key || isCurrentlyPlayingItem {
