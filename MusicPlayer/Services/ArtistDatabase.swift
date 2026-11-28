@@ -104,7 +104,10 @@ enum ArtistDatabase {
         "nocopyrightsounds", "ncs", "taz network", "nightcore reality", "wave music",
         "selected", "koala kontrol", "future house music", "spinnin records", "monstercat",
         "worldstarhiphop", "genius", "vevo", "chillcity", "arctic empire", "david dean burkhart",
-        "alexrainbirdmusic", "chilledcow", "lofi girl", "unique vibes", "royal bass", "cloud vibes"
+        "alexrainbirdmusic", "chilledcow", "lofi girl", "unique vibes", "royal bass", "cloud vibes",
+        "hybe labels", "smtown", "jyp entertainment", "yg entertainment", "starship", "cube entertainment",
+        "sony music", "sony music japan", "universal music", "warner music", "warner music japan",
+        "avex", "aniplex", "toho animation", "king records", "lantis"
     ]
 
     private static let channelKeywordTokens: [String] = [
@@ -179,6 +182,31 @@ enum ArtistDatabase {
             matchedSplitRange = r
         }
 
+        // CJK lenticular-bracket artist prefix (e.g. `【Ado】うっせぇわ` -> Artist "Ado", Song "うっせぇわ").
+        if matchedSplitRange == nil,
+           let lenticRegex = try? NSRegularExpression(pattern: #"^【([^】]{1,40})】\s*(.+)$"#),
+           let m = lenticRegex.firstMatch(in: withoutNoise, range: NSRange(location: 0, length: (withoutNoise as NSString).length)),
+           let r1 = Range(m.range(at: 1), in: withoutNoise),
+           let r2 = Range(m.range(at: 2), in: withoutNoise) {
+            let lArtRaw = String(withoutNoise[r1]).trimmingCharacters(in: .whitespacesAndNewlines)
+            let lSong = String(withoutNoise[r2]).trimmingCharacters(in: .whitespacesAndNewlines)
+            let lowLArt = lArtRaw.lowercased()
+            let isNoiseTag = lowLArt.contains("official") || lowLArt.contains("lyric") || lowLArt.contains("mv")
+                || lowLArt.contains("sub") || lowLArt.contains("audio") || lowLArt.contains("full")
+                || lowLArt.contains("歌詞") || lowLArt.contains("和訳")
+            if !isNoiseTag, !lArtRaw.isEmpty, !lSong.isEmpty {
+                let cArt = canonicalizeSingle(lArtRaw)
+                return ParsedTrackHints(
+                    songTitle: lSong,
+                    artistHint: cArt,
+                    allArtists: mergeUniqueArtists([cArt], featuredFromBrackets),
+                    albumHint: wholeAlbum,
+                    isExplicitSingle: wholeExplicitSingle,
+                    alternatePair: nil
+                )
+            }
+        }
+
         // CJK corner-bracket split when no dash separator exists (e.g. `YOASOBI「アイドル」` or `米津玄師『Lemon』`).
         if matchedSplitRange == nil,
            let cjkRegex = try? NSRegularExpression(pattern: #"^([^\「\『]{2,40})[\「\『]([^\」\』]{1,80})[\」\』]"#),
@@ -199,13 +227,51 @@ enum ArtistDatabase {
             }
         }
 
+        // K-Pop / quoted MV title format without dash (e.g. `NewJeans (뉴진스) 'Super Shy' Official MV`).
+        if matchedSplitRange == nil,
+           let quoteRegex = try? NSRegularExpression(pattern: #"^([^'\u2018\u2019"\u201C\u201D\(\[]{2,45}?)(?:\s*[\(\[][^\)\]]{1,30}[\)\]])?\s*['\u2018"\u201C]([^'\u2019"\u201D]{1,80})['\u2019"\u201D]"#),
+           let m = quoteRegex.firstMatch(in: withoutNoise, range: NSRange(location: 0, length: (withoutNoise as NSString).length)),
+           let r1 = Range(m.range(at: 1), in: withoutNoise),
+           let r2 = Range(m.range(at: 2), in: withoutNoise) {
+            var qArtist = String(withoutNoise[r1]).trimmingCharacters(in: .whitespacesAndNewlines)
+            let qTokens = qArtist.split(separator: " ").map(String.init)
+            if qTokens.count == 2,
+               let second = qTokens.last,
+               second.unicodeScalars.contains(where: { (0xAC00...0xD7AF).contains($0.value) || (0x3040...0x30FF).contains($0.value) || (0x4E00...0x9FFF).contains($0.value) }) {
+                qArtist = qTokens[0]
+            }
+            let cArtist = canonicalizeSingle(qArtist)
+            let qSong = String(withoutNoise[r2]).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !cArtist.isEmpty && !qSong.isEmpty {
+                return ParsedTrackHints(
+                    songTitle: qSong,
+                    artistHint: cArtist,
+                    allArtists: mergeUniqueArtists([cArtist], featuredFromBrackets),
+                    albumHint: wholeAlbum,
+                    isExplicitSingle: wholeExplicitSingle,
+                    alternatePair: nil
+                )
+            }
+        }
+
         if let range = matchedSplitRange {
             let leftRaw = stripLeadingTrackNumber(String(withoutNoise[..<range.lowerBound]))
-            let rightRaw = String(withoutNoise[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+            var rightRaw = String(withoutNoise[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+            var trailingPipeAlbum: String?
+            if let pipeRange = rightRaw.range(of: " | ", options: .backwards) {
+                let afterPipe = String(rightRaw[pipeRange.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+                let beforePipe = String(rightRaw[..<pipeRange.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+                let lowAfter = afterPipe.lowercased()
+                if !beforePipe.isEmpty, !afterPipe.isEmpty, afterPipe.count <= 60,
+                   !lowAfter.contains("official"), !lowAfter.contains("lyric"), !lowAfter.contains("video") {
+                    trailingPipeAlbum = afterPipe
+                    rightRaw = beforePipe
+                }
+            }
             if !leftRaw.isEmpty && !rightRaw.isEmpty {
                 let (left, leftAlbum, leftSingle, _) = extractBracketedProjectTag(from: leftRaw)
                 let (right, rightAlbum, rightSingle, _) = extractBracketedProjectTag(from: rightRaw)
-                let resolvedAlbum = rightAlbum ?? leftAlbum ?? wholeAlbum
+                let resolvedAlbum = trailingPipeAlbum ?? rightAlbum ?? leftAlbum ?? wholeAlbum
                 let explicitSingle = leftSingle || rightSingle || wholeExplicitSingle
 
                 let leftIsChannel = looksLikeUploaderChannel(left, customIgnoredChannels: ignoredChannels) ||
@@ -342,7 +408,7 @@ enum ArtistDatabase {
         var isSingle = false
         var artistCandidate: String?
 
-        let pattern = #"\s*[\(\[]([^\)\]]{2,48})[\)\]]\s*$"#
+        let pattern = #"(?<=\s)[\(\[]([^\)\]]{2,48})[\)\]]\s*$"#
         let versionKeywords: [String] = [
             "remix", "live", "acoustic", "instrumental", "karaoke", "cover",
             "slowed", "reverb", "sped", "nightcore", "demo", "unplugged", "8d",
@@ -847,9 +913,19 @@ enum ArtistDatabase {
             text = featRegex.stringByReplacingMatches(in: text, range: NSRange(location: 0, length: nsText.length), withTemplate: " ")
         }
 
-        // Strip trailing "feat. Artist" when unbracketed
+        // Strip bracketed/CJK/multilingual release noise FIRST so trailing `feat. Artist` isn't blocked by `[Official Audio]`.
+        let noisePattern = #"(?:[\(\[]\s*(?:official(?:\s+(?:music|lyric|audio|hd|4k))?\s*(?:video|audio|visualizer|mv|m/v)?|video\s+oficial|audio\s+oficial|clip\s+officiel|videoclip|letra|paroles|lyrics?|lyric video|audio|video|hd|4k|hq|explicit|clean|remaster(?:ed)?(?:\s*\d{4})?|live|acoustic|sped up|slowed(?:\s*\+\s*reverb)?|topic)\s*[\)\]]|【[^】]*(?:lyric|official|mv|sub|audio|full|hd|4k|和訳|歌詞)[^】]*】|\s+(?:official\s+(?:music\s+)?video|official\s+(?:audio|mv)|video\s+oficial|clip\s+officiel|m/v|mv)\s*$)"#
+        if let noiseRegex = try? NSRegularExpression(pattern: noisePattern, options: [.caseInsensitive]) {
+            text = noiseRegex.stringByReplacingMatches(
+                in: text,
+                range: NSRange(location: 0, length: (text as NSString).length),
+                withTemplate: " "
+            ).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        // Strip trailing "feat. Artist" or tight "feat.Artist" when unbracketed
         if let inlineFeatRegex = try? NSRegularExpression(
-            pattern: #"\s+(?:feat\.?|ft\.?|featuring)\s+([^-\|\(\)\[\]]+)$"#,
+            pattern: #"\s+(?:feat|ft|featuring)(?:\.?\s+|\.)([^-\|\(\)\[\]]+)$"#,
             options: [.caseInsensitive]
         ) {
             let nsText = text as NSString
@@ -859,16 +935,6 @@ enum ArtistDatabase {
                 featured.append(contentsOf: splitAndCanonicalize(rawGuests))
             }
             text = inlineFeatRegex.stringByReplacingMatches(in: text, range: NSRange(location: 0, length: nsText.length), withTemplate: "")
-        }
-
-        // Remove bracketed/parenthetical noise tags cleanly
-        let noisePattern = #"[\(\[]\s*(?:official(?:\s+(?:music|lyric|audio|hd|4k))?\s*(?:video|audio|visualizer|mv|m/v)?|lyrics?|lyric video|audio|video|hd|4k|hq|explicit|clean|remaster(?:ed)?(?:\s*\d{4})?|live|acoustic|sped up|slowed(?:\s*\+\s*reverb)?|topic)\s*[\)\]]"#
-        if let noiseRegex = try? NSRegularExpression(pattern: noisePattern, options: [.caseInsensitive]) {
-            text = noiseRegex.stringByReplacingMatches(
-                in: text,
-                range: NSRange(location: 0, length: (text as NSString).length),
-                withTemplate: " "
-            )
         }
 
         while text.contains("  ") {

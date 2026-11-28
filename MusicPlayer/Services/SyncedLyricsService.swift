@@ -1124,19 +1124,39 @@ final class SyncedLyricsService {
     }
 
     nonisolated static func areArtistsCompatible(target: String, candidate: String) -> Bool {
-        func clean(_ s: String) -> String {
-            let stripped = s
-                .replacingOccurrences(of: #"(?i)\s*-\s*topic$|vevo$|\s+official$"#, with: "", options: .regularExpression)
+        func stripChannelSuffix(_ s: String) -> String {
+            s.replacingOccurrences(of: #"(?i)\s*-\s*topic$|vevo$|\s+official$"#, with: "", options: .regularExpression)
                 .trimmingCharacters(in: .whitespacesAndNewlines)
-            return normalizeComparable(ArtistDatabase.canonicalizeSingle(stripped))
         }
-        let nTarget = clean(target)
-        let nCand = clean(candidate)
+        func aliasForms(_ s: String) -> Set<String> {
+            let stripped = stripChannelSuffix(s)
+            var out = Set<String>()
+            let fullNorm = normalizeComparable(ArtistDatabase.canonicalizeSingle(stripped))
+            if !fullNorm.isEmpty { out.insert(fullNorm) }
+            // Preserve base + parenthesized bilingual aliases (e.g. "BTS (방탄소년단)" & "방탄소년단(BTS)" -> {"bts", "방탄소년단"})
+            if let parenRegex = try? NSRegularExpression(pattern: #"[\(\[]([^\)\]]+)[\)\]]"#) {
+                let ns = stripped as NSString
+                for m in parenRegex.matches(in: stripped, range: NSRange(location: 0, length: ns.length)) where m.numberOfRanges > 1 {
+                    let inner = normalizeComparable(ns.substring(with: m.range(at: 1)))
+                    if !inner.isEmpty { out.insert(inner) }
+                }
+                let outer = parenRegex.stringByReplacingMatches(in: stripped, range: NSRange(location: 0, length: ns.length), withTemplate: " ")
+                let outerNorm = normalizeComparable(ArtistDatabase.canonicalizeSingle(outer))
+                if !outerNorm.isEmpty { out.insert(outerNorm) }
+            }
+            for sep in [",", "/", "&", " x ", " × "] {
+                for part in stripped.components(separatedBy: sep) {
+                    let pn = normalizeComparable(ArtistDatabase.canonicalizeSingle(part))
+                    if !pn.isEmpty { out.insert(pn) }
+                }
+            }
+            return out
+        }
+
+        let nTarget = normalizeComparable(ArtistDatabase.canonicalizeSingle(stripChannelSuffix(target)))
+        let nCand = normalizeComparable(ArtistDatabase.canonicalizeSingle(stripChannelSuffix(candidate)))
         let genericArtists: Set<String> = ["", "unknown artist", "unknown", "various artists", "topic"]
         if genericArtists.contains(nTarget) || genericArtists.contains(nCand) {
-            return true
-        }
-        if nTarget == nCand {
             return true
         }
 
@@ -1145,10 +1165,15 @@ final class SyncedLyricsService {
             "philharmonic", "choir", "tribute", "lullaby", "karaoke", "backing", "8bit",
             "chiptune", "musicbox", "cover", "strings"
         ]
-        let tTokens = Set(nTarget.split(separator: " ").map(String.init))
-        let cTokens = Set(nCand.split(separator: " ").map(String.init))
+        let tAliases = aliasForms(target)
+        let cAliases = aliasForms(candidate)
+        let tTokens = Set(tAliases.flatMap { $0.split(separator: " ").map(String.init) })
+        let cTokens = Set(cAliases.flatMap { $0.split(separator: " ").map(String.init) })
         if !cTokens.subtracting(tTokens).intersection(derivativeMarkers).isEmpty {
             return false
+        }
+        if nTarget == nCand || !tAliases.intersection(cAliases).isEmpty {
+            return true
         }
         if tTokens.count == 1, let single = tTokens.first {
             // A 1-word artist like "Coda" or "Datfootdive" must match identically or via collaborator connectors (&, feat, x).
@@ -1828,7 +1853,7 @@ final class SyncedLyricsService {
     private func buildLyricsFromLRCLIBRow(_ row: [String: Any], cacheKey: String, duration: Double?) -> ResolvedTrackLyrics? {
         let track = (row["trackName"] as? String) ?? ""
         let artist = (row["artistName"] as? String) ?? ""
-        let dur = row["duration"] as? Double
+        let dur = (row["duration"] as? NSNumber)?.doubleValue
         if let synced = row["syncedLyrics"] as? String, !synced.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             let parsed = Self.parseLRCOrPlain(text: synced, duration: duration ?? dur)
             if !parsed.lines.isEmpty {
@@ -1878,7 +1903,7 @@ final class SyncedLyricsService {
         let artistName = (row["artistName"] as? String) ?? ""
         let synced = row["syncedLyrics"] as? String
         let plain = row["plainLyrics"] as? String
-        let dur = row["duration"] as? Double
+        let dur = (row["duration"] as? NSNumber)?.doubleValue
         let isInstrumental = (row["instrumental"] as? Bool) == true
 
         var score = 0
@@ -3161,7 +3186,7 @@ final class SyncedLyricsService {
     private static func stripNoisyTitleTokens(_ text: String) -> String {
         text
             .replacingOccurrences(
-                of: #"\s*[\(\[]\s*(?:official|lyrics?|lyric video|audio|video|visualizer|mv|m/v|hd|4k|explicit|clean|mixed|dj\s*mix|remaster(?:ed)?(?:\s*\d{4})?)[^\)\]]*[\)\]]"#,
+                of: #"(?:\s*[\(\[]\s*(?:official|lyrics?|lyric video|audio|video|visualizer|mv|m/v|video\s+oficial|audio\s+oficial|clip\s+officiel|videoclip|letra|paroles|hd|4k|explicit|clean|mixed|dj\s*mix|remaster(?:ed)?(?:\s*\d{4})?)[^\)\]]*[\)\]]|【[^】]*(?:lyric|official|mv|sub|audio|full|hd|4k|和訳|歌詞)[^】]*】|\s+(?:official\s+(?:music\s+)?video|official\s+(?:audio|mv)|video\s+oficial|clip\s+officiel)\s*$)"#,
                 with: "",
                 options: [.regularExpression, .caseInsensitive]
             )
@@ -3331,7 +3356,11 @@ final class SyncedLyricsService {
     nonisolated private static func normalizeComparable(_ text: String) -> String {
         let stripped = normalizeSmartPunctuation(text)
             .folding(options: [.diacriticInsensitive, .caseInsensitive], locale: .current)
-            .replacingOccurrences(of: #"[\(\[].*?[\)\]]"#, with: " ", options: .regularExpression)
+            .replacingOccurrences(
+                of: #"(?<=\s)[\(\[][^\)\]]*(?:feat\.?|ft\.?|featuring|with|prod|official|video|audio|lyric|visualizer|mv|live|remix|rework|remaster|acoustic|unplugged|slowed|sped|nightcore|version|ver\.|edit|demo|clean|explicit|deluxe|bonus|radio|mono|stereo|instrumental|karaoke|tribute|piano|lullaby|cover|\d{4})[^\)\]]*[\)\]]"#,
+                with: " ",
+                options: .regularExpression
+            )
         var scalars: [UnicodeScalar] = []
         scalars.reserveCapacity(stripped.unicodeScalars.count)
         var lastWasSpace = true

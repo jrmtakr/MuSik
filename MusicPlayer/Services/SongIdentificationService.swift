@@ -1274,7 +1274,7 @@ final class SongIdentificationService {
 
     /// Works out the real title/artist/album/cover for a file. Returns nil when the sources don't agree
     /// (the caller then keeps the original title rather than guessing).
-    func identify(
+    private func identify(
         fileURL: URL,
         hintTitle: String,
         hintArtist: String,
@@ -1517,7 +1517,10 @@ final class SongIdentificationService {
                 combined.append(cand)
             }
         }
-        return (combined, playerInfo.languageCode)
+        // Keep original order within each tier: cards with explicit albums come before albumless entries.
+        let withAlbum = combined.filter { !($0.album?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true) }
+        let withoutAlbum = combined.filter { ($0.album?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true) }
+        return (withAlbum + withoutAlbum, playerInfo.languageCode)
     }
 
     private static func fetchYouTubeNextCards(videoID: String) async -> [Candidate] {
@@ -1592,9 +1595,13 @@ final class SongIdentificationService {
         if let captions = dict["captions"] as? [String: Any],
            let list = captions["playerCaptionsTracklistRenderer"] as? [String: Any],
            let tracks = list["captionTracks"] as? [[String: Any]] {
-            let nonAuto = tracks.first { ($0["kind"] as? String) != "asr" } ?? tracks.first
-            langCode = (nonAuto?["languageCode"] as? String)?
-                .trimmingCharacters(in: .whitespacesAndNewlines)
+            // Auto-generated ASR captions reflect actual sung/spoken audio language, whereas a single/first
+            // community track is often a fan translation (ar, zh, it, de, en) rather than the audio language.
+            if let asr = tracks.first(where: { ($0["kind"] as? String) == "asr" }),
+               let code = (asr["languageCode"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !code.isEmpty {
+                langCode = code
+            }
         }
 
         guard let videoDetails = dict["videoDetails"] as? [String: Any] else {
@@ -1745,9 +1752,33 @@ final class SongIdentificationService {
         walk(json, depth: 0)
 
         var results: [Candidate] = []
+        let bioPattern = #"(?i)\(born\s|\b\d{4}\s*[–\-]\s*(?:\d{4}|present)\b|\b(?:singer-songwriter|singer|songwriter|musician|record producer|hip-hop producer|producer|rapper|recording artist|vocalist|composer|actor|actress|author|youtuber)\b"#
         for card in attributeCards {
-            guard let title = text(card["title"]), !title.isEmpty,
+            guard let rawCardTitle = text(card["title"]), !rawCardTitle.isEmpty,
                   let artist = text(card["subtitle"]), !artist.isEmpty else { continue }
+            let rawAlbum = text(card["secondarySubtitle"])?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let album = (rawAlbum?.isEmpty == false) ? rawAlbum : nil
+
+            // Reject YouTube Knowledge Graph people/bio cards ("Karol G" / "Colombian singer-songwriter (born 1991)")
+            if album == nil && artist.range(of: bioPattern, options: .regularExpression) != nil {
+                continue
+            }
+
+            // Clean cards where YouTube echoes "Artist - Song [Official Audio]" inside card title (e.g. Nujabes).
+            var cleanTitle = stripVersionNoise(rawCardTitle, keepVersionTags: true)
+            let normArtist = normalize(artist)
+            for sep in [" - ", " — ", " – "] {
+                if let range = cleanTitle.range(of: sep) {
+                    let left = String(cleanTitle[..<range.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+                    let right = String(cleanTitle[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !right.isEmpty && !normArtist.isEmpty && normalize(left) == normArtist {
+                        cleanTitle = stripVersionNoise(right, keepVersionTags: true)
+                        break
+                    }
+                }
+            }
+            guard !cleanTitle.isEmpty else { continue }
+
             var artURL: URL?
             if let image = card["image"] as? [String: Any],
                let sources = (image["sources"] as? [[String: Any]]) ?? ((image["image"] as? [String: Any])?["sources"] as? [[String: Any]]),
@@ -1755,15 +1786,17 @@ final class SongIdentificationService {
                 artURL = URL(string: urlString)
             }
             results.append(Candidate(
-                title: title,
+                title: cleanTitle,
                 artist: artist,
-                album: text(card["secondarySubtitle"]),
+                album: album,
                 artworkURL: artURL,
                 sourceName: "YouTube Music info"
             ))
         }
-        if !results.isEmpty {
-            return results
+        let withAlbum = results.filter { !($0.album?.isEmpty ?? true) }
+        let withoutAlbum = results.filter { ($0.album?.isEmpty ?? true) }
+        if !withAlbum.isEmpty || !withoutAlbum.isEmpty {
+            return withAlbum + withoutAlbum
         }
 
         let song = infoRows.first(where: { $0.label == "SONG" })?.value
@@ -1827,13 +1860,14 @@ final class SongIdentificationService {
                         guard let title = row["trackName"] as? String,
                               let artist = row["artistName"] as? String else { continue }
                         let duration = (row["trackTimeMillis"] as? NSNumber).map { $0.doubleValue / 1000.0 }
-                        guard let score = matchScore(claim: claim, title: title, artist: artist, duration: duration, localDuration: localDuration) else {
+                        let candAlbum = row["collectionName"] as? String
+                        guard let score = matchScore(claim: claim, title: title, artist: artist, duration: duration, localDuration: localDuration, album: candAlbum) else {
                             continue
                         }
                         let hit = Candidate(
                             title: title,
                             artist: artist,
-                            album: row["collectionName"] as? String,
+                            album: candAlbum,
                             genre: row["primaryGenreName"] as? String,
                             artworkURL: (row["artworkUrl100"] as? String).flatMap { URL(string: $0) },
                             durationSeconds: duration,
@@ -1883,17 +1917,18 @@ final class SongIdentificationService {
                   let artistObj = row["artist"] as? [String: Any],
                   let artist = artistObj["name"] as? String else { continue }
             let duration = (row["duration"] as? NSNumber)?.doubleValue
-            guard let score = matchScore(claim: claim, title: title, artist: artist, duration: duration, localDuration: localDuration) else {
+            let albumObj = row["album"] as? [String: Any]
+            let candAlbum = albumObj?["title"] as? String
+            guard let score = matchScore(claim: claim, title: title, artist: artist, duration: duration, localDuration: localDuration, album: candAlbum) else {
                 continue
             }
-            let albumObj = row["album"] as? [String: Any]
             let coverStr = (albumObj?["cover_xl"] as? String)
                 ?? (albumObj?["cover_big"] as? String)
                 ?? (albumObj?["cover_medium"] as? String)
             let hit = Candidate(
                 title: title,
                 artist: artist,
-                album: albumObj?["title"] as? String,
+                album: candAlbum,
                 isrc: row["isrc"] as? String,
                 artworkURL: coverStr.flatMap { URL(string: $0) },
                 durationSeconds: duration,
@@ -2056,7 +2091,8 @@ final class SongIdentificationService {
         title: String,
         artist: String,
         duration: Double?,
-        localDuration: Double?
+        localDuration: Double?,
+        album candidateAlbum: String? = nil
     ) -> Double? {
         let titleSim = similarity(stripVersionNoise(claim.title, keepVersionTags: false), stripVersionNoise(title, keepVersionTags: false))
         guard titleSim >= 0.8 else { return nil }
@@ -2107,19 +2143,42 @@ final class SongIdentificationService {
                 && artistSim >= 0.85
                 && claim.sourceName != "Alternate orientation"
                 && claim.sourceName != "Heard lyrics"
-            let exact = titleSim >= 0.99 && artistSim >= 0.9
+            let exact = titleSim >= 0.96 && artistSim >= 0.90
             let trusted = claim.sourceName != "Video title" && claim.sourceName != "File name"
+            let mvIntrosAllowed = exact && !claim.artist.isEmpty && trusted && localDuration < 480 && duration < 480
             let tolerance: Double
             if strongExplicitTitleAndArtist {
-                tolerance = trusted ? 45.0 : 25.0
+                tolerance = mvIntrosAllowed ? 95.0 : (trusted ? 45.0 : 25.0)
             } else {
-                tolerance = exact ? (trusted ? 45.0 : durationTolerance * 3) : durationTolerance
+                tolerance = exact ? (mvIntrosAllowed ? 95.0 : (trusted ? 45.0 : durationTolerance * 3)) : durationTolerance
             }
             guard diff <= tolerance else { return nil }
             durationScore = max(0.05, 1.0 - diff / (tolerance + 1.0))
         }
         let editionPenalty = (!hasExtraEditionParenthetical(claim.title) && hasExtraEditionParenthetical(title)) ? 0.14 : 0.0
-        return titleSim * 0.5 + artistSim * 0.3 + durationScore * 0.2 - editionPenalty
+
+        var albumAdjustment = 0.0
+        if let candAlb = candidateAlbum?.trimmingCharacters(in: .whitespacesAndNewlines), !candAlb.isEmpty {
+            let cleanCandAlb = stripVersionNoise(candAlb, keepVersionTags: false)
+            if let claimAlb = claim.album?.trimmingCharacters(in: .whitespacesAndNewlines), !claimAlb.isEmpty {
+                let cleanClaimAlb = stripVersionNoise(claimAlb, keepVersionTags: false)
+                if similarity(cleanClaimAlb, cleanCandAlb) >= 0.65
+                    || normalize(cleanCandAlb).joined(separator: " ").contains(normalize(cleanClaimAlb).joined(separator: " ")) {
+                    albumAdjustment += 0.12
+                }
+            }
+            let lowerAlb = candAlb.lowercased()
+            let lowerClaimAlb = (claim.album ?? "").lowercased()
+            let genericMixMarkers = [
+                "final mix", "greatest hits", "best of", "highlights", "anniversary",
+                "now that's what i call", "ministry of sound", "party hits", "summer hits",
+                "workout", "essential"
+            ]
+            if genericMixMarkers.contains(where: { lowerAlb.contains($0) && !lowerClaimAlb.contains($0) && !claim.title.lowercased().contains($0) }) {
+                albumAdjustment -= 0.14
+            }
+        }
+        return titleSim * 0.5 + artistSim * 0.3 + durationScore * 0.2 - editionPenalty + albumAdjustment
     }
 
     nonisolated static func normalize(_ s: String) -> [String] {
@@ -2190,16 +2249,18 @@ final class SongIdentificationService {
     nonisolated static func stripVersionNoise(_ title: String, keepVersionTags: Bool) -> String {
         var result = title
         let noisePatterns = [
-            #"(?i)[\(\[][^\)\]]*(official|video|audio|lyric|visualizer|hd|4k|mv|m/v|music video|explicit|clean)[^\)\]]*[\)\]]"#,
+            #"(?i)[\(\[][^\)\]]*(official|video|audio|lyric|visualizer|hd|4k|mv|m/v|music video|video oficial|audio oficial|clip officiel|videoclip|letra|paroles|explicit|clean)[^\)\]]*[\)\]]"#,
+            #"(?i)【[^】]*(lyric|official|mv|sub|audio|full|hd|4k|和訳|歌詞)[^】]*】"#,
+            #"(?i)\s+(official\s+(?:music\s+)?video|official\s+(?:audio|mv)|video\s+oficial|clip\s+officiel)\s*$"#,
             #"(?i)\s+-\s+(remaster(ed)?( \d{4})?|\d{4} remaster(ed)?|single version|radio edit|mono|stereo)\s*$"#,
             #"(?i)[\(\[](feat\.?|ft\.?|featuring|with) [^\)\]]*[\)\]]"#,
-            #"(?i)\s+(feat\.?|ft\.?|featuring) .+$"#
+            #"(?i)\s+(?:feat|ft|featuring)(?:\.?\s+|\.).+$"#
         ]
         for pattern in noisePatterns {
             result = result.replacingOccurrences(of: pattern, with: "", options: .regularExpression)
         }
         if !keepVersionTags {
-            result = result.replacingOccurrences(of: #"[\(\[][^\)\]]*[\)\]]"#, with: "", options: .regularExpression)
+            result = result.replacingOccurrences(of: #"(?<=\s)[\(\[][^\)\]]*[\)\]]"#, with: "", options: .regularExpression)
         }
         return result
             .replacingOccurrences(of: #"\s{2,}"#, with: " ", options: .regularExpression)
