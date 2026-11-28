@@ -307,6 +307,119 @@ final class MuseJRMTests: XCTestCase {
         XCTAssertFalse(parsed.allArtists.contains { $0.lowercased().contains("google") })
     }
 
+    // MARK: - Round 1: Sync Accuracy Score, Speech Hints, Scorable Lyrics
+
+    func testSyncAccuracyReportMeasuresLateAndEarlyLyrics() {
+        // Lyrics displayed at 10/20/30/40s; the voice is actually heard 0.3s later on every line.
+        let lyrics = ResolvedTrackLyrics(
+            cacheKey: "acc-en",
+            trackTitle: "Fixture",
+            artistName: "Fixture Artist",
+            isTimeSynced: true,
+            sourceLabel: "Synced Lyrics",
+            attributionText: "Time-synced via LRCLIB",
+            syncedOffsetSeconds: 0,
+            expectedDurationSeconds: 60,
+            lines: [
+                SyncedLyricLine(startTime: 10, endTime: 13, text: "Hello darkness my old friend", words: [], isInstrumentalBreak: false),
+                SyncedLyricLine(startTime: 20, endTime: 23, text: "Running through the city lights", words: [], isInstrumentalBreak: false),
+                SyncedLyricLine(startTime: 30, endTime: 33, text: "Nobody knows the trouble", words: [], isInstrumentalBreak: false),
+                SyncedLyricLine(startTime: 40, endTime: 43, text: "Something wonderful tonight", words: [], isInstrumentalBreak: false)
+            ]
+        )
+        func words(_ text: String, at t: Double) -> [HeardWord] {
+            text.split(separator: " ").enumerated().map { idx, w in
+                HeardWord(token: SongAudioListener.normalizeToken(String(w)), rawText: String(w), time: t + Double(idx) * 0.4, endTime: t + Double(idx) * 0.4 + 0.35)
+            }
+        }
+        let heard = words("hello darkness my old friend", at: 10.3) + words("running through the city lights", at: 20.3)
+            + words("nobody knows the trouble", at: 30.3) + words("something wonderful tonight", at: 40.3)
+        let report = SongAudioListener.syncAccuracyReport(lyrics: lyrics, heard: heard)
+        XCTAssertEqual(report.matchedLines, 4)
+        XCTAssertEqual(report.totalLines, 4)
+        XCTAssertEqual(report.medianOffsetSeconds ?? 99, 0.3, accuracy: 0.02)
+        XCTAssertEqual(report.p90AbsOffsetSeconds ?? 99, 0.3, accuracy: 0.02)
+
+        // A user timing offset shifts where lines are displayed, and the score follows it.
+        var shifted = lyrics
+        shifted.syncedOffsetSeconds = -0.3
+        XCTAssertEqual(SongAudioListener.syncAccuracyReport(lyrics: shifted, heard: heard).medianOffsetSeconds ?? 99, 0.0, accuracy: 0.02)
+
+        // Nothing heard: no score, but the line count is still reported.
+        let empty = SongAudioListener.syncAccuracyReport(lyrics: lyrics, heard: [])
+        XCTAssertEqual(empty.matchedLines, 0)
+        XCTAssertNil(empty.medianOffsetSeconds)
+    }
+
+    func testSyncAccuracyReportWorksForJapaneseLines() {
+        // Coda "Crazy my Beat": LRCLIB has 31.65s/35.40s/39.15s; the old aligner displayed them at 32.80s/35.55s/39.95s.
+        let warped = ResolvedTrackLyrics(
+            cacheKey: "acc-ja",
+            trackTitle: "Crazy my Beat",
+            artistName: "Coda",
+            isTimeSynced: true,
+            sourceLabel: "Synced Lyrics",
+            attributionText: "Time-synced via LRCLIB",
+            syncedOffsetSeconds: 0,
+            expectedDurationSeconds: 269.6,
+            lines: [
+                SyncedLyricLine(startTime: 32.80, endTime: 35.49, text: "たまんねーぜッ", words: [], isInstrumentalBreak: false),
+                SyncedLyricLine(startTime: 35.55, endTime: 39.16, text: "なんか知んねーうちに", words: [], isInstrumentalBreak: false),
+                SyncedLyricLine(startTime: 39.95, endTime: 45.99, text: "悪夢は始まってんだ dangerous yeah", words: [], isInstrumentalBreak: false)
+            ]
+        )
+        let heard = [
+            HeardWord(token: "たまんねーぜ", rawText: "たまんねーぜ", time: 31.65, endTime: 33.0),
+            HeardWord(token: "なんか知んねーうちに", rawText: "なんか知んねーうちに", time: 35.40, endTime: 37.0),
+            HeardWord(token: "悪夢は始まってんだ", rawText: "悪夢は始まってんだ", time: 39.15, endTime: 41.0)
+        ]
+        let report = SongAudioListener.syncAccuracyReport(lyrics: warped, heard: heard)
+        XCTAssertEqual(report.matchedLines, 3)
+        XCTAssertEqual(report.medianOffsetSeconds ?? 99, -0.80, accuracy: 0.02, "Negative = lyrics shown late")
+        XCTAssertEqual(report.p90AbsOffsetSeconds ?? 99, 1.15, accuracy: 0.02)
+    }
+
+    func testSpeechHintsUseTitleAndArtistOnly() {
+        XCTAssertEqual(SongAudioListener.whisperLanguageHint(title: "うっせぇわ", artist: "Ado"), "ja")
+        XCTAssertEqual(SongAudioListener.whisperLanguageHint(title: "Super Shy", artist: "뉴진스"), "ko")
+        XCTAssertNil(SongAudioListener.whisperLanguageHint(title: "Crazy my Beat", artist: "Coda"))
+        XCTAssertNil(SongAudioListener.whisperLanguageHint(title: "月亮代表我的心", artist: nil), "Han-only text stays on auto-detect")
+
+        XCTAssertEqual(SongAudioListener.speechPromptHint(title: "stay", artist: "datfootdive - Topic"), "stay — datfootdive")
+        XCTAssertEqual(SongAudioListener.speechPromptHint(title: "crazy my beat - Google Search", artist: ""), "crazy my beat")
+        XCTAssertEqual(SongAudioListener.speechPromptHint(title: "Lemon (Official Video)", artist: "Unknown Artist"), "Lemon")
+        XCTAssertNil(SongAudioListener.speechPromptHint(title: nil, artist: "Coda"))
+    }
+
+    func testOnlyPublishedTimingIsScoredForAccuracy() {
+        let published = Self.makeSyncedLyrics(starts: [1, 5, 9, 13], expectedDuration: 30, sourceLabel: "Synced Lyrics", attribution: "Time-synced via LRCLIB")
+        XCTAssertTrue(SyncedLyricsService.isScorableSyncedLyrics(published))
+        let transcribed = Self.makeSyncedLyrics(starts: [1, 5, 9, 13], expectedDuration: 30, sourceLabel: "Vocal Adlibs & Instrumental", attribution: nil)
+        XCTAssertFalse(SyncedLyricsService.isScorableSyncedLyrics(transcribed), "Lines built from the transcript would trivially score 0s")
+        let fullSong = Self.makeSyncedLyrics(starts: [1, 5, 9, 13], expectedDuration: 30, sourceLabel: "Full-Song Lyrics", attribution: nil)
+        XCTAssertFalse(SyncedLyricsService.isScorableSyncedLyrics(fullSong))
+    }
+
+    func testDiagnosticsExportIncludesSyncScoreAndPlaybackBackend() throws {
+        let testPath = "__xctest__/round1_track.mp4"
+        SyncDiagnosticsService.shared.updateTrack(relativePath: testPath, fileName: "round1_track.mp4") { diag in
+            diag.syncMatchedLines = "31/35"
+            diag.syncMedianOffsetSeconds = -0.12
+            diag.syncP90OffsetSeconds = 0.4
+            diag.syncScoreSource = "playback check"
+            diag.playbackBackend = "AVPlayer (player compensates latency)"
+            diag.latencyCompensationSeconds = 0
+        }
+        XCTAssertEqual(SyncDiagnosticsService.shared.entry(for: testPath)?.syncMatchedLines, "31/35")
+        let url = try XCTUnwrap(SyncDiagnosticsService.shared.exportDiagnosticsFileURL())
+        defer { try? FileManager.default.removeItem(at: url) }
+        let obj = try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any]
+        let entry = (obj?["tracks"] as? [[String: Any]])?.first(where: { ($0["relativePath"] as? String) == testPath })
+        XCTAssertEqual(entry?["syncMatchedLines"] as? String, "31/35")
+        XCTAssertEqual(entry?["syncMedianOffsetSeconds"] as? Double ?? 99, -0.12, accuracy: 0.001)
+        XCTAssertEqual(entry?["playbackBackend"] as? String, "AVPlayer (player compensates latency)")
+    }
+
     // MARK: - Fixture Helpers
 
     private static func makeSyncedLyrics(
