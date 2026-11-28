@@ -1973,6 +1973,24 @@ final class SyncedLyricsService {
             includeDurationScore: false
         )
 
+        // Prefer clean monolingual LRC over bilingual duplicate-timestamp LRCs (same [mm:ss.xx] used for JP + Romaji/EN).
+        if let synced, !synced.isEmpty {
+            let linesWithTags = synced.components(separatedBy: .newlines).filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+            var timestamps: [String] = []
+            timestamps.reserveCapacity(linesWithTags.count)
+            for l in linesWithTags {
+                if let r = l.range(of: #"^\[\d{1,3}:\d{2}(?:[\.:]\d{1,3})?\]"#, options: .regularExpression) {
+                    timestamps.append(String(l[r]))
+                }
+            }
+            if timestamps.count >= 8 {
+                let uniqueCount = Set(timestamps).count
+                if Double(uniqueCount) / Double(timestamps.count) < 0.72 {
+                    score -= 28
+                }
+            }
+        }
+
         // Prevent false positives when retrying title-only or mismatched uploader channel tags
         if strictArtistlessGuard && !artistMatched {
             let wordCount = normTargetSong.split(separator: " ").count
@@ -2966,6 +2984,33 @@ final class SyncedLyricsService {
         if !timedEntries.isEmpty {
             timedEntries.sort { $0.time < $1.time }
 
+            // Deduplicate bilingual dual-timestamp lines (same [mm:ss.xx] repeated for Native + Romaji/Translation).
+            var dedupedEntries: [(time: Double, rawBody: String)] = []
+            dedupedEntries.reserveCapacity(timedEntries.count)
+            for entry in timedEntries {
+                let cleanCurr = stripEnhancedTimestamps(entry.rawBody)
+                if let last = dedupedEntries.last,
+                   abs(entry.time - last.time) <= 0.05,
+                   !cleanCurr.isEmpty {
+                    let cleanPrev = stripEnhancedTimestamps(last.rawBody)
+                    if !cleanPrev.isEmpty {
+                        let prevNonLatin = cleanPrev.unicodeScalars.contains {
+                            (0x3040...0x30FF).contains($0.value) || (0x4E00...0x9FFF).contains($0.value) || (0xAC00...0xD7AF).contains($0.value)
+                        }
+                        let currNonLatin = cleanCurr.unicodeScalars.contains {
+                            (0x3040...0x30FF).contains($0.value) || (0x4E00...0x9FFF).contains($0.value) || (0xAC00...0xD7AF).contains($0.value)
+                        }
+                        // Prefer native non-Latin line when paired with a Latin/Romaji duplicate at the exact same timestamp.
+                        if !prevNonLatin && currNonLatin {
+                            dedupedEntries[dedupedEntries.count - 1] = entry
+                        }
+                        continue
+                    }
+                }
+                dedupedEntries.append(entry)
+            }
+            timedEntries = dedupedEntries
+
             var built: [SyncedLyricLine] = []
 
             // Optional intro interlude dots when first lyric starts > 5.5s into the song
@@ -2984,8 +3029,8 @@ final class SyncedLyricsService {
             for i in 0..<timedEntries.count {
                 let entry = timedEntries[i]
                 let nextTime: Double = {
-                    if i + 1 < timedEntries.count {
-                        return max(entry.time + 0.4, timedEntries[i + 1].time)
+                    if let nextIdx = ((i + 1)..<timedEntries.count).first(where: { timedEntries[$0].time > entry.time + 0.05 }) {
+                        return max(entry.time + 0.4, timedEntries[nextIdx].time)
                     }
                     if let duration, duration > entry.time + 0.5 {
                         return duration

@@ -2098,13 +2098,16 @@ enum SongAudioListener {
             guard !line.isInstrumentalBreak, !line.isSpokenDialogue else { continue }
             guard line.startTime >= 0, line.startTime + 0.4 < maxCurveTime else { continue }
 
-            let prevStartFloor: Double = (idx > 0) ? (refined[idx - 1].startTime + 0.35) : 0.0
-            let nextStart: Double = (idx + 1 < count) ? refined[idx + 1].startTime : maxCurveTime
             let sepFromPrevStart = (idx > 0) ? (line.startTime - refined[idx - 1].startTime) : line.startTime
+            let prevStartFloor: Double = (idx > 0)
+                ? max(refined[idx - 1].startTime + 0.35, refined[idx - 1].startTime + min(0.95, sepFromPrevStart * 0.55))
+                : 0.0
+            let nextStart: Double = (idx + 1 < count) ? refined[idx + 1].startTime : maxCurveTime
+            let maxBackwardPull: Double = (idx == 0 || sepFromPrevStart >= 2.2) ? 1.35 : 0.85
 
             var newStart = line.startTime
             if idx == 0 || sepFromPrevStart >= 0.85 || line.hasNativeWordTimings {
-                let minAllowed = max(max(0.05, prevStartFloor), line.startTime - 1.35)
+                let minAllowed = max(max(0.05, prevStartFloor), line.startTime - maxBackwardPull)
                 let maxAllowed = min(nextStart - 0.30, line.startTime + 0.50)
                 if maxAllowed > minAllowed + 0.05 {
                     let origScore = onsetScore(at: line.startTime, orig: line.startTime)
