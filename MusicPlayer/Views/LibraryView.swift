@@ -261,6 +261,7 @@ struct LibraryView: View {
                             }
                         }
                         .listStyle(.plain)
+                        .scrollDismissesKeyboard(.interactively)
                         .refreshable {
                             mediaManager.loadLocalFiles()
                         }
@@ -788,6 +789,7 @@ struct LibraryView: View {
                     }
                     if mediaManager.currentItem?.relativePath == item.relativePath {
                         if item.isVideo {
+                            UIApplication.shared.dismissKeyboard()
                             showPlayerSheet = true
                             if !mediaManager.isPlaying {
                                 mediaManager.resume()
@@ -796,6 +798,7 @@ struct LibraryView: View {
                             mediaManager.togglePlayPause()
                         }
                     } else {
+                        UIApplication.shared.dismissKeyboard()
                         if mediaManager.play(item) && item.isVideo {
                             showPlayerSheet = true
                         }

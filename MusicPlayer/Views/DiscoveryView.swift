@@ -12,6 +12,7 @@ struct DiscoveryView: View {
     @Binding var selectedTab: AppTab
 
     @State private var searchInput = ""
+    @FocusState private var isSearchFocused: Bool
     @State private var showSaveLinkAlert = false
     @State private var saveLinkText = ""
     @State private var showWebsiteEditor = false
@@ -72,6 +73,7 @@ struct DiscoveryView: View {
                             items: offlineSongs,
                             actionTitle: "More"
                         ) {
+                            dismissKeyboard()
                             if let first = offlineSongs.first {
                                 mediaManager.play(first)
                             }
@@ -84,6 +86,7 @@ struct DiscoveryView: View {
                             items: recentItems,
                             actionTitle: "More"
                         ) {
+                            dismissKeyboard()
                             selectedTab = .playlists
                         }
                     }
@@ -103,6 +106,7 @@ struct DiscoveryView: View {
                 .padding(.horizontal, 16)
                 .padding(.vertical, 12)
             }
+            .scrollDismissesKeyboard(.interactively)
             .navigationTitle("Discovery")
             .refreshable {
                 await refreshDiscoveryFeeds(force: true)
@@ -110,25 +114,44 @@ struct DiscoveryView: View {
             .task {
                 await refreshDiscoveryFeeds(force: false)
             }
+            .onChange(of: showPlayerSheet) { _, _ in
+                dismissKeyboard()
+            }
+            .onChange(of: selectedTab) { _, _ in
+                dismissKeyboard()
+            }
+            .onDisappear {
+                dismissKeyboard()
+            }
             .toolbar {
                 ToolbarItemGroup(placement: .topBarTrailing) {
                     Button {
+                        dismissKeyboard()
                         showWrappedSheet = true
                     } label: {
                         Label("Wrapped", systemImage: "sparkles")
                     }
 
                     Button {
+                        dismissKeyboard()
                         showMangaReaderHub = true
                     } label: {
                         Label("Manga Reader", systemImage: "book.pages")
                     }
 
                     Button {
+                        dismissKeyboard()
                         selectedTab = .browser
                     } label: {
                         Label("Browser", systemImage: "globe")
                     }
+                }
+                ToolbarItemGroup(placement: .keyboard) {
+                    Spacer()
+                    Button("Done") {
+                        dismissKeyboard()
+                    }
+                    .font(.subheadline.weight(.semibold))
                 }
             }
             .miniPlayerInset(showPlayerSheet: $showPlayerSheet)
@@ -209,7 +232,22 @@ struct DiscoveryView: View {
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
                     .submitLabel(.go)
+                    .focused($isSearchFocused)
                     .onSubmit(submitSearch)
+
+                if isSearchFocused || !searchInput.isEmpty {
+                    Button {
+                        if !searchInput.isEmpty {
+                            searchInput = ""
+                        } else {
+                            dismissKeyboard()
+                        }
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                }
 
                 Button(action: submitSearch) {
                     Image(systemName: "magnifyingglass")
@@ -642,9 +680,11 @@ struct DiscoveryView: View {
     private func trendingSongRow(_ song: TrendingSongItem) -> some View {
         let isResolving = trendingService.resolvingSongID == song.id
         return Button {
+            dismissKeyboard()
             Task {
                 let played = await trendingService.playTrendingSong(song, isVideo: song.videoID != nil)
                 if played && song.videoID != nil {
+                    dismissKeyboard()
                     showPlayerSheet = true
                 }
             }
@@ -843,6 +883,7 @@ struct DiscoveryView: View {
             VStack(spacing: 8) {
                 ForEach(items) { item in
                     Button {
+                        dismissKeyboard()
                         mediaManager.play(item)
                         if item.isVideo {
                             showPlayerSheet = true
@@ -909,7 +950,13 @@ struct DiscoveryView: View {
         }
     }
 
+    private func dismissKeyboard() {
+        isSearchFocused = false
+        UIApplication.shared.dismissKeyboard()
+    }
+
     private func submitSearch() {
+        dismissKeyboard()
         guard let target = resolvedInputURL(searchInput) else { return }
         openURLInBrowser(target.absoluteString, title: searchInput)
         searchInput = ""
@@ -928,6 +975,7 @@ struct DiscoveryView: View {
     }
 
     private func openURLInBrowser(_ urlString: String, title: String? = nil) {
+        dismissKeyboard()
         browserStore.openInActiveTab(urlString: urlString, title: title)
         selectedTab = .browser
     }

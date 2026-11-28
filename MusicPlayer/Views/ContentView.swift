@@ -175,8 +175,12 @@ private struct ContentSystemEventsModifier: ViewModifier {
             .onChange(of: actionRouter.shouldPresentPlayerSheet) { _, shouldShow in
                 if shouldShow {
                     actionRouter.shouldPresentPlayerSheet = false
+                    UIApplication.shared.dismissKeyboard()
                     showPlayerSheet = true
                 }
+            }
+            .onChange(of: selectedTab) { _, _ in
+                UIApplication.shared.dismissKeyboard()
             }
             .onChange(of: settings.useCustomTextColor) { _, _ in updateNavigationBarAppearance() }
             .onChange(of: settings.customTextHex) { _, _ in updateNavigationBarAppearance() }
@@ -193,7 +197,19 @@ private struct ContentSheetsAndAlertsModifier: ViewModifier {
 
     func body(content: Content) -> some View {
         content
-            .sheet(isPresented: $showPlayerSheet) {
+            .onChange(of: showPlayerSheet) { _, isPresented in
+                UIApplication.shared.dismissKeyboard()
+                if !isPresented {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) {
+                        if !showPlayerSheet && quickLookTarget == nil && shortcutImportURLItem == nil {
+                            UIApplication.shared.dismissKeyboard()
+                        }
+                    }
+                }
+            }
+            .sheet(isPresented: $showPlayerSheet, onDismiss: {
+                UIApplication.shared.dismissKeyboard()
+            }) {
                 NowPlayingView()
             }
             .sheet(item: $quickLookTarget) { target in

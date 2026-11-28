@@ -1568,6 +1568,8 @@ struct BrowserTabView: View {
                     awaitingAutoOpenPlayer = false
                     offlineReadyItem = nil
                     browser.pausePageMedia()
+                    isAddressFieldFocused = false
+                    UIApplication.shared.dismissKeyboard()
                     if songIDService.isBlockedPendingAI(cachedItem) {
                         songIDService.prioritize(cachedItem)
                     }
@@ -2111,6 +2113,8 @@ struct BrowserTabView: View {
                 songIDService.prioritize(item)
             }
             offlineReadyItem = nil
+            isAddressFieldFocused = false
+            UIApplication.shared.dismissKeyboard()
             if mediaManager.play(item) {
                 showPlayerSheet = true
             }
@@ -2611,6 +2615,8 @@ struct BrowserTabView: View {
                 songIDService.prioritize(existingItem)
             }
             cachingOverlayTitle = nil
+            isAddressFieldFocused = false
+            UIApplication.shared.dismissKeyboard()
             if mediaManager.play(existingItem) {
                 showPlayerSheet = true
             }

@@ -22,8 +22,6 @@ struct NowPlayingView: View {
     @Environment(\.dismiss) private var dismiss
 
     @State private var displayMode: NowPlayingDisplayMode = .player
-    @State private var scrubPosition: Double = 0
-    @State private var isEditingScrubber = false
     @State private var showCustomSleepAlert = false
     @State private var customSleepMinutes = ""
     @State private var showEqualizerSheet = false
@@ -93,11 +91,6 @@ struct NowPlayingView: View {
                     .applyAppTheme()
                 }
             }
-            .onChange(of: mediaManager.currentTime) { _, newTime in
-                if !isEditingScrubber {
-                    scrubPosition = newTime
-                }
-            }
             .onChange(of: mediaManager.currentItem?.relativePath) { _, _ in
                 if let current = mediaManager.currentItem {
                     lyricsService.loadLyricsIfNeeded(for: current)
@@ -106,14 +99,17 @@ struct NowPlayingView: View {
             .onChange(of: songIDService.completedRevision) { _, _ in
                 if let current = mediaManager.currentItem,
                    songIDService.lastCompletedRelativePath == current.relativePath || lyricsService.currentLyrics == nil {
-                    lyricsService.loadLyricsIfNeeded(for: current, forceReload: true)
+                    lyricsService.loadLyricsIfNeeded(for: current, forceReload: lyricsService.currentLyrics == nil)
                 }
             }
             .onAppear {
-                scrubPosition = mediaManager.currentTime
+                UIApplication.shared.dismissKeyboard()
                 if let current = mediaManager.currentItem {
                     lyricsService.loadLyricsIfNeeded(for: current)
                 }
+            }
+            .onDisappear {
+                UIApplication.shared.dismissKeyboard()
             }
             .navigationBarTitleDisplayMode(.inline)
             .toolbar(displayMode == .player ? .visible : .hidden, for: .navigationBar)
@@ -473,32 +469,11 @@ struct NowPlayingView: View {
     }
 
     private var scrubberSection: some View {
-        let total = max(mediaManager.duration, 1)
-        let displayedTime = isEditingScrubber ? scrubPosition : mediaManager.currentTime
-        let remaining = max(mediaManager.duration - displayedTime, 0)
-
-        return VStack(spacing: 6) {
-            Slider(
-                value: $scrubPosition,
-                in: 0...total
-            ) { editing in
-                isEditingScrubber = editing
-                if editing {
-                    mediaManager.beginScrubbing()
-                } else {
-                    mediaManager.endScrubbing(at: scrubPosition)
-                }
-            }
-            .tint(.accentColor)
-
-            HStack {
-                Text(MediaTimeFormatter.format(displayedTime))
-                Spacer()
-                Text("-\(MediaTimeFormatter.format(remaining))")
-            }
-            .font(.caption.monospacedDigit())
-            .foregroundStyle(.secondary)
-        }
+        TrackProgressSliderView(
+            tintColor: .accentColor,
+            labelFont: .caption.monospacedDigit(),
+            labelColor: .secondary
+        )
     }
 
     private func transportControls(item: MediaItem) -> some View {
@@ -931,33 +906,13 @@ struct NowPlayingView: View {
     }
 
     private func compactAppleMusicFooter(item: MediaItem) -> some View {
-        let total = max(mediaManager.duration, 1)
-        let displayedTime = isEditingScrubber ? scrubPosition : mediaManager.currentTime
-        let remaining = max(mediaManager.duration - displayedTime, 0)
-
-        return VStack(spacing: 14) {
-            VStack(spacing: 4) {
-                Slider(
-                    value: $scrubPosition,
-                    in: 0...total
-                ) { editing in
-                    isEditingScrubber = editing
-                    if editing {
-                        mediaManager.beginScrubbing()
-                    } else {
-                        mediaManager.endScrubbing(at: scrubPosition)
-                    }
-                }
-                .tint(.white)
-
-                HStack {
-                    Text(MediaTimeFormatter.format(displayedTime))
-                    Spacer()
-                    Text("-\(MediaTimeFormatter.format(remaining))")
-                }
-                .font(.caption2.monospacedDigit().weight(.medium))
-                .foregroundStyle(.white.opacity(0.65))
-            }
+        VStack(spacing: 14) {
+            TrackProgressSliderView(
+                tintColor: .white,
+                labelFont: .caption2.monospacedDigit().weight(.medium),
+                labelColor: .white.opacity(0.65),
+                spacing: 4
+            )
 
             HStack(spacing: 42) {
                 Button {
@@ -1095,6 +1050,55 @@ struct NowPlayingView: View {
             }
             .buttonStyle(.plain)
             .accessibilityLabel("Playing Next Queue")
+        }
+    }
+}
+
+private struct TrackProgressSliderView: View {
+    @Environment(MediaManager.self) private var mediaManager
+
+    let tintColor: Color
+    let labelFont: Font
+    let labelColor: Color
+    var spacing: CGFloat = 6
+
+    @State private var scrubPosition: Double = 0
+    @State private var isEditingScrubber = false
+
+    var body: some View {
+        let total = max(mediaManager.duration, 1)
+        let displayedTime = isEditingScrubber ? scrubPosition : mediaManager.currentTime
+        let remaining = max(mediaManager.duration - displayedTime, 0)
+
+        VStack(spacing: spacing) {
+            Slider(
+                value: $scrubPosition,
+                in: 0...total
+            ) { editing in
+                isEditingScrubber = editing
+                if editing {
+                    mediaManager.beginScrubbing()
+                } else {
+                    mediaManager.endScrubbing(at: scrubPosition)
+                }
+            }
+            .tint(tintColor)
+
+            HStack {
+                Text(MediaTimeFormatter.format(displayedTime))
+                Spacer()
+                Text("-\(MediaTimeFormatter.format(remaining))")
+            }
+            .font(labelFont)
+            .foregroundStyle(labelColor)
+        }
+        .onAppear {
+            scrubPosition = mediaManager.currentTime
+        }
+        .onChange(of: mediaManager.currentTime) { _, newTime in
+            if !isEditingScrubber {
+                scrubPosition = newTime
+            }
         }
     }
 }

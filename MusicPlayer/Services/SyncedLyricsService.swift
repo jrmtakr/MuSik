@@ -173,6 +173,8 @@ final class SyncedLyricsService {
 
     @ObservationIgnored private var memoryCache: [String: ResolvedTrackLyrics] = [:]
     @ObservationIgnored private var activeFetchTask: Task<Void, Never>?
+    @ObservationIgnored private var activeFetchToken = UUID()
+    @ObservationIgnored private var activeRefinementTask: Task<Void, Never>?
     @ObservationIgnored private var activeAITask: Task<Void, Never>?
     @ObservationIgnored private var activeAITaskKey: String?
     @ObservationIgnored private var autoAttemptedKeys: Set<String> = []
@@ -220,15 +222,18 @@ final class SyncedLyricsService {
 
         if !forceReload {
             if currentLyrics?.cacheKey == key { return }
+            if currentLoadingKey == key && activeFetchTask != nil { return }
             aiStatusMessage = nil
             aiErrorMessage = nil
             lastRecognizedTrackInfo = nil
             if let inMem = memoryCache[key] {
+                currentLoadingKey = nil
                 currentLyrics = inMem
                 lastError = nil
                 return
             }
             if let disk = loadFromDisk(key: key) {
+                currentLoadingKey = nil
                 memoryCache[key] = disk
                 currentLyrics = disk
                 lastError = nil
@@ -236,12 +241,14 @@ final class SyncedLyricsService {
                    !item.relativePath.hasPrefix("__remote__/"),
                    !item.isHLS,
                    !disk.sourceLabel.localizedCaseInsensitiveContains("Custom") {
-                    activeFetchTask?.cancel()
-                    activeFetchTask = Task {
+                    activeRefinementTask?.cancel()
+                    activeRefinementTask = Task { [weak self] in
+                        guard let self else { return }
                         let summary = await SongAudioListener.listenWithSummary(
                             to: item.fileURL,
                             titleHint: item.displayTitle,
-                            artistHint: item.artist
+                            artistHint: item.artist,
+                            allowModelDownload: false
                         )
                         guard !Task.isCancelled else { return }
                         let heard: [HeardWord]? = summary.words.isEmpty ? nil : summary.words
@@ -262,6 +269,7 @@ final class SyncedLyricsService {
                             || disk.attributionText?.contains("NetEase") == true
                         if !isContradicted && !isLegacyStudioCache && (disk.isTimeSynced || disk.lines.count >= 4) {
                             let reAligned = await SongAudioListener.autoAlign(lyrics: disk, heard: heard, fileURL: item.fileURL)
+                            guard !Task.isCancelled else { return }
                             storeAlignedLyrics(reAligned, for: item)
                         } else {
                             let updatedOk = await fetchAndAlignDuringImport(
@@ -271,8 +279,9 @@ final class SyncedLyricsService {
                                 duration: item.durationSeconds,
                                 heard: heard
                             )
-                            if !updatedOk && !isContradicted && (disk.isTimeSynced || disk.lines.count >= 4) {
+                            if !updatedOk && !isContradicted && (disk.isTimeSynced || disk.lines.count >= 4) && !Task.isCancelled {
                                 let reAligned = await SongAudioListener.autoAlign(lyrics: disk, heard: heard, fileURL: item.fileURL)
+                                guard !Task.isCancelled else { return }
                                 storeAlignedLyrics(reAligned, for: item)
                             }
                         }
@@ -283,6 +292,7 @@ final class SyncedLyricsService {
         }
 
         activeFetchTask?.cancel()
+        activeRefinementTask?.cancel()
         if activeAITaskKey != key {
             activeAITask?.cancel()
             activeAITaskKey = nil
@@ -291,27 +301,40 @@ final class SyncedLyricsService {
             aiErrorMessage = nil
             lastRecognizedTrackInfo = nil
         }
+
+        let fetchToken = UUID()
+        activeFetchToken = fetchToken
         currentLoadingKey = key
         lastError = nil
         if forceReload || currentLyrics?.cacheKey != key {
             currentLyrics = nil
         }
 
-        activeFetchTask = Task {
+        activeFetchTask = Task { [weak self] in
+            guard let self else { return }
+            defer {
+                if self.activeFetchToken == fetchToken {
+                    self.activeFetchTask = nil
+                    if self.currentLoadingKey == key {
+                        self.currentLoadingKey = nil
+                    }
+                }
+            }
+
+            let unknownFirstListen = WholeSongAIService.shared.shouldDeferOnlineLyricsForFirstListen(item)
             let importAnalysisPending = SongIdentificationService.shared.isIdentifying(item)
             if !forceReload,
                customTitle == nil,
                customArtist == nil,
                !item.relativePath.hasPrefix("__remote__/"),
-               (WholeSongAIService.shared.shouldDeferOnlineLyricsForFirstListen(item) || importAnalysisPending) {
+               unknownFirstListen {
                 let offline = await loadOfflineEmbeddedOrSidecarLyrics(
                     item: item,
                     cacheKey: key,
                     title: item.displayTitle,
                     artist: item.artist ?? ""
                 )
-                guard !Task.isCancelled else { return }
-                currentLoadingKey = nil
+                guard !Task.isCancelled, self.activeFetchToken == fetchToken else { return }
                 if let offline {
                     memoryCache[key] = offline
                     saveToDisk(offline)
@@ -332,32 +355,44 @@ final class SyncedLyricsService {
             if !item.relativePath.hasPrefix("__remote__/") {
                 let split = splitArtistAndSong(rawTitle: rawTitle, rawArtist: rawArtist)
                 if let offline = await loadOfflineEmbeddedOrSidecarLyrics(item: item, cacheKey: key, title: split.song, artist: split.artist) {
-                    guard !Task.isCancelled else { return }
+                    guard !Task.isCancelled, self.activeFetchToken == fetchToken else { return }
                     var alignedOffline = offline
+                    var vocalCurve: VocalEnvelope?
                     if !item.isHLS {
-                        let artistHintOrNil: String? = rawArtist.isEmpty ? nil : rawArtist
-                        let preSummary = await SongAudioListener.listenWithSummary(
-                            to: item.fileURL,
-                            titleHint: rawTitle,
-                            artistHint: artistHintOrNil
+                        vocalCurve = await Self.extractVocalCurveBounded(for: item.fileURL, timeoutSeconds: 5.0)
+                        guard !Task.isCancelled, self.activeFetchToken == fetchToken else { return }
+                        alignedOffline = await SongAudioListener.autoAlign(
+                            lyrics: offline,
+                            heard: nil,
+                            fileURL: item.fileURL,
+                            precomputedCurve: vocalCurve
                         )
-                        guard !Task.isCancelled else { return }
-                        alignedOffline = await SongAudioListener.autoAlign(lyrics: offline, heard: preSummary.words, fileURL: item.fileURL)
-                        guard !Task.isCancelled else { return }
+                        guard !Task.isCancelled, self.activeFetchToken == fetchToken else { return }
                     }
                     alignedOffline.alignmentVersion = Self.currentAlignmentVersion
-                    currentLoadingKey = nil
                     memoryCache[key] = alignedOffline
                     saveToDisk(alignedOffline)
                     currentLyrics = alignedOffline
                     lastError = nil
+                    currentLoadingKey = nil
+
+                    if !item.isHLS {
+                        self.scheduleBackgroundLyricsRefinement(
+                            item: item,
+                            cacheKey: key,
+                            rawTitle: rawTitle,
+                            rawArtist: rawArtist,
+                            candidates: [offline],
+                            vocalCurve: vocalCurve
+                        )
+                    }
                     return
                 }
             }
 
             let resolved: ResolvedTrackLyrics?
             if !item.relativePath.hasPrefix("__remote__/") && !item.isHLS {
-                // Fetch all version candidates, extract harmonic vocal curve, and listen concurrently for accurate selection.
+                // Phase 1: Fetch lyric candidates + on-device vocal curve concurrently without blocking on ASR downloads.
                 async let candidatesTask = collectAllCandidateLyrics(
                     item: item,
                     cacheKey: key,
@@ -366,20 +401,63 @@ final class SyncedLyricsService {
                     duration: item.durationSeconds,
                     rawTitleOverride: customTitle
                 )
-                async let curveTask = SongAudioListener.extractVocalCurve(for: item.fileURL)
-                async let listenTask = SongAudioListener.listenWithSummary(
-                    to: item.fileURL,
-                    titleHint: rawTitle,
-                    artistHint: rawArtist.isEmpty ? nil : rawArtist
-                )
-                let (candidates, vocalCurve, summary) = await (candidatesTask, curveTask, listenTask)
-                guard !Task.isCancelled else { return }
+                async let curveTask = Self.extractVocalCurveBounded(for: item.fileURL, timeoutSeconds: 5.0)
+                let (candidates, vocalCurve) = await (candidatesTask, curveTask)
+                guard !Task.isCancelled, self.activeFetchToken == fetchToken else { return }
 
-                let heard: [HeardWord]? = summary.words.isEmpty ? nil : summary.words
                 let langCtx = SongAudioListener.detectLanguageContext(
                     title: rawTitle,
                     artist: rawArtist.isEmpty ? nil : rawArtist
                 )
+
+                if !candidates.isEmpty,
+                   var initialChosen = selectVerifiedLyrics(
+                       from: candidates,
+                       targetTitle: rawTitle,
+                       targetArtist: rawArtist,
+                       targetDuration: item.durationSeconds,
+                       heard: nil,
+                       isNonEnglish: langCtx.isNonEnglish,
+                       englishASROnForeignTrack: false,
+                       vocalCurve: vocalCurve
+                   ) {
+                    initialChosen = await SongAudioListener.autoAlign(
+                        lyrics: initialChosen,
+                        heard: nil,
+                        fileURL: item.fileURL,
+                        precomputedCurve: vocalCurve
+                    )
+                    guard !Task.isCancelled, self.activeFetchToken == fetchToken else { return }
+                    initialChosen.alignmentVersion = Self.currentAlignmentVersion
+                    memoryCache[key] = initialChosen
+                    saveToDisk(initialChosen)
+                    currentLyrics = initialChosen
+                    lastError = nil
+                    currentLoadingKey = nil
+
+                    // Phase 2: Refine version choice and word timestamps silently in the background.
+                    self.scheduleBackgroundLyricsRefinement(
+                        item: item,
+                        cacheKey: key,
+                        rawTitle: rawTitle,
+                        rawArtist: rawArtist,
+                        candidates: candidates,
+                        vocalCurve: vocalCurve
+                    )
+                    return
+                }
+
+                // Fallback when no candidate immediately matched or zero candidates exist: bounded audio transcription.
+                let summary = await Self.listenSummaryBounded(
+                    to: item.fileURL,
+                    titleHint: rawTitle,
+                    artistHint: rawArtist.isEmpty ? nil : rawArtist,
+                    maxSeconds: 180,
+                    timeoutSeconds: 20.0
+                )
+                guard !Task.isCancelled, self.activeFetchToken == fetchToken else { return }
+
+                let heard: [HeardWord]? = summary.words.isEmpty ? nil : summary.words
                 let isNonEnglish = langCtx.isNonEnglish || {
                     guard let lang = summary.detectedLanguage?.lowercased(), !lang.isEmpty else { return false }
                     return !lang.hasPrefix("en")
@@ -403,7 +481,7 @@ final class SyncedLyricsService {
                         fileURL: item.fileURL,
                         precomputedCurve: vocalCurve
                     )
-                    guard !Task.isCancelled else { return }
+                    guard !Task.isCancelled, self.activeFetchToken == fetchToken else { return }
                     chosen = matched
                 } else if let heard, heard.count >= 4, !englishASROnForeignTrack {
                     let split = splitArtistAndSong(rawTitle: rawTitle, rawArtist: rawArtist)
@@ -425,22 +503,164 @@ final class SyncedLyricsService {
                 )
             }
 
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled, self.activeFetchToken == fetchToken else { return }
             if var resolved {
                 resolved.alignmentVersion = Self.currentAlignmentVersion
-                currentLoadingKey = nil
                 memoryCache[key] = resolved
                 saveToDisk(resolved)
                 currentLyrics = resolved
                 lastError = nil
             } else {
-                currentLoadingKey = nil
-                lastError = "No lyrics for first time listen"
+                lastError = "Lyrics not found yet. Tap Retry or Genius Search below."
                 if customTitle == nil && customArtist == nil && !item.relativePath.hasPrefix("__remote__/") && !importAnalysisPending {
                     WholeSongAIService.shared.triggerIfFirstTimeUnknown(item: item)
                 }
             }
         }
+    }
+
+    private func scheduleBackgroundLyricsRefinement(
+        item: MediaItem,
+        cacheKey key: String,
+        rawTitle: String,
+        rawArtist: String,
+        candidates: [ResolvedTrackLyrics],
+        vocalCurve: VocalEnvelope?
+    ) {
+        activeRefinementTask?.cancel()
+        activeRefinementTask = Task { [weak self] in
+            guard let self else { return }
+            let summary = await Self.listenSummaryBounded(
+                to: item.fileURL,
+                titleHint: rawTitle,
+                artistHint: rawArtist.isEmpty ? nil : rawArtist,
+                maxSeconds: 15 * 60,
+                timeoutSeconds: 40.0
+            )
+            guard !Task.isCancelled, !summary.words.isEmpty else { return }
+
+            let heard = summary.words
+            let langCtx = SongAudioListener.detectLanguageContext(
+                title: rawTitle,
+                artist: rawArtist.isEmpty ? nil : rawArtist
+            )
+            let isNonEnglish = langCtx.isNonEnglish || {
+                guard let lang = summary.detectedLanguage?.lowercased(), !lang.isEmpty else { return false }
+                return !lang.hasPrefix("en")
+            }()
+            let englishASROnForeignTrack = isNonEnglish && (summary.detectedLanguage?.lowercased().hasPrefix("en") ?? false)
+
+            guard var refined = selectVerifiedLyrics(
+                from: candidates,
+                targetTitle: rawTitle,
+                targetArtist: rawArtist,
+                targetDuration: item.durationSeconds,
+                heard: heard,
+                isNonEnglish: isNonEnglish,
+                englishASROnForeignTrack: englishASROnForeignTrack,
+                vocalCurve: vocalCurve
+            ) else {
+                return
+            }
+
+            refined = await SongAudioListener.autoAlign(
+                lyrics: refined,
+                heard: heard,
+                fileURL: item.fileURL,
+                precomputedCurve: vocalCurve
+            )
+            guard !Task.isCancelled else { return }
+            if let existing = memoryCache[key],
+               existing.sourceLabel.localizedCaseInsensitiveContains("Custom") {
+                return
+            }
+            storeAlignedLyrics(refined, for: item)
+        }
+    }
+
+    private static func extractVocalCurveBounded(for fileURL: URL, timeoutSeconds: Double) async -> VocalEnvelope? {
+        let curveTask = Task {
+            await SongAudioListener.extractVocalCurve(for: fileURL)
+        }
+        let timerTask = Task {
+            let ns = UInt64(max(0.5, timeoutSeconds) * 1_000_000_000)
+            try? await Task.sleep(nanoseconds: ns)
+            curveTask.cancel()
+        }
+        let curve = await curveTask.value
+        timerTask.cancel()
+        return curve
+    }
+
+    private static func listenSummaryBounded(
+        to fileURL: URL,
+        titleHint: String?,
+        artistHint: String?,
+        maxSeconds: Double,
+        timeoutSeconds: Double
+    ) async -> SongAudioListener.ListenSummary {
+        final class SummaryGate: @unchecked Sendable {
+            private let lock = NSLock()
+            private var done = false
+            private var stored: SongAudioListener.ListenSummary?
+            private var cont: CheckedContinuation<SongAudioListener.ListenSummary, Never>?
+
+            func wait(_ c: CheckedContinuation<SongAudioListener.ListenSummary, Never>) {
+                lock.lock()
+                if done, let s = stored {
+                    stored = nil
+                    lock.unlock()
+                    c.resume(returning: s)
+                    return
+                }
+                cont = c
+                lock.unlock()
+            }
+
+            func resolve(_ s: SongAudioListener.ListenSummary) {
+                lock.lock()
+                guard !done else {
+                    lock.unlock()
+                    return
+                }
+                done = true
+                let c = cont
+                cont = nil
+                if c == nil { stored = s }
+                lock.unlock()
+                c?.resume(returning: s)
+            }
+        }
+
+        let emptyFallback = SongAudioListener.ListenSummary(words: [], detectedLanguage: nil, isMostlyInstrumental: false)
+        let gate = SummaryGate()
+        let workTask = Task {
+            let summary = await SongAudioListener.listenWithSummary(
+                to: fileURL,
+                titleHint: titleHint,
+                artistHint: artistHint,
+                maxSeconds: maxSeconds,
+                allowModelDownload: false
+            )
+            gate.resolve(summary)
+        }
+        let timerTask = Task {
+            let ns = UInt64(max(1.0, timeoutSeconds) * 1_000_000_000)
+            try? await Task.sleep(nanoseconds: ns)
+            workTask.cancel()
+            gate.resolve(emptyFallback)
+        }
+        let result = await withTaskCancellationHandler {
+            await withCheckedContinuation { (c: CheckedContinuation<SongAudioListener.ListenSummary, Never>) in
+                gate.wait(c)
+            }
+        } onCancel: {
+            timerTask.cancel()
+            workTask.cancel()
+            gate.resolve(emptyFallback)
+        }
+        timerTask.cancel()
+        return result
     }
 
     func installLyrics(_ lyrics: ResolvedTrackLyrics, for item: MediaItem) {
@@ -563,6 +783,7 @@ final class SyncedLyricsService {
         guard !isAIRecognizing else { return }
         let key = cacheKey(for: item)
         activeAITask?.cancel()
+        activeRefinementTask?.cancel()
         activeAITaskKey = key
         isAIRecognizing = true
         aiErrorMessage = nil
@@ -777,7 +998,7 @@ final class SyncedLyricsService {
         )
     }
 
-    /// Concurrently collects candidate lyrics from Studio Karaoke, LRCLIB, Genius, and YouTube captions.
+    /// Concurrently collects candidate lyrics from Studio Karaoke, LRCLIB, Genius, and YouTube captions with a hard per-provider deadline.
     private func collectAllCandidateLyrics(
         item: MediaItem,
         cacheKey key: String,
@@ -789,34 +1010,59 @@ final class SyncedLyricsService {
         let split = splitArtistAndSong(rawTitle: title, rawArtist: artist)
         let rawTitle = (rawTitleOverride?.isEmpty == false ? rawTitleOverride! : title)
 
-        async let studioTask = fetchStudioKaraokeCandidates(
-            cacheKey: key,
-            song: split.song,
-            artist: split.artist,
-            duration: duration
-        )
-        async let lrclibTask = fetchTopLRCLIBCandidates(
-            cacheKey: key,
-            song: split.song,
-            artist: split.artist,
-            rawTitle: rawTitle,
-            duration: duration,
-            maxResults: 4
-        )
-        async let geniusTask = fetchTopGeniusCandidates(
-            cacheKey: key,
-            song: split.song,
-            artist: split.artist,
-            maxResults: 2
-        )
-        async let ytTask = fetchFromYouTubeCreatorSubtitles(
-            item: item,
-            cacheKey: key,
-            song: split.song,
-            artist: split.artist
-        )
+        let studioTask = Task {
+            await fetchStudioKaraokeCandidates(
+                cacheKey: key,
+                song: split.song,
+                artist: split.artist,
+                duration: duration
+            )
+        }
+        let lrclibTask = Task {
+            await fetchTopLRCLIBCandidates(
+                cacheKey: key,
+                song: split.song,
+                artist: split.artist,
+                rawTitle: rawTitle,
+                duration: duration,
+                maxResults: 4
+            )
+        }
+        let geniusTask = Task {
+            await fetchTopGeniusCandidates(
+                cacheKey: key,
+                song: split.song,
+                artist: split.artist,
+                maxResults: 2
+            )
+        }
+        let ytTask = Task {
+            await fetchFromYouTubeCreatorSubtitles(
+                item: item,
+                cacheKey: key,
+                song: split.song,
+                artist: split.artist
+            )
+        }
+        let timeoutTask = Task {
+            try? await Task.sleep(nanoseconds: 9_000_000_000)
+            studioTask.cancel()
+            lrclibTask.cancel()
+            geniusTask.cancel()
+            ytTask.cancel()
+        }
 
-        let (studio, lrclib, genius, ytCaptions) = await (studioTask, lrclibTask, geniusTask, ytTask)
+        let (studio, lrclib, genius, ytCaptions) = await withTaskCancellationHandler {
+            await (studioTask.value, lrclibTask.value, geniusTask.value, ytTask.value)
+        } onCancel: {
+            timeoutTask.cancel()
+            studioTask.cancel()
+            lrclibTask.cancel()
+            geniusTask.cancel()
+            ytTask.cancel()
+        }
+        timeoutTask.cancel()
+
         var combined = studio + lrclib + genius
         if let ytCaptions {
             combined.append(ytCaptions)

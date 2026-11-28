@@ -131,7 +131,8 @@ enum LiveAudioLyricsAI {
                 to: item.fileURL,
                 titleHint: item.displayTitle,
                 artistHint: item.artist,
-                maxSeconds: 15 * 60
+                maxSeconds: 15 * 60,
+                allowModelDownload: false
             ) { chunkIdx, totalChunks, totalSeconds in
                 Task { @MainActor in
                     let mins = Int(totalSeconds) / 60

@@ -332,8 +332,14 @@ struct MiniPlayerInsetModifier: ViewModifier {
                     }
 
                     MiniPlayerBar(
-                        onExpand: { showPlayerSheet = true },
-                        onQueueTap: { showQueueSheet = true }
+                        onExpand: {
+                            UIApplication.shared.dismissKeyboard()
+                            showPlayerSheet = true
+                        },
+                        onQueueTap: {
+                            UIApplication.shared.dismissKeyboard()
+                            showQueueSheet = true
+                        }
                     )
                 }
             }
@@ -354,5 +360,11 @@ extension View {
 
     func applyCustomTextStyle() -> some View {
         modifier(CustomTextStyleModifier())
+    }
+}
+
+extension UIApplication {
+    func dismissKeyboard() {
+        sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
     }
 }

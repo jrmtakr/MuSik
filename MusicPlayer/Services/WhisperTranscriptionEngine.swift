@@ -35,7 +35,12 @@ actor WhisperTranscriptionEngine {
 
     private var whisperKit: WhisperKit?
     private var initTask: Task<WhisperKit?, Never>?
+    private var initTaskIsNetworkDownload = false
     private var lastFailureAt: Date?
+
+    var isModelReadyInMemory: Bool {
+        whisperKit != nil
+    }
 
     private static var modelsBaseURL: URL {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -267,6 +272,9 @@ actor WhisperTranscriptionEngine {
     private func ensureLoaded(allowDownload: Bool) async -> WhisperKit? {
         if let whisperKit { return whisperKit }
         if let existingTask = initTask {
+            if !allowDownload && initTaskIsNetworkDownload {
+                return nil
+            }
             return await existingTask.value
         }
         if let lastFailureAt, Date().timeIntervalSince(lastFailureAt) < 120 {
@@ -298,7 +306,7 @@ actor WhisperTranscriptionEngine {
                     load: true,
                     download: false
                 )
-                loadedKit = try? await WhisperKit(cachedConfig)
+                loadedKit = await Self.loadKitWithTimeout(config: cachedConfig, timeoutSeconds: 18.0)
                 if loadedKit == nil {
                     UserDefaults.standard.removeObject(forKey: Self.savedFolderDefaultsKey)
                 }
@@ -314,7 +322,7 @@ actor WhisperTranscriptionEngine {
                     load: true,
                     download: true
                 )
-                loadedKit = try? await WhisperKit(primaryConfig)
+                loadedKit = await Self.loadKitWithTimeout(config: primaryConfig, timeoutSeconds: 45.0)
                 if loadedKit == nil {
                     let fallbackConfig = WhisperKitConfig(
                         model: Self.fallbackVariantName,
@@ -326,7 +334,7 @@ actor WhisperTranscriptionEngine {
                         load: true,
                         download: true
                     )
-                    loadedKit = try? await WhisperKit(fallbackConfig)
+                    loadedKit = await Self.loadKitWithTimeout(config: fallbackConfig, timeoutSeconds: 45.0)
                 }
             }
             guard let kit = loadedKit else {
@@ -339,8 +347,10 @@ actor WhisperTranscriptionEngine {
         }
 
         initTask = task
+        initTaskIsNetworkDownload = (cachedPath == nil && allowDownload)
         let loaded = await task.value
         initTask = nil
+        initTaskIsNetworkDownload = false
         if let loaded {
             self.whisperKit = loaded
             self.lastFailureAt = nil
@@ -348,6 +358,65 @@ actor WhisperTranscriptionEngine {
             self.lastFailureAt = Date()
         }
         return loaded
+    }
+
+    private final class KitTimeoutGate: @unchecked Sendable {
+        private let lock = NSLock()
+        private var finished = false
+        private var result: WhisperKit?
+        private var continuation: CheckedContinuation<WhisperKit?, Never>?
+
+        func wait(_ cont: CheckedContinuation<WhisperKit?, Never>) {
+            lock.lock()
+            if finished {
+                let value = result
+                result = nil
+                lock.unlock()
+                cont.resume(returning: value)
+                return
+            }
+            continuation = cont
+            lock.unlock()
+        }
+
+        func finish(_ kit: WhisperKit?) {
+            lock.lock()
+            guard !finished else {
+                lock.unlock()
+                return
+            }
+            finished = true
+            let cont = continuation
+            continuation = nil
+            if cont == nil {
+                result = kit
+            }
+            lock.unlock()
+            cont?.resume(returning: kit)
+        }
+    }
+
+    private static func loadKitWithTimeout(config: WhisperKitConfig, timeoutSeconds: Double) async -> WhisperKit? {
+        let gate = KitTimeoutGate()
+        let loadTask = Task {
+            let kit = try? await WhisperKit(config)
+            gate.finish(kit)
+        }
+        let timerTask = Task {
+            let ns = UInt64(max(1.0, timeoutSeconds) * 1_000_000_000)
+            try? await Task.sleep(nanoseconds: ns)
+            loadTask.cancel()
+            gate.finish(nil)
+        }
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { (cont: CheckedContinuation<WhisperKit?, Never>) in
+                gate.wait(cont)
+            }
+        } onCancel: {
+            timerTask.cancel()
+            loadTask.cancel()
+            gate.finish(nil)
+        }
     }
 
     /// Extracts 16 kHz PCM and applies stereo Mid-Side Wiener center-vocal enhancement + sub-120 Hz attenuation

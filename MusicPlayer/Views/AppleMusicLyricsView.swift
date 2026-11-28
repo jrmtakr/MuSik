@@ -272,12 +272,12 @@ struct AppleMusicLyricsView: View {
                 return
             }
             let latest = mediaManager.currentItem?.relativePath == item.relativePath ? (mediaManager.currentItem ?? item) : item
-            lyricsService.loadLyricsIfNeeded(for: latest, forceReload: true)
+            lyricsService.loadLyricsIfNeeded(for: latest, forceReload: lyricsService.currentLyrics == nil)
         }
         .onChange(of: wholeSongAI.activeTrackPath) { oldPath, newPath in
             if oldPath == item.relativePath, newPath != item.relativePath {
                 let latest = mediaManager.currentItem?.relativePath == item.relativePath ? (mediaManager.currentItem ?? item) : item
-                lyricsService.loadLyricsIfNeeded(for: latest, forceReload: true)
+                lyricsService.loadLyricsIfNeeded(for: latest, forceReload: lyricsService.currentLyrics == nil)
             }
         }
     }

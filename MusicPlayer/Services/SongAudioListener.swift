@@ -186,6 +186,7 @@ enum SongAudioListener {
         titleHint: String? = nil,
         artistHint: String? = nil,
         maxSeconds: Double = 15 * 60,
+        allowModelDownload: Bool = true,
         languageHint: String? = nil,
         onProgress: (@Sendable (Int, Int, Double) -> Void)? = nil
     ) async -> ListenSummary {
@@ -196,7 +197,7 @@ enum SongAudioListener {
         if let summary = await WhisperTranscriptionEngine.shared.transcribeWholeFileSummary(
             fileURL: fileURL,
             maxSeconds: maxSeconds,
-            allowDownload: true,
+            allowDownload: allowModelDownload,
             languageHint: effectiveHint,
             onProgress: onProgress
         ) {
@@ -496,37 +497,91 @@ enum SongAudioListener {
         request.taskHint = .dictation
         request.requiresOnDeviceRecognition = requireOnDevice
 
-        let gate = ResumeOnceGate()
-        return await withCheckedContinuation { (cont: CheckedContinuation<([HeardWord], Bool), Never>) in
-            let task = recognizer.recognitionTask(with: request) { result, error in
-                if let result, result.isFinal {
-                    let words = result.bestTranscription.segments.compactMap { seg -> HeardWord? in
-                        let token = normalizeToken(seg.substring)
-                        return token.isEmpty ? nil : HeardWord(
-                            token: token,
-                            rawText: seg.substring,
-                            time: offset + seg.timestamp,
-                            endTime: offset + seg.timestamp + max(0.08, seg.duration)
-                        )
+        final class RecognitionSessionGate: @unchecked Sendable {
+            private let lock = NSLock()
+            private var finished = false
+            private var task: SFSpeechRecognitionTask?
+            private var continuation: CheckedContinuation<([HeardWord], Bool), Never>?
+
+            func bind(task: SFSpeechRecognitionTask, cont: CheckedContinuation<([HeardWord], Bool), Never>) {
+                lock.lock()
+                if finished {
+                    lock.unlock()
+                    task.cancel()
+                    cont.resume(returning: ([], true))
+                    return
+                }
+                self.task = task
+                self.continuation = cont
+                lock.unlock()
+            }
+
+            func finish(words: [HeardWord], hadError: Bool) {
+                lock.lock()
+                guard !finished else {
+                    lock.unlock()
+                    return
+                }
+                finished = true
+                let cont = continuation
+                continuation = nil
+                task = nil
+                lock.unlock()
+                cont?.resume(returning: (words, hadError))
+            }
+
+            func cancelAndFinish() {
+                lock.lock()
+                guard !finished else {
+                    lock.unlock()
+                    return
+                }
+                finished = true
+                let activeTask = task
+                let cont = continuation
+                task = nil
+                continuation = nil
+                lock.unlock()
+                activeTask?.cancel()
+                cont?.resume(returning: ([], true))
+            }
+        }
+
+        let gate = RecognitionSessionGate()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { (cont: CheckedContinuation<([HeardWord], Bool), Never>) in
+                let task = recognizer.recognitionTask(with: request) { result, error in
+                    if let result, result.isFinal {
+                        let words = result.bestTranscription.segments.compactMap { seg -> HeardWord? in
+                            let token = normalizeToken(seg.substring)
+                            return token.isEmpty ? nil : HeardWord(
+                                token: token,
+                                rawText: seg.substring,
+                                time: offset + seg.timestamp,
+                                endTime: offset + seg.timestamp + max(0.08, seg.duration)
+                            )
+                        }
+                        gate.finish(words: words, hadError: false)
+                    } else if error != nil {
+                        let partialWords = result?.bestTranscription.segments.compactMap { seg -> HeardWord? in
+                            let token = normalizeToken(seg.substring)
+                            return token.isEmpty ? nil : HeardWord(
+                                token: token,
+                                rawText: seg.substring,
+                                time: offset + seg.timestamp,
+                                endTime: offset + seg.timestamp + max(0.08, seg.duration)
+                            )
+                        } ?? []
+                        gate.finish(words: partialWords, hadError: true)
                     }
-                    if gate.claim() { cont.resume(returning: (words, false)) }
-                } else if error != nil {
-                    let partialWords = result?.bestTranscription.segments.compactMap { seg -> HeardWord? in
-                        let token = normalizeToken(seg.substring)
-                        return token.isEmpty ? nil : HeardWord(
-                            token: token,
-                            rawText: seg.substring,
-                            time: offset + seg.timestamp,
-                            endTime: offset + seg.timestamp + max(0.08, seg.duration)
-                        )
-                    } ?? []
-                    if gate.claim() { cont.resume(returning: (partialWords, true)) }
+                }
+                gate.bind(task: task, cont: cont)
+                DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 24) {
+                    gate.cancelAndFinish()
                 }
             }
-            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 90) {
-                task.cancel()
-                if gate.claim() { cont.resume(returning: ([], true)) }
-            }
+        } onCancel: {
+            gate.cancelAndFinish()
         }
     }
 

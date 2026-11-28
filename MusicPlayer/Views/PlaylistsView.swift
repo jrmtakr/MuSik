@@ -194,6 +194,7 @@ struct PlaylistsView: View {
                             Spacer()
 
                             Button {
+                                UIApplication.shared.dismissKeyboard()
                                 mediaManager.playPlaylist(last)
                                 if mediaManager.currentItem?.isVideo == true {
                                     showPlayerSheet = true
@@ -407,6 +408,7 @@ struct PlaylistsView: View {
                             MediaRowView(
                                 item: item,
                                 onPlay: {
+                                    UIApplication.shared.dismissKeyboard()
                                     if mediaManager.play(item) && item.isVideo { showPlayerSheet = true }
                                 },
                                 onQuickLook: {
@@ -425,6 +427,7 @@ struct PlaylistsView: View {
                 }
             }
             .listStyle(.insetGrouped)
+            .scrollDismissesKeyboard(.interactively)
             .navigationTitle("Playlists")
             .searchable(text: $searchText, prompt: "Search on Library")
             .toolbar {
