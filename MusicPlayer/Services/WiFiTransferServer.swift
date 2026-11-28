@@ -681,7 +681,7 @@ private final class HTTPConnectionSession {
         for url in urls {
             let values = try? url.resourceValues(forKeys: Set(keys))
             let name = url.lastPathComponent
-            if dirRelPath.isEmpty && name == "Inbox" { continue }
+            if dirRelPath.isEmpty && (name == "Inbox" || name == "huggingface") { continue }
             let isDir = (values?.isDirectory == true) && url.pathExtension.lowercased() != "movpkg"
             let relPath = dirRelPath.isEmpty ? name : "\(dirRelPath)/\(name)"
             let sizeText = isDir ? "Folder" : ByteCountFormatter.string(fromByteCount: Int64(values?.fileSize ?? 0), countStyle: .file)

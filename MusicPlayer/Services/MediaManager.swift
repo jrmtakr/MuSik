@@ -210,6 +210,7 @@ final class MediaManager {
     // MARK: - Scanning & Importing
 
     func loadLocalFiles() {
+        WhisperTranscriptionEngine.relocateLegacyDocumentsHuggingFaceFolder()
         let drainedInboxPaths = drainInboxIfNeeded()
 
         var loadedItems: [MediaItem] = []
@@ -360,7 +361,7 @@ final class MediaManager {
             let dateAdded = values?.contentModificationDate ?? values?.creationDate ?? .now
 
             if isDir {
-                if relativePrefix.isEmpty && fileName == "Inbox" {
+                if relativePrefix.isEmpty && (fileName == "Inbox" || fileName == "huggingface") {
                     continue
                 }
                 if ext == "movpkg" {

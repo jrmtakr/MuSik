@@ -253,6 +253,10 @@ final class LibraryBackupService {
                     guard (try? std.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else { continue }
                     let rel = String(std.path.dropFirst(basePath.count)).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
                     guard !rel.isEmpty else { continue }
+                    let rootComponent = rel.split(separator: "/").first.map(String.init)
+                    if prefix == "media" && (rootComponent == "Inbox" || rootComponent == "huggingface") {
+                        continue
+                    }
                     let size = Int64((try? std.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
                     entries.append(SourceEntry(diskURL: std, archivePath: "\(prefix)/\(rel)", byteSize: size))
                 }

@@ -53,7 +53,45 @@ actor WhisperTranscriptionEngine {
 
     /// Warms up or downloads the local Whisper CoreML model silently in background after app launch.
     func warmUpInBackground() async {
+        Self.relocateLegacyDocumentsHuggingFaceFolder()
         _ = await ensureLoaded(allowDownload: true)
+    }
+
+    /// Moves any legacy `Documents/huggingface` cache created by older WhisperKit defaults out of user Documents
+    /// into `Application Support/WhisperModels` so users never see an internal cache folder in Files.
+    nonisolated static func relocateLegacyDocumentsHuggingFaceFolder() {
+        let fm = FileManager.default
+        guard let docsURL = fm.urls(for: .documentDirectory, in: .userDomainMask).first else { return }
+        let legacyHF = docsURL.appendingPathComponent("huggingface", isDirectory: true)
+        guard fm.fileExists(atPath: legacyHF.path) else { return }
+
+        guard let appSupport = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else { return }
+        let modelsBase = appSupport.appendingPathComponent("WhisperModels", isDirectory: true)
+        try? fm.createDirectory(at: modelsBase, withIntermediateDirectories: true)
+        let destHF = modelsBase.appendingPathComponent("huggingface", isDirectory: true)
+
+        if !fm.fileExists(atPath: destHF.path) {
+            if (try? fm.moveItem(at: legacyHF, to: destHF)) != nil {
+                return
+            }
+        }
+
+        if let enumerator = fm.enumerator(at: legacyHF, includingPropertiesForKeys: [.isDirectoryKey]) {
+            let basePath = legacyHF.standardizedFileURL.path
+            while let src = enumerator.nextObject() as? URL {
+                let isDir = (try? src.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
+                let rel = String(src.standardizedFileURL.path.dropFirst(basePath.count)).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+                guard !rel.isEmpty else { continue }
+                let target = destHF.appendingPathComponent(rel, isDirectory: isDir)
+                if isDir {
+                    try? fm.createDirectory(at: target, withIntermediateDirectories: true)
+                } else if !fm.fileExists(atPath: target.path) {
+                    try? fm.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
+                    try? fm.moveItem(at: src, to: target)
+                }
+            }
+        }
+        try? fm.removeItem(at: legacyHF)
     }
 
     var isModelCachedLocally: Bool {
@@ -295,10 +333,13 @@ actor WhisperTranscriptionEngine {
         }
 
         let task = Task<WhisperKit?, Never> {
+            Self.relocateLegacyDocumentsHuggingFaceFolder()
             var loadedKit: WhisperKit?
             if let cachedPath {
                 let cachedConfig = WhisperKitConfig(
                     modelFolder: cachedPath,
+                    downloadBase: Self.modelsBaseURL,
+                    tokenizerFolder: Self.modelsBaseURL,
                     computeOptions: Self.backgroundSafeComputeOptions,
                     verbose: false,
                     logLevel: .none,
@@ -315,6 +356,7 @@ actor WhisperTranscriptionEngine {
                 let primaryConfig = WhisperKitConfig(
                     model: Self.primaryVariantName,
                     downloadBase: Self.modelsBaseURL,
+                    tokenizerFolder: Self.modelsBaseURL,
                     computeOptions: Self.backgroundSafeComputeOptions,
                     verbose: false,
                     logLevel: .none,
@@ -327,6 +369,7 @@ actor WhisperTranscriptionEngine {
                     let fallbackConfig = WhisperKitConfig(
                         model: Self.fallbackVariantName,
                         downloadBase: Self.modelsBaseURL,
+                        tokenizerFolder: Self.modelsBaseURL,
                         computeOptions: Self.backgroundSafeComputeOptions,
                         verbose: false,
                         logLevel: .none,
