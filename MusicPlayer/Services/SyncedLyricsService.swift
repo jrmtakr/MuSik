@@ -8,12 +8,33 @@ struct LyricWordTiming: Identifiable, Codable, Hashable, Sendable {
     let text: String
     let startTime: Double
     let endTime: Double
+    var hasTrailingSpace: Bool
 
-    init(id: UUID = UUID(), text: String, startTime: Double, endTime: Double) {
+    enum CodingKeys: String, CodingKey {
+        case id, text, startTime, endTime, hasTrailingSpace
+    }
+
+    init(
+        id: UUID = UUID(),
+        text: String,
+        startTime: Double,
+        endTime: Double,
+        hasTrailingSpace: Bool = true
+    ) {
         self.id = id
         self.text = text
         self.startTime = startTime
         self.endTime = endTime
+        self.hasTrailingSpace = hasTrailingSpace
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        text = try c.decode(String.self, forKey: .text)
+        startTime = try c.decode(Double.self, forKey: .startTime)
+        endTime = try c.decode(Double.self, forKey: .endTime)
+        hasTrailingSpace = try c.decodeIfPresent(Bool.self, forKey: .hasTrailingSpace) ?? true
     }
 }
 
@@ -140,7 +161,7 @@ struct AIRecognizedTrackInfo: Equatable, Sendable {
 @Observable
 final class SyncedLyricsService {
     static let shared = SyncedLyricsService()
-    nonisolated static let currentAlignmentVersion = 8
+    nonisolated static let currentAlignmentVersion = 9
 
     var currentLyrics: ResolvedTrackLyrics?
     var currentLoadingKey: String?
@@ -236,17 +257,24 @@ final class SyncedLyricsService {
                             }
                             return false
                         }()
-                        if !isContradicted && (disk.isTimeSynced || disk.lines.count >= 4) {
+                        let isLegacyStudioCache = disk.sourceLabel.contains("Studio")
+                            || disk.attributionText?.contains("Kugou") == true
+                            || disk.attributionText?.contains("NetEase") == true
+                        if !isContradicted && !isLegacyStudioCache && (disk.isTimeSynced || disk.lines.count >= 4) {
                             let reAligned = await SongAudioListener.autoAlign(lyrics: disk, heard: heard, fileURL: item.fileURL)
                             storeAlignedLyrics(reAligned, for: item)
                         } else {
-                            _ = await fetchAndAlignDuringImport(
+                            let updatedOk = await fetchAndAlignDuringImport(
                                 item: item,
                                 title: item.displayTitle,
                                 artist: item.artist ?? "",
                                 duration: item.durationSeconds,
                                 heard: heard
                             )
+                            if !updatedOk && !isContradicted && (disk.isTimeSynced || disk.lines.count >= 4) {
+                                let reAligned = await SongAudioListener.autoAlign(lyrics: disk, heard: heard, fileURL: item.fileURL)
+                                storeAlignedLyrics(reAligned, for: item)
+                            }
                         }
                     }
                 }
@@ -329,7 +357,7 @@ final class SyncedLyricsService {
 
             let resolved: ResolvedTrackLyrics?
             if !item.relativePath.hasPrefix("__remote__/") && !item.isHLS {
-                // Fetch all version candidates and listen to audio simultaneously for fast, version-safe alignment.
+                // Fetch all version candidates, extract harmonic vocal curve, and listen concurrently for accurate selection.
                 async let candidatesTask = collectAllCandidateLyrics(
                     item: item,
                     cacheKey: key,
@@ -338,12 +366,13 @@ final class SyncedLyricsService {
                     duration: item.durationSeconds,
                     rawTitleOverride: customTitle
                 )
+                async let curveTask = SongAudioListener.extractVocalCurve(for: item.fileURL)
                 async let listenTask = SongAudioListener.listenWithSummary(
                     to: item.fileURL,
                     titleHint: rawTitle,
                     artistHint: rawArtist.isEmpty ? nil : rawArtist
                 )
-                let (candidates, summary) = await (candidatesTask, listenTask)
+                let (candidates, vocalCurve, summary) = await (candidatesTask, curveTask, listenTask)
                 guard !Task.isCancelled else { return }
 
                 let heard: [HeardWord]? = summary.words.isEmpty ? nil : summary.words
@@ -364,10 +393,16 @@ final class SyncedLyricsService {
                     targetDuration: item.durationSeconds,
                     heard: heard,
                     isNonEnglish: isNonEnglish,
-                    englishASROnForeignTrack: englishASROnForeignTrack
+                    englishASROnForeignTrack: englishASROnForeignTrack,
+                    vocalCurve: vocalCurve
                 )
                 if var matched = chosen {
-                    matched = await SongAudioListener.autoAlign(lyrics: matched, heard: heard, fileURL: item.fileURL)
+                    matched = await SongAudioListener.autoAlign(
+                        lyrics: matched,
+                        heard: heard,
+                        fileURL: item.fileURL,
+                        precomputedCurve: vocalCurve
+                    )
                     guard !Task.isCancelled else { return }
                     chosen = matched
                 } else if let heard, heard.count >= 4, !englishASROnForeignTrack {
@@ -815,7 +850,7 @@ final class SyncedLyricsService {
         return false
     }
 
-    /// Evaluates candidate versions against metadata compatibility AND symmetric heard-audio verification.
+    /// Evaluates candidate versions against metadata compatibility, acoustic phrase alignment, AND symmetric heard-audio verification.
     func selectVerifiedCandidateWithConfidence(
         from candidates: [ResolvedTrackLyrics],
         targetTitle: String,
@@ -823,7 +858,8 @@ final class SyncedLyricsService {
         targetDuration: Double?,
         heard: [HeardWord]?,
         isNonEnglish: Bool,
-        englishASROnForeignTrack: Bool
+        englishASROnForeignTrack: Bool,
+        vocalCurve: VocalEnvelope? = nil
     ) -> (lyrics: ResolvedTrackLyrics, confirmedByAudio: Bool)? {
         guard !candidates.isEmpty else { return nil }
         let targetText = "\(targetTitle) \(targetArtist)"
@@ -834,7 +870,7 @@ final class SyncedLyricsService {
 
         for cand in candidates {
             let hasNativeWords = cand.lines.contains { $0.hasNativeWordTimings && !$0.words.isEmpty }
-            var score = hasNativeWords ? 0.45 : (cand.isTimeSynced ? 0.25 : 0.0)
+            var score = hasNativeWords ? 0.30 : (cand.isTimeSynced ? 0.25 : 0.0)
             let compat = Self.versionCompatibilityScore(
                 targetText: targetText,
                 candidateText: "\(cand.trackTitle) \(cand.artistName)",
@@ -842,6 +878,11 @@ final class SyncedLyricsService {
                 candidateDuration: cand.expectedDurationSeconds
             )
             score += Double(compat) * 0.015
+
+            if let vocalCurve, cand.isTimeSynced {
+                let acousticScore = SongAudioListener.acousticTimingScore(for: cand, curve: vocalCurve)
+                score += acousticScore * 1.4
+            }
 
             var confirmed = false
             var rejected = false
@@ -883,7 +924,8 @@ final class SyncedLyricsService {
         targetDuration: Double?,
         heard: [HeardWord]?,
         isNonEnglish: Bool,
-        englishASROnForeignTrack: Bool
+        englishASROnForeignTrack: Bool,
+        vocalCurve: VocalEnvelope? = nil
     ) -> ResolvedTrackLyrics? {
         selectVerifiedCandidateWithConfidence(
             from: candidates,
@@ -892,7 +934,8 @@ final class SyncedLyricsService {
             targetDuration: targetDuration,
             heard: heard,
             isNonEnglish: isNonEnglish,
-            englishASROnForeignTrack: englishASROnForeignTrack
+            englishASROnForeignTrack: englishASROnForeignTrack,
+            vocalCurve: vocalCurve
         )?.lyrics
     }
 
@@ -912,6 +955,13 @@ final class SyncedLyricsService {
     ) async -> Bool {
         let key = cacheKey(for: item, artistOverride: artist, titleOverride: title)
         let split = splitArtistAndSong(rawTitle: title, rawArtist: artist)
+
+        let extractCurve = !item.isHLS && !item.relativePath.hasPrefix("__remote__/")
+        let targetFileURL = item.fileURL
+        async let curveTask: VocalEnvelope? = {
+            guard extractCurve else { return nil }
+            return await SongAudioListener.extractVocalCurve(for: targetFileURL)
+        }()
 
         let candidates: [ResolvedTrackLyrics]
         if let prefetchedCandidates {
@@ -940,6 +990,7 @@ final class SyncedLyricsService {
                 rawTitleOverride: title
             )
         }
+        let vocalCurve = await curveTask
 
         let langHintNonEnglish = isNonEnglish || SongAudioListener.detectLanguageContext(title: title, artist: artist.isEmpty ? nil : artist).isNonEnglish
 
@@ -951,10 +1002,16 @@ final class SyncedLyricsService {
             targetDuration: duration,
             heard: heard,
             isNonEnglish: langHintNonEnglish,
-            englishASROnForeignTrack: englishASROnForeignTrack
+            englishASROnForeignTrack: englishASROnForeignTrack,
+            vocalCurve: vocalCurve
         ) {
             if !item.isHLS {
-                selected = await SongAudioListener.autoAlign(lyrics: selected, heard: heard, fileURL: item.fileURL)
+                selected = await SongAudioListener.autoAlign(
+                    lyrics: selected,
+                    heard: heard,
+                    fileURL: item.fileURL,
+                    precomputedCurve: vocalCurve
+                )
             }
             storeAlignedLyrics(selected, for: item)
             return true
@@ -2006,51 +2063,88 @@ final class SyncedLyricsService {
                 segments.append((tok, max(lineStart, wStart), min(lineEnd + 0.5, wEnd)))
             }
 
-            // Merge sub-syllable runs into space-separated words preserving exact start..end timing.
+            // Preserve syllable-level CJK timings (without adding spaces) while keeping clean ASCII words.
+            func isCJKScalar(_ s: UnicodeScalar) -> Bool {
+                let v = s.value
+                return (0x3040...0x30FF).contains(v)
+                    || (0x4E00...0x9FFF).contains(v)
+                    || (0x3400...0x4DBF).contains(v)
+                    || (0xAC00...0xD7AF).contains(v)
+            }
+            func isSmallKanaOrPunct(_ ch: Character) -> Bool {
+                let attachSet: Set<Character> = [
+                    "ぁ","ぃ","ぅ","ぇ","ぉ","ゃ","ゅ","ょ","っ","ゎ","ゐ","ゑ",
+                    "ァ","ィ","ゥ","ェ","ォ","ャ","ュ","ョ","ッ","ヮ","ヶ","ヵ","ー",
+                    "！","？","。","、","・","!", "?", ".", ",", ";", ":", "'", "’", "-", "…", "~"
+                ]
+                return attachSet.contains(ch)
+            }
+
             var mergedWords: [LyricWordTiming] = []
             var curText = ""
             var curStart: Double?
             var curEnd: Double = lineStart
+            var curIsCJK = false
 
-            func flushWord() {
+            func flushWord(trailingSpace: Bool) {
                 let clean = curText.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !clean.isEmpty, let s = curStart {
-                    mergedWords.append(LyricWordTiming(text: clean, startTime: s, endTime: max(s + 0.05, curEnd)))
+                    mergedWords.append(
+                        LyricWordTiming(
+                            text: clean,
+                            startTime: s,
+                            endTime: max(s + 0.05, curEnd),
+                            hasTrailingSpace: trailingSpace
+                        )
+                    )
                 }
                 curText = ""
                 curStart = nil
+                curIsCJK = false
             }
 
             for seg in segments {
                 let rawTok = seg.text
-                if rawTok.first?.isWhitespace == true {
-                    flushWord()
+                let hasLeadingSpace = rawTok.first?.isWhitespace == true
+                if hasLeadingSpace && !curText.isEmpty {
+                    flushWord(trailingSpace: true)
                 }
-                let trimmedLeading = rawTok.replacingOccurrences(of: #"^\s+"#, with: "", options: .regularExpression)
+                let trimmedTok = rawTok.trimmingCharacters(in: .whitespacesAndNewlines)
                 let hasTrailingSpace = rawTok.last?.isWhitespace == true
-                if !trimmedLeading.isEmpty {
-                    if curStart == nil { curStart = seg.start }
-                    curText += trimmedLeading
-                    curEnd = max(curEnd, seg.end)
+
+                guard !trimmedTok.isEmpty else {
+                    if hasTrailingSpace && !curText.isEmpty {
+                        flushWord(trailingSpace: true)
+                    }
+                    continue
                 }
+
+                let tokHasCJK = trimmedTok.unicodeScalars.contains(where: isCJKScalar)
+                let isAttachOnly = trimmedTok.allSatisfy(isSmallKanaOrPunct)
+
+                if !curText.isEmpty && !isAttachOnly {
+                    if tokHasCJK != curIsCJK || (curIsCJK && tokHasCJK) {
+                        flushWord(trailingSpace: false)
+                    }
+                }
+
+                if curStart == nil { curStart = seg.start }
+                curText += trimmedTok
+                curEnd = max(curEnd, seg.end)
+                curIsCJK = curIsCJK || tokHasCJK
+
                 if hasTrailingSpace {
-                    flushWord()
+                    flushWord(trailingSpace: true)
                 }
             }
-            flushWord()
+            flushWord(trailingSpace: true)
 
-            let plainText = mergedWords.map(\.text).joined(separator: " ")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let plainText = mergedWords.enumerated().map { idx, w in
+                (idx + 1 < mergedWords.count && w.hasTrailingSpace) ? "\(w.text) " : w.text
+            }.joined().trimmingCharacters(in: .whitespacesAndNewlines)
             guard !plainText.isEmpty else { continue }
 
-            let lowerPlain = plainText.lowercased()
-            if lowerPlain.contains("作词") || lowerPlain.contains("作曲") || lowerPlain.contains("编曲")
-                || lowerPlain.contains("制作人") || lowerPlain.contains("tme")
-                || lowerPlain.range(
-                    of: #"\b(?:produced|written|composed|lyrics|arranged|mixed|mastered)\s+by\b"#,
-                    options: .regularExpression
-                ) != nil
-                || (rawBuilt.count < 4 && (lowerPlain.hasPrefix("composer:") || lowerPlain.hasPrefix("lyricist:") || lowerPlain.hasPrefix("producer:"))) {
+            if SongAudioListener.isCreditOrHeaderLine(plainText, isIntroRegion: rawBuilt.count < 4) {
                 continue
             }
             if rawBuilt.isEmpty, !normSongArtist.isEmpty, normalizeComparable(plainText) == normSongArtist {
@@ -2075,12 +2169,32 @@ final class SyncedLyricsService {
                 ))
             }
             let vocalGap = nextStart - cur.start
-            let boundedEnd = vocalGap > 8.5 ? cur.end : min(cur.end, max(cur.start + 0.35, nextStart - 0.04))
+            let boundedEnd = vocalGap > 8.5 ? cur.end : min(cur.end, max(cur.start + 0.35, nextStart - 0.05))
+            let wordDeadline = max(cur.start + 0.25, boundedEnd - 0.015)
+            let lastWordEnd = cur.words.last?.endTime ?? boundedEnd
+            let boundedWords: [LyricWordTiming] = {
+                guard !cur.words.isEmpty else { return [] }
+                if lastWordEnd <= wordDeadline { return cur.words }
+                let origSpan = max(0.25, lastWordEnd - cur.start)
+                let newSpan = max(0.20, wordDeadline - cur.start)
+                let scale = newSpan / origSpan
+                return cur.words.map { w in
+                    let ws = cur.start + max(0, w.startTime - cur.start) * scale
+                    let we = cur.start + max(0.04, w.endTime - cur.start) * scale
+                    return LyricWordTiming(
+                        id: w.id,
+                        text: w.text,
+                        startTime: min(wordDeadline - 0.04, ws),
+                        endTime: min(wordDeadline, max(ws + 0.04, we)),
+                        hasTrailingSpace: w.hasTrailingSpace
+                    )
+                }
+            }()
             output.append(SyncedLyricLine(
                 startTime: cur.start,
                 endTime: boundedEnd,
                 text: cur.text,
-                words: cur.words,
+                words: boundedWords,
                 isInstrumentalBreak: false,
                 hasNativeWordTimings: true
             ))

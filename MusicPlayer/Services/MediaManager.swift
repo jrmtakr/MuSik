@@ -726,7 +726,9 @@ final class MediaManager {
     // MARK: - Playback, Repeat, Favorites, Recents, & Up Next
 
     private func activatePlaybackAudioSession() {
-        ImportKeepAlive.shared.stop()
+        Task { @MainActor in
+            ImportKeepAlive.shared.stop()
+        }
         let session = AVAudioSession.sharedInstance()
         try? session.setCategory(.playback, mode: .default)
         try? session.setActive(true)
@@ -1096,7 +1098,7 @@ final class MediaManager {
             if let currentItem {
                 updateNowPlayingInfo(for: currentItem)
             }
-            BackgroundWorkCoordinator.shared.refreshBackgroundState()
+            Task { @MainActor in BackgroundWorkCoordinator.shared.refreshBackgroundState() }
             return
         }
 
@@ -1107,7 +1109,7 @@ final class MediaManager {
             if let currentItem {
                 updateNowPlayingInfo(for: currentItem)
             }
-            BackgroundWorkCoordinator.shared.refreshBackgroundState()
+            Task { @MainActor in BackgroundWorkCoordinator.shared.refreshBackgroundState() }
             return
         }
 
@@ -1117,7 +1119,7 @@ final class MediaManager {
         if let currentItem {
             updateNowPlayingInfo(for: currentItem)
         }
-        BackgroundWorkCoordinator.shared.refreshBackgroundState()
+        Task { @MainActor in BackgroundWorkCoordinator.shared.refreshBackgroundState() }
     }
 
     func stop() {
@@ -1131,7 +1133,7 @@ final class MediaManager {
         currentTime = 0
         duration = 0
         NowPlayingManager.clear()
-        BackgroundWorkCoordinator.shared.refreshBackgroundState()
+        Task { @MainActor in BackgroundWorkCoordinator.shared.refreshBackgroundState() }
     }
 
     func beginScrubbing() {

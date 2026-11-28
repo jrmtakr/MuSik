@@ -526,7 +526,7 @@ struct AppleMusicLyricsView: View {
     private func wordHighlightedText(words: [LyricWordTiming], effectiveTime: Double) -> Text {
         words.enumerated().reduce(Text("")) { partial, pair in
             let (idx, word) = pair
-            let prefixSpace = idx == 0 ? "" : " "
+            let prefixSpace = (idx > 0 && words[idx - 1].hasTrailingSpace) ? " " : ""
             let progress: Double
             if effectiveTime >= word.endTime {
                 progress = 1.0
@@ -535,7 +535,7 @@ struct AppleMusicLyricsView: View {
             } else {
                 let span = max(0.04, word.endTime - word.startTime)
                 let norm = min(1.0, max(0.0, (effectiveTime - word.startTime) / span))
-                progress = 1.0 - pow(1.0 - norm, 2.2)
+                progress = 1.0 - pow(1.0 - norm, 2.5)
             }
             let wordOpacity = 0.36 + 0.64 * progress
             return partial + Text(prefixSpace + word.text)
@@ -678,10 +678,16 @@ struct AppleMusicLyricsView: View {
     private func interpolatedPlaybackTime(at now: Date, offset: Double, tempoScale: Double = 1.0) -> Double {
         let rawTime: Double
         if mediaManager.isPlaying {
-            let dt = max(0, min(0.18, now.timeIntervalSince(lastSyncWallTime)))
-            let hwLatency = mediaManager.isUsingEqualizerBackend
-                ? min(0.45, max(0.0, AVAudioSession.sharedInstance().outputLatency))
-                : 0.0
+            let dt = max(0, min(0.25, now.timeIntervalSince(lastSyncWallTime)))
+            let hwLatency: Double = {
+                guard mediaManager.isUsingEqualizerBackend else { return 0.0 }
+                let session = AVAudioSession.sharedInstance()
+                let isBuiltIn = session.currentRoute.outputs.allSatisfy {
+                    $0.portType == .builtInSpeaker || $0.portType == .builtInReceiver
+                }
+                if isBuiltIn || session.outputLatency <= 0.05 { return 0.0 }
+                return min(0.35, session.outputLatency)
+            }()
             rawTime = max(0, lastSyncPlaybackTime + dt * Double(mediaManager.playbackRate) - hwLatency)
         } else {
             rawTime = mediaManager.currentTime
@@ -697,7 +703,7 @@ struct AppleMusicLyricsView: View {
         var bestIdx: Int?
         var bestStart = -Double.infinity
         for (idx, line) in lines.enumerated() where line.startTime >= 0 {
-            if effectiveTime >= line.startTime - 0.04 {
+            if effectiveTime >= line.startTime - 0.06 {
                 if line.startTime >= bestStart - 0.001 || bestIdx == nil {
                     bestIdx = idx
                     bestStart = max(bestStart, line.startTime)
