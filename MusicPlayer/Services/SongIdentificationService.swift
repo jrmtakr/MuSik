@@ -62,14 +62,24 @@ final class SongIdentificationService {
         (UserDefaults.standard.object(forKey: Self.enabledDefaultsKey) as? Bool) ?? true
     }
 
-    private(set) var pendingCount = 0
+    private(set) var pendingCount = 0 {
+        didSet {
+            BackgroundWorkCoordinator.shared.refreshBackgroundState()
+        }
+    }
     private(set) var identifiedThisSession = 0
-    private(set) var activePath: String?
+    private(set) var activePath: String? {
+        didSet {
+            BackgroundWorkCoordinator.shared.refreshBackgroundState()
+        }
+    }
+    var hasPendingWork: Bool { activePath != nil || !queue.isEmpty || pendingCount > 0 }
     private(set) var lastStatus: String?
     /// Per-track live analysis progress (`0.0 ... 1.0`) and step label for imported songs/videos.
     private(set) var progressByPath: [String: Double] = [:]
     private(set) var stepLabelByPath: [String: String] = [:]
-    /// Incremented whenever any track finishes AI analysis so waiting views (like Browser player auto-open) wake up cleanly.
+    /// Incremented whenever any track finishes analysis so waiting views refresh track info and synced lyrics.
+    private(set) var lastCompletedRelativePath: String?
     private(set) var completedRevision: Int = 0
     /// Set when an optional audio engine can't run; shown in Settings.
     private(set) var engineUnavailableReason: String?
@@ -262,6 +272,7 @@ final class SongIdentificationService {
                 Self.syncStateBox.setPending(request.relativePath, pending: false)
                 self.activePath = nil
                 self.queuedPaths.remove(request.relativePath)
+                self.lastCompletedRelativePath = request.relativePath
                 self.completedRevision &+= 1
             }
         }
@@ -308,6 +319,26 @@ final class SongIdentificationService {
                 jobID: nil
             )
         }
+    }
+
+    func resumePendingIfNeeded() {
+        guard isEnabled else { return }
+        for item in MediaManager.shared.items where !item.isHLS && !item.relativePath.hasPrefix("__remote__/") {
+            guard MediaManager.shared.customMetadata(forRelativePath: item.relativePath)?.aiAnalysisCompleted == false else {
+                continue
+            }
+            if activePath != item.relativePath && !queuedPaths.contains(item.relativePath) {
+                enqueue(
+                    item,
+                    hintTitle: item.displayTitle,
+                    hintArtist: item.artist ?? "",
+                    sourceVideoID: MediaManager.shared.customMetadata(forRelativePath: item.relativePath)?.sourceVideoID,
+                    sourcePlatform: nil,
+                    jobID: nil
+                )
+            }
+        }
+        startWorkerIfNeeded()
     }
 
     func rekeyPath(from oldPath: String, to newPath: String) {

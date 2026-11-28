@@ -188,14 +188,18 @@ struct SettingsView: View {
 
                     Toggle(isOn: $settings.keepImportingWhenLocked) {
                         VStack(alignment: .leading, spacing: 2) {
-                            Text("Keep Importing When Locked")
-                            Text("Plays silence while a playlist import runs and nothing else is playing, so iOS doesn't pause it. Never interrupts your music.")
+                            Text("Background Sync & Analysis Keep-Alive")
+                            Text("Plays silence while downloads, caching, or song analysis run in the background and nothing else is playing, so iOS doesn't pause them. Never interrupts your music.")
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
                         }
                     }
                     .onChange(of: settings.keepImportingWhenLocked) { _, enabled in
-                        if !enabled { ImportKeepAlive.shared.stop() }
+                        if !enabled {
+                            ImportKeepAlive.shared.stop()
+                        } else {
+                            BackgroundWorkCoordinator.shared.refreshBackgroundState()
+                        }
                     }
 
                     Toggle(isOn: $settings.autoIdentifyImportedSongs) {

@@ -23,7 +23,11 @@ struct WholeSongAIResult: Codable, Hashable, Sendable {
 final class WholeSongAIService {
     static let shared = WholeSongAIService()
 
-    var activeTrackPath: String?
+    var activeTrackPath: String? {
+        didSet {
+            BackgroundWorkCoordinator.shared.refreshBackgroundState()
+        }
+    }
     var progressFraction: Double = 0
     var statusMessage: String?
     var lastError: String?

@@ -740,7 +740,7 @@ private struct SmartPlaylistDetailView: View {
                         HStack(spacing: 12) {
                             Button {
                                 mediaManager.isShuffleEnabled = false
-                                if let first = tracks.first(where: { !mediaManager.isAIAnalysisPending(for: $0) }) ?? tracks.first {
+                                if let first = tracks.first {
                                     if mediaManager.play(first) && first.isVideo { showPlayerSheet = true }
                                 }
                             } label: {
@@ -753,8 +753,7 @@ private struct SmartPlaylistDetailView: View {
 
                             Button {
                                 mediaManager.isShuffleEnabled = true
-                                let readyTracks = tracks.filter { !mediaManager.isAIAnalysisPending(for: $0) }
-                                if let picked = (readyTracks.isEmpty ? tracks : readyTracks).randomElement() {
+                                if let picked = tracks.randomElement() {
                                     if mediaManager.play(picked) && picked.isVideo { showPlayerSheet = true }
                                 }
                             } label: {

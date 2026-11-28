@@ -14,6 +14,8 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         UNUserNotificationCenter.current().delegate = self
         SystemActionRouter.registerHomeQuickActions()
         PlaylistImportManager.shared.registerBackgroundTasks()
+        BackgroundWorkCoordinator.shared.registerBackgroundTasks()
+        BackgroundWorkCoordinator.shared.startObserving()
         TrendingArtistsService.shared.registerBackgroundRefresh()
         return true
     }
@@ -146,13 +148,21 @@ struct MusicPlayerApp: App {
                 }
                 .onChange(of: scenePhase) { _, phase in
                     if phase == .active {
+                        BackgroundWorkCoordinator.shared.noteScenePhase(isBackground: false)
                         Task {
                             await trendingService.refreshIfDue()
                             trendingService.scheduleDailyMidnightRefresh()
                         }
-                    } else if phase == .background || phase == .inactive {
+                    } else if phase == .background {
+                        BackgroundWorkCoordinator.shared.noteScenePhase(isBackground: true)
                         wrappedService.flushDiskSave()
                         timeMachine.flushDiskSave()
+                        DiscoverQueueService.shared.flushPlayedHistoryToDisk()
+                        trendingService.scheduleDailyMidnightRefresh()
+                    } else if phase == .inactive {
+                        wrappedService.flushDiskSave()
+                        timeMachine.flushDiskSave()
+                        DiscoverQueueService.shared.flushPlayedHistoryToDisk()
                         trendingService.scheduleDailyMidnightRefresh()
                     }
                 }
@@ -168,14 +178,9 @@ struct MusicPlayerApp: App {
                     switch mediaManager.importAnyFile(from: url) {
                     case .media(let item):
                         SongIdentificationService.shared.prioritize(item)
-                        Task { @MainActor in
-                            while mediaManager.isAIAnalysisPending(for: item) {
-                                try? await Task.sleep(for: .milliseconds(350))
-                            }
-                            let refreshed = mediaManager.items.first(where: { $0.relativePath == item.relativePath }) ?? item
-                            if mediaManager.play(refreshed) {
-                                showPlayerSheet = true
-                            }
+                        let refreshed = mediaManager.items.first(where: { $0.relativePath == item.relativePath }) ?? item
+                        if mediaManager.play(refreshed) {
+                            showPlayerSheet = true
                         }
                     case .document(let file):
                         quickLookTarget = QuickLookTarget(title: file.name, fileURL: file.fileURL)

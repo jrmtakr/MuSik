@@ -220,6 +220,12 @@ final class PlaylistImportManager {
         jobs.filter { !$0.isFinished }
     }
 
+    var hasActiveBackgroundWork: Bool {
+        activeJobs.contains(where: { !$0.isPaused && !$0.isCancelled })
+            || !activeDownloadTasksByTrackID.isEmpty
+            || !activeResolvingTrackIDs.isEmpty
+    }
+
     /// Songs being worked on right now (found on YouTube / downloading), for the "Now caching" list.
     func inFlightTracks(in job: PlaylistImportJob) -> [PlaylistImportTrackJob] {
         job.tracks.filter { $0.status == .resolving || $0.status == .downloading }
@@ -385,12 +391,16 @@ final class PlaylistImportManager {
                 reloadLibrary: false
             )
         }
-        guard activeJobs.contains(where: { !$0.isPaused && !$0.isCancelled }) else { return }
+        guard activeJobs.contains(where: { !$0.isPaused && !$0.isCancelled }) else {
+            BackgroundWorkCoordinator.shared.refreshBackgroundState()
+            return
+        }
 
         // Stay awake while locked/backgrounded so songs keep being found, not just downloaded.
         if !MediaManager.shared.isPlaying {
             ImportKeepAlive.shared.start()
         }
+        BackgroundWorkCoordinator.shared.refreshBackgroundState()
         scheduleNextBGProcessingTaskIfNeeded()
         if bgExecutionTaskID == .invalid {
             bgExecutionTaskID = UIApplication.shared.beginBackgroundTask(withName: "MuseJRM.PlaylistBgQueue") { [weak self] in
@@ -992,16 +1002,9 @@ final class PlaylistImportManager {
             }
         }
 
-        // Background keep-alive: not needed while music is playing (that keeps the app awake), but
-        // needed again if the music stops while an import is still running.
-        let hasRunnableJobs = activeJobs.contains(where: { !$0.isPaused && !$0.isCancelled })
-        if UIApplication.shared.applicationState == .background {
-            if hasRunnableJobs && !MediaManager.shared.isPlaying {
-                ImportKeepAlive.shared.start()
-            } else if !hasRunnableJobs || MediaManager.shared.isPlaying {
-                ImportKeepAlive.shared.stop()
-            }
-        }
+        // Background keep-alive: delegate to BackgroundWorkCoordinator so single-video caches &
+        // song analysis keep running cleanly even after playlist batch jobs finish.
+        BackgroundWorkCoordinator.shared.refreshBackgroundState()
 
         finalizeCompletedJobsIfNeeded()
         ensurePumping()
@@ -1072,7 +1075,7 @@ final class PlaylistImportManager {
                 finalizeCompletedJobsIfNeeded()
                 if activeDownloadTasksByTrackID.isEmpty && activeResolvingTrackIDs.isEmpty {
                     BrowserYouTubeResolver.shared.releaseIdleWebView()
-                    ImportKeepAlive.shared.stop()
+                    BackgroundWorkCoordinator.shared.refreshBackgroundState()
                     if let bgTask = pendingBGProcessingTask {
                         bgTask.setTaskCompleted(success: true)
                         pendingBGProcessingTask = nil

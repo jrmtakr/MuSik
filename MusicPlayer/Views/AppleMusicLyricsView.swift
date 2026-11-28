@@ -152,6 +152,7 @@ struct AppleMusicLyricsView: View {
 
     @State private var tiktokMedia = TikTokMediaService.shared
     @State private var wholeSongAI = WholeSongAIService.shared
+    @State private var songIDService = SongIdentificationService.shared
     @State private var lastSyncWallTime: Date = .now
     @State private var lastSyncPlaybackTime: Double = 0
     @State private var pinnedSeekIndex: Int?
@@ -265,6 +266,19 @@ struct AppleMusicLyricsView: View {
         }
         .onChange(of: mediaManager.isPlaying) { _, _ in
             syncClockSnapshot()
+        }
+        .onChange(of: songIDService.completedRevision) { _, _ in
+            guard songIDService.lastCompletedRelativePath == item.relativePath || lyricsService.currentLyrics == nil else {
+                return
+            }
+            let latest = mediaManager.currentItem?.relativePath == item.relativePath ? (mediaManager.currentItem ?? item) : item
+            lyricsService.loadLyricsIfNeeded(for: latest, forceReload: true)
+        }
+        .onChange(of: wholeSongAI.activeTrackPath) { oldPath, newPath in
+            if oldPath == item.relativePath, newPath != item.relativePath {
+                let latest = mediaManager.currentItem?.relativePath == item.relativePath ? (mediaManager.currentItem ?? item) : item
+                lyricsService.loadLyricsIfNeeded(for: latest, forceReload: true)
+            }
         }
     }
 
@@ -615,6 +629,22 @@ struct AppleMusicLyricsView: View {
                         .tint(.white)
                         .frame(maxWidth: 220)
                     Text(wholeSongAI.statusMessage ?? "Listening to whole song...")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.white.opacity(0.75))
+                        .multilineTextAlignment(.center)
+                }
+                .padding(.top, 2)
+            } else if songIDService.isIdentifying(item) {
+                VStack(spacing: 6) {
+                    if let prog = songIDService.analysisProgress(for: item) {
+                        ProgressView(value: max(0.05, prog))
+                            .tint(.white)
+                            .frame(maxWidth: 220)
+                    } else {
+                        ProgressView()
+                            .tint(.white)
+                    }
+                    Text(songIDService.analysisStatusText(for: item) ?? "Matching song & syncing lyrics in background...")
                         .font(.caption.weight(.medium))
                         .foregroundStyle(.white.opacity(0.75))
                         .multilineTextAlignment(.center)

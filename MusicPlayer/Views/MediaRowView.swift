@@ -75,7 +75,7 @@ struct MediaRowView: View {
                         HStack(spacing: 5) {
                             Text(item.displayTitle)
                                 .font(.body.weight(.semibold))
-                                .foregroundStyle(isPendingAIAnalysis ? .secondary : (isCurrent ? Color.accentColor : .primary))
+                                .foregroundStyle(isCurrent ? Color.accentColor : .primary)
                                 .lineLimit(1)
 
                             if isFavorite {
@@ -163,18 +163,12 @@ struct MediaRowView: View {
                 Button {
                     if isPendingAIAnalysis {
                         songIDService.prioritize(item)
-                    } else {
-                        onPlay()
                     }
+                    onPlay()
                 } label: {
-                    if isPendingAIAnalysis {
-                        Label("Analyzing Before Play...", systemImage: "waveform.and.magnifyingglass")
-                    } else {
-                        Label(isCurrent && mediaManager.isPlaying ? "Pause" : "Play",
-                              systemImage: isCurrent && mediaManager.isPlaying ? "pause.fill" : "play.fill")
-                    }
+                    Label(isCurrent && mediaManager.isPlaying ? "Pause" : "Play",
+                          systemImage: isCurrent && mediaManager.isPlaying ? "pause.fill" : "play.fill")
                 }
-                .disabled(isPendingAIAnalysis)
 
                 Button {
                     mediaManager.addToNextPlay(item)

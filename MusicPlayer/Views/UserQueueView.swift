@@ -193,7 +193,7 @@ struct UserQueueContentView: View {
 
             HStack(spacing: 8) {
                 queueTabPill(.upNext, title: "Playing Next (\(queuedRows.count))", systemImage: "list.bullet")
-                queueTabPill(.discover, title: "Discover Queue (\(discoverQueue.items.count))", systemImage: "sparkles")
+                queueTabPill(.discover, title: "Discover Queue (\(discoverQueue.visibleItems.count))", systemImage: "sparkles")
             }
             .listRowBackground(Color.clear)
             .listRowSeparator(.hidden)
@@ -497,7 +497,8 @@ struct UserQueueContentView: View {
     }
 
     private var discoverQueueSection: some View {
-        Section {
+        let visibleItems = discoverQueue.visibleItems
+        return Section {
             if let status = discoverQueue.statusMessage {
                 HStack(spacing: 8) {
                     ProgressView()
@@ -509,7 +510,7 @@ struct UserQueueContentView: View {
                 .listRowBackground(Color.clear)
             }
 
-            if discoverQueue.items.isEmpty && discoverQueue.isLoading {
+            if visibleItems.isEmpty && discoverQueue.isLoading {
                 VStack(spacing: 10) {
                     ProgressView()
                     Text("Finding related songs & videos...")
@@ -519,7 +520,7 @@ struct UserQueueContentView: View {
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 24)
                 .listRowBackground(Color.clear)
-            } else if discoverQueue.items.isEmpty {
+            } else if visibleItems.isEmpty {
                 VStack(spacing: 10) {
                     Image(systemName: "sparkles")
                         .font(.title2)
@@ -545,7 +546,7 @@ struct UserQueueContentView: View {
                 .padding(.vertical, 20)
                 .listRowBackground(Color.clear)
             } else {
-                ForEach(discoverQueue.items) { item in
+                ForEach(visibleItems) { item in
                     discoverQueueRow(item)
                 }
 
@@ -588,6 +589,27 @@ struct UserQueueContentView: View {
                     .lineLimit(1)
 
                     Spacer()
+
+                    Menu {
+                        Text("\(discoverQueue.playedEntries.count) Played Tracks Tracked")
+                        if !discoverQueue.playedEntries.isEmpty {
+                            Divider()
+                            ForEach(discoverQueue.playedEntries.prefix(8)) { entry in
+                                Text("\(entry.title) — \(entry.artist.isEmpty ? "Unknown" : entry.artist)")
+                            }
+                            Divider()
+                            Button(role: .destructive) {
+                                AppHaptics.selection()
+                                discoverQueue.clearPlayedHistory()
+                            } label: {
+                                Label("Reset Played History", systemImage: "trash")
+                            }
+                        }
+                    } label: {
+                        Label("Played (\(discoverQueue.playedEntries.count))", systemImage: "clock.arrow.circlepath")
+                            .font(.caption2.weight(.semibold))
+                    }
+                    .tint(isEmbeddedDarkGlass ? .white.opacity(0.8) : .secondary)
 
                     Button {
                         AppHaptics.selection()

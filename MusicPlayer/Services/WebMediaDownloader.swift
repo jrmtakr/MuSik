@@ -110,11 +110,44 @@ struct FailedCacheEvent: Equatable {
 @MainActor
 @Observable
 final class WebMediaDownloader {
-    private(set) var activeDownloads: [BrowserDownloadItem] = []
-    private(set) var isResolvingFallback: Bool = false
+    private(set) var activeDownloads: [BrowserDownloadItem] = [] {
+        didSet { BackgroundWorkCoordinator.shared.refreshBackgroundState() }
+    }
+    private(set) var isResolvingFallback: Bool = false {
+        didSet { BackgroundWorkCoordinator.shared.refreshBackgroundState() }
+    }
+    private(set) var pendingFinalizationCount: Int = 0 {
+        didSet { BackgroundWorkCoordinator.shared.refreshBackgroundState() }
+    }
+    private(set) var isResolvingURL: Bool = false {
+        didSet { BackgroundWorkCoordinator.shared.refreshBackgroundState() }
+    }
+    private(set) var isResolvingBrowserStream: Bool = false {
+        didSet { BackgroundWorkCoordinator.shared.refreshBackgroundState() }
+    }
+    var isFinalizingDownload: Bool { pendingFinalizationCount > 0 }
+    var hasPendingWork: Bool {
+        !activeDownloads.isEmpty || isResolvingFallback || isFinalizingDownload || isResolvingURL || isResolvingBrowserStream
+    }
     var lastCompletedMediaItem: MediaItem?
     var lastCompletedCacheEvent: CompletedCacheEvent?
     var lastFailedCacheEvent: FailedCacheEvent?
+
+    func setResolvingBrowserStream(_ resolving: Bool) {
+        if isResolvingBrowserStream != resolving {
+            isResolvingBrowserStream = resolving
+        }
+    }
+
+    private func beginFinalization() {
+        pendingFinalizationCount += 1
+    }
+
+    private func endFinalization() {
+        if pendingFinalizationCount > 0 {
+            pendingFinalizationCount -= 1
+        }
+    }
 
     private struct YouTubeFallbackContext {
         let videoID: String
@@ -349,7 +382,9 @@ final class WebMediaDownloader {
             activeAsyncTasks.removeValue(forKey: downloadID)
 
             if !handledBySegmentPipeline && !Task.isCancelled {
-                // Remove placeholder row before delegating to AVAssetDownloadURLSession fallback
+                // Keep finalization active while handing off placeholder to AVAssetDownloadURLSession fallback
+                beginFinalization()
+                defer { endFinalization() }
                 activeDownloads.removeAll { $0.id == downloadID }
                 startAppleAVAssetHLSDownload(
                     from: targetURL,
@@ -406,8 +441,10 @@ final class WebMediaDownloader {
         let session = ephemeralDataSession
         let asyncTask = Task {
             defer {
+                beginFinalization()
                 activeAsyncTasks.removeValue(forKey: downloadID)
                 activeDownloads.removeAll { $0.id == downloadID }
+                endFinalization()
             }
 
             let tracker = AdaptiveProgressTracker()
@@ -987,8 +1024,10 @@ final class WebMediaDownloader {
             let session = ephemeralDataSession
             let asyncTask = Task {
                 defer {
+                    beginFinalization()
                     activeAsyncTasks.removeValue(forKey: downloadID)
                     activeDownloads.removeAll { $0.id == downloadID }
+                    endFinalization()
                 }
                 let pageRef = pageURL ?? headers?["Referer"].flatMap(URL.init(string:))
                 guard let tempFile = await fetchTempFile(from: normalizedURL, ext: inferredExt, headers: mergedHeaders, using: session, pageURL: pageRef, onProgress: { frac in
@@ -1155,6 +1194,8 @@ final class WebMediaDownloader {
             recordFailedDownload(sourceURL: nil, message: "Please enter the correct link")
             return
         }
+        isResolvingURL = true
+        defer { isResolvingURL = false }
 
         if YouTubeStreamResolver.isYouTubeURL(url),
            let videoID = YouTubeStreamResolver.extractVideoID(from: url) {
@@ -1390,6 +1431,8 @@ final class WebMediaDownloader {
         }
         guard let tempURL = output.tempURL else { return false }
 
+        beginFinalization()
+        defer { endFinalization() }
         activeDownloads.removeAll { $0.id == downloadID }
         if let saved = MediaManager.shared.importTemporaryFile(
             from: tempURL,
@@ -2290,10 +2333,12 @@ final class WebMediaDownloader {
             return
         }
         activeURLTasks.removeValue(forKey: id)
+        beginFinalization()
         activeDownloads.removeAll { $0.id == id }
 
         if !isHLS {
             if !(200...299).contains(statusCode) && statusCode != 0 {
+                defer { endFinalization() }
                 try? FileManager.default.removeItem(at: tempFileURL)
                 if statusCode == 403 && !meta.didRetryHeaderless && meta.hadRefererOrCookie {
                     let cleanID = UUID()
@@ -2326,6 +2371,7 @@ final class WebMediaDownloader {
                 return
             }
             if mimeType.contains("html") {
+                defer { endFinalization() }
                 try? FileManager.default.removeItem(at: tempURLOrFallback(tempFileURL))
                 tryNextFallbackOrFail(
                     fallbacks: meta.fallbackStreams,
@@ -2338,7 +2384,8 @@ final class WebMediaDownloader {
             }
         }
 
-        Task {
+        Task { @MainActor in
+            defer { self.endFinalization() }
             if let limit = meta.maxDurationSeconds, !isHLS {
                 if let seconds = await resolveLocalDuration(at: tempFileURL), seconds > limit {
                     try? FileManager.default.removeItem(at: tempFileURL)
@@ -2375,6 +2422,8 @@ final class WebMediaDownloader {
     private func tempURLOrFallback(_ url: URL) -> URL { url }
 
     fileprivate func handleFailedDownload(taskIdentifier: Int, error: Error) {
+        beginFinalization()
+        defer { endFinalization() }
         let removedMeta: DownloadMeta?
         if let id = taskToDownloadID.removeValue(forKey: taskIdentifier) {
             removedMeta = downloadMeta.removeValue(forKey: id)

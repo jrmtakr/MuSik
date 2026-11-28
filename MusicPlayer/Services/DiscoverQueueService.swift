@@ -2,6 +2,15 @@ import Foundation
 import Observation
 import UIKit
 
+struct DiscoverPlayedEntry: Codable, Identifiable, Hashable, Sendable {
+    let id: String
+    let videoID: String?
+    let normKey: String
+    let title: String
+    let artist: String
+    var playedAt: Date
+}
+
 struct DiscoverQueueItem: Identifiable, Hashable, Sendable {
     enum MediaKind: String, Sendable {
         case song = "Song"
@@ -141,12 +150,22 @@ final class DiscoverQueueService {
     }
 
     @ObservationIgnored private var refreshTask: Task<Void, Never>?
+    private(set) var playedEntries: [DiscoverPlayedEntry] = []
     @ObservationIgnored private var playedHistoryIDs: [String] = []
     @ObservationIgnored private var playedNormKeys: Set<String> = []
     @ObservationIgnored private var playedDiscoverStack: [DiscoverQueueItem] = []
     @ObservationIgnored private var usedSeedVideoIDs: Set<String> = []
     @ObservationIgnored private var lastSeedItem: MediaItem?
     @ObservationIgnored private var videoIDCacheByNormKey: [String: String] = [:]
+    @ObservationIgnored private var pendingHistorySaveTask: Task<Void, Never>?
+
+    private static var historyFileURL: URL {
+        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent("discover_played_history.json")
+    }
+
+    private static let maxPersistedHistoryCount = 1000
 
     private init() {
         if UserDefaults.standard.object(forKey: Self.autoPlayDefaultsKey) == nil {
@@ -154,6 +173,7 @@ final class DiscoverQueueService {
         } else {
             self.isAutoPlayEnabled = UserDefaults.standard.bool(forKey: Self.autoPlayDefaultsKey)
         }
+        loadPlayedHistoryFromDisk()
     }
 
     // MARK: - Queue Source Switching (Personal Queue / Playlist <-> Discover Queue)
@@ -192,6 +212,25 @@ final class DiscoverQueueService {
 
     // MARK: - Playback Tracking & Auto-Refresh
 
+    var visibleItems: [DiscoverQueueItem] {
+        items.filter { !isCurrentOrPlayed($0) }
+    }
+
+    func isCurrentOrPlayed(_ candidate: DiscoverQueueItem) -> Bool {
+        let exclusionIDs = currentExclusionIDs(including: lastSeedItem)
+        if exclusionIDs.contains(candidate.id) { return true }
+        if let vid = candidate.videoID, !vid.isEmpty, exclusionIDs.contains(vid) { return true }
+        if let rel = candidate.localRelativePath, !rel.isEmpty, exclusionIDs.contains("local:\(rel)") { return true }
+        if let current = MediaManager.shared.currentItem, matches(candidate, item: current) {
+            return true
+        }
+        let norm = Self.normalizedTrackKey(title: candidate.title, artist: candidate.artist)
+        if !norm.isEmpty && playedNormKeys.contains(norm) {
+            return true
+        }
+        return false
+    }
+
     func handleNowPlayingChanged(to item: MediaItem, fromDiscoverQueue: Bool = false) {
         let key = trackKey(for: item)
         recordPlayedTrack(item)
@@ -199,13 +238,14 @@ final class DiscoverQueueService {
             lastSeedItem = item
         }
 
+        let activeID = fromDiscoverQueue ? activePlayingID : nil
+        items.removeAll { candidate in
+            if let activeID, candidate.id == activeID { return true }
+            return matches(candidate, item: item)
+        }
+
         if fromDiscoverQueue {
             isPlayingFromDiscoverQueue = true
-            let activeID = activePlayingID
-            items.removeAll { candidate in
-                if let activeID, candidate.id == activeID { return true }
-                return matches(candidate, item: item)
-            }
             if items.isEmpty {
                 Task { @MainActor [weak self] in
                     await self?.discoverMore()
@@ -246,8 +286,8 @@ final class DiscoverQueueService {
             usedSeedVideoIDs.insert(itemID)
         }
         let capturedItem = item
-        let snapshotHistory = Set(playedHistoryIDs)
-        let snapshotNorms = playedNormKeys
+        let exclusionIDs = currentExclusionIDs(including: item)
+        let exclusionNorms = currentExclusionNorms(including: item)
 
         refreshTask = Task { [weak self] in
             guard let self else { return }
@@ -257,8 +297,8 @@ final class DiscoverQueueService {
                 cleanSong: cleanMeta.song,
                 cleanArtist: cleanMeta.artist,
                 videoCache: self.videoIDCacheByNormKey,
-                excludedIDs: snapshotHistory,
-                excludedNorms: snapshotNorms
+                excludedIDs: exclusionIDs,
+                excludedNorms: exclusionNorms
             )
             guard !Task.isCancelled, self.seedKey == key else { return }
 
@@ -266,6 +306,7 @@ final class DiscoverQueueService {
                 let normKey = Self.normalizedTrackKey(title: cleanMeta.song, artist: cleanMeta.artist)
                 self.videoIDCacheByNormKey[normKey] = resolvedSeed
                 self.usedSeedVideoIDs.insert(resolvedSeed)
+                self.appendHistoryID(resolvedSeed)
                 if !capturedItem.relativePath.hasPrefix("__remote__/") {
                     MediaManager.shared.setSourceVideoID(resolvedSeed, for: capturedItem)
                 }
@@ -300,8 +341,9 @@ final class DiscoverQueueService {
         let clean = cleanedMetadata(for: anchorItem)
         let offlineMatches = buildLocalRelatedItems(for: anchorItem, cleanArtist: clean.artist, cleanTitle: clean.song)
         let priorShownIDs = Set(items.map(\.id)).union(items.compactMap(\.videoID))
-        let snapshotHistory = Set(playedHistoryIDs).union(priorShownIDs)
-        let snapshotNorms = playedNormKeys
+        let baseExcludedIDs = currentExclusionIDs(including: anchorItem)
+        let baseExcludedNorms = currentExclusionNorms(including: anchorItem)
+        let snapshotHistory = baseExcludedIDs.union(priorShownIDs)
 
         var fetched = await Self.fetchOnlineRelatedItems(
             for: anchorItem,
@@ -310,20 +352,20 @@ final class DiscoverQueueService {
             cleanArtist: clean.artist,
             videoCache: videoIDCacheByNormKey,
             excludedIDs: snapshotHistory,
-            excludedNorms: snapshotNorms
+            excludedNorms: baseExcludedNorms
         )
 
-        // If rotating from the previous wave excluded too many, widen once keeping ONLY playedHistoryIDs excluded.
+        // If rotating from the previous wave excluded too many, widen once while still strictly keeping
+        // the currently playing song AND all played songs excluded.
         if fetched.items.count < 5 {
-            let playedOnly = Set(playedHistoryIDs)
             fetched = await Self.fetchOnlineRelatedItems(
                 for: anchorItem,
                 seedVideoID: unusedFromQueue ?? fallbackVid ?? chosenSeedVid,
                 cleanSong: clean.song,
                 cleanArtist: clean.artist,
                 videoCache: videoIDCacheByNormKey,
-                excludedIDs: playedOnly,
-                excludedNorms: snapshotNorms
+                excludedIDs: baseExcludedIDs,
+                excludedNorms: baseExcludedNorms
             )
         }
 
@@ -417,19 +459,19 @@ final class DiscoverQueueService {
     @discardableResult
     func playNextAutoDiscover(after item: MediaItem?) async -> Bool {
         enterDiscoverPlaybackMode(preservingPlaylistID: MediaManager.shared.activePlaylistID)
-        if items.isEmpty {
+        if visibleItems.isEmpty {
             if isLoading {
                 let deadline = Date().addingTimeInterval(3.5)
                 while isLoading && Date() < deadline {
                     try? await Task.sleep(nanoseconds: 150_000_000)
                 }
             }
-            if items.isEmpty {
+            if visibleItems.isEmpty {
                 await discoverMore()
             }
         }
 
-        for candidate in Array(items.prefix(4)) {
+        for candidate in Array(visibleItems.prefix(4)) {
             if await playItem(candidate) {
                 return true
             }
@@ -530,18 +572,155 @@ final class DiscoverQueueService {
         return (song, artist)
     }
 
+    private func loadPlayedHistoryFromDisk() {
+        guard let data = try? Data(contentsOf: Self.historyFileURL),
+              let decoded = try? JSONDecoder().decode([DiscoverPlayedEntry].self, from: data) else {
+            return
+        }
+        playedEntries = Array(decoded.prefix(Self.maxPersistedHistoryCount))
+        rebuildPlayedLookupTables()
+    }
+
+    func flushPlayedHistoryToDisk() {
+        pendingHistorySaveTask?.cancel()
+        pendingHistorySaveTask = nil
+        if let data = try? JSONEncoder().encode(playedEntries) {
+            try? data.write(to: Self.historyFileURL, options: [.atomic])
+        }
+    }
+
+    private func schedulePlayedHistorySave() {
+        pendingHistorySaveTask?.cancel()
+        let snapshot = playedEntries
+        pendingHistorySaveTask = Task {
+            try? await Task.sleep(for: .milliseconds(350))
+            guard !Task.isCancelled else { return }
+            if let data = try? JSONEncoder().encode(snapshot) {
+                try? data.write(to: Self.historyFileURL, options: [.atomic])
+            }
+        }
+    }
+
+    private func rebuildPlayedLookupTables() {
+        var ids: [String] = []
+        var seenIDs = Set<String>()
+        var norms = Set<String>()
+        for entry in playedEntries {
+            if let vid = entry.videoID, !vid.isEmpty, seenIDs.insert(vid).inserted {
+                ids.append(vid)
+            }
+            if seenIDs.insert(entry.id).inserted {
+                ids.append(entry.id)
+            }
+            if !entry.normKey.isEmpty {
+                norms.insert(entry.normKey)
+            }
+        }
+        playedHistoryIDs = ids
+        playedNormKeys = norms
+    }
+
+    func clearPlayedHistory() {
+        playedEntries.removeAll()
+        playedHistoryIDs.removeAll()
+        playedNormKeys.removeAll()
+        playedDiscoverStack.removeAll()
+        usedSeedVideoIDs.removeAll()
+        if let current = MediaManager.shared.currentItem {
+            recordPlayedTrack(current)
+            refreshIfNeeded(for: current, force: true)
+        } else {
+            flushPlayedHistoryToDisk()
+        }
+    }
+
+    private func appendPlayedEntry(
+        id: String,
+        videoID: String?,
+        normKey: String,
+        title: String,
+        artist: String
+    ) {
+        let entryID = !id.isEmpty ? id : (!normKey.isEmpty ? "key:\(normKey)" : UUID().uuidString)
+        playedEntries.removeAll { existing in
+            existing.id == entryID
+                || (videoID != nil && !videoID!.isEmpty && existing.videoID == videoID)
+                || (!normKey.isEmpty && existing.normKey == normKey)
+        }
+        playedEntries.insert(
+            DiscoverPlayedEntry(
+                id: entryID,
+                videoID: videoID,
+                normKey: normKey,
+                title: title,
+                artist: artist,
+                playedAt: .now
+            ),
+            at: 0
+        )
+        if playedEntries.count > Self.maxPersistedHistoryCount {
+            playedEntries = Array(playedEntries.prefix(Self.maxPersistedHistoryCount))
+        }
+        rebuildPlayedLookupTables()
+        schedulePlayedHistorySave()
+    }
+
+    private func currentExclusionIDs(including seedItem: MediaItem?) -> Set<String> {
+        var ids = Set(playedHistoryIDs)
+        let mm = MediaManager.shared
+        let itemsToExclude = [seedItem, mm.currentItem].compactMap { $0 }
+        for track in itemsToExclude {
+            if let vid = mm.sourceVideoID(for: track), !vid.isEmpty {
+                ids.insert(vid)
+            }
+            if track.relativePath.hasPrefix("__remote__/") {
+                let raw = String(track.relativePath.dropFirst("__remote__/".count))
+                if let first = raw.split(separator: "/").first, !first.isEmpty {
+                    ids.insert(String(first))
+                }
+            }
+            ids.insert("local:\(track.relativePath)")
+        }
+        return ids
+    }
+
+    private func currentExclusionNorms(including seedItem: MediaItem?) -> Set<String> {
+        var norms = playedNormKeys
+        let mm = MediaManager.shared
+        let itemsToExclude = [seedItem, mm.currentItem].compactMap { $0 }
+        for track in itemsToExclude {
+            for k in canonicalKeys(for: track) {
+                norms.insert(k)
+            }
+        }
+        return norms
+    }
+
+    private func canonicalKeys(for item: MediaItem) -> Set<String> {
+        var keys = Set<String>()
+        let clean = cleanedMetadata(for: item)
+        let cleanKey = Self.normalizedTrackKey(title: clean.song, artist: clean.artist)
+        if !cleanKey.isEmpty { keys.insert(cleanKey) }
+        let rawKey = Self.normalizedTrackKey(title: item.displayTitle, artist: item.artist ?? "")
+        if !rawKey.isEmpty { keys.insert(rawKey) }
+        return keys
+    }
+
     private func recordPlayedTrack(_ item: MediaItem) {
-        if let vid = MediaManager.shared.sourceVideoID(for: item), !vid.isEmpty {
+        let vid = MediaManager.shared.sourceVideoID(for: item)
+        if let vid, !vid.isEmpty {
             appendHistoryID(vid)
         }
         let clean = cleanedMetadata(for: item)
         let norm = Self.normalizedTrackKey(title: clean.song, artist: clean.artist)
-        if !norm.isEmpty {
-            playedNormKeys.insert(norm)
-            if playedNormKeys.count > 400 {
-                playedNormKeys = Set(playedNormKeys.prefix(250))
-            }
-        }
+        let entryID = (vid?.isEmpty == false) ? vid! : (!norm.isEmpty ? "key:\(norm)" : "local:\(item.relativePath)")
+        appendPlayedEntry(
+            id: entryID,
+            videoID: vid,
+            normKey: norm,
+            title: clean.song.isEmpty ? item.displayTitle : clean.song,
+            artist: clean.artist
+        )
     }
 
     private func recordPlayedDiscoverItem(_ discoverItem: DiscoverQueueItem) {
@@ -550,32 +729,50 @@ final class DiscoverQueueService {
             appendHistoryID(vid)
         }
         let norm = Self.normalizedTrackKey(title: discoverItem.title, artist: discoverItem.artist)
-        if !norm.isEmpty {
-            playedNormKeys.insert(norm)
-        }
+        appendPlayedEntry(
+            id: discoverItem.id,
+            videoID: discoverItem.videoID,
+            normKey: norm,
+            title: discoverItem.title,
+            artist: discoverItem.artist
+        )
     }
 
     private func appendHistoryID(_ id: String) {
+        guard !id.isEmpty else { return }
         playedHistoryIDs.removeAll { $0 == id }
-        playedHistoryIDs.append(id)
-        if playedHistoryIDs.count > 250 {
-            playedHistoryIDs.removeFirst(playedHistoryIDs.count - 250)
+        playedHistoryIDs.insert(id, at: 0)
+        if playedHistoryIDs.count > Self.maxPersistedHistoryCount {
+            playedHistoryIDs = Array(playedHistoryIDs.prefix(Self.maxPersistedHistoryCount))
         }
     }
 
     private func matches(_ discoverItem: DiscoverQueueItem, item: MediaItem) -> Bool {
         if let vid = discoverItem.videoID,
+           !vid.isEmpty,
            let itemVid = MediaManager.shared.sourceVideoID(for: item),
            vid == itemVid {
+            return true
+        }
+        if item.relativePath.hasPrefix("__remote__/"),
+           let vid = discoverItem.videoID, !vid.isEmpty,
+           item.relativePath.contains(vid) {
             return true
         }
         if let local = discoverItem.localRelativePath, local == item.relativePath {
             return true
         }
         let dNorm = Self.normalizedTrackKey(title: discoverItem.title, artist: discoverItem.artist)
-        let clean = cleanedMetadata(for: item)
-        let iNorm = Self.normalizedTrackKey(title: clean.song, artist: clean.artist)
-        return !dNorm.isEmpty && dNorm == iNorm
+        guard !dNorm.isEmpty else { return false }
+        if canonicalKeys(for: item).contains(dNorm) {
+            return true
+        }
+        let dSongOnly = Self.normalizedSongOnlyKey(title: discoverItem.title, artist: discoverItem.artist)
+        let iClean = cleanedMetadata(for: item)
+        let iSongOnly = Self.normalizedSongOnlyKey(title: iClean.song, artist: iClean.artist)
+        let dArtistEmpty = Self.isPlaceholderArtist(discoverItem.artist)
+        let iArtistEmpty = Self.isPlaceholderArtist(iClean.artist)
+        return !dSongOnly.isEmpty && dSongOnly == iSongOnly && (dArtistEmpty || iArtistEmpty)
     }
 
     private func findCachedLocalMatch(for discoverItem: DiscoverQueueItem, in library: [MediaItem]) -> MediaItem? {
@@ -602,15 +799,17 @@ final class DiscoverQueueService {
         let seedTitleKey = ArtistDatabase.normalizeLookupKey(cleanTitle)
 
         var scored: [(score: Int, item: MediaItem)] = []
-        let historySet = Set(playedHistoryIDs)
-        for cand in mm.items where cand.relativePath != seed.relativePath {
-            if let candVid = mm.sourceVideoID(for: cand), historySet.contains(candVid) { continue }
-            if historySet.contains("local:\(cand.relativePath)") { continue }
+        let exclusionIDs = currentExclusionIDs(including: seed)
+        let exclusionNorms = currentExclusionNorms(including: seed)
+        let activeCurrent = mm.currentItem
+        for cand in mm.items where cand.relativePath != seed.relativePath && cand.relativePath != activeCurrent?.relativePath {
+            if let candVid = mm.sourceVideoID(for: cand), exclusionIDs.contains(candVid) { continue }
+            if exclusionIDs.contains("local:\(cand.relativePath)") { continue }
+            if !canonicalKeys(for: cand).isDisjoint(with: exclusionNorms) { continue }
             let meta = cleanedMetadata(for: cand)
             let candArtistKey = ArtistDatabase.normalizeLookupKey(meta.artist)
             let candTitleKey = ArtistDatabase.normalizeLookupKey(meta.song)
             if candTitleKey == seedTitleKey && candArtistKey == seedArtistKey { continue }
-            if playedNormKeys.contains(Self.normalizedTrackKey(title: meta.song, artist: meta.artist)) { continue }
 
             var score = 0
             if !seedArtistKey.isEmpty && candArtistKey == seedArtistKey {
@@ -656,24 +855,38 @@ final class DiscoverQueueService {
         withOffline offline: [DiscoverQueueItem],
         seedItem: MediaItem
     ) -> [DiscoverQueueItem] {
-        let library = MediaManager.shared.items
-        var seenIDs = Set<String>()
-        var seenNorms = Set<String>()
-        let seedClean = cleanedMetadata(for: seedItem)
-        seenNorms.insert(Self.normalizedTrackKey(title: seedClean.song, artist: seedClean.artist))
-        if let seedVid = MediaManager.shared.sourceVideoID(for: seedItem) {
-            seenIDs.insert(seedVid)
-        }
+        let mm = MediaManager.shared
+        let library = mm.items
+        var seenIDs = currentExclusionIDs(including: seedItem)
+        var seenNorms = currentExclusionNorms(including: seedItem)
+        let activeItems = [seedItem, mm.currentItem].compactMap { $0 }
+        let activeSongOnlyKeys = Set(activeItems.map { track in
+            let clean = cleanedMetadata(for: track)
+            return Self.normalizedSongOnlyKey(title: clean.song, artist: clean.artist)
+        }.filter { !$0.isEmpty })
 
         var result: [DiscoverQueueItem] = []
 
         func appendIfUnique(_ candidate: DiscoverQueueItem) {
+            if seenIDs.contains(candidate.id) { return }
             if let vid = candidate.videoID, !vid.isEmpty {
                 guard seenIDs.insert(vid).inserted else { return }
+            }
+            if let rel = candidate.localRelativePath, !rel.isEmpty {
+                if seenIDs.contains("local:\(rel)") { return }
+            }
+            for active in activeItems where matches(candidate, item: active) {
+                return
             }
             let norm = Self.normalizedTrackKey(title: candidate.title, artist: candidate.artist)
             if !norm.isEmpty {
                 guard seenNorms.insert(norm).inserted else { return }
+            }
+            if Self.isPlaceholderArtist(candidate.artist) {
+                let songOnly = Self.normalizedSongOnlyKey(title: candidate.title, artist: candidate.artist)
+                if !songOnly.isEmpty && activeSongOnlyKeys.contains(songOnly) {
+                    return
+                }
             }
             if let local = findCachedLocalMatch(for: candidate, in: library),
                candidate.localRelativePath == nil {
@@ -706,9 +919,45 @@ final class DiscoverQueueService {
 
     // MARK: - Non-Isolated Online YouTube Music Related Mix + Videos
 
-    nonisolated private static func normalizedTrackKey(title: String, artist: String) -> String {
-        let t = ArtistDatabase.normalizeLookupKey(title)
-        let a = ArtistDatabase.normalizeLookupKey(artist)
+    nonisolated private static func isPlaceholderArtist(_ artist: String) -> Bool {
+        let norm = ArtistDatabase.normalizeLookupKey(artist)
+        return norm.isEmpty
+            || norm == "unknown artist"
+            || norm == "youtube music"
+            || norm == "youtube video"
+            || norm == "various artists"
+    }
+
+    nonisolated private static func normalizedSongOnlyKey(title: String, artist: String) -> String {
+        let extracted = ArtistDatabase.extractArtists(
+            rawArtistTag: isPlaceholderArtist(artist) ? nil : artist,
+            rawTitle: title,
+            isArtistVerified: false
+        )
+        let effectiveArtist = extracted.primaryArtist.isEmpty ? (isPlaceholderArtist(artist) ? nil : artist) : extracted.primaryArtist
+        let cleaned = ArtistDatabase.cleanSongTitleForSearch(rawTitle: title, rawArtistTag: effectiveArtist)
+        let song = cleaned.songOnly.isEmpty ? title : cleaned.songOnly
+        return ArtistDatabase.normalizeLookupKey(song)
+    }
+
+    nonisolated static func normalizedTrackKey(title: String, artist: String) -> String {
+        let extracted = ArtistDatabase.extractArtists(
+            rawArtistTag: isPlaceholderArtist(artist) ? nil : artist,
+            rawTitle: title,
+            isArtistVerified: false
+        )
+        let effectiveArtist = extracted.primaryArtist.isEmpty
+            ? (isPlaceholderArtist(artist) ? "" : artist)
+            : extracted.primaryArtist
+        let cleaned = ArtistDatabase.cleanSongTitleForSearch(
+            rawTitle: title,
+            rawArtistTag: effectiveArtist.isEmpty ? nil : effectiveArtist
+        )
+        let resolvedSong = cleaned.songOnly.isEmpty ? title : cleaned.songOnly
+        let resolvedArtist = isPlaceholderArtist(effectiveArtist) ? "" : ArtistDatabase.canonicalizeSingle(effectiveArtist)
+        let t = ArtistDatabase.normalizeLookupKey(resolvedSong)
+        let a = ArtistDatabase.normalizeLookupKey(resolvedArtist)
+        if t.isEmpty && a.isEmpty { return "" }
         return "\(t)|\(a)"
     }
 

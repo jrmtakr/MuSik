@@ -17,6 +17,7 @@ struct NowPlayingView: View {
     @Environment(SleepTimerManager.self) private var sleepTimer
     @Environment(WebMediaDownloader.self) private var downloader
     @Environment(SyncedLyricsService.self) private var lyricsService
+    @State private var songIDService = SongIdentificationService.shared
     @Environment(GroupPlaylistService.self) private var groupService
     @Environment(\.dismiss) private var dismiss
 
@@ -100,6 +101,12 @@ struct NowPlayingView: View {
             .onChange(of: mediaManager.currentItem?.relativePath) { _, _ in
                 if let current = mediaManager.currentItem {
                     lyricsService.loadLyricsIfNeeded(for: current)
+                }
+            }
+            .onChange(of: songIDService.completedRevision) { _, _ in
+                if let current = mediaManager.currentItem,
+                   songIDService.lastCompletedRelativePath == current.relativePath || lyricsService.currentLyrics == nil {
+                    lyricsService.loadLyricsIfNeeded(for: current, forceReload: true)
                 }
             }
             .onAppear {

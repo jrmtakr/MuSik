@@ -726,6 +726,7 @@ final class MediaManager {
     // MARK: - Playback, Repeat, Favorites, Recents, & Up Next
 
     private func activatePlaybackAudioSession() {
+        ImportKeepAlive.shared.stop()
         let session = AVAudioSession.sharedInstance()
         try? session.setCategory(.playback, mode: .default)
         try? session.setActive(true)
@@ -749,10 +750,6 @@ final class MediaManager {
             Task { @MainActor in
                 SongIdentificationService.shared.prioritize(capturedItem)
             }
-            let detail = SongIdentificationService.stepLabelSync(forRelativePath: item.relativePath)
-                ?? "Listening to whole song..."
-            statusMessage = "Analyzing track before playback: \(detail)"
-            return false
         }
 
         if !keepExternalQueue {
@@ -1099,6 +1096,7 @@ final class MediaManager {
             if let currentItem {
                 updateNowPlayingInfo(for: currentItem)
             }
+            BackgroundWorkCoordinator.shared.refreshBackgroundState()
             return
         }
 
@@ -1109,6 +1107,7 @@ final class MediaManager {
             if let currentItem {
                 updateNowPlayingInfo(for: currentItem)
             }
+            BackgroundWorkCoordinator.shared.refreshBackgroundState()
             return
         }
 
@@ -1118,6 +1117,7 @@ final class MediaManager {
         if let currentItem {
             updateNowPlayingInfo(for: currentItem)
         }
+        BackgroundWorkCoordinator.shared.refreshBackgroundState()
     }
 
     func stop() {
@@ -1131,6 +1131,7 @@ final class MediaManager {
         currentTime = 0
         duration = 0
         NowPlayingManager.clear()
+        BackgroundWorkCoordinator.shared.refreshBackgroundState()
     }
 
     func beginScrubbing() {
@@ -1438,9 +1439,6 @@ final class MediaManager {
         for idx in upNextPaths.indices {
             let nextPath = upNextPaths[idx]
             if let match = byPath[nextPath] {
-                if isAIAnalysisPending(for: match) {
-                    continue
-                }
                 upNextPaths.remove(at: idx)
                 manualQueuePaths.removeAll { $0 == nextPath }
                 saveLibraryState()
@@ -1490,16 +1488,8 @@ final class MediaManager {
     }
 
     private func playFallbackActiveQueue(fromQueueOnly: Bool) {
-        let rawQueue = activeQueue
-        let readyQueue = rawQueue.filter { !isAIAnalysisPending(for: $0) }
-        let queue = readyQueue.isEmpty ? rawQueue : readyQueue
+        let queue = activeQueue
         guard !queue.isEmpty else { return }
-
-        if readyQueue.isEmpty {
-            pause()
-            statusMessage = "Waiting for track analysis to finish..."
-            return
-        }
 
         if isShuffleEnabled, queue.count > 1 {
             // No-repeat shuffle: every song plays once before any song repeats.
@@ -2691,12 +2681,7 @@ final class MediaManager {
             errorMessage = "Playlist \"\(playlist.name)\" has no playable files."
             return
         }
-        let readyItems = allItems.filter { !isAIAnalysisPending(for: $0) }
-        let playlistItems = readyItems.isEmpty ? allItems : readyItems
-        if readyItems.isEmpty, let firstPending = allItems.first {
-            _ = play(firstPending, inPlaylist: playlist.id)
-            return
-        }
+        let playlistItems = allItems
         let first: MediaItem
         if let startItem {
             first = startItem
@@ -2762,19 +2747,13 @@ final class MediaManager {
     }
 
     func shuffleAllOfflineMusic() {
-        let rawPool = audioItems.isEmpty ? items : audioItems
-        let readyPool = rawPool.filter { !isAIAnalysisPending(for: $0) }
-        let pool = readyPool.isEmpty ? rawPool : readyPool
+        let pool = audioItems.isEmpty ? items : audioItems
         let excludedPath = currentItem?.relativePath
         let nonRepeatingPool = pool.count > 1
             ? pool.filter { $0.relativePath != excludedPath }
             : pool
         guard !pool.isEmpty else {
             errorMessage = "No offline tracks available to shuffle."
-            return
-        }
-        if readyPool.isEmpty {
-            _ = play(pool[0])
             return
         }
         isShuffleEnabled = true
@@ -2804,10 +2783,7 @@ final class MediaManager {
             play(queued)
             return
         }
-        if let recent = recentItems.first(where: { !isAIAnalysisPending(for: $0) })
-            ?? items.first(where: { !isAIAnalysisPending(for: $0) })
-            ?? recentItems.first
-            ?? items.first {
+        if let recent = recentItems.first ?? items.first {
             play(recent)
         } else {
             errorMessage = "No offline media in library yet."
@@ -3248,6 +3224,11 @@ final class MediaManager {
         loadPlaylists()
         loadLibraryState()
         loadLocalFiles()
+    }
+
+    func flushStateBeforeTermination() {
+        saveLibraryState()
+        savePlaylists()
     }
 
     private func saveLibraryState() {

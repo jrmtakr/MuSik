@@ -1383,7 +1383,6 @@ struct BrowserTabView: View {
     @State private var resolvingStepLabel: String?
     @State private var cachingOverlayTitle: String?
     @State private var awaitingAutoOpenPlayer = false
-    @State private var awaitingAIAutoPlayItem: MediaItem?
     @State private var offlineReadyItem: MediaItem?
     @State private var songIDService = SongIdentificationService.shared
     @FocusState private var isAddressFieldFocused: Bool
@@ -1410,10 +1409,16 @@ struct BrowserTabView: View {
         return parsed
     }
 
+    private var isDownloadPipelineActive: Bool {
+        isResolvingYouTubeCache
+            || !downloader.activeDownloads.isEmpty
+            || downloader.isResolvingFallback
+            || downloader.isFinalizingDownload
+    }
+
     private var showCachingOverlay: Bool {
         isResolvingYouTubeCache
-            || (cachingOverlayTitle != nil && !downloader.activeDownloads.isEmpty)
-            || awaitingAIAutoPlayItem != nil
+            || (cachingOverlayTitle != nil && isDownloadPipelineActive)
     }
 
     var body: some View {
@@ -1552,54 +1557,50 @@ struct BrowserTabView: View {
             .onChange(of: downloader.lastCompletedCacheEvent) { _, event in
                 guard let event else { return }
                 let cachedItem = event.item
-                offlineReadyItem = cachedItem
                 isResolvingYouTubeCache = false
                 if let vid = activeCacheVideoID ?? currentYouTubeVideoID {
                     cachedMediaByYouTubeID[vid] = cachedItem.id
                     mediaManager.setSourceVideoID(vid, for: cachedItem)
                 }
                 activeCacheVideoID = nil
-                if awaitingAutoOpenPlayer {
+                cachingOverlayTitle = nil
+                if awaitingAutoOpenPlayer || settings.autoOpenPlayerAfterCache {
                     awaitingAutoOpenPlayer = false
+                    offlineReadyItem = nil
                     browser.pausePageMedia()
                     if songIDService.isBlockedPendingAI(cachedItem) {
                         songIDService.prioritize(cachedItem)
                     }
-                    awaitingAIAutoPlayItem = nil
-                    cachingOverlayTitle = nil
-                    offlineReadyItem = nil
                     if mediaManager.play(cachedItem) {
                         showPlayerSheet = true
                     }
                 } else {
-                    cachingOverlayTitle = nil
+                    offlineReadyItem = cachedItem
                 }
             }
-            .onChange(of: songIDService.completedRevision) { _, _ in
-                guard let pending = awaitingAIAutoPlayItem else { return }
-                if !songIDService.isBlockedPendingAI(pending) {
-                    awaitingAIAutoPlayItem = nil
+            .onChange(of: isDownloadPipelineActive) { _, active in
+                guard !active else { return }
+                if cachingOverlayTitle != nil {
                     cachingOverlayTitle = nil
-                    offlineReadyItem = nil
-                    let refreshed = mediaManager.items.first(where: { $0.relativePath == pending.relativePath }) ?? pending
-                    browser.pausePageMedia()
-                    if mediaManager.play(refreshed) {
-                        showPlayerSheet = true
+                }
+                if awaitingAutoOpenPlayer {
+                    Task { @MainActor in
+                        try? await Task.sleep(for: .milliseconds(250))
+                        if !isDownloadPipelineActive {
+                            awaitingAutoOpenPlayer = false
+                        }
                     }
                 }
             }
-            .onChange(of: downloader.activeDownloads.isEmpty) { _, isEmpty in
-                if isEmpty && !isResolvingYouTubeCache && !downloader.isResolvingFallback && awaitingAIAutoPlayItem == nil && cachingOverlayTitle != nil {
-                    cachingOverlayTitle = nil
-                    awaitingAutoOpenPlayer = false
-                }
+            .onChange(of: isResolvingYouTubeCache) { _, resolving in
+                downloader.setResolvingBrowserStream(resolving)
             }
             .onChange(of: downloader.lastFailedCacheEvent) { _, event in
                 guard let event else { return }
                 if let failedURL = event.sourceURL?.absoluteString {
                     autoCachedURLs.remove(failedURL)
                 }
-                if downloader.activeDownloads.isEmpty {
+                if downloader.activeDownloads.isEmpty && !downloader.isResolvingFallback {
                     let failedVideoID = activeCacheVideoID ?? currentYouTubeVideoID
                     if let failedVideoID {
                         startedYouTubeCacheIDs.remove(failedVideoID)
@@ -2019,7 +2020,6 @@ struct BrowserTabView: View {
         isResolvingYouTubeCache = false
         cachingOverlayTitle = nil
         awaitingAutoOpenPlayer = false
-        awaitingAIAutoPlayItem = nil
         activeCacheVideoID = nil
         urlString = tab.urlString
         if let parsed = resolvedURL(from: tab.urlString) {
@@ -2045,19 +2045,16 @@ struct BrowserTabView: View {
 
     private func cachingOverlayView(title: String) -> some View {
         let currentDownload = downloader.activeDownloads.first
-        let aiPendingItem = awaitingAIAutoPlayItem
-        let aiStep = aiPendingItem.flatMap { songIDService.analysisStatusText(for: $0) }
-        let aiProgress = aiPendingItem.flatMap { songIDService.analysisProgress(for: $0) }
         return VStack(spacing: 14) {
             HStack(spacing: 12) {
                 ProgressView()
-                    .tint(aiPendingItem != nil && currentDownload == nil ? .purple : .orange)
+                    .tint(.orange)
                     .controlSize(.large)
                 VStack(alignment: .leading, spacing: 3) {
                     Text(
                         currentDownload != nil
                         ? "Caching Video..."
-                        : (aiPendingItem != nil ? "Analyzing Whole Song..." : (resolvingStepLabel ?? "Fetching Video Stream..."))
+                        : (downloader.isFinalizingDownload ? "Finishing Cache..." : (resolvingStepLabel ?? "Fetching Video Stream..."))
                     )
                     .font(.subheadline.weight(.semibold))
                     Text(title)
@@ -2083,26 +2080,6 @@ struct BrowserTabView: View {
                             .foregroundStyle(.secondary)
                     }
                 }
-            } else if aiPendingItem != nil {
-                VStack(spacing: 6) {
-                    if let aiProgress {
-                        ProgressView(value: aiProgress)
-                            .progressViewStyle(.linear)
-                            .tint(.purple)
-                    }
-                    HStack {
-                        Text(aiStep ?? "Listening to whole song & syncing lyrics...")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                        Spacer()
-                        if let aiProgress {
-                            Text("\(Int(aiProgress * 100))%")
-                                .font(.caption2.monospacedDigit().weight(.semibold))
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                }
             } else {
                 Text("Opening in player when ready")
                     .font(.caption2)
@@ -2112,13 +2089,8 @@ struct BrowserTabView: View {
 
             HStack {
                 Spacer()
-                Button(aiPendingItem != nil && currentDownload == nil ? "Hide" : "Cancel", role: .destructive) {
-                    if aiPendingItem != nil && currentDownload == nil {
-                        awaitingAIAutoPlayItem = nil
-                        cachingOverlayTitle = nil
-                    } else {
-                        cancelBrowserCaching(resumeWebPlayback: false)
-                    }
+                Button("Cancel", role: .destructive) {
+                    cancelBrowserCaching(resumeWebPlayback: false)
                 }
                 .font(.caption.weight(.medium))
                 .buttonStyle(.bordered)
@@ -2132,10 +2104,10 @@ struct BrowserTabView: View {
     }
 
     private func offlineReadyBanner(_ item: MediaItem) -> some View {
-        let isPendingAI = songIDService.isBlockedPendingAI(item)
-        let aiStep = songIDService.analysisStatusText(for: item)
+        let isAnalyzingInBg = songIDService.isBlockedPendingAI(item)
+        let bgStep = songIDService.analysisStatusText(for: item)
         return Button {
-            if isPendingAI {
+            if isAnalyzingInBg {
                 songIDService.prioritize(item)
             }
             offlineReadyItem = nil
@@ -2144,34 +2116,28 @@ struct BrowserTabView: View {
             }
         } label: {
             HStack(spacing: 10) {
-                if isPendingAI {
-                    ProgressView()
-                        .controlSize(.small)
-                        .tint(.purple)
-                } else {
-                    Image(systemName: "checkmark.circle.fill")
-                        .foregroundStyle(.green)
-                }
+                Image(systemName: "checkmark.circle.fill")
+                    .foregroundStyle(.green)
                 VStack(alignment: .leading, spacing: 1) {
-                    Text(isPendingAI ? "Analyzing Whole Song..." : "👉 Tap to playback offline!")
+                    Text("👉 Tap to playback offline!")
                         .font(.caption.weight(.bold))
                         .foregroundStyle(.primary)
-                    Text(isPendingAI ? (aiStep ?? item.displayTitle) : item.displayTitle)
+                    Text(isAnalyzingInBg ? (bgStep ?? "Syncing song info & lyrics in background...") : item.displayTitle)
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                 }
                 Spacer()
-                Text(isPendingAI ? "Syncing" : "Play")
+                Text("Play")
                     .font(.caption.weight(.semibold))
                     .padding(.horizontal, 10)
                     .padding(.vertical, 4)
-                    .background(isPendingAI ? Color.purple : Color.green, in: Capsule())
+                    .background(Color.green, in: Capsule())
                     .foregroundStyle(.white)
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
-            .background((isPendingAI ? Color.purple : Color.green).opacity(0.14))
+            .background(Color.green.opacity(0.14))
         }
         .buttonStyle(.plain)
     }
@@ -2481,10 +2447,12 @@ struct BrowserTabView: View {
             if let dur = media.durationSeconds, dur > 0, dur < 3, !media.isActivelyPlaying {
                 return
             }
-            if media.isActivelyPlaying {
-                awaitingAutoOpenPlayer = true
+            if media.isActivelyPlaying || settings.autoOpenPlayerAfterCache {
+                awaitingAutoOpenPlayer = settings.autoOpenPlayerAfterCache || media.isActivelyPlaying
                 cachingOverlayTitle = media.title ?? (browser.pageTitle.isEmpty ? "Caching Video..." : browser.pageTitle)
-                browser.pausePageMedia()
+                if media.isActivelyPlaying {
+                    browser.pausePageMedia()
+                }
             }
             autoCachedURLs.insert(key)
             handleDetectedMedia(media, autoMode: true)
@@ -2586,7 +2554,6 @@ struct BrowserTabView: View {
         resolvingStepLabel = nil
         cachingOverlayTitle = nil
         awaitingAutoOpenPlayer = false
-        awaitingAIAutoPlayItem = nil
         activeCacheVideoID = nil
         promptedURLsThisPage.removeAll()
         browser.clearDetectedStreams()
@@ -2608,7 +2575,6 @@ struct BrowserTabView: View {
         resolvingStepLabel = nil
         cachingOverlayTitle = nil
         awaitingAutoOpenPlayer = false
-        awaitingAIAutoPlayItem = nil
         activeCacheVideoID = nil
         inFlightYouTubeResolveID = nil
         if resumeWebPlayback {
@@ -2644,7 +2610,6 @@ struct BrowserTabView: View {
             if songIDService.isBlockedPendingAI(existingItem) {
                 songIDService.prioritize(existingItem)
             }
-            awaitingAIAutoPlayItem = nil
             cachingOverlayTitle = nil
             if mediaManager.play(existingItem) {
                 showPlayerSheet = true
@@ -2677,7 +2642,6 @@ struct BrowserTabView: View {
         activeYouTubeResolveTask = nil
         startedYouTubeCacheIDs.remove(videoID)
         autoStreamedYouTubeIDs.remove(videoID)
-        awaitingAIAutoPlayItem = nil
         currentYouTubeVideoID = videoID
         activeCacheVideoID = videoID
         inFlightYouTubeResolveID = videoID
@@ -2725,7 +2689,7 @@ struct BrowserTabView: View {
                     isResolvingYouTubeCache = false
                     resolvingStepLabel = nil
                     activeYouTubeResolveToken = nil
-                    if !handedOffToCache && downloader.activeDownloads.isEmpty && awaitingAIAutoPlayItem == nil {
+                    if !handedOffToCache && !isDownloadPipelineActive {
                         cachingOverlayTitle = nil
                         awaitingAutoOpenPlayer = false
                         if activeCacheVideoID == videoID {
@@ -2921,7 +2885,7 @@ struct BrowserTabView: View {
 
         if settings.autoCacheDetectedMedia || forcePlayerOpen {
             guard !startedYouTubeCacheIDs.contains(videoID) else {
-                if downloader.activeDownloads.isEmpty && awaitingAIAutoPlayItem == nil {
+                if !isDownloadPipelineActive {
                     isResolvingYouTubeCache = false
                     cachingOverlayTitle = nil
                     awaitingAutoOpenPlayer = false
@@ -2965,7 +2929,7 @@ struct BrowserTabView: View {
                 maxDurationMinutes: settings.maxCacheDurationMinutes,
                 youTubeVideoID: videoID
             )
-            if downloader.activeDownloads.isEmpty && !downloader.isResolvingFallback && awaitingAIAutoPlayItem == nil {
+            if !isDownloadPipelineActive {
                 cachingOverlayTitle = nil
                 awaitingAutoOpenPlayer = false
                 activeCacheVideoID = nil
@@ -3036,12 +3000,19 @@ struct BrowserTabView: View {
 
         Task {
             let headers = await resolvedHeaders(for: media)
+            let title = media.title ?? (browser.pageTitle.isEmpty ? nil : browser.pageTitle)
+            if settings.autoOpenPlayerAfterCache || awaitingAutoOpenPlayer {
+                awaitingAutoOpenPlayer = true
+                if cachingOverlayTitle == nil {
+                    cachingOverlayTitle = title ?? "Caching Media..."
+                }
+            }
             let resolvedMedia = DetectedBrowserMedia(
                 url: media.url,
                 pairedAudioURL: media.pairedAudioURL,
                 isHLS: media.isHLS,
                 isAudio: media.isAudio,
-                title: media.title ?? (browser.pageTitle.isEmpty ? nil : browser.pageTitle),
+                title: title,
                 author: media.author,
                 qualityLabel: media.qualityLabel,
                 referer: media.referer,

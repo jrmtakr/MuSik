@@ -1,5 +1,6 @@
 import Accelerate
 import AVFoundation
+import CoreML
 import Foundation
 import WhisperKit
 
@@ -26,6 +27,11 @@ actor WhisperTranscriptionEngine {
     private static let primaryVariantName = "openai_whisper-small"
     private static let fallbackVariantName = "openai_whisper-base"
     private static let savedFolderDefaultsKey = "musejrm.whisper.modelFolder.v2"
+    private static let backgroundSafeComputeOptions = ModelComputeOptions(
+        melCompute: .cpuAndNeuralEngine,
+        audioEncoderCompute: .cpuAndNeuralEngine,
+        textDecoderCompute: .cpuAndNeuralEngine
+    )
 
     private var whisperKit: WhisperKit?
     private var initTask: Task<WhisperKit?, Never>?
@@ -285,6 +291,7 @@ actor WhisperTranscriptionEngine {
             if let cachedPath {
                 let cachedConfig = WhisperKitConfig(
                     modelFolder: cachedPath,
+                    computeOptions: Self.backgroundSafeComputeOptions,
                     verbose: false,
                     logLevel: .none,
                     prewarm: false,
@@ -300,6 +307,7 @@ actor WhisperTranscriptionEngine {
                 let primaryConfig = WhisperKitConfig(
                     model: Self.primaryVariantName,
                     downloadBase: Self.modelsBaseURL,
+                    computeOptions: Self.backgroundSafeComputeOptions,
                     verbose: false,
                     logLevel: .none,
                     prewarm: false,
@@ -311,6 +319,7 @@ actor WhisperTranscriptionEngine {
                     let fallbackConfig = WhisperKitConfig(
                         model: Self.fallbackVariantName,
                         downloadBase: Self.modelsBaseURL,
+                        computeOptions: Self.backgroundSafeComputeOptions,
                         verbose: false,
                         logLevel: .none,
                         prewarm: false,
