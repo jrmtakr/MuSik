@@ -67,10 +67,11 @@ final class MuseJRMTests: XCTestCase {
         """
         let parsed = SyncedLyricsService.parseLRCOrPlain(text: lrc, duration: 25.0)
         XCTAssertTrue(parsed.isSynced)
-        XCTAssertEqual(parsed.lines.count, 2)
-        XCTAssertEqual(parsed.lines[0].text, "唯一無二じゃなくちゃイヤイヤ")
-        XCTAssertEqual(parsed.lines[0].endTime, 13.50, accuracy: 0.05)
-        XCTAssertEqual(parsed.lines[1].text, "それこそ本物のアイ")
+        let lyricLines = parsed.lines.filter { !$0.isInstrumentalBreak }
+        XCTAssertEqual(lyricLines.count, 2)
+        XCTAssertEqual(lyricLines[0].text, "唯一無二じゃなくちゃイヤイヤ")
+        XCTAssertEqual(lyricLines[0].endTime, 13.50, accuracy: 0.05)
+        XCTAssertEqual(lyricLines[1].text, "それこそ本物のアイ")
 
         XCTAssertEqual(SongIdentificationService.stripVersionNoise("Luv(sic)", keepVersionTags: false), "Luv(sic)")
         XCTAssertEqual(SongIdentificationService.similarity("BLOODY STREAM", "Bloody Stream"), 1.0, accuracy: 0.001)
@@ -98,22 +99,35 @@ final class MuseJRMTests: XCTestCase {
 
         for i in 0..<Int(frameCount) {
             let t = Double(i) / sr
-            let base = Float(0.02 * sin(2.0 * .pi * 95.0 * t))
+            let base = Float(0.08 * sin(2.0 * .pi * 95.0 * t))
             let inVocal1 = (t >= 4.0 && t <= 7.5)
             let inVocal2 = (t >= 12.0 && t <= 15.5)
             var vocal: Float = 0
             if inVocal1 || inVocal2 {
                 vocal = Float(
-                    0.35 * sin(2.0 * .pi * 380.0 * t)
-                    + 0.22 * sin(2.0 * .pi * 760.0 * t)
-                    + 0.14 * sin(2.0 * .pi * 1140.0 * t)
+                    0.30 * sin(2.0 * .pi * 380.0 * t)
+                    + 0.24 * sin(2.0 * .pi * 760.0 * t)
+                    + 0.18 * sin(2.0 * .pi * 1140.0 * t)
+                    + 0.14 * sin(2.0 * .pi * 1520.0 * t)
+                    + 0.10 * sin(2.0 * .pi * 2280.0 * t)
                 )
             }
             chL[i] = base + vocal
-            chR[i] = -base + vocal
+            chR[i] = base + vocal
         }
-        let audioFile = try AVAudioFile(forWriting: wavURL, settings: format.settings)
+        let pcmSettings: [String: Any] = [
+            AVFormatIDKey: kAudioFormatLinearPCM,
+            AVSampleRateKey: sr,
+            AVNumberOfChannelsKey: 2,
+            AVLinearPCMBitDepthKey: 16,
+            AVLinearPCMIsFloatKey: false,
+            AVLinearPCMIsBigEndianKey: false
+        ]
+        let audioFile = try AVAudioFile(forWriting: wavURL, settings: pcmSettings, commonFormat: .pcmFormatFloat32, interleaved: false)
         try audioFile.write(from: buffer)
+
+        let curve = await SongAudioListener.extractVocalCurve(for: wavURL)
+        XCTAssertNotNil(curve)
 
         // Feed intentionally +1.3s late LRC lines (`5.3s` and `13.3s`) and verify autoAlign pulls them onto `4.0s` / `12.0s`.
         let lateLyrics = ResolvedTrackLyrics(
@@ -131,7 +145,7 @@ final class MuseJRMTests: XCTestCase {
             ]
         )
 
-        let aligned = await SongAudioListener.autoAlign(lyrics: lateLyrics, heard: nil, fileURL: wavURL)
+        let aligned = await SongAudioListener.autoAlign(lyrics: lateLyrics, heard: nil, fileURL: wavURL, precomputedCurve: curve)
         let firstNonBreak = aligned.lines.first { !$0.isInstrumentalBreak }
         XCTAssertNotNil(firstNonBreak)
         if let first = firstNonBreak {
