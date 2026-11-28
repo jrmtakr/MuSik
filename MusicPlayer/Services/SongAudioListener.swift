@@ -192,13 +192,17 @@ enum SongAudioListener {
     ) async -> ListenSummary {
         let langCtx = detectLanguageContext(title: titleHint ?? fileURL.deletingPathExtension().lastPathComponent, artist: artistHint)
         let titleIsInstrumental = hasInstrumentalFilenameHint([titleHint ?? "", fileURL.deletingPathExtension().lastPathComponent].joined(separator: " "))
-        let effectiveHint = languageHint ?? (langCtx.isNonEnglish ? nil : nil) // Allow Whisper auto language ID
+        // Only force a language when the title/artist script makes it unambiguous (kana -> ja, hangul -> ko);
+        // everything else keeps Whisper's own language detection.
+        let effectiveHint = languageHint ?? whisperLanguageHint(title: titleHint, artist: artistHint)
+        let promptHint = speechPromptHint(title: titleHint, artist: artistHint)
 
         if let summary = await WhisperTranscriptionEngine.shared.transcribeWholeFileSummary(
             fileURL: fileURL,
             maxSeconds: maxSeconds,
             allowDownload: allowModelDownload,
             languageHint: effectiveHint,
+            promptHint: promptHint,
             onProgress: onProgress
         ) {
             let heardWords = summary.words.map {
@@ -335,6 +339,105 @@ enum SongAudioListener {
             detectedLanguage: langCtx.speechLocaleID,
             isMostlyInstrumental: isInst
         )
+    }
+
+    /// Whisper language code when the title/artist script is unambiguous: kana -> "ja", hangul -> "ko".
+    /// Han-only text could be Chinese or Japanese, so it is left to auto-detection.
+    nonisolated static func whisperLanguageHint(title: String?, artist: String?) -> String? {
+        let combined = [title ?? "", artist ?? ""].joined(separator: " ")
+        var hasKana = false
+        var hasHangul = false
+        for scalar in combined.unicodeScalars {
+            let v = scalar.value
+            if (0x3040...0x309F).contains(v) || (0x30A0...0x30FF).contains(v) || (0xFF65...0xFF9F).contains(v) {
+                hasKana = true
+            } else if (0xAC00...0xD7AF).contains(v) || (0x1100...0x11FF).contains(v) || (0x3130...0x318F).contains(v) {
+                hasHangul = true
+            }
+        }
+        if hasKana && !hasHangul { return "ja" }
+        if hasHangul && !hasKana { return "ko" }
+        return nil
+    }
+
+    /// Short context hint for the speech model built from the song title and artist only
+    /// (cleaned of file-name / browser / channel noise). Never includes candidate lyrics.
+    nonisolated static func speechPromptHint(title: String?, artist: String?) -> String? {
+        let cleanTitle = ArtistDatabase.stripBrowserPageTitleSuffix(title ?? "")
+            .replacingOccurrences(of: #"(?i)[\(\[][^\)\]]*(?:official|video|audio|lyric|visualizer|mv|hd|4k)[^\)\]]*[\)\]]"#, with: "", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard cleanTitle.count >= 2 else { return nil }
+        let cleanArtist = (artist ?? "")
+            .replacingOccurrences(of: #"(?i)\s*-\s*topic$|vevo$"#, with: "", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let generic: Set<String> = ["", "unknown", "unknown artist", "various artists"]
+        let hint = generic.contains(cleanArtist.lowercased()) ? cleanTitle : "\(cleanTitle) — \(cleanArtist)"
+        return String(hint.prefix(80))
+    }
+
+    struct SyncAccuracyReport: Sendable, Equatable {
+        let matchedLines: Int
+        let totalLines: Int
+        /// Median of (heard time - displayed lyric time); positive = lyrics appear early, negative = late.
+        let medianOffsetSeconds: Double?
+        let p90AbsOffsetSeconds: Double?
+    }
+
+    /// Measures how well displayed lyric line times agree with where the speech model actually heard each line.
+    /// Language-agnostic: matches the first few letters/characters of each line against a time-stamped stream
+    /// of the heard characters within +/-6s of the line, so it works for English and CJK alike.
+    nonisolated static func syncAccuracyReport(lyrics: ResolvedTrackLyrics, heard: [HeardWord]) -> SyncAccuracyReport {
+        var chars: [Character] = []
+        var times: [Double] = []
+        for w in heard.sorted(by: { $0.time < $1.time }) {
+            let norm = Array(normalizeToken(w.rawText.isEmpty ? w.token : w.rawText).lowercased())
+            guard !norm.isEmpty else { continue }
+            let step = max(0.01, (w.endTime - w.time) / Double(norm.count))
+            for (k, ch) in norm.enumerated() {
+                chars.append(ch)
+                times.append(w.time + Double(k) * step)
+            }
+        }
+        let lines = lyrics.lines.filter {
+            !$0.isInstrumentalBreak && !$0.isSpokenDialogue && !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        let tempo = max(0.25, lyrics.tempoScale)
+        var offsets: [Double] = []
+        for line in lines {
+            let lineChars = Array(tokens(line.text).joined().lowercased())
+            guard !lineChars.isEmpty else { continue }
+            let isCJK = lineChars.contains { ch in
+                ch.unicodeScalars.contains { s in
+                    let v = s.value
+                    return (0x3040...0x30FF).contains(v) || (0x4E00...0x9FFF).contains(v) || (0xAC00...0xD7AF).contains(v)
+                }
+            }
+            let k = min(lineChars.count, isCJK ? 4 : 8)
+            guard k >= (isCJK ? 2 : 5), chars.count >= k else { continue }
+            let needle = Array(lineChars.prefix(k))
+            let shown = (line.startTime - lyrics.syncedOffsetSeconds) / tempo
+            var best: Double?
+            var i = 0
+            while i <= chars.count - k {
+                let t = times[i]
+                if t >= shown - 6.0 && t <= shown + 6.0 && chars[i] == needle[0] && Array(chars[i..<(i + k)]) == needle {
+                    let d = t - shown
+                    if best == nil || abs(d) < abs(best!) { best = d }
+                }
+                i += 1
+            }
+            if let best { offsets.append(best) }
+        }
+        guard offsets.count >= 3 else {
+            return SyncAccuracyReport(matchedLines: offsets.count, totalLines: lines.count, medianOffsetSeconds: nil, p90AbsOffsetSeconds: nil)
+        }
+        let sorted = offsets.sorted()
+        let median = sorted.count % 2 == 1
+            ? sorted[sorted.count / 2]
+            : (sorted[sorted.count / 2 - 1] + sorted[sorted.count / 2]) / 2
+        let absSorted = offsets.map { abs($0) }.sorted()
+        let p90 = absSorted[min(absSorted.count - 1, Int((Double(absSorted.count) * 0.9).rounded(.up)) - 1)]
+        return SyncAccuracyReport(matchedLines: offsets.count, totalLines: lines.count, medianOffsetSeconds: median, p90AbsOffsetSeconds: p90)
     }
 
     static func listen(

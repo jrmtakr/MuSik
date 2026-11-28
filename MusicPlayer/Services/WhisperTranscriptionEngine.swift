@@ -2,7 +2,33 @@ import Accelerate
 import AVFoundation
 import CoreML
 import Foundation
+import Observation
 import WhisperKit
+
+/// Observable download / readiness state of the on-device lyrics speech model, shown in Settings.
+@MainActor
+@Observable
+final class SpeechModelStatus {
+    static let shared = SpeechModelStatus()
+
+    enum Phase: Equatable, Sendable {
+        case notDownloaded
+        case downloading
+        case preparing
+        case downloaded
+        case ready
+        case failed
+    }
+
+    var phase: Phase = .notDownloaded
+    /// 0...1 download progress while `phase == .downloading`.
+    var fraction: Double = 0
+    var detail: String?
+
+    private init() {}
+
+    var isBusy: Bool { phase == .downloading || phase == .preparing }
+}
 
 /// On-device CoreML Whisper transcription engine backed by `WhisperKit`.
 /// Keeps the `.ipa` small by downloading the quantized `openai_whisper-base` CoreML bundle once into
@@ -27,6 +53,7 @@ actor WhisperTranscriptionEngine {
     private static let primaryVariantName = "openai_whisper-small"
     private static let fallbackVariantName = "openai_whisper-base"
     private static let savedFolderDefaultsKey = "musejrm.whisper.modelFolder.v2"
+    /// Time cap for loading/compiling the model on device (the download itself is not capped).
     static let downloadLoadTimeoutSeconds: Double = 300
     private static let backgroundSafeComputeOptions = ModelComputeOptions(
         melCompute: .cpuAndNeuralEngine,
@@ -51,6 +78,35 @@ actor WhisperTranscriptionEngine {
     }
 
     private init() {}
+
+    /// User-initiated download from Settings: clears the retry cooldown and downloads (with progress) + loads the model.
+    @discardableResult
+    func downloadNow() async -> Bool {
+        lastFailureAt = nil
+        return await ensureLoaded(allowDownload: true) != nil
+    }
+
+    /// Re-publishes the current state for the Settings screen without starting any download.
+    func refreshStatus() {
+        if whisperKit != nil {
+            Self.publish(.ready, fraction: 1)
+        } else if initTask != nil {
+            return
+        } else if isModelCachedLocally {
+            Self.publish(.downloaded, fraction: 1)
+        } else {
+            Self.publish(.notDownloaded, fraction: 0)
+        }
+    }
+
+    nonisolated static func publish(_ phase: SpeechModelStatus.Phase, fraction: Double? = nil, detail: String? = nil) {
+        Task { @MainActor in
+            let status = SpeechModelStatus.shared
+            status.phase = phase
+            if let fraction { status.fraction = min(1, max(0, fraction)) }
+            status.detail = detail
+        }
+    }
 
     /// Warms up or downloads the local Whisper CoreML model silently in background after app launch.
     func warmUpInBackground() async {
@@ -129,6 +185,7 @@ actor WhisperTranscriptionEngine {
         maxSeconds: Double = 15 * 60,
         allowDownload: Bool = false,
         languageHint: String? = nil,
+        promptHint: String? = nil,
         onProgress: (@Sendable (Int, Int, Double) -> Void)? = nil
     ) async -> TranscriptionSummary? {
         guard let prepared = SongAudioListener.prepareReadableAudioFile(for: fileURL) else {
@@ -151,7 +208,7 @@ actor WhisperTranscriptionEngine {
         let totalSec = pcm.durationSeconds
         let totalChunks = max(1, Int(ceil(totalSec / 30.0)))
         let useAutoLang = (languageHint?.isEmpty ?? true)
-        let options = DecodingOptions(
+        var options = DecodingOptions(
             verbose: false,
             task: .transcribe,
             language: useAutoLang ? nil : languageHint,
@@ -167,6 +224,15 @@ actor WhisperTranscriptionEngine {
             noSpeechThreshold: 0.92,
             chunkingStrategy: nil
         )
+        // Context hint (song title / artist only, never candidate lyrics, so the transcript can't just echo
+        // the lyrics we are trying to verify). Helps names, slang and script choice (e.g. Japanese titles).
+        if let promptHint, !promptHint.isEmpty, let tokenizer = kit.tokenizer {
+            let promptTokens = tokenizer.encode(text: " " + promptHint)
+                .filter { $0 < tokenizer.specialTokens.specialTokenBegin }
+            if !promptTokens.isEmpty {
+                options.promptTokens = Array(promptTokens.prefix(48))
+            }
+        }
 
         onProgress?(1, totalChunks, totalSec)
         guard let results = try? await kit.transcribe(
@@ -340,6 +406,7 @@ actor WhisperTranscriptionEngine {
             Self.relocateLegacyDocumentsHuggingFaceFolder()
             var loadedKit: WhisperKit?
             if let cachedPath {
+                Self.publish(.preparing, fraction: 1)
                 let cachedConfig = WhisperKitConfig(
                     downloadBase: Self.modelsBaseURL,
                     modelFolder: cachedPath,
@@ -357,38 +424,49 @@ actor WhisperTranscriptionEngine {
                 }
             }
             if loadedKit == nil, allowDownload {
-                let primaryConfig = WhisperKitConfig(
-                    model: Self.primaryVariantName,
-                    downloadBase: Self.modelsBaseURL,
-                    tokenizerFolder: Self.modelsBaseURL,
-                    computeOptions: Self.backgroundSafeComputeOptions,
-                    verbose: false,
-                    logLevel: .none,
-                    prewarm: false,
-                    load: true,
-                    download: true
-                )
-                // First-time download + CoreML compile of the model can take minutes on a phone; a 45s cap could cancel
-                // it on every launch, leaving adlib/vocal transcription on the weaker fallback recognizer.
-                loadedKit = await Self.loadKitWithTimeout(config: primaryConfig, timeoutSeconds: Self.downloadLoadTimeoutSeconds)
-                if loadedKit == nil {
-                    let fallbackConfig = WhisperKitConfig(
-                        model: Self.fallbackVariantName,
+                // Download first (no time cap, with progress for Settings), then load/compile under a time cap.
+                // Previously download + compile shared one 45s cap, which could cancel the first-time download.
+                for variant in [Self.primaryVariantName, Self.fallbackVariantName] {
+                    guard !Task.isCancelled else { break }
+                    Self.publish(.downloading, fraction: 0)
+                    let folder: URL?
+                    do {
+                        folder = try await WhisperKit.download(
+                            variant: variant,
+                            downloadBase: Self.modelsBaseURL,
+                            progressCallback: { progress in
+                                Self.publish(.downloading, fraction: progress.fractionCompleted)
+                            }
+                        )
+                    } catch {
+                        folder = nil
+                    }
+                    guard let folder else { continue }
+                    Self.publish(.preparing, fraction: 1)
+                    let downloadedConfig = WhisperKitConfig(
                         downloadBase: Self.modelsBaseURL,
+                        modelFolder: folder.path,
                         tokenizerFolder: Self.modelsBaseURL,
                         computeOptions: Self.backgroundSafeComputeOptions,
                         verbose: false,
                         logLevel: .none,
                         prewarm: false,
                         load: true,
-                        download: true
+                        download: false
                     )
-                    loadedKit = await Self.loadKitWithTimeout(config: fallbackConfig, timeoutSeconds: Self.downloadLoadTimeoutSeconds)
+                    loadedKit = await Self.loadKitWithTimeout(config: downloadedConfig, timeoutSeconds: Self.downloadLoadTimeoutSeconds)
+                    if loadedKit != nil { break }
                 }
             }
             guard let kit = loadedKit else {
+                if allowDownload {
+                    Self.publish(.failed, detail: "Download didn't finish. Check your connection and try again.")
+                } else {
+                    Self.publish(.notDownloaded, fraction: 0)
+                }
                 return nil
             }
+            Self.publish(.ready, fraction: 1)
             if let folderPath = kit.modelFolder?.path, !folderPath.isEmpty {
                 UserDefaults.standard.set(folderPath, forKey: Self.savedFolderDefaultsKey)
             }

@@ -179,6 +179,8 @@ final class SyncedLyricsService {
     @ObservationIgnored private var activeAITask: Task<Void, Never>?
     @ObservationIgnored private var activeAITaskKey: String?
     @ObservationIgnored private var autoAttemptedKeys: Set<String> = []
+    @ObservationIgnored private var syncCheckedPaths: Set<String> = []
+    @ObservationIgnored private var activeSyncCheckTask: Task<Void, Never>?
 
     private static var cacheDirectoryURL: URL {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -237,6 +239,7 @@ final class SyncedLyricsService {
                 currentLoadingKey = nil
                 currentLyrics = inMem
                 lastError = nil
+                scheduleSyncAccuracyCheckIfNeeded(item: item, lyrics: inMem)
                 return
             }
             if let disk = loadFromDisk(key: key) {
@@ -281,7 +284,7 @@ final class SyncedLyricsService {
                         if !isContradicted && !isLegacyStudioCache && !needsFreshCandidates && (disk.isTimeSynced || disk.lines.count >= 4) {
                             let reAligned = await SongAudioListener.autoAlign(lyrics: disk, heard: heard, fileURL: item.fileURL)
                             guard !Task.isCancelled else { return }
-                            storeAlignedLyrics(reAligned, for: item)
+                            storeAlignedLyrics(reAligned, for: item, heard: heard)
                         } else {
                             let updatedOk = await fetchAndAlignDuringImport(
                                 item: item,
@@ -297,6 +300,8 @@ final class SyncedLyricsService {
                             }
                         }
                     }
+                } else {
+                    scheduleSyncAccuracyCheckIfNeeded(item: item, lyrics: disk)
                 }
                 return
             }
@@ -670,6 +675,50 @@ final class SyncedLyricsService {
         }
     }
 
+    /// Lyrics whose timing came from a published/aligned source (not built from the transcript itself),
+    /// so comparing them with what the speech model heard is a meaningful accuracy check.
+    nonisolated static func isScorableSyncedLyrics(_ lyrics: ResolvedTrackLyrics) -> Bool {
+        guard lyrics.isTimeSynced, !isDotsOnlyLyrics(lyrics) else { return false }
+        let label = lyrics.sourceLabel.lowercased()
+        return !(label.contains("full-song") || label.contains("adlib") || label.contains("instrumental") || label.contains("transcribed"))
+    }
+
+    private static func recordSyncAccuracy(item: MediaItem, lyrics: ResolvedTrackLyrics, heard: [HeardWord], source: String) {
+        let report = SongAudioListener.syncAccuracyReport(lyrics: lyrics, heard: heard)
+        SyncDiagnosticsService.shared.updateTrack(relativePath: item.relativePath, fileName: item.fileName) { diag in
+            diag.syncMatchedLines = "\(report.matchedLines)/\(report.totalLines)"
+            diag.syncMedianOffsetSeconds = report.medianOffsetSeconds.map { ($0 * 100).rounded() / 100 }
+            diag.syncP90OffsetSeconds = report.p90AbsOffsetSeconds.map { ($0 * 100).rounded() / 100 }
+            diag.syncScoreSource = source
+            diag.heardWordCount = heard.count
+        }
+    }
+
+    /// One background listen per song (when the speech model is already on the phone) to score how well the
+    /// cached lyrics line up, so every song gets a measured sync error in the diagnostics export.
+    private func scheduleSyncAccuracyCheckIfNeeded(item: MediaItem, lyrics: ResolvedTrackLyrics) {
+        guard Self.isScorableSyncedLyrics(lyrics),
+              !item.isHLS,
+              !item.relativePath.hasPrefix("__remote__/"),
+              !syncCheckedPaths.contains(item.relativePath),
+              SyncDiagnosticsService.shared.entry(for: item.relativePath)?.syncMatchedLines == nil else {
+            return
+        }
+        syncCheckedPaths.insert(item.relativePath)
+        activeSyncCheckTask?.cancel()
+        activeSyncCheckTask = Task {
+            guard await WhisperTranscriptionEngine.shared.isModelCachedLocally else { return }
+            let summary = await SongAudioListener.listenWithSummary(
+                to: item.fileURL,
+                titleHint: item.displayTitle,
+                artistHint: item.artist,
+                allowModelDownload: false
+            )
+            guard !Task.isCancelled, !summary.words.isEmpty else { return }
+            Self.recordSyncAccuracy(item: item, lyrics: lyrics, heard: summary.words, source: "playback check")
+        }
+    }
+
     private func scheduleBackgroundLyricsRefinement(
         item: MediaItem,
         cacheKey key: String,
@@ -725,7 +774,7 @@ final class SyncedLyricsService {
                existing.sourceLabel.localizedCaseInsensitiveContains("Custom") {
                 return
             }
-            storeAlignedLyrics(refined, for: item)
+            storeAlignedLyrics(refined, for: item, heard: heard)
         }
     }
 
@@ -1501,7 +1550,7 @@ final class SyncedLyricsService {
                     precomputedCurve: vocalCurve
                 )
             }
-            storeAlignedLyrics(selected, for: item)
+            storeAlignedLyrics(selected, for: item, heard: heard)
             return true
         }
 
@@ -1596,7 +1645,7 @@ final class SyncedLyricsService {
 
     /// Saves lyrics that were already re-timed against this exact file, so playback uses them as-is
     /// (and the play-time auto-sync doesn't shift them a second time).
-    func storeAlignedLyrics(_ lyrics: ResolvedTrackLyrics, for item: MediaItem) {
+    func storeAlignedLyrics(_ lyrics: ResolvedTrackLyrics, for item: MediaItem, heard: [HeardWord]? = nil) {
         let key = cacheKey(for: item)
         let stored = ResolvedTrackLyrics(
             cacheKey: key,
@@ -1625,6 +1674,10 @@ final class SyncedLyricsService {
             diag.sampleTimingLines = stored.lines.filter { !$0.isInstrumentalBreak && $0.startTime >= 0 }.prefix(6).map {
                 String(format: "[%.2f..%.2f] %@", $0.startTime, $0.endTime, String($0.text.prefix(40)))
             }
+        }
+        if let heard, !heard.isEmpty, Self.isScorableSyncedLyrics(stored) {
+            Self.recordSyncAccuracy(item: item, lyrics: stored, heard: heard, source: "alignment listen")
+            syncCheckedPaths.insert(item.relativePath)
         }
         autoAttemptedKeys.insert(key)
         let isCurrentlyPlayingItem = MediaManager.shared.currentItem?.relativePath == item.relativePath

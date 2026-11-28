@@ -40,6 +40,12 @@ final class SyncDiagnosticsService: @unchecked Sendable {
         var lyricsFallback: String?
         var transcriptionRescue: String?
 
+        // Sync accuracy: displayed lyric times vs where the speech model heard each line
+        var syncMatchedLines: String?
+        var syncMedianOffsetSeconds: Double?
+        var syncP90OffsetSeconds: Double?
+        var syncScoreSource: String?
+
         // Audio alignment & playback route
         var alignmentNote: String?
         var lineCount: Int?
@@ -47,6 +53,8 @@ final class SyncDiagnosticsService: @unchecked Sendable {
         var audioOutputRoute: String?
         var isUsingEqualizerBackend: Bool?
         var outputLatencySeconds: Double?
+        var playbackBackend: String?
+        var latencyCompensationSeconds: Double?
     }
 
     private struct ExportEnvelope: Codable {
@@ -97,6 +105,12 @@ final class SyncDiagnosticsService: @unchecked Sendable {
         let snapshot = entries
         lock.unlock()
         saveSnapshot(snapshot)
+    }
+
+    func entry(for relativePath: String) -> TrackEntry? {
+        lock.lock()
+        defer { lock.unlock() }
+        return entries.first(where: { $0.relativePath == relativePath })
     }
 
     func recordCount() -> Int {
