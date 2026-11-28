@@ -165,11 +165,15 @@ struct AppleMusicLyricsView: View {
     @State private var randomGifURL: URL?
 
     var body: some View {
-        VStack(spacing: 0) {
+        let expectedKey = lyricsService.cacheKey(for: item)
+
+        return VStack(spacing: 0) {
             aiStatusHeaderBar
 
             ZStack(alignment: .bottom) {
-                if let lyrics = lyricsService.currentLyrics, !lyrics.lines.isEmpty {
+                if let lyrics = lyricsService.currentLyrics,
+                   lyrics.cacheKey == expectedKey,
+                   !lyrics.lines.isEmpty {
                     TimelineView(.animation(minimumInterval: mediaManager.isPlaying ? (1.0 / 30.0) : 0.25)) { timeline in
                         let effectiveTime = interpolatedPlaybackTime(
                             at: timeline.date,
@@ -186,7 +190,7 @@ struct AppleMusicLyricsView: View {
                             activeIndex: activeIdx
                         )
                     }
-                } else if lyricsService.currentLoadingKey != nil {
+                } else if lyricsService.currentLoadingKey == expectedKey {
                     VStack(spacing: 14) {
                         ProgressView()
                             .tint(.white)
@@ -286,7 +290,9 @@ struct AppleMusicLyricsView: View {
 
     @ViewBuilder
     private var aiStatusHeaderBar: some View {
-        let statusMsg = lyricsService.aiErrorMessage ?? lyricsService.aiStatusMessage
+        let isSameTrackStatus = lyricsService.aiStatusRelativePath == nil
+            || lyricsService.aiStatusRelativePath == item.relativePath
+        let statusMsg = isSameTrackStatus ? (lyricsService.aiErrorMessage ?? lyricsService.aiStatusMessage) : nil
         let savedInfo = lyricsService.lastRecognizedTrackInfo
         let showSavedBanner = savedInfo?.relativePath == item.relativePath && savedInfo?.wasAutoSaved == true
 
@@ -524,17 +530,18 @@ struct AppleMusicLyricsView: View {
     }
 
     private func wordHighlightedText(words: [LyricWordTiming], effectiveTime: Double) -> Text {
-        words.enumerated().reduce(Text("")) { partial, pair in
+        let visualTime = mediaManager.isPlaying ? (effectiveTime + 0.04) : effectiveTime
+        return words.enumerated().reduce(Text("")) { partial, pair in
             let (idx, word) = pair
             let prefixSpace = (idx > 0 && words[idx - 1].hasTrailingSpace) ? " " : ""
             let progress: Double
-            if effectiveTime >= word.endTime {
+            if visualTime >= word.endTime {
                 progress = 1.0
-            } else if effectiveTime <= word.startTime {
+            } else if visualTime <= word.startTime {
                 progress = 0.0
             } else {
                 let span = max(0.04, word.endTime - word.startTime)
-                let norm = min(1.0, max(0.0, (effectiveTime - word.startTime) / span))
+                let norm = min(1.0, max(0.0, (visualTime - word.startTime) / span))
                 progress = 1.0 - pow(1.0 - norm, 2.5)
             }
             let wordOpacity = 0.36 + 0.64 * progress
@@ -602,7 +609,7 @@ struct AppleMusicLyricsView: View {
 
     private var emptyOrErrorLyricsView: some View {
         VStack(spacing: 16) {
-            Text("No lyrics for first time listen")
+            Text("Analyzing Lyrics")
                 .font(.title3.weight(.bold))
                 .foregroundStyle(.white)
                 .multilineTextAlignment(.center)

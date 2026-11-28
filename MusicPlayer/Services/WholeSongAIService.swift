@@ -105,7 +105,7 @@ final class WholeSongAIService {
     }
 
     /// While an unknown song is on its first listen (before AI finishes listening to the whole song),
-    /// lyrics should not be guessed prematurely so the UI cleanly displays "No lyrics for first time listen".
+    /// lyrics should not be guessed prematurely so the UI cleanly displays "Analyzing Lyrics".
     func shouldDeferOnlineLyricsForFirstListen(_ item: MediaItem) -> Bool {
         guard !item.relativePath.hasPrefix("__remote__/") else { return false }
         return isUnknownSongNeedingFirstListen(item) || isListening(to: item)
@@ -459,7 +459,7 @@ final class WholeSongAIService {
         if let finalResolvedLyrics {
             SyncedLyricsService.shared.installLyrics(finalResolvedLyrics, for: refreshedItem)
         } else if MediaManager.shared.currentItem?.relativePath == refreshedItem.relativePath {
-            SyncedLyricsService.shared.lastError = "No lyrics for first time listen"
+            SyncedLyricsService.shared.lastError = "Analyzing Lyrics"
         }
 
         let excerpt = fullTranscript.isEmpty

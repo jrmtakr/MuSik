@@ -161,7 +161,7 @@ struct AIRecognizedTrackInfo: Equatable, Sendable {
 @Observable
 final class SyncedLyricsService {
     static let shared = SyncedLyricsService()
-    nonisolated static let currentAlignmentVersion = 9
+    nonisolated static let currentAlignmentVersion = 10
 
     var currentLyrics: ResolvedTrackLyrics?
     var currentLoadingKey: String?
@@ -169,6 +169,7 @@ final class SyncedLyricsService {
     var isAIRecognizing: Bool = false
     var aiStatusMessage: String?
     var aiErrorMessage: String?
+    var aiStatusRelativePath: String?
     var lastRecognizedTrackInfo: AIRecognizedTrackInfo?
 
     @ObservationIgnored private var memoryCache: [String: ResolvedTrackLyrics] = [:]
@@ -222,10 +223,16 @@ final class SyncedLyricsService {
 
         if !forceReload {
             if currentLyrics?.cacheKey == key { return }
+            if currentLyrics?.cacheKey != key {
+                currentLyrics = nil
+            }
+            if aiStatusRelativePath != item.relativePath {
+                aiStatusRelativePath = nil
+                aiStatusMessage = nil
+                aiErrorMessage = nil
+                lastRecognizedTrackInfo = nil
+            }
             if currentLoadingKey == key && activeFetchTask != nil { return }
-            aiStatusMessage = nil
-            aiErrorMessage = nil
-            lastRecognizedTrackInfo = nil
             if let inMem = memoryCache[key] {
                 currentLoadingKey = nil
                 currentLyrics = inMem
@@ -297,6 +304,7 @@ final class SyncedLyricsService {
             activeAITask?.cancel()
             activeAITaskKey = nil
             isAIRecognizing = false
+            aiStatusRelativePath = nil
             aiStatusMessage = nil
             aiErrorMessage = nil
             lastRecognizedTrackInfo = nil
@@ -344,7 +352,7 @@ final class SyncedLyricsService {
                     if !importAnalysisPending {
                         WholeSongAIService.shared.triggerIfFirstTimeUnknown(item: item)
                     }
-                    lastError = importAnalysisPending ? nil : "No lyrics for first time listen"
+                    lastError = "Analyzing Lyrics"
                 }
                 return
             }
@@ -483,7 +491,7 @@ final class SyncedLyricsService {
                     )
                     guard !Task.isCancelled, self.activeFetchToken == fetchToken else { return }
                     chosen = matched
-                } else if let heard, heard.count >= 4, !englishASROnForeignTrack {
+                } else if let heard, !heard.isEmpty, !englishASROnForeignTrack {
                     let split = splitArtistAndSong(rawTitle: rawTitle, rawArtist: rawArtist)
                     chosen = SongAudioListener.buildSyncedLyricsFromHeard(
                         heard,
@@ -491,6 +499,15 @@ final class SyncedLyricsService {
                         artistName: split.artist.isEmpty ? (item.artist ?? "Unknown Artist") : split.artist,
                         cacheKey: key,
                         duration: item.durationSeconds
+                    )
+                } else if summary.isMostlyInstrumental || SongAudioListener.hasInstrumentalFilenameHint(rawTitle) {
+                    let split = splitArtistAndSong(rawTitle: rawTitle, rawArtist: rawArtist)
+                    chosen = SongAudioListener.buildInstrumentalLyricsIfNeeded(
+                        trackTitle: split.song.isEmpty ? item.displayTitle : split.song,
+                        artistName: split.artist.isEmpty ? (item.artist ?? "Unknown Artist") : split.artist,
+                        cacheKey: key,
+                        duration: item.durationSeconds,
+                        curve: vocalCurve
                     )
                 }
                 resolved = chosen
@@ -786,6 +803,7 @@ final class SyncedLyricsService {
         activeRefinementTask?.cancel()
         activeAITaskKey = key
         isAIRecognizing = true
+        aiStatusRelativePath = item.relativePath
         aiErrorMessage = nil
         aiStatusMessage = "Listening across full song..."
 
@@ -802,7 +820,9 @@ final class SyncedLyricsService {
                 playbackRate: playbackRate,
                 forceReidentify: forceReidentify
             ) { [weak self] stepText in
-                self?.aiStatusMessage = stepText
+                guard let self, MediaManager.shared.currentItem?.relativePath == item.relativePath else { return }
+                self.aiStatusRelativePath = item.relativePath
+                self.aiStatusMessage = stepText
             }
             guard !Task.isCancelled else {
                 if self.activeAITaskKey == key {
@@ -812,15 +832,20 @@ final class SyncedLyricsService {
             }
             isAIRecognizing = false
             activeAITaskKey = nil
-            aiStatusMessage = outcome.statusMessage
-            aiErrorMessage = outcome.errorMessage
+
+            let isStillCurrentTrack = MediaManager.shared.currentItem?.relativePath == item.relativePath
+            if isStillCurrentTrack {
+                aiStatusRelativePath = item.relativePath
+                aiStatusMessage = outcome.statusMessage
+                aiErrorMessage = outcome.errorMessage
+            }
 
             if let updated = outcome.alignedLyrics {
                 storeAlignedLyrics(updated, for: item)
-                if let saved = memoryCache[key] {
+                if isStillCurrentTrack, let saved = memoryCache[key] {
                     currentLyrics = saved
+                    lastError = nil
                 }
-                lastError = nil
             }
 
             if let rawTitle = outcome.identifiedTitle?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -926,7 +951,9 @@ final class SyncedLyricsService {
     ) {
         guard SFSpeechRecognizer.authorizationStatus() == .authorized,
               !isAIRecognizing,
-              currentLoadingKey == nil else {
+              currentLoadingKey == nil,
+              !SongIdentificationService.shared.isBlockedPendingAI(item),
+              !WholeSongAIService.shared.isListening(to: item) else {
             return
         }
         let key = cacheKey(for: item)
@@ -1096,6 +1123,42 @@ final class SyncedLyricsService {
         return false
     }
 
+    nonisolated static func areArtistsCompatible(target: String, candidate: String) -> Bool {
+        func clean(_ s: String) -> String {
+            let stripped = s
+                .replacingOccurrences(of: #"(?i)\s*-\s*topic$|vevo$|\s+official$"#, with: "", options: .regularExpression)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return normalizeComparable(ArtistDatabase.canonicalizeSingle(stripped))
+        }
+        let nTarget = clean(target)
+        let nCand = clean(candidate)
+        let genericArtists: Set<String> = ["", "unknown artist", "unknown", "various artists", "topic"]
+        if genericArtists.contains(nTarget) || genericArtists.contains(nCand) {
+            return true
+        }
+        if nTarget == nCand {
+            return true
+        }
+
+        let derivativeMarkers: Set<String> = [
+            "piano", "trio", "quartet", "quintet", "ensemble", "orchestra", "symphony",
+            "philharmonic", "choir", "tribute", "lullaby", "karaoke", "backing", "8bit",
+            "chiptune", "musicbox", "cover", "strings"
+        ]
+        let tTokens = Set(nTarget.split(separator: " ").map(String.init))
+        let cTokens = Set(nCand.split(separator: " ").map(String.init))
+        if !cTokens.subtracting(tTokens).intersection(derivativeMarkers).isEmpty {
+            return false
+        }
+        if tTokens.count == 1, let single = tTokens.first {
+            // A 1-word artist like "Coda" or "Datfootdive" must match identically or via collaborator connectors (&, feat, x).
+            let connectors: Set<String> = ["feat", "ft", "featuring", "and", "with", "x"]
+            let extras = cTokens.subtracting(tTokens)
+            return cTokens.contains(single) && (extras.isEmpty || !extras.intersection(connectors).isEmpty)
+        }
+        return !tTokens.intersection(cTokens).isEmpty && (nCand.contains(nTarget) || nTarget.contains(nCand))
+    }
+
     /// Evaluates candidate versions against metadata compatibility, acoustic phrase alignment, AND symmetric heard-audio verification.
     func selectVerifiedCandidateWithConfidence(
         from candidates: [ResolvedTrackLyrics],
@@ -1109,6 +1172,14 @@ final class SyncedLyricsService {
     ) -> (lyrics: ResolvedTrackLyrics, confirmedByAudio: Bool)? {
         guard !candidates.isEmpty else { return nil }
         let targetText = "\(targetTitle) \(targetArtist)"
+        let cleanTargetArtist = targetArtist
+            .replacingOccurrences(of: #"(?i)\s*-\s*topic$|vevo$|\s+official$"#, with: "", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let normTargetArtist = Self.normalizeComparable(cleanTargetArtist)
+        let artistIsKnown = !normTargetArtist.isEmpty
+            && normTargetArtist != "unknown artist"
+            && normTargetArtist != "various artists"
+            && !ArtistDatabase.looksLikeUploaderChannel(targetArtist)
 
         var bestCandidate: ResolvedTrackLyrics?
         var bestConfirmed = false
@@ -1124,6 +1195,11 @@ final class SyncedLyricsService {
                 candidateDuration: cand.expectedDurationSeconds
             )
             score += Double(compat) * 0.015
+
+            let artistMatch = Self.areArtistsCompatible(target: cleanTargetArtist, candidate: cand.artistName)
+            if artistIsKnown {
+                score += artistMatch ? 0.45 : -0.90
+            }
 
             if let vocalCurve, cand.isTimeSynced {
                 let acousticScore = SongAudioListener.acousticTimingScore(for: cand, curve: vocalCurve)
@@ -1141,15 +1217,21 @@ final class SyncedLyricsService {
                     confirmed = true
                     score += 2.2 + report.compositeScore * 1.8
                 case .inconclusive:
-                    score += 0.1 + (foreignMismatch ? 0 : report.globalMatchRatio * 0.5)
+                    if artistIsKnown && !artistMatch {
+                        rejected = true
+                    } else {
+                        score += 0.1 + (foreignMismatch ? 0 : report.globalMatchRatio * 0.5)
+                    }
                 case .contradicted:
-                    if foreignMismatch && compat >= 0 {
+                    if foreignMismatch && compat >= 0 && (!artistIsKnown || artistMatch) {
                         score -= 0.1
                     } else {
                         rejected = true
                         score -= 4.5
                     }
                 }
+            } else if artistIsKnown && !artistMatch {
+                rejected = true
             }
 
             if !rejected && score > bestScore {
@@ -1263,18 +1345,32 @@ final class SyncedLyricsService {
             return true
         }
 
-        // Unreleased / offline-only / alternate-version song fallback: build synced lyrics from speech transcription.
-        if let heard, heard.count >= 4, !englishASROnForeignTrack {
-            let finalTitle = split.song.isEmpty ? item.displayTitle : split.song
-            let finalArtist = split.artist.isEmpty ? (item.artist ?? "Unknown Artist") : split.artist
+        // Unreleased / instrumental-adlib / alternate-version song fallback: build synced lyrics from speech transcription.
+        let splitFinal = splitArtistAndSong(rawTitle: title, rawArtist: artist)
+        let trackFinalTitle = splitFinal.song.isEmpty ? item.displayTitle : splitFinal.song
+        let trackFinalArtist = splitFinal.artist.isEmpty ? (item.artist ?? "Unknown Artist") : splitFinal.artist
+        if let heard, !heard.isEmpty, !englishASROnForeignTrack {
             if let transcribed = SongAudioListener.buildSyncedLyricsFromHeard(
                 heard,
-                trackTitle: finalTitle,
-                artistName: finalArtist,
+                trackTitle: trackFinalTitle,
+                artistName: trackFinalArtist,
                 cacheKey: cacheKey(for: item),
                 duration: duration ?? item.durationSeconds
             ) {
                 storeAlignedLyrics(transcribed, for: item)
+                return true
+            }
+        }
+        if SongAudioListener.hasInstrumentalFilenameHint(title) || (heard?.isEmpty ?? true) {
+            if let inst = SongAudioListener.buildInstrumentalLyricsIfNeeded(
+                trackTitle: trackFinalTitle,
+                artistName: trackFinalArtist,
+                cacheKey: cacheKey(for: item),
+                duration: duration ?? item.durationSeconds,
+                curve: vocalCurve,
+                onlyIfMostlyInstrumental: true
+            ) {
+                storeAlignedLyrics(inst, for: item)
                 return true
             }
         }

@@ -160,7 +160,7 @@ final class SongIdentificationService {
         let jobID: UUID?
     }
 
-    private struct Candidate {
+    private struct Candidate: Sendable {
         var title: String
         var artist: String
         var album: String?
@@ -408,10 +408,12 @@ final class SongIdentificationService {
         lastStatus = "Analyzing \"\(request.hintTitle)\"..."
 
         async let embeddedTask = Self.readEmbeddedMetadata(from: request.fileURL)
-        async let ytCardsTask = (request.sourceVideoID?.isEmpty == false)
-            ? Self.youtubeMusicCardsInVideo(videoID: request.sourceVideoID!)
-            : []
-        let (embedded, ytCards) = await (embeddedTask, ytCardsTask)
+        async let ytInfoTask: (cards: [Candidate], languageCode: String?) = (request.sourceVideoID?.isEmpty == false)
+            ? Self.fetchYouTubeVideoMetadata(videoID: request.sourceVideoID!)
+            : ([], nil)
+        let (embedded, ytInfo) = await (embeddedTask, ytInfoTask)
+        let ytCards = ytInfo.cards
+        let ytLangCode = ytInfo.languageCode
         let seedTitle = (embedded.title?.isEmpty == false ? embedded.title! : request.hintTitle)
         let seedArtist = (embedded.artist?.isEmpty == false ? embedded.artist! : request.hintArtist)
 
@@ -463,7 +465,8 @@ final class SongIdentificationService {
             sourceVideoID: request.sourceVideoID,
             sourcePlatform: request.sourcePlatform,
             fileParsed: effectiveParsed,
-            alternateFileParsed: fileHintParsed
+            alternateFileParsed: fileHintParsed,
+            prefetchedYTCards: ytCards
         )
         if let candidate = song,
            !acceptCandidateSong(
@@ -476,11 +479,9 @@ final class SongIdentificationService {
             song = nil
         }
 
-        // Listen to the whole song AND prefetch lyric version candidates simultaneously so analysis completes fast.
-        await Self.ensureSpeechPermissionIfPossible()
-        updateTrackStep(path: request.relativePath, progress: 0.15, label: "Listening to whole song...")
-        lastStatus = "Listening to whole song: \"\(song?.title ?? bestSeedTitle)\"..."
-
+        // Start extracting harmonic vocal curve, prefetching lyrics, and fetching cover art concurrently.
+        let vocalFileURL = request.fileURL
+        async let vocalCurveTask = SongAudioListener.extractVocalCurve(for: vocalFileURL)
         let prefetchSeedSong = song
         let prefetchItem = MediaManager.shared.items.first(where: { $0.relativePath == request.relativePath })
         async let prefetchedLyricsTask: [ResolvedTrackLyrics]? = prefetchLyricsIfReady(
@@ -489,15 +490,149 @@ final class SongIdentificationService {
             fallbackDuration: request.durationSeconds
         )
 
+        var earlyApplied = false
+        var earlyCoverApplied = false
+        if var immediateSong = song {
+            if immediateSong.album?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true {
+                immediateSong.album = fileAlbumOrProject ?? (effectiveParsed.isExplicitSingle ? "Single" : "Single")
+            } else {
+                immediateSong.album = Self.normalizeReleaseLabel(immediateSong.album, fallbackWhenNoAlbum: fileAlbumOrProject ?? "Single")
+            }
+            updateTrackStep(path: request.relativePath, progress: 0.25, label: "Applying verified artist, album & cover...")
+            var earlyCover: UIImage?
+            if let artURL = immediateSong.artworkURL {
+                earlyCover = await Self.downloadImage(artURL)
+            }
+            if earlyCover == nil && MediaManager.shared.thumbnails[request.relativePath] == nil {
+                earlyCover = await Task.detached(priority: .utility) {
+                    FFmpegMediaService.extractArtworkOrFrame(from: request.fileURL, at: 2.0, maxDimension: 640)
+                }.value
+            }
+            earlyApplied = MediaManager.shared.applyAutoIdentifiedMetadata(
+                relativePath: request.relativePath,
+                title: immediateSong.title,
+                artist: immediateSong.artist,
+                album: immediateSong.album,
+                genre: immediateSong.genre,
+                isrc: immediateSong.isrc,
+                coverImage: earlyCover,
+                source: immediateSong.source,
+                forceOverwriteVerified: allowOverwriteVerified
+            )
+            earlyCoverApplied = (earlyCover != nil)
+            song = immediateSong
+        }
+
+        let vocalCurve = await vocalCurveTask
+        let prefetchedCandidates = await prefetchedLyricsTask
+
+        let langTargetTitle = song?.title ?? bestSeedTitle
+        let langTargetArtist = (song?.artist.isEmpty == false ? song!.artist : bestSeedArtist)
+        let langCtx = SongAudioListener.detectLanguageContext(
+            title: langTargetTitle,
+            artist: langTargetArtist.isEmpty ? nil : langTargetArtist
+        )
+        let genreNonEnglish: Bool = {
+            let g = (song?.genre ?? "").lowercased()
+            return g.contains("anime") || g.contains("j-pop") || g.contains("j-rock") || g.contains("k-pop") || g.contains("kayokyoku")
+        }()
+        let ytNonEnglish = ytLangCode.map { !$0.lowercased().hasPrefix("en") && !$0.isEmpty } ?? false
+        let isNonEnglishEarly = langCtx.isNonEnglish || genreNonEnglish || ytNonEnglish
+        let titleHasInstrumentalHint = SongAudioListener.hasInstrumentalFilenameHint(bestSeedTitle)
+            || SongAudioListener.hasInstrumentalFilenameHint(seedTitle)
+            || SongAudioListener.hasInstrumentalFilenameHint(bareFileTitle)
+
+        // Fast Synced Path: when catalog/YouTube already confirmed the exact track and we already have
+        // time-synced lyrics matching its harmonic vocal curve, align & finish in ~2-3s instead of running slow full-song STT.
+        let modelReadyInRAM = await WhisperTranscriptionEngine.shared.isModelReadyInMemory
+        if let immediateSong = song,
+           !titleHasInstrumentalHint,
+           let prefetchedCandidates,
+           !prefetchedCandidates.isEmpty,
+           let item = MediaManager.shared.items.first(where: { $0.relativePath == request.relativePath }) {
+            let titleMatched = prefetchedCandidates.filter { cand in
+                Self.similarity(Self.stripVersionNoise(cand.trackTitle, keepVersionTags: false),
+                                Self.stripVersionNoise(immediateSong.title, keepVersionTags: false)) >= 0.8
+            }
+            if let verified = SyncedLyricsService.shared.selectVerifiedCandidateWithConfidence(
+                from: titleMatched.isEmpty ? prefetchedCandidates : titleMatched,
+                targetTitle: immediateSong.title,
+                targetArtist: immediateSong.artist,
+                targetDuration: immediateSong.durationSeconds ?? request.durationSeconds,
+                heard: nil,
+                isNonEnglish: isNonEnglishEarly,
+                englishASROnForeignTrack: false,
+                vocalCurve: vocalCurve
+            ), verified.lyrics.isTimeSynced {
+                let acousticFit = vocalCurve.map { SongAudioListener.acousticTimingScore(for: verified.lyrics, curve: $0) } ?? 0.25
+                if acousticFit >= 0.08 || !modelReadyInRAM {
+                    updateTrackStep(path: request.relativePath, progress: 0.85, label: "Aligning lyrics across whole song...")
+                    let aligned = await SongAudioListener.autoAlign(
+                        lyrics: verified.lyrics,
+                        heard: nil,
+                        fileURL: item.fileURL,
+                        precomputedCurve: vocalCurve
+                    )
+                    SyncedLyricsService.shared.storeAlignedLyrics(aligned, for: item)
+                    if Self.normalize(immediateSong.title) != Self.normalize(immediateSong.artist) {
+                        let indexFileURL = request.fileURL
+                        let indexPath = request.relativePath
+                        let confirmedSnapshot = immediateSong
+                        Task.detached(priority: .background) {
+                            await ShazamFingerprintEngine.shared.indexConfirmedTrack(
+                                fileURL: indexFileURL,
+                                trackKey: indexPath,
+                                song: confirmedSnapshot
+                            )
+                        }
+                    }
+                    WholeSongAIService.shared.markCompletedFromImport(
+                        relativePath: request.relativePath,
+                        title: immediateSong.title,
+                        album: immediateSong.album,
+                        artist: immediateSong.artist,
+                        genre: immediateSong.genre,
+                        heardWordCount: 0,
+                        heardExcerpt: nil,
+                        hasLyrics: true
+                    )
+                    if earlyApplied {
+                        identifiedThisSession += 1
+                        lastStatus = "Identified \"\(immediateSong.title)\" by \(immediateSong.artist) (\(immediateSong.album ?? "Single"))"
+                        if let jobID = request.jobID {
+                            PlaylistImportManager.shared.noteTrackIdentified(jobID: jobID)
+                        }
+                    }
+                    progressByPath[request.relativePath] = 1.0
+                    return earlyApplied ? immediateSong : nil
+                }
+            }
+        }
+
+        // Slow/Rescue Path: listen across the song when track is unknown, lacks synced online lyrics, or needs ASR verification.
+        await Self.ensureSpeechPermissionIfPossible()
+        updateTrackStep(path: request.relativePath, progress: 0.32, label: "Listening to whole song...")
+        lastStatus = "Listening to whole song: \"\(song?.title ?? bestSeedTitle)\"..."
+
+        let inferredLangHint: String? = {
+            if let ytLangCode, !ytLangCode.isEmpty { return ytLangCode }
+            let g = (song?.genre ?? "").lowercased()
+            if g.contains("anime") || g.contains("j-pop") || g.contains("j-rock") { return "ja" }
+            if g.contains("k-pop") { return "ko" }
+            return nil
+        }()
+
         let capturedPath = request.relativePath
         let capturedLabelTitle = song?.title ?? bestSeedTitle
         let listenSummary = await SongAudioListener.listenWithSummary(
             to: request.fileURL,
-            titleHint: bestSeedTitle,
-            artistHint: bestSeedArtist.isEmpty ? nil : bestSeedArtist
+            titleHint: langTargetTitle,
+            artistHint: langTargetArtist.isEmpty ? nil : langTargetArtist,
+            allowModelDownload: !earlyApplied,
+            languageHint: inferredLangHint
         ) { [weak self] chunkIdx, totalChunks, totalSeconds in
             Task { @MainActor in
-                let frac = 0.15 + 0.52 * (Double(chunkIdx) / Double(max(1, totalChunks)))
+                let frac = 0.32 + 0.45 * (Double(chunkIdx) / Double(max(1, totalChunks)))
                 let mins = Int(totalSeconds) / 60
                 let secs = Int(totalSeconds) % 60
                 let label = "Listening to song (\(chunkIdx)/\(totalChunks) • \(mins):\(String(format: "%02d", secs)))..."
@@ -505,19 +640,11 @@ final class SongIdentificationService {
                 self?.lastStatus = "Listening to whole song (\(chunkIdx)/\(totalChunks)): \"\(capturedLabelTitle)\""
             }
         }
-        let prefetchedCandidates = await prefetchedLyricsTask
         let heard: [HeardWord]? = listenSummary.words.isEmpty ? nil : listenSummary.words
-        let langCtx = SongAudioListener.detectLanguageContext(
-            title: bestSeedTitle,
-            artist: bestSeedArtist.isEmpty ? nil : bestSeedArtist
-        )
-        let isNonEnglishTrack = langCtx.isNonEnglish || {
+        let isNonEnglishTrack = isNonEnglishEarly || {
             guard let lang = listenSummary.detectedLanguage?.lowercased(), !lang.isEmpty else { return false }
             return !lang.hasPrefix("en")
         }()
-        let titleHasInstrumentalHint = SongAudioListener.hasInstrumentalFilenameHint(bestSeedTitle)
-            || SongAudioListener.hasInstrumentalFilenameHint(seedTitle)
-            || SongAudioListener.hasInstrumentalFilenameHint(bareFileTitle)
         let blockEnglishAudioGuess = listenSummary.isMostlyInstrumental || titleHasInstrumentalHint || isNonEnglishTrack
         let englishASROnForeignTrack = isNonEnglishTrack
             && (listenSummary.detectedLanguage?.lowercased().hasPrefix("en") ?? false)
@@ -739,7 +866,8 @@ final class SongIdentificationService {
 
         updateTrackStep(path: request.relativePath, progress: 0.85, label: "Saving verified title, artist & cover...")
         var cover: UIImage?
-        if let artURL = finalSong.artworkURL {
+        let sameArtURL = earlyApplied && earlyCoverApplied && finalSong.artworkURL == prefetchSeedSong?.artworkURL
+        if !sameArtURL, let artURL = finalSong.artworkURL {
             cover = await Self.downloadImage(artURL)
         }
         if cover == nil && MediaManager.shared.thumbnails[request.relativePath] == nil {
@@ -748,23 +876,35 @@ final class SongIdentificationService {
             }.value
         }
 
-        let applied = MediaManager.shared.applyAutoIdentifiedMetadata(
-            relativePath: request.relativePath,
-            title: finalSong.title,
-            artist: finalSong.artist,
-            album: finalSong.album,
-            genre: finalSong.genre,
-            isrc: finalSong.isrc,
-            coverImage: cover,
-            source: finalSong.source,
-            forceOverwriteVerified: allowOverwriteVerified
-        )
-        if applied {
+        let needsMetadataUpdate = !earlyApplied
+            || allowOverwriteVerified
+            || (!earlyCoverApplied && cover != nil)
+            || finalSong.source != prefetchSeedSong?.source
+            || finalSong.artist.caseInsensitiveCompare(prefetchSeedSong?.artist ?? "") != .orderedSame
+            || (finalSong.album ?? "").caseInsensitiveCompare(prefetchSeedSong?.album ?? "") != .orderedSame
+
+        let applied: Bool = {
+            guard needsMetadataUpdate else { return true }
+            return MediaManager.shared.applyAutoIdentifiedMetadata(
+                relativePath: request.relativePath,
+                title: finalSong.title,
+                artist: finalSong.artist,
+                album: finalSong.album,
+                genre: finalSong.genre,
+                isrc: finalSong.isrc,
+                coverImage: cover,
+                source: finalSong.source,
+                forceOverwriteVerified: allowOverwriteVerified || earlyApplied
+            )
+        }()
+        if applied && !earlyApplied {
             identifiedThisSession += 1
             lastStatus = "Identified \"\(finalSong.title)\" by \(finalSong.artist) (\(finalSong.album ?? "Single"))"
             if let jobID = request.jobID {
                 PlaylistImportManager.shared.noteTrackIdentified(jobID: jobID)
             }
+        } else if earlyApplied {
+            lastStatus = "Identified \"\(finalSong.title)\" by \(finalSong.artist) (\(finalSong.album ?? "Single"))"
         }
 
         // Index this confirmed track into our local Shazam acoustic fingerprint DB.
@@ -788,7 +928,7 @@ final class SongIdentificationService {
         if !titleHasInstrumentalHint,
            let item = MediaManager.shared.items.first(where: { $0.relativePath == request.relativePath }) {
             if let lyrics = lyricsToAlign {
-                let aligned = await SongAudioListener.autoAlign(lyrics: lyrics, heard: heard, fileURL: item.fileURL)
+                let aligned = await SongAudioListener.autoAlign(lyrics: lyrics, heard: heard, fileURL: item.fileURL, precomputedCurve: vocalCurve)
                 SyncedLyricsService.shared.storeAlignedLyrics(aligned, for: item)
                 hasFinalLyrics = true
             } else {
@@ -812,6 +952,17 @@ final class SongIdentificationService {
                     englishASROnForeignTrack: englishASROnForeignTrack
                 )
             }
+        } else if titleHasInstrumentalHint,
+                  let item = MediaManager.shared.items.first(where: { $0.relativePath == request.relativePath }),
+                  let inst = SongAudioListener.buildInstrumentalLyricsIfNeeded(
+                      trackTitle: finalSong.title,
+                      artistName: finalSong.artist,
+                      cacheKey: SyncedLyricsService.shared.cacheKey(for: item),
+                      duration: finalSong.durationSeconds ?? request.durationSeconds,
+                      curve: vocalCurve
+                  ) {
+            SyncedLyricsService.shared.storeAlignedLyrics(inst, for: item)
+            hasFinalLyrics = true
         }
         WholeSongAIService.shared.markCompletedFromImport(
             relativePath: request.relativePath,
@@ -1078,6 +1229,18 @@ final class SongIdentificationService {
             return false
         }
 
+        // Never replace a direct artist/band with a derivative Piano Trio / Ensemble / Tribute / Karaoke / Cover act.
+        let derivativeMarkers: Set<String> = [
+            "piano", "trio", "quartet", "quintet", "ensemble", "orchestra", "symphony",
+            "philharmonic", "choir", "tribute", "players", "singers", "lullaby", "babies",
+            "karaoke", "backing", "8bit", "chiptune", "musicbox", "cover", "strings", "lofi"
+        ]
+        let candArtToks = Set(candArtistNorm)
+        let allowedMarkers = Set(Self.normalize(seedArtist)).union(Self.normalize(seedTitle)).union(Self.normalize(bareFileTitle))
+        if !candArtToks.subtracting(allowedMarkers).intersection(derivativeMarkers).isEmpty {
+            return false
+        }
+
         let seedLooksReal = !cleanSeed.isEmpty && !Self.isGenericTitleHint(cleanSeed) && !Self.isGenericTitleHint(bareFileTitle)
         if seedLooksReal {
             let titleMatch = Self.similarity(cleanSeed, cleanCand)
@@ -1119,7 +1282,8 @@ final class SongIdentificationService {
         sourceVideoID: String?,
         sourcePlatform: ExternalPlaylistPlatform?,
         fileParsed: ArtistDatabase.ParsedTrackHints? = nil,
-        alternateFileParsed: ArtistDatabase.ParsedTrackHints? = nil
+        alternateFileParsed: ArtistDatabase.ParsedTrackHints? = nil,
+        prefetchedYTCards: [Candidate]? = nil
     ) async -> IdentifiedSong? {
         // --- Gather "what it claims to be" ---------------------------------------------------
         var claims: [Candidate] = []
@@ -1152,10 +1316,17 @@ final class SongIdentificationService {
             ))
         }
 
-        // 2) YouTube's own "Music" box for this video.
-        if let videoID = sourceVideoID, !videoID.isEmpty,
-           let ytMusic = await Self.youtubeMusicCardsInVideo(videoID: videoID).first {
-            appendUniqueClaim(ytMusic)
+        // 2) YouTube's own "Music" box, Art-Track metadata ("Provided to YouTube by..."), & video details.
+        let ytCards: [Candidate]
+        if let prefetchedYTCards {
+            ytCards = prefetchedYTCards
+        } else if let videoID = sourceVideoID, !videoID.isEmpty {
+            ytCards = await Self.youtubeMusicCardsInVideo(videoID: videoID)
+        } else {
+            ytCards = []
+        }
+        for card in ytCards {
+            appendUniqueClaim(card)
         }
 
         // 3) Cleaned-up song title + artist ("Song - Artist (Official Video)" → "Song" / "Artist").
@@ -1266,11 +1437,21 @@ final class SongIdentificationService {
     /// A claim is confirmed when a catalog (iTunes, Deezer, or MusicBrainz) or an exact LRCLIB lyrics entry
     /// has the same title + artist and — when we know the file length — the same length.
     private func confirm(_ claim: Candidate, localDuration: Double?) async -> IdentifiedSong? {
-        if let hit = await Self.itunesMatch(for: claim, localDuration: localDuration) {
-            return Self.merge(claim: claim, catalog: hit, catalogName: "iTunes")
+        async let itunesTask = Self.itunesMatchScored(for: claim, localDuration: localDuration)
+        async let deezerTask = Self.deezerMatchScored(for: claim, localDuration: localDuration)
+        let (itunesHit, deezerHit) = await (itunesTask, deezerTask)
+
+        if let itunesHit, let deezerHit {
+            if deezerHit.score > itunesHit.score + 0.04 {
+                return Self.merge(claim: claim, catalog: deezerHit.hit, catalogName: "Deezer")
+            }
+            return Self.merge(claim: claim, catalog: itunesHit.hit, catalogName: "iTunes")
         }
-        if let hit = await Self.deezerMatch(for: claim, localDuration: localDuration) {
-            return Self.merge(claim: claim, catalog: hit, catalogName: "Deezer")
+        if let itunesHit {
+            return Self.merge(claim: claim, catalog: itunesHit.hit, catalogName: "iTunes")
+        }
+        if let deezerHit {
+            return Self.merge(claim: claim, catalog: deezerHit.hit, catalogName: "Deezer")
         }
         if let hit = await musicBrainzMatch(for: claim, localDuration: localDuration) {
             return Self.merge(claim: claim, catalog: hit, catalogName: "MusicBrainz")
@@ -1285,10 +1466,13 @@ final class SongIdentificationService {
                !Self.isGenericTitleHint(claim.title),
                let lrc = await Self.lrclibTitleMatch(title: claim.title, duration: duration) {
                 let enriched = Candidate(title: lrc.title, artist: lrc.artist, sourceName: claim.sourceName)
-                if let hit = await Self.itunesMatch(for: enriched, localDuration: localDuration) {
+                async let eItunesTask = Self.itunesMatch(for: enriched, localDuration: localDuration)
+                async let eDeezerTask = Self.deezerMatch(for: enriched, localDuration: localDuration)
+                let (eItunes, eDeezer) = await (eItunesTask, eDeezerTask)
+                if let hit = eItunes {
                     return Self.merge(claim: claim, catalog: hit, catalogName: "LRCLIB + iTunes")
                 }
-                if let hit = await Self.deezerMatch(for: enriched, localDuration: localDuration) {
+                if let hit = eDeezer {
                     return Self.merge(claim: claim, catalog: hit, catalogName: "LRCLIB + Deezer")
                 }
                 return Self.merge(claim: claim, catalog: lrc, catalogName: "LRCLIB")
@@ -1311,10 +1495,32 @@ final class SongIdentificationService {
         )
     }
 
-    // MARK: - Source: YouTube "Music" box
+    // MARK: - Source: YouTube "Music" box + Official Art Track / Video Credits
 
-    /// Reads all tracks listed in YouTube's "Music" section under a video (single track or multi-track compilation).
+    /// Reads all tracks listed in YouTube's "Music" section plus official Art Track & video description credits.
     private static func youtubeMusicCardsInVideo(videoID: String) async -> [Candidate] {
+        await fetchYouTubeVideoMetadata(videoID: videoID).cards
+    }
+
+    /// Queries YouTube `/next` and `/player` concurrently so track title, artist, album, artwork, and caption language
+    /// come straight from YouTube's Music box, `- Topic` Art Track blocks, and description credits.
+    private static func fetchYouTubeVideoMetadata(videoID: String) async -> (cards: [Candidate], languageCode: String?) {
+        async let nextCardsTask = fetchYouTubeNextCards(videoID: videoID)
+        async let playerTask = fetchYouTubePlayerArtTrack(videoID: videoID)
+        let (nextCards, playerInfo) = await (nextCardsTask, playerTask)
+
+        var combined: [Candidate] = []
+        var seen = Set<String>()
+        for cand in (nextCards + playerInfo.cards) {
+            let key = "\(normalize(cand.title).joined(separator: " "))|\(normalize(cand.artist).joined(separator: " "))"
+            if seen.insert(key).inserted {
+                combined.append(cand)
+            }
+        }
+        return (combined, playerInfo.languageCode)
+    }
+
+    private static func fetchYouTubeNextCards(videoID: String) async -> [Candidate] {
         guard let url = URL(string: "https://www.youtube.com/youtubei/v1/next?prettyPrint=false") else { return [] }
         let body: [String: Any] = [
             "videoId": videoID,
@@ -1324,7 +1530,7 @@ final class SongIdentificationService {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.httpBody = bodyData
-        request.timeoutInterval = 12
+        request.timeoutInterval = 8
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue(WebMediaDownloader.browserUserAgent, forHTTPHeaderField: "User-Agent")
         request.setValue("https://www.youtube.com", forHTTPHeaderField: "Origin")
@@ -1337,6 +1543,169 @@ final class SongIdentificationService {
               let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode),
               let json = try? JSONSerialization.jsonObject(with: data) else { return [] }
         return parseYouTubeMusicCards(json)
+    }
+
+    private static func fetchYouTubePlayerArtTrack(videoID: String) async -> (cards: [Candidate], languageCode: String?) {
+        guard let apiURL = URL(string: "https://www.youtube.com/youtubei/v1/player?prettyPrint=false") else {
+            return ([], nil)
+        }
+        let body: [String: Any] = [
+            "videoId": videoID,
+            "context": [
+                "client": [
+                    "clientName": "IOS",
+                    "clientVersion": YouTubeStreamResolver.iosClientVersion,
+                    "deviceMake": "Apple",
+                    "deviceModel": "iPhone16,2",
+                    "osName": "iPhone",
+                    "osVersion": "18.3.2",
+                    "hl": "en",
+                    "gl": "US"
+                ]
+            ],
+            "contentCheckOk": true,
+            "racyCheckOk": true
+        ]
+        guard let bodyData = try? JSONSerialization.data(withJSONObject: body) else {
+            return ([], nil)
+        }
+        var req = URLRequest(url: apiURL)
+        req.httpMethod = "POST"
+        req.httpBody = bodyData
+        req.timeoutInterval = 8
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue(YouTubeStreamResolver.iosClientUserAgent, forHTTPHeaderField: "User-Agent")
+        req.setValue("https://www.youtube.com", forHTTPHeaderField: "Origin")
+        req.setValue("5", forHTTPHeaderField: "X-YouTube-Client-Name")
+        req.setValue(YouTubeStreamResolver.iosClientVersion, forHTTPHeaderField: "X-YouTube-Client-Version")
+        if let cookies = await BrowserYouTubeResolver.youtubeCookieHeader() {
+            req.setValue(cookies, forHTTPHeaderField: "Cookie")
+        }
+
+        guard let (data, resp) = try? await URLSession.shared.data(for: req),
+              let http = resp as? HTTPURLResponse, (200...299).contains(http.statusCode),
+              let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return ([], nil)
+        }
+
+        var langCode: String?
+        if let captions = dict["captions"] as? [String: Any],
+           let list = captions["playerCaptionsTracklistRenderer"] as? [String: Any],
+           let tracks = list["captionTracks"] as? [[String: Any]] {
+            let nonAuto = tracks.first { ($0["kind"] as? String) != "asr" } ?? tracks.first
+            langCode = (nonAuto?["languageCode"] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        guard let videoDetails = dict["videoDetails"] as? [String: Any] else {
+            return ([], langCode)
+        }
+        let vdTitle = (videoDetails["title"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let vdAuthor = (videoDetails["author"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let vdDur = (videoDetails["lengthSeconds"] as? String).flatMap { Double($0) }
+        let desc = (videoDetails["shortDescription"] as? String) ?? ""
+        let artURL: URL? = {
+            guard let thumb = videoDetails["thumbnail"] as? [String: Any],
+                  let thumbs = thumb["thumbnails"] as? [[String: Any]],
+                  let lastStr = thumbs.last?["url"] as? String else { return nil }
+            return URL(string: lastStr)
+        }()
+
+        var cards: [Candidate] = []
+        let lines = desc
+            .components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        // 1) Official "- Topic" / Distributor Art Track description:
+        //    "Provided to YouTube by ..."
+        //    "<Song Title> · <Artist Name>"
+        //    "<Album Title>"
+        if desc.contains("Provided to YouTube by") || vdAuthor.localizedCaseInsensitiveContains("- Topic") {
+            if let dotIdx = lines.firstIndex(where: { $0.contains(" · ") }) {
+                let parts = lines[dotIdx].components(separatedBy: " · ")
+                let songPart = parts.first?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                let artistPart = (parts.count >= 2 ? parts[1] : vdAuthor.replacingOccurrences(of: #"(?i)\s*-\s*topic$"#, with: "", options: .regularExpression))
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                var albumPart: String?
+                if dotIdx + 1 < lines.count {
+                    let nextLine = lines[dotIdx + 1]
+                    let lowerNext = nextLine.lowercased()
+                    let isMetaLine = nextLine.hasPrefix("℗")
+                        || nextLine.hasPrefix("©")
+                        || lowerNext.hasPrefix("released on:")
+                        || lowerNext.hasPrefix("provided to youtube")
+                        || lowerNext.hasPrefix("auto-generated")
+                        || lowerNext.hasPrefix("http")
+                        || nextLine.contains(":")
+                    if !isMetaLine && nextLine.count <= 90 {
+                        albumPart = nextLine
+                    }
+                }
+                if !songPart.isEmpty && !artistPart.isEmpty {
+                    cards.append(Candidate(
+                        title: songPart,
+                        artist: ArtistDatabase.canonicalizeSingle(artistPart),
+                        album: albumPart,
+                        artworkURL: artURL,
+                        durationSeconds: vdDur,
+                        sourceName: "YouTube Art Track"
+                    ))
+                }
+            }
+        }
+
+        // 2) Structured "Song / Artist / Album" lines inside normal video descriptions.
+        var descSong: String?
+        var descArtist: String?
+        var descAlbum: String?
+        for line in lines {
+            if let r = line.range(of: #"(?i)^(song|track|title)\s*[:\-]\s*(.+)$"#, options: .regularExpression) {
+                let val = String(line[r]).replacingOccurrences(of: #"(?i)^(song|track|title)\s*[:\-]\s*"#, with: "", options: .regularExpression).trimmingCharacters(in: .whitespacesAndNewlines)
+                if descSong == nil && !val.isEmpty { descSong = val }
+            } else if let r = line.range(of: #"(?i)^artist\s*[:\-]\s*(.+)$"#, options: .regularExpression) {
+                let val = String(line[r]).replacingOccurrences(of: #"(?i)^artist\s*[:\-]\s*"#, with: "", options: .regularExpression).trimmingCharacters(in: .whitespacesAndNewlines)
+                if descArtist == nil && !val.isEmpty { descArtist = val }
+            } else if let r = line.range(of: #"(?i)^album\s*[:\-]\s*(.+)$"#, options: .regularExpression) {
+                let val = String(line[r]).replacingOccurrences(of: #"(?i)^album\s*[:\-]\s*"#, with: "", options: .regularExpression).trimmingCharacters(in: .whitespacesAndNewlines)
+                if descAlbum == nil && !val.isEmpty { descAlbum = val }
+            }
+        }
+        if let descSong, let descArtist {
+            cards.append(Candidate(
+                title: descSong,
+                artist: ArtistDatabase.canonicalizeSingle(descArtist),
+                album: descAlbum,
+                artworkURL: artURL,
+                durationSeconds: vdDur,
+                sourceName: "YouTube Description"
+            ))
+        } else if vdAuthor.localizedCaseInsensitiveContains("- Topic"), !vdTitle.isEmpty {
+            let cleanTopicArtist = vdAuthor
+                .replacingOccurrences(of: #"(?i)\s*-\s*topic$"#, with: "", options: .regularExpression)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !cleanTopicArtist.isEmpty {
+                cards.append(Candidate(
+                    title: stripVersionNoise(vdTitle, keepVersionTags: true),
+                    artist: ArtistDatabase.canonicalizeSingle(cleanTopicArtist),
+                    album: descAlbum,
+                    artworkURL: artURL,
+                    durationSeconds: vdDur,
+                    sourceName: "YouTube Art Track"
+                ))
+            }
+        }
+
+        // Infer non-English language if description/title contains CJK script even without captions.
+        if langCode == nil && containsCJKOrKanaOrHangul("\(vdTitle) \(desc.prefix(300))") {
+            let joinedSample = "\(vdTitle) \(desc.prefix(300))"
+            let hasKana = joinedSample.unicodeScalars.contains { (0x3040...0x30FF).contains($0.value) }
+            let hasHangul = joinedSample.unicodeScalars.contains { (0xAC00...0xD7AF).contains($0.value) }
+            if hasKana { langCode = "ja" }
+            else if hasHangul { langCode = "ko" }
+        }
+
+        return (cards, langCode)
     }
 
     /// Handles both layouts YouTube has used: `videoAttributeViewModel` cards (title = song,
@@ -1413,6 +1782,10 @@ final class SongIdentificationService {
     // MARK: - Catalog: iTunes
 
     private static func itunesMatch(for claim: Candidate, localDuration: Double?) async -> Candidate? {
+        await itunesMatchScored(for: claim, localDuration: localDuration)?.hit
+    }
+
+    private static func itunesMatchScored(for claim: Candidate, localDuration: Double?) async -> (score: Double, hit: Candidate)? {
         let term = [claim.artist, stripVersionNoise(claim.title, keepVersionTags: false)]
             .filter { !$0.isEmpty }
             .joined(separator: " ")
@@ -1426,53 +1799,70 @@ final class SongIdentificationService {
                 countries.append("US")
             }
         } else {
-            countries = ["US"]
-            for c in langCtx.preferredITunesCountries where !countries.contains(c) && countries.count < 3 {
+            countries = ["US", "JP", "GB"]
+            for c in langCtx.preferredITunesCountries where !countries.contains(where: { $0.caseInsensitiveCompare(c) == .orderedSame }) && countries.count < 4 {
                 countries.append(c)
             }
         }
         let resultLimit = claim.artist.isEmpty ? "25" : "15"
+        let stores = Array(countries.prefix(3))
 
-        var best: (score: Double, hit: Candidate)?
-        for country in countries.prefix(3) {
-            var comps = URLComponents(string: "https://itunes.apple.com/search")
-            comps?.queryItems = [
-                URLQueryItem(name: "term", value: term),
-                URLQueryItem(name: "country", value: country),
-                URLQueryItem(name: "media", value: "music"),
-                URLQueryItem(name: "entity", value: "song"),
-                URLQueryItem(name: "limit", value: resultLimit)
-            ]
-            guard let url = comps?.url,
-                  let json = await fetchJSON(url),
-                  let rows = json["results"] as? [[String: Any]] else { continue }
+        return await withTaskGroup(of: (score: Double, hit: Candidate)?.self) { group in
+            for country in stores {
+                group.addTask {
+                    var comps = URLComponents(string: "https://itunes.apple.com/search")
+                    comps?.queryItems = [
+                        URLQueryItem(name: "term", value: term),
+                        URLQueryItem(name: "country", value: country),
+                        URLQueryItem(name: "media", value: "music"),
+                        URLQueryItem(name: "entity", value: "song"),
+                        URLQueryItem(name: "limit", value: resultLimit)
+                    ]
+                    guard let url = comps?.url,
+                          let json = await fetchJSON(url),
+                          let rows = json["results"] as? [[String: Any]] else { return nil }
 
-            for row in rows {
-                guard let title = row["trackName"] as? String,
-                      let artist = row["artistName"] as? String else { continue }
-                let duration = (row["trackTimeMillis"] as? NSNumber).map { $0.doubleValue / 1000.0 }
-                guard let score = matchScore(claim: claim, title: title, artist: artist, duration: duration, localDuration: localDuration) else {
-                    continue
+                    var localBest: (score: Double, hit: Candidate)?
+                    for row in rows {
+                        guard let title = row["trackName"] as? String,
+                              let artist = row["artistName"] as? String else { continue }
+                        let duration = (row["trackTimeMillis"] as? NSNumber).map { $0.doubleValue / 1000.0 }
+                        guard let score = matchScore(claim: claim, title: title, artist: artist, duration: duration, localDuration: localDuration) else {
+                            continue
+                        }
+                        let hit = Candidate(
+                            title: title,
+                            artist: artist,
+                            album: row["collectionName"] as? String,
+                            genre: row["primaryGenreName"] as? String,
+                            artworkURL: (row["artworkUrl100"] as? String).flatMap { URL(string: $0) },
+                            durationSeconds: duration,
+                            sourceName: "iTunes"
+                        )
+                        if localBest == nil || score > localBest!.score { localBest = (score, hit) }
+                    }
+                    return localBest
                 }
-                let hit = Candidate(
-                    title: title,
-                    artist: artist,
-                    album: row["collectionName"] as? String,
-                    genre: row["primaryGenreName"] as? String,
-                    artworkURL: (row["artworkUrl100"] as? String).flatMap { URL(string: $0) },
-                    durationSeconds: duration,
-                    sourceName: "iTunes"
-                )
-                if best == nil || score > best!.score { best = (score, hit) }
             }
-            if best != nil { break }
+
+            var overallBest: (score: Double, hit: Candidate)?
+            for await cand in group {
+                guard let cand else { continue }
+                if overallBest == nil || cand.score > overallBest!.score {
+                    overallBest = cand
+                }
+            }
+            return overallBest
         }
-        return best?.hit
     }
 
     // MARK: - Catalog: Deezer (global & indie tracks, no key required)
 
     private static func deezerMatch(for claim: Candidate, localDuration: Double?) async -> Candidate? {
+        await deezerMatchScored(for: claim, localDuration: localDuration)?.hit
+    }
+
+    private static func deezerMatchScored(for claim: Candidate, localDuration: Double?) async -> (score: Double, hit: Candidate)? {
         let term = [claim.artist, stripVersionNoise(claim.title, keepVersionTags: false)]
             .filter { !$0.isEmpty }
             .joined(separator: " ")
@@ -1511,7 +1901,7 @@ final class SongIdentificationService {
             )
             if best == nil || score > best!.score { best = (score, hit) }
         }
-        return best?.hit
+        return best
     }
 
     // MARK: - Catalog: MusicBrainz (+ Cover Art Archive)
@@ -1678,10 +2068,29 @@ final class SongIdentificationService {
             return nil
         }
 
+        // Reject derivative tribute/cover/ensemble artist acts (e.g. "Coda" must never match "Coda Piano Trio").
+        let derivativeArtistTokens: Set<String> = [
+            "piano", "trio", "quartet", "quintet", "ensemble", "orchestra", "symphony",
+            "philharmonic", "choir", "tribute", "players", "singers", "lullaby", "babies",
+            "karaoke", "backing", "8bit", "chiptune", "musicbox", "cover", "strings",
+            "guitar", "saxophone", "violin", "cello", "lofi", "acapella"
+        ]
+        let candArtistSet = Set(normalize(artist))
+        let allowedArtistExtras = Set(normalize(claim.artist)).union(Set(normalize(claim.title)))
+        if !candArtistSet.subtracting(allowedArtistExtras).intersection(derivativeArtistTokens).isEmpty {
+            return nil
+        }
+
         var artistSim = 1.0
         if !claim.artist.isEmpty {
-            let artistContained = containsArtist(artist, claim.artist) ? 0.9 : 0
-            let claimContainsCatalogArtist = (normalize(artist).count >= 2 && containsArtist(claim.artist, artist)) ? 0.85 : 0
+            let claimToks = normalize(claim.artist)
+            let connectorWords: Set<String> = ["feat", "ft", "featuring", "with", "and", "x"]
+            let extras = candArtistSet.subtracting(Set(claimToks))
+            let hasCollaboratorConnector = !extras.intersection(connectorWords).isEmpty
+            let artistContained = containsArtist(artist, claim.artist) && (claimToks.count >= 2 || extras.isEmpty || hasCollaboratorConnector)
+                ? 0.90
+                : 0.0
+            let claimContainsCatalogArtist = (candArtistSet.count >= 2 && containsArtist(claim.artist, artist)) ? 0.85 : 0.0
             artistSim = max(similarity(claim.artist, artist), artistContained, claimContainsCatalogArtist)
             guard artistSim >= 0.6 else { return nil }
         }
@@ -1702,9 +2111,9 @@ final class SongIdentificationService {
             let trusted = claim.sourceName != "Video title" && claim.sourceName != "File name"
             let tolerance: Double
             if strongExplicitTitleAndArtist {
-                tolerance = max(150.0, 600.0)
+                tolerance = trusted ? 45.0 : 25.0
             } else {
-                tolerance = exact ? (trusted ? 150 : durationTolerance * 3) : durationTolerance
+                tolerance = exact ? (trusted ? 45.0 : durationTolerance * 3) : durationTolerance
             }
             guard diff <= tolerance else { return nil }
             durationScore = max(0.05, 1.0 - diff / (tolerance + 1.0))
@@ -1807,7 +2216,7 @@ final class SongIdentificationService {
         return url
     }
 
-    private static func fetchJSON(_ url: URL) async -> [String: Any]? {
+    nonisolated private static func fetchJSON(_ url: URL) async -> [String: Any]? {
         var request = URLRequest(url: url)
         request.timeoutInterval = 12
         request.setValue(userAgent, forHTTPHeaderField: "User-Agent")

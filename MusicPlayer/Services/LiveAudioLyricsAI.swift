@@ -288,7 +288,7 @@ enum LiveAudioLyricsAI {
         }
 
         var recognized: RecognizedLyricsCandidate?
-        if heardWords.count >= 3 {
+        if heardWords.count >= 4 {
             recognized = await identifyBestSong(
                 heardWords: heardWords,
                 duration: item.durationSeconds,
@@ -855,7 +855,15 @@ enum LiveAudioLyricsAI {
         }
 
         if let bestLRCLIB = rescored.max(by: { $0.score < $1.score }),
-           bestLRCLIB.textOverlapCount >= 4 && bestLRCLIB.score >= 75 {
+           bestLRCLIB.textOverlapCount >= 5 && bestLRCLIB.score >= 82 {
+            let hintArtist = (rawArtistHint ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            let artistMatchesOrUnknown = hintArtist.isEmpty
+                || hintArtist == "Unknown Artist"
+                || SyncedLyricsService.areArtistsCompatible(target: hintArtist, candidate: bestLRCLIB.artistName)
+                || bestLRCLIB.textOverlapCount >= 8
+            if !artistMatchesOrUnknown {
+                return nil
+            }
             if let dur = bestLRCLIB.durationSeconds, let localDur = duration, localDur > 10, abs(dur - localDur) > 28.0 {
                 // Duration mismatch is too wide for a confident transcript-based rename.
             } else {

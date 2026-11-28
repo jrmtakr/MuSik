@@ -193,7 +193,7 @@ actor WhisperTranscriptionEngine {
             var localWeight = 0.0
             let captionNoisePhrases = [
                 "thanks for watching", "thank you for watching", "subscribe to",
-                "subtitles by", "amara.org", "구독과 좋아요"
+                "subtitles by", "amara.org", "구독과 좋아요", "[music]", "(music)"
             ]
             for result in segResults {
                 let lang = result.language.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -204,11 +204,14 @@ actor WhisperTranscriptionEngine {
                     let segDur = max(0.1, Double(seg.end - seg.start))
                     localSum += Double(seg.noSpeechProb) * segDur
                     localWeight += segDur
-                    // Hip-hop / beat-backed vocals frequently sit in noSpeechProb 0.72..0.94; only discard extreme silence
-                    // or explicit caption-noise hallucinations when probability is elevated.
-                    if seg.noSpeechProb > 0.96 { continue }
-                    let lowerSeg = seg.text.lowercased()
-                    if seg.noSpeechProb > 0.45 && captionNoisePhrases.contains(where: { lowerSeg.contains($0) }) {
+                    // Hip-hop / beat-backed & sparse vaporwave vocal adlibs often sit in noSpeechProb 0.72..0.97;
+                    // only discard near-certain silence or silence noise hallucinations.
+                    if seg.noSpeechProb > 0.98 { continue }
+                    let lowerSeg = seg.text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                    if seg.noSpeechProb > 0.50 && captionNoisePhrases.contains(where: { lowerSeg.contains($0) }) {
+                        continue
+                    }
+                    if seg.noSpeechProb > 0.72 && (lowerSeg == "thank you" || lowerSeg == "thank you." || lowerSeg == "you") {
                         continue
                     }
                     if let segWords = seg.words, !segWords.isEmpty {
@@ -337,8 +340,8 @@ actor WhisperTranscriptionEngine {
             var loadedKit: WhisperKit?
             if let cachedPath {
                 let cachedConfig = WhisperKitConfig(
-                    modelFolder: cachedPath,
                     downloadBase: Self.modelsBaseURL,
+                    modelFolder: cachedPath,
                     tokenizerFolder: Self.modelsBaseURL,
                     computeOptions: Self.backgroundSafeComputeOptions,
                     verbose: false,
