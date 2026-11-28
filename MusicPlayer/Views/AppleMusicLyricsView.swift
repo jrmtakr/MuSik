@@ -688,15 +688,7 @@ struct AppleMusicLyricsView: View {
         let rawTime: Double
         if mediaManager.isPlaying {
             let dt = max(0, min(0.25, now.timeIntervalSince(lastSyncWallTime)))
-            let hwLatency: Double = {
-                guard mediaManager.isUsingEqualizerBackend else { return 0.0 }
-                let session = AVAudioSession.sharedInstance()
-                let isBuiltIn = session.currentRoute.outputs.allSatisfy {
-                    $0.portType == .builtInSpeaker || $0.portType == .builtInReceiver
-                }
-                if isBuiltIn || session.outputLatency <= 0.05 { return 0.0 }
-                return min(0.35, session.outputLatency)
-            }()
+            let hwLatency = equalizerLatencyCompensation()
             rawTime = max(0, lastSyncPlaybackTime + dt * Double(mediaManager.playbackRate) - hwLatency)
         } else {
             rawTime = mediaManager.currentTime
@@ -706,6 +698,18 @@ struct AppleMusicLyricsView: View {
             effective = max(effective, pinnedSeekEffectiveMin)
         }
         return effective
+    }
+
+    /// AVPlayer and the FFmpeg player already subtract the audio route's output latency from their clocks;
+    /// only the equalizer (AVAudioEngine) backend reports render time, so Bluetooth delay is subtracted here.
+    private func equalizerLatencyCompensation() -> Double {
+        guard mediaManager.isUsingEqualizerBackend else { return 0.0 }
+        let session = AVAudioSession.sharedInstance()
+        let isBuiltIn = session.currentRoute.outputs.allSatisfy {
+            $0.portType == .builtInSpeaker || $0.portType == .builtInReceiver
+        }
+        if isBuiltIn || session.outputLatency <= 0.05 { return 0.0 }
+        return min(0.5, session.outputLatency)
     }
 
     private func activeLineIndex(in lines: [SyncedLyricLine], at effectiveTime: Double, now: Date = .now) -> Int? {
@@ -767,6 +771,10 @@ struct AppleMusicLyricsView: View {
             diag.audioOutputRoute = routeDesc.isEmpty ? "unknown" : routeDesc
             diag.isUsingEqualizerBackend = mediaManager.isUsingEqualizerBackend
             diag.outputLatencySeconds = session.outputLatency
+            diag.playbackBackend = mediaManager.isUsingFFmpegBackend
+                ? "FFmpeg (player compensates latency)"
+                : (mediaManager.isUsingEqualizerBackend ? "Equalizer (lyrics view compensates latency)" : "AVPlayer (player compensates latency)")
+            diag.latencyCompensationSeconds = equalizerLatencyCompensation()
         }
     }
 

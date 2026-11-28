@@ -406,6 +406,14 @@ struct SettingsView: View {
                     }
                 }
 
+                Section {
+                    SpeechModelSettingsRow()
+                } header: {
+                    Text("Lyrics Speech Model")
+                } footer: {
+                    Text("One-time download used to hear lyrics in songs with adlibs or no published lyrics, and to measure lyric timing. Use Wi-Fi.")
+                }
+
                 Section("Storage & About") {
                     LabeledContent("Stored Media", value: "\(mediaManager.items.count) items")
                     LabeledContent("Documents & Files", value: "\(mediaManager.otherFiles.count) files")
@@ -725,6 +733,65 @@ private struct AppIconsPickerView: View {
                     settings.selectedAppIconName = choice.iconName
                 }
             }
+        }
+    }
+}
+
+/// Download status, progress bar and manual download button for the on-device lyrics speech model.
+private struct SpeechModelSettingsRow: View {
+    private var status: SpeechModelStatus { SpeechModelStatus.shared }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Label("Speech Model", systemImage: "waveform")
+                Spacer()
+                Text(statusText)
+                    .font(.caption)
+                    .foregroundStyle(status.phase == .failed ? Color.red : Color.secondary)
+            }
+
+            if status.phase == .downloading {
+                ProgressView(value: status.fraction)
+                Text("Downloading… \(Int((status.fraction * 100).rounded()))%")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            } else if status.phase == .preparing {
+                ProgressView()
+                Text("Setting up on this device. This can take a minute the first time.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+
+            if status.phase == .failed, let detail = status.detail {
+                Text(detail)
+                    .font(.caption2)
+                    .foregroundStyle(.red)
+            }
+
+            if status.phase == .notDownloaded || status.phase == .failed || status.phase == .downloaded {
+                Button {
+                    Task { await WhisperTranscriptionEngine.shared.downloadNow() }
+                } label: {
+                    Label(status.phase == .downloaded ? "Load Now" : (status.phase == .failed ? "Try Again" : "Download Now"),
+                          systemImage: "arrow.down.circle")
+                }
+            }
+        }
+        .padding(.vertical, 2)
+        .task {
+            await WhisperTranscriptionEngine.shared.refreshStatus()
+        }
+    }
+
+    private var statusText: String {
+        switch status.phase {
+        case .notDownloaded: return "Not downloaded"
+        case .downloading: return "Downloading"
+        case .preparing: return "Setting up"
+        case .downloaded: return "Downloaded"
+        case .ready: return "Ready"
+        case .failed: return "Failed"
         }
     }
 }
