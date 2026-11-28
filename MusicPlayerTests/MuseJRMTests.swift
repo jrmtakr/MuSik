@@ -123,8 +123,10 @@ final class MuseJRMTests: XCTestCase {
             AVLinearPCMIsFloatKey: false,
             AVLinearPCMIsBigEndianKey: false
         ]
-        let audioFile = try AVAudioFile(forWriting: wavURL, settings: pcmSettings, commonFormat: .pcmFormatFloat32, interleaved: false)
-        try audioFile.write(from: buffer)
+        do {
+            let audioFile = try AVAudioFile(forWriting: wavURL, settings: pcmSettings, commonFormat: .pcmFormatFloat32, interleaved: false)
+            try audioFile.write(from: buffer)
+        }
 
         let curve = await SongAudioListener.extractVocalCurve(for: wavURL)
         XCTAssertNotNil(curve)
